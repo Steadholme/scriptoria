@@ -1,0 +1,50 @@
+[package]
+name = "inkwell"
+version = "0.1.0"
+edition = "2021"
+description = "Inkwell — personal blog / CMS with SSO authoring for the HOLDFAST stack."
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "inkwell"
+path = "src/lib.rs"
+
+[[bin]]
+name = "inkwell"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP framework (shared with keystone/keyward/beacon): Form/State/Path extractors, typed responses.
+axum = "0.8"
+# Async runtime axum runs on. The Store trait is async: handlers `.await` it directly and
+# PgStore drives sqlx natively, so a worker thread is NEVER blocked (no sync-over-async bridge).
+# `rt-multi-thread` keeps the serving runtime parallel for concurrent reads.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+# Erase the async Store trait methods so `Arc<dyn Store>` stays object-safe (handlers depend
+# only on the trait, exactly like the keystone/keyward/beacon seam).
+async-trait = "0.1"
+# Deserialize the urlencoded compose/edit/delete form bodies.
+serde = { version = "1", features = ["derive"] }
+# Ergonomic error/store enums -> JSON error envelope.
+thiserror = "2"
+# Structured logging.
+tracing = "0.1"
+tracing-subscriber = "0.3"
+# Markdown -> HTML for the reading view. We SANITIZE: raw HTML events are escaped to text and
+# link/image URLs are scheme-allowlisted, so no raw HTML / `javascript:` injection survives.
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+# Epoch -> UTC date components for the post timeline (std only — no C deps). Same crate the
+# rest of the estate pins.
+time = { version = "0.3", default-features = false, features = ["std"] }
+# CSPRNG bytes for the double-submit CSRF token. `getrandom` is a tiny libc-backed shim (no
+# rand_chacha tree), and `hex` (already used by watchtower) encodes the token.
+getrandom = "0.2"
+hex = "0.4"
+# Portable PostgreSQL data layer. Runtime queries only (sqlx::query/Row) — NO compile-time
+# macros, so the build needs NO database. rustls TLS (no openssl). Standard SQL only, so the
+# same statements later run unchanged on FusionDB over pgwire.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
+
+[dev-dependencies]
+# ServiceExt::oneshot drives the Router in-process for the end-to-end tests (no port bind).
+tower = { version = "0.5", features = ["util"] }

@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>{{TITLE_TEXT}} · Inkwell</title>
+  <style>{{CSS}}</style>
+</head>
+<body class="page-reading">
+{{TOPBAR}}
+<main class="reader">
+  <a class="back-link" href="/">&larr; All posts</a>
+  <article class="article">
+    <header class="article__head">
+      <h1 class="article__title">{{TITLE}}</h1>
+      <div class="article__meta">{{META}}</div>
+      {{ACTIONS}}
+    </header>
+    <div class="article__body">
+      {{BODY}}
+    </div>
+  </article>
+  {{RELATED}}
+</main>
+</body>
+</html>

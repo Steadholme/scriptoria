@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>{{HEADING}} · Inkwell</title>
+  <style>{{CSS}}</style>
+</head>
+<body class="page-console">
+{{TOPBAR}}
+<main class="console console--narrow">
+  <div class="console__head">
+    <h1>{{HEADING}}</h1>
+    <p class="sub">{{SUBHEAD}}</p>
+  </div>
+  <section class="card">
+    <div class="card__body">
+      <form class="editor" method="post" action="{{ACTION}}">
+        <input type="hidden" name="csrf_token" value="{{CSRF}}">
+        <div class="field">
+          <label for="title">Title</label>
+          <input type="text" id="title" name="title" required maxlength="200" placeholder="Post title" value="{{TITLE_VALUE}}">
+        </div>
+        <div class="field">
+          <label for="body">Body <span class="muted">(Markdown)</span></label>
+          <textarea id="body" name="body" class="editor__body" placeholder="Write in Markdown&hellip;">{{BODY_VALUE}}</textarea>
+        </div>
+        <div class="field field--inline">
+          <label class="check"><input type="checkbox" name="published" {{PUBLISHED_CHECKED}}> Published</label>
+        </div>
+        <div class="editor__actions">
+          <button class="btn btn-primary" type="submit">{{SUBMIT_LABEL}}</button>
+          <a class="btn btn-ghost" href="{{CANCEL_HREF}}">Cancel</a>
+        </div>
+      </form>
+      {{DELETE}}
+    </div>
+  </section>
+</main>
+</body>
+</html>

@@ -1,0 +1,51 @@
+[package]
+name = "lattice"
+version = "0.1.0"
+edition = "2021"
+description = "Lattice — server-rendered knowledge-base wiki for the HOLDFAST stack."
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "lattice"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lattice"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP framework (shared with keystone/keyward/watchtower): Path/State/Form extractors,
+# typed Html/Redirect responses.
+axum = "0.8"
+# Async runtime axum runs on. The Store trait is async: handlers `.await` it directly and
+# PgStore uses sqlx natively, so a worker thread is NEVER blocked (no sync-over-async bridge).
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+# Erase the async Store trait methods so `Arc<dyn Store>` stays object-safe (same seam as the
+# rest of the estate).
+async-trait = "0.1"
+# Deserialize the urlencoded edit form + the new-page / edit query strings.
+serde = { version = "1", features = ["derive"] }
+# Ergonomic error/store enums -> HTML/JSON error responses.
+thiserror = "2"
+# Structured logging.
+tracing = "0.1"
+tracing-subscriber = "0.3"
+# CommonMark rendering for page bodies. Raw HTML in the source is NEUTRALIZED at the event
+# level (emitted as escaped text), so stored markdown can never inject script/markup — only
+# our own safe [[wiki-link]] anchors are passed through as HTML.
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+# CSPRNG for CSRF tokens + revision ids (pure Rust, no OpenSSL — only glibc, like keyward).
+getrandom = "0.2"
+# Hex-encode the random bytes for the CSRF token / revision id.
+hex = "0.4"
+# Epoch -> UTC components for human-readable "last edited" timestamps (std only — no extra C
+# deps). Same crate the rest of the estate pins.
+time = { version = "0.3", default-features = false, features = ["std"] }
+# Portable PostgreSQL data layer. Runtime queries only (sqlx::query/Row) — NO compile-time
+# macros, so the build needs NO database. rustls TLS (no openssl). The same standard-SQL
+# statements later run unchanged on FusionDB over pgwire.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
+
+[dev-dependencies]
+# ServiceExt::oneshot drives the Router in-process for the end-to-end tests (no port bind).
+tower = { version = "0.5", features = ["util"] }

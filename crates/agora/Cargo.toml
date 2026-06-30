@@ -1,0 +1,53 @@
+[package]
+name = "agora"
+version = "0.1.0"
+edition = "2021"
+description = "Agora — server-rendered discussion forum + SSO identity for the HOLDFAST stack."
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "agora"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agora"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP framework (shared with keystone/keyward/beacon): State/Path/Query/Form extractors,
+# typed responses. The `form` + `query` features are on by default.
+axum = "0.8"
+# Async runtime axum runs on. The Store trait is async: handlers `.await` it directly and
+# PgStore drives sqlx natively, so a worker thread is NEVER blocked (no sync-over-async
+# bridge). `rt-multi-thread` keeps the serving runtime parallel for concurrent reads.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+# Erase the async Store trait methods so `Arc<dyn Store>` stays object-safe (handlers depend
+# only on the trait, exactly like the keystone/keyward/beacon seam).
+async-trait = "0.1"
+# (De)serialize form bodies + JSON envelopes; serde_json backs the error envelope/tests.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Ergonomic error/store enums -> error response.
+thiserror = "2"
+# Structured logging.
+tracing = "0.1"
+tracing-subscriber = "0.3"
+# Epoch -> UTC components for absolute timestamps (std only — no C deps), same crate the
+# rest of the estate pins.
+time = { version = "0.3", default-features = false, features = ["std"] }
+# Portable PostgreSQL data layer. Runtime queries only (sqlx::query/Row) — NO compile-time
+# macros, so the build needs NO database. rustls TLS (no openssl). Standard SQL only, so the
+# same statements later run unchanged on FusionDB over pgwire.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
+# CommonMark -> HTML for post bodies. We feed it through an event filter that neutralises raw
+# HTML (rendered as text) and unsafe link/image schemes, so user markdown can never inject
+# script. `html` feature only — no SIMD/C toolchain.
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+# CSPRNG (OsRng) for opaque ids + CSRF tokens. 0.8 line matches the rest of the estate.
+rand = "0.8"
+# Hex-encode the random id/token bytes.
+hex = "0.4"
+
+[dev-dependencies]
+# ServiceExt::oneshot drives the Router in-process for the end-to-end tests (no port bind).
+tower = { version = "0.5", features = ["util"] }

@@ -1,0 +1,31 @@
+[package]
+name = "scriptoria"
+version = "0.1.0"
+edition = "2021"
+description = "Scriptoria — one deployable hosting the HOLDFAST content surfaces (blog / forum / wiki) behind a Host-based vhost demux. Each surface keeps its own database, routes, and subdomain; this binary just composes the three library crates so the estate runs one container instead of three."
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "scriptoria"
+path = "src/main.rs"
+
+[dependencies]
+# The three content surfaces, vendored as path-dep library crates and reused VERBATIM (their
+# code, schemas, routes, templates and tests are unchanged). Scriptoria only adds the vhost demux,
+# so each surface behaves exactly as its standalone service did — Cortex still federates the three
+# separate databases and its hard-coded blog/forum/wiki.w33d.xyz deep links keep resolving.
+inkwell = { path = "crates/inkwell" }
+agora = { path = "crates/agora" }
+lattice = { path = "crates/lattice" }
+
+# HTTP framework — the outer Host-demux router + the per-surface routers returned by each crate's
+# `app()`. Same axum the surfaces use.
+axum = "0.8"
+# Async runtime: connect/migrate the three Postgres stores at startup, then serve. `net` backs the
+# dependency-free `healthcheck` subcommand's loopback probe.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
+# `ServiceExt::oneshot` drives the chosen per-surface Router for one request inside the demux.
+tower = { version = "0.5", features = ["util"] }
+# Structured logging (shared with the surfaces).
+tracing = "0.1"
+tracing-subscriber = "0.3"
