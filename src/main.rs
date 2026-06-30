@@ -1,12 +1,19 @@
-//! Scriptoria — one container hosting the HOLDFAST content surfaces (blog / forum / wiki).
+//! Scriptoria — one container hosting the HOLDFAST content surfaces
+//! (blog / forum / wiki / comments / paste / drive).
 //!
-//! Each surface is its OWN library crate (Inkwell/Agora/Lattice), reused verbatim: same schema,
-//! same routes, same templates, same OWN database, same subdomain. This binary only adds a
-//! **Host-based vhost demux** so the estate runs ONE deployable instead of three. Sluice points
-//! `blog.w33d.xyz`, `forum.w33d.xyz` and `wiki.w33d.xyz` all at this container; each request is
-//! dispatched to the matching surface's router by its `Host` header. Because the surfaces keep
-//! their exact paths and separate databases, Cortex's federation + its hard-coded
-//! `blog/forum/wiki.w33d.xyz/...` deep links keep working unchanged.
+//! Each surface is its OWN library crate (Inkwell/Agora/Lattice/Echo/Pastefire/Aperture), reused
+//! verbatim: same schema, same routes, same templates, same OWN database, same subdomain. This
+//! binary only adds a **Host-based vhost demux** so the estate runs ONE deployable instead of six.
+//! Sluice points `blog.w33d.xyz`, `forum.w33d.xyz`, `wiki.w33d.xyz`, `comments.w33d.xyz`,
+//! `paste.w33d.xyz` and `drive.w33d.xyz` all at this container; each request is dispatched to the
+//! matching surface's router by its `Host` header. Because the surfaces keep their exact paths and
+//! separate databases, Cortex's federation + its hard-coded `blog/forum/wiki.w33d.xyz/...` deep
+//! links keep working unchanged, and Echo's iframe widget keeps framing under
+//! `comments.w33d.xyz/embed/{key}` (its own `X-Frame-Options: SAMEORIGIN` headers are emitted by
+//! Echo's handlers, unchanged).
+//!
+//! Echo (comments) also runs its OWN Watchtower audit sink; Aperture (drive) stores blobs in Cairn
+//! S3 over its OWN reqwest+rustls client — both built explicitly below from each surface's OWN env.
 //!
 //! `healthcheck` subcommand: a dependency-free loopback `GET /healthz` (host-agnostic) used as the
 //! container HEALTHCHECK, so the image needs no curl.
@@ -26,13 +33,16 @@ use tower::ServiceExt;
 /// Default listen address — internal-only; Sluice fronts the three subdomains at this upstream.
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8700";
 
-/// The three composed per-surface routers, dispatched by Host. Cheap to clone (each `Router` is
+/// The six composed per-surface routers, dispatched by Host. Cheap to clone (each `Router` is
 /// `Arc`-backed internally).
 #[derive(Clone)]
 struct Vhosts {
     blog: Router,
     forum: Router,
     wiki: Router,
+    comments: Router,
+    paste: Router,
+    drive: Router,
 }
 
 #[tokio::main]
@@ -51,18 +61,28 @@ async fn main() {
     let blog = build_blog().await.unwrap_or_else(|e| fatal("blog (inkwell)", e));
     let forum = build_forum().await.unwrap_or_else(|e| fatal("forum (agora)", e));
     let wiki = build_wiki().await.unwrap_or_else(|e| fatal("wiki (lattice)", e));
+    let comments = build_comments().await.unwrap_or_else(|e| fatal("comments (echo)", e));
+    let paste = build_paste().await.unwrap_or_else(|e| fatal("paste (pastefire)", e));
+    let drive = build_drive().await.unwrap_or_else(|e| fatal("drive (aperture)", e));
 
     let app = Router::new()
         // Host-agnostic liveness for the container HEALTHCHECK + estate probes.
         .route("/healthz", get(|| async { "ok" }))
         .fallback(dispatch)
-        .with_state(Vhosts { blog, forum, wiki });
+        .with_state(Vhosts {
+            blog,
+            forum,
+            wiki,
+            comments,
+            paste,
+            drive,
+        });
 
     let addr: SocketAddr = bind_addr.parse().expect("invalid BIND_ADDR");
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
-    tracing::info!(%addr, "Scriptoria listening (blog/forum/wiki vhost demux)");
+    tracing::info!(%addr, "Scriptoria listening (blog/forum/wiki/comments/paste/drive vhost demux)");
     axum::serve(listener, app).await.expect("server error");
 }
 
@@ -74,7 +94,8 @@ async fn dispatch(State(v): State<Vhosts>, req: Request) -> Response {
         .get(header::HOST)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
-    // Match on the leading label (`blog`/`forum`/`wiki`), ignoring any port.
+    // Match on the leading label (`blog`/`forum`/`wiki`/`comments`/`paste`/`drive`), ignoring any
+    // port.
     let label = host
         .split(':')
         .next()
@@ -86,6 +107,9 @@ async fn dispatch(State(v): State<Vhosts>, req: Request) -> Response {
         "forum" => v.forum,
         "wiki" => v.wiki,
         "blog" => v.blog,
+        "comments" => v.comments,
+        "paste" => v.paste,
+        "drive" => v.drive,
         _ => return (StatusCode::NOT_FOUND, "unknown content host").into_response(),
     };
     // `Router` is a tower `Service` (the exact `app(state).oneshot(req)` path the surfaces' own
@@ -145,6 +169,108 @@ async fn build_wiki() -> Result<Router, String> {
         store: Arc::new(pg),
     };
     Ok(lattice::app(state))
+}
+
+/// Build the comments (Echo) surface router against `ECHO_DATABASE_URL`, with Echo's OWN audit sink.
+///
+/// State is built EXPLICITLY (not via `echo::build_state_from_env`, which keys the store off
+/// `ECHO_STORE`/the bare `DATABASE_URL` that would collide in-process): connect + migrate Echo's OWN
+/// Postgres, start its OWN Watchtower audit emitter exactly as Echo does
+/// (`AUDIT_ENABLED` + `WATCHTOWER_URL` + `AUDIT_INGEST_TOKEN`), and assemble the `AppState` Echo's
+/// `app()` expects. Echo's handlers emit `X-Frame-Options: SAMEORIGIN` on `/embed/{key}` themselves
+/// — unchanged — so the iframe widget the other content apps embed keeps framing.
+async fn build_comments() -> Result<Router, String> {
+    let dsn = require_env("ECHO_DATABASE_URL")?;
+    let pg = echo::store::PgStore::connect(&dsn)
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
+    pg.migrate().await.map_err(|e| format!("migrate: {e}"))?;
+    tracing::info!("comments (echo) store ready");
+    let audit = echo::audit::AuditSink::start(
+        env_truthy("AUDIT_ENABLED"),
+        &echo::config::env_nonempty("WATCHTOWER_URL").unwrap_or_default(),
+        echo::config::env_nonempty("AUDIT_INGEST_TOKEN").as_deref(),
+    );
+    let state = echo::AppState {
+        config: Arc::new(echo::config::Config::from_env()),
+        store: Arc::new(pg),
+        audit,
+    };
+    Ok(echo::app(state))
+}
+
+/// Build the paste (Pastefire) surface router against `PASTEFIRE_DATABASE_URL`.
+///
+/// Built EXPLICITLY (not via `pastefire::build_state_from_env`, which reads the bare `DATABASE_URL`
+/// that would collide in-process): connect + migrate Pastefire's OWN Postgres and assemble the
+/// `AppState` its `app()` expects. `Config::from_env()` keeps every Pastefire knob unchanged.
+async fn build_paste() -> Result<Router, String> {
+    let dsn = require_env("PASTEFIRE_DATABASE_URL")?;
+    let pg = pastefire::store::PgStore::connect(&dsn)
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
+    pg.migrate().await.map_err(|e| format!("migrate: {e}"))?;
+    tracing::info!("paste (pastefire) store ready");
+    let state = pastefire::AppState {
+        config: Arc::new(pastefire::config::Config::from_env()),
+        store: Arc::new(pg),
+    };
+    Ok(pastefire::app(state))
+}
+
+/// Build the drive (Aperture) surface router against `APERTURE_DATABASE_URL`, with Aperture's OWN
+/// Cairn S3 blob store.
+///
+/// Built EXPLICITLY (not via `aperture::build_state_from_env`, which reads the bare `DATABASE_URL`
+/// that would collide in-process): connect + migrate Aperture's OWN Postgres metadata store, then
+/// stand up the OWN blob store. The blob backend mirrors Aperture's own `build_state_from_env`,
+/// selected by `APERTURE_BLOBS` (`s3` -> Cairn via `S3Blobs::connect(&config.s3)` using the
+/// `S3_ENDPOINT`/`S3_BUCKET`/`S3_REGION`/`S3_ACCESS_KEY`/`S3_SECRET_KEY` env Aperture's
+/// `Config::from_env()` already parsed; `memory` default for a DB-only deploy). The S3 client is a
+/// native-async reqwest+rustls(ring) client — no extra CryptoProvider install is needed (ring is
+/// the only provider compiled in, so rustls auto-installs it), matching the rest of the estate.
+async fn build_drive() -> Result<Router, String> {
+    let dsn = require_env("APERTURE_DATABASE_URL")?;
+    let pg = aperture::store::PgStore::connect(&dsn)
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
+    pg.migrate().await.map_err(|e| format!("migrate: {e}"))?;
+    tracing::info!("drive (aperture) metadata store ready");
+
+    let config = aperture::config::Config::from_env();
+    let blobs_kind = std::env::var("APERTURE_BLOBS").unwrap_or_else(|_| "memory".to_string());
+    let blobs: Arc<dyn aperture::blobs::Blobs> = match blobs_kind.as_str() {
+        "s3" => {
+            tracing::info!(
+                endpoint = config.s3.endpoint,
+                bucket = config.s3.bucket,
+                "APERTURE_BLOBS=s3 — using Cairn object store"
+            );
+            Arc::new(aperture::blobs::S3Blobs::connect(&config.s3)?)
+        }
+        "memory" => Arc::new(aperture::blobs::MemoryBlobs::new()),
+        other => return Err(format!("unknown APERTURE_BLOBS={other} (use memory|s3)")),
+    };
+
+    let state = aperture::AppState {
+        config: Arc::new(config),
+        store: Arc::new(pg),
+        blobs,
+    };
+    Ok(aperture::app(state))
+}
+
+/// Interpret a boolean-ish env var (`on` / `true` / `1` / `yes`, case-insensitive). Mirrors the
+/// private `env_truthy` Echo uses in its own `build_state_from_env`, so audit is gated identically.
+fn env_truthy(key: &str) -> bool {
+    matches!(
+        std::env::var(key)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "on" | "true" | "1" | "yes"
+    )
 }
 
 /// Read a required env var, returning a descriptive error when unset/empty.

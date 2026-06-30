@@ -1,2 +1,5 @@
 target/
 crates/*/target/
+# Vendored surface crates resolve through the parent lockfile; their own Cargo.lock files
+# (regenerated whenever a crate's tests are run standalone) are not tracked.
+crates/*/Cargo.lock

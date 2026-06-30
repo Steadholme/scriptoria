@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Drive · Aperture · HOLDFAST</title>
+  <style>{{CSS}}</style>
+</head>
+<body class="page-console">
+  <header class="topbar">
+    <div class="topbar__inner">
+      <a class="brand" href="/" aria-label="HOLDFAST Drive">
+        <span class="brand__glyph" aria-hidden="true">{{SHIELD}}</span>
+        <span class="brand__word">HOLDFAST</span>
+      </a>
+      <div class="topbar__right">{{USERBOX}}</div>
+    </div>
+  </header>
+
+  <main class="console">
+    <div class="console__head">
+      <h1>Your drive</h1>
+      <p class="sub">Images, screenshots and files — stored privately and shareable by link. Ownership comes from your single sign-on session.</p>
+    </div>
+
+    <form id="uploadForm" class="dropzone" method="post" action="/upload" enctype="multipart/form-data">
+      <input type="hidden" name="csrf_token" value="{{CSRF}}">
+      <input id="fileInput" class="dropzone__input" type="file" name="file" required>
+      <label for="fileInput" class="dropzone__label">
+        <span class="dropzone__icon" aria-hidden="true">&#8682;</span>
+        <span class="dropzone__text"><strong>Choose a file</strong> or drag &amp; drop it here</span>
+        <span id="fileName" class="dropzone__hint">Nothing selected yet</span>
+      </label>
+      <div class="dropzone__actions">
+        <button class="btn btn-primary" type="submit">Upload</button>
+      </div>
+    </form>
+
+    <div class="section-head">
+      <h2>Files</h2>
+      <span class="count-badge">{{COUNT}}</span>
+    </div>
+
+    <ul class="gallery-grid">
+      {{CARDS}}
+    </ul>
+  </main>
+
+  <script>
+    (function () {
+      var input = document.getElementById('fileInput');
+      var name = document.getElementById('fileName');
+      var zone = document.getElementById('uploadForm');
+      if (!input || !zone) { return; }
+      function show() {
+        if (input.files && input.files.length) {
+          name.textContent = input.files[0].name;
+          zone.classList.add('has-file');
+        } else {
+          name.textContent = 'Nothing selected yet';
+          zone.classList.remove('has-file');
+        }
+      }
+      input.addEventListener('change', show);
+      ['dragenter', 'dragover'].forEach(function (ev) {
+        zone.addEventListener(ev, function (e) { e.preventDefault(); zone.classList.add('dragging'); });
+      });
+      ['dragleave', 'drop'].forEach(function (ev) {
+        zone.addEventListener(ev, function (e) { e.preventDefault(); zone.classList.remove('dragging'); });
+      });
+      zone.addEventListener('drop', function (e) {
+        if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
+          input.files = e.dataTransfer.files;
+          show();
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

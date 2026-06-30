@@ -1,0 +1,272 @@
+//! HTTP handlers + shared server-render helpers.
+//!
+//! - [`health`] — unauthenticated liveness probe (`/healthz`).
+//! - [`files`] — the drive surface (gallery, upload, detail, raw, delete, public share).
+//!
+//! The shared design tokens / CSS are embedded (via `include_str!`) and inlined into every page,
+//! matching the HOLDFAST enterprise brand: brand gradient, indigo accent, cards, buttons, the
+//! app-bar with the shield + wordmark. All producer-supplied text (file names, types) is
+//! HTML-escaped on render (defense-in-depth against stored XSS); blob bytes are served as inline
+//! images only when magic-sniffed, otherwise as downloads.
+
+pub mod files;
+pub mod health;
+
+use axum::http::StatusCode;
+use axum::response::Html;
+
+/// Embedded design system, inlined into each rendered page's `<style>`.
+pub const APP_CSS: &str = include_str!("../../static/app.css");
+
+/// The HOLDFAST shield glyph (small, for the app-bar brand lockup).
+pub const SHIELD_SVG: &str = r##"<svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="hf-shield-sm" x1="8" y1="4" x2="40" y2="44" gradientUnits="userSpaceOnUse"><stop stop-color="#818CF8"/><stop offset="1" stop-color="#4F46E5"/></linearGradient></defs><path d="M24 4 8 9.5V22c0 11 7 17.4 16 21.5C33 39.4 40 33 40 22V9.5L24 4Z" fill="url(#hf-shield-sm)"/><rect x="20" y="19" width="8" height="13" rx="1" fill="#fff" fill-opacity="0.92"/><path d="M20 19v-2.5a4 4 0 0 1 8 0V19" stroke="#fff" stroke-width="2" stroke-opacity="0.92" fill="none"/></svg>"##;
+
+/// A generic document glyph shown on gallery cards / detail previews for non-image files.
+pub const FILE_SVG: &str = r##"<svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 4h16l10 10v28a2 2 0 0 1-2 2H12a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Z" fill="#EEF2FF" stroke="#C7D2FE" stroke-width="2"/><path d="M28 4v10h10" fill="#fff" stroke="#C7D2FE" stroke-width="2"/></svg>"##;
+
+/// Cross-subdomain SSO logout (terminated at the Keystone IdP behind the gateway).
+pub const LOGOUT_URL: &str = "https://id.w33d.xyz/_gw/auth/logout";
+
+/// Branded error page shell.
+const ERROR_HTML: &str = include_str!("../../templates/error.html");
+
+/// Format epoch seconds as a compact UTC timestamp `YYYY-MM-DD HH:MM:SSZ`.
+pub fn fmt_ts(secs: i64) -> String {
+    match time::OffsetDateTime::from_unix_timestamp(secs) {
+        Ok(dt) => format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}Z",
+            dt.year(),
+            dt.month() as u8,
+            dt.day(),
+            dt.hour(),
+            dt.minute(),
+            dt.second()
+        ),
+        Err(_) => secs.to_string(),
+    }
+}
+
+/// Human-readable byte size (`1.0 KB`, `2.3 MB`, ...). Decimal units, one decimal place above KB.
+pub fn human_size(bytes: i64) -> String {
+    const KB: f64 = 1024.0;
+    let b = bytes.max(0) as f64;
+    if b < KB {
+        return format!("{bytes} B");
+    }
+    let units = ["KB", "MB", "GB", "TB"];
+    let mut size = b / KB;
+    let mut unit = 0;
+    while size >= KB && unit < units.len() - 1 {
+        size /= KB;
+        unit += 1;
+    }
+    format!("{size:.1} {}", units[unit])
+}
+
+/// Detect the content type from the leading magic bytes for the raster image types Aperture
+/// renders inline. Returns `None` when no known image signature matches, so the caller falls back
+/// to a sanitized client-provided type (and serves it as a download).
+pub fn sniff_image(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() >= 8 && bytes[..8] == [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
+        return Some("image/png");
+    }
+    if bytes.len() >= 3 && bytes[..3] == [0xFF, 0xD8, 0xFF] {
+        return Some("image/jpeg");
+    }
+    if bytes.len() >= 6 && (&bytes[..6] == b"GIF87a" || &bytes[..6] == b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if bytes.len() >= 2 && &bytes[..2] == b"BM" {
+        return Some("image/bmp");
+    }
+    None
+}
+
+/// Sanitize a client-supplied content type to a conservative token, defaulting to
+/// `application/octet-stream`. Only `type/subtype` of safe characters survives; anything else
+/// (header-injection attempts, blanks) collapses to the default.
+pub fn sanitize_content_type(raw: &str) -> String {
+    let raw = raw.trim();
+    let base = raw.split(';').next().unwrap_or("").trim();
+    let ok = !base.is_empty()
+        && base.len() <= 128
+        && base.contains('/')
+        && base
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'/' | b'-' | b'+' | b'.'));
+    if ok {
+        base.to_ascii_lowercase()
+    } else {
+        "application/octet-stream".to_string()
+    }
+}
+
+/// Resolve the stored content type for an upload: prefer the magic-sniffed image type, else the
+/// sanitized client type. The returned type drives BOTH metadata display and the inline/download
+/// serving decision (`model::is_inline_image`).
+pub fn resolve_content_type(bytes: &[u8], client_type: &str) -> String {
+    match sniff_image(bytes) {
+        Some(image) => image.to_string(),
+        None => sanitize_content_type(client_type),
+    }
+}
+
+/// Sanitize a file name for use in a `Content-Disposition` `filename=""` parameter: strip control
+/// characters, quotes and path separators so the header can't be split or traverse. Empty input
+/// becomes `file`.
+pub fn safe_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '"' | '\\' | '/' | '\r' | '\n') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "file".to_string()
+    } else {
+        trimmed.chars().take(200).collect()
+    }
+}
+
+/// The right side of the app-bar: a page title, an "All apps" pill back to the apex portal, the
+/// signed-in user chip (avatar initial + email, when known), and the cross-subdomain logout link.
+/// Shared by every page so the chrome stays identical across the estate.
+pub fn userbox(title: &str, email: Option<&str>) -> String {
+    // A user chip (avatar initial + email) is shown only when a gateway identity is known; the
+    // "All apps" pill and logout complete the shared app-bar chrome.
+    let chip = match email {
+        Some(e) if !e.is_empty() => {
+            let initial = e
+                .chars()
+                .next()
+                .map(|c| c.to_uppercase().to_string())
+                .unwrap_or_else(|| "H".to_string());
+            format!(
+                "<span class=\"userchip\"><span class=\"userchip__avatar\" aria-hidden=\"true\">{}</span><span class=\"user-email\">{}</span></span>",
+                esc(&initial),
+                esc(e),
+            )
+        }
+        _ => String::new(),
+    };
+    format!(
+        concat!(
+            "<span class=\"topbar__title\">{title}</span>",
+            "<a class=\"allapps\" href=\"https://w33d.xyz\" title=\"All apps\">",
+            "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\">",
+            "<rect x=\"3\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/>",
+            "<rect x=\"3\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/></svg>All apps</a>",
+            "{chip}",
+            "<a class=\"btn btn-ghost btn-sm\" href=\"{LOGOUT_URL}\">Log out</a>",
+        ),
+        title = esc(title),
+        chip = chip,
+        LOGOUT_URL = LOGOUT_URL,
+    )
+}
+
+/// Render the branded error page (used by [`crate::error::AppError`]). `email` is shown in the
+/// app-bar when a gateway identity is known.
+pub fn render_error(
+    status: StatusCode,
+    heading: &str,
+    message: &str,
+    email: Option<&str>,
+) -> (StatusCode, Html<String>) {
+    let body = ERROR_HTML
+        .replace("{{CSS}}", APP_CSS)
+        .replace("{{SHIELD}}", SHIELD_SVG)
+        .replace("{{USERBOX}}", &userbox("Drive", email))
+        .replace("{{STATUS}}", &status.as_u16().to_string())
+        .replace("{{HEADING}}", &esc(heading))
+        .replace("{{MESSAGE}}", &esc(message));
+    (status, Html(body))
+}
+
+/// Minimal HTML escaping for text/attribute interpolation.
+pub fn esc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escapes_html_metacharacters() {
+        assert_eq!(esc("<script>&\"'"), "&lt;script&gt;&amp;&quot;&#x27;");
+    }
+
+    #[test]
+    fn human_size_scales_units() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(1024), "1.0 KB");
+        assert_eq!(human_size(1536), "1.5 KB");
+        assert_eq!(human_size(1024 * 1024), "1.0 MB");
+        assert_eq!(human_size(5 * 1024 * 1024), "5.0 MB");
+    }
+
+    #[test]
+    fn sniff_detects_png_jpeg_gif() {
+        let png = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0];
+        assert_eq!(sniff_image(&png), Some("image/png"));
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0, 0];
+        assert_eq!(sniff_image(&jpeg), Some("image/jpeg"));
+        assert_eq!(sniff_image(b"GIF89a...."), Some("image/gif"));
+        assert_eq!(sniff_image(b"not an image"), None);
+    }
+
+    #[test]
+    fn resolve_prefers_magic_over_client_lies() {
+        // A PNG claimed as text/html is still served as an image (and never as HTML).
+        let png = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        assert_eq!(resolve_content_type(&png, "text/html"), "image/png");
+        // HTML claimed as image/png is NOT an inline image (no magic) -> sanitized client type.
+        assert_eq!(resolve_content_type(b"<html>", "image/png"), "image/png");
+        assert!(!crate::model::is_inline_image(&resolve_content_type(
+            b"<html>",
+            "text/html"
+        )));
+    }
+
+    #[test]
+    fn sanitize_content_type_rejects_garbage() {
+        assert_eq!(sanitize_content_type("image/png"), "image/png");
+        assert_eq!(sanitize_content_type("IMAGE/PNG"), "image/png");
+        assert_eq!(sanitize_content_type("text/html; charset=utf-8"), "text/html");
+        assert_eq!(sanitize_content_type("no-slash"), "application/octet-stream");
+        assert_eq!(
+            sanitize_content_type("evil\r\nSet-Cookie: x"),
+            "application/octet-stream"
+        );
+        assert_eq!(sanitize_content_type(""), "application/octet-stream");
+    }
+
+    #[test]
+    fn safe_filename_strips_dangerous_chars() {
+        assert_eq!(safe_filename("report.pdf"), "report.pdf");
+        assert_eq!(safe_filename("a/b\\c\"d"), "a_b_c_d");
+        assert_eq!(safe_filename("with\r\nnewline"), "with__newline");
+        assert_eq!(safe_filename("   "), "file");
+    }
+}

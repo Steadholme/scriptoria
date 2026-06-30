@@ -10,13 +10,20 @@ name = "scriptoria"
 path = "src/main.rs"
 
 [dependencies]
-# The three content surfaces, vendored as path-dep library crates and reused VERBATIM (their
-# code, schemas, routes, templates and tests are unchanged). Scriptoria only adds the vhost demux,
-# so each surface behaves exactly as its standalone service did — Cortex still federates the three
-# separate databases and its hard-coded blog/forum/wiki.w33d.xyz deep links keep resolving.
+# The content surfaces, vendored as path-dep library crates and reused VERBATIM (their code,
+# schemas, routes, templates and tests are unchanged). Scriptoria only adds the vhost demux, so
+# each surface behaves exactly as its standalone service did — Cortex still federates the separate
+# databases and its hard-coded blog/forum/wiki.w33d.xyz deep links keep resolving.
 inkwell = { path = "crates/inkwell" }
 agora = { path = "crates/agora" }
 lattice = { path = "crates/lattice" }
+# Three more content surfaces folded in behind the SAME demux: Echo (embeddable threaded comments,
+# comments.w33d.xyz — the iframe widget the other content apps embed), Pastefire (pastebin,
+# paste.w33d.xyz) and Aperture (image host + file drive, drive.w33d.xyz; blobs in Cairn S3). Each
+# keeps its OWN database, subdomain, routes and config — no behavior change.
+echo = { path = "crates/echo" }
+pastefire = { path = "crates/pastefire" }
+aperture = { path = "crates/aperture" }
 
 # HTTP framework — the outer Host-demux router + the per-surface routers returned by each crate's
 # `app()`. Same axum the surfaces use.

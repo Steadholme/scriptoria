@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>{{TITLE}} · Pastefire · HOLDFAST</title>
+  <style>{{CSS}}</style>
+</head>
+<body class="page-console">
+  <header class="topbar">
+    <div class="topbar__inner">
+      <a class="brand" href="/" aria-label="HOLDFAST Pastefire">
+        <span class="brand__glyph" aria-hidden="true">{{SHIELD}}</span>
+        <span class="brand__word">HOLDFAST</span>
+      </a>
+      <div class="topbar__right">{{USERBOX}}</div>
+    </div>
+  </header>
+
+  <main class="console">
+    <div class="console__head console__head--row">
+      <div>
+        <h1>{{TITLE}}</h1>
+        <p class="sub">{{META}}</p>
+      </div>
+      <a class="btn btn-ghost btn-sm" href="/">New paste</a>
+    </div>
+
+    {{BURN_NOTICE}}
+
+    <section class="card">
+      <div class="card__head">
+        <span class="lang-badge lang-badge--lg">{{LANG_LABEL}}</span>
+        <div class="code-tools">
+          <button class="btn btn-secondary btn-sm" id="copyBtn" type="button" data-label="Copy">Copy</button>
+          <a class="btn btn-ghost btn-sm" href="/raw/{{ID}}">View raw</a>
+          {{DELETE}}
+        </div>
+      </div>
+      <div class="card__body card__body--code">
+        <pre id="code" class="code-pre"><code>{{BODY}}</code></pre>
+      </div>
+    </section>
+
+    {{SIMILAR}}
+  </main>
+
+  <script>
+    (function () {
+      var btn = document.getElementById('copyBtn');
+      var code = document.getElementById('code');
+      if (!btn || !code || !navigator.clipboard) { if (btn) { btn.disabled = true; } return; }
+      btn.addEventListener('click', function () {
+        navigator.clipboard.writeText(code.textContent).then(function () {
+          btn.textContent = 'Copied';
+          setTimeout(function () { btn.textContent = btn.getAttribute('data-label'); }, 1200);
+        });
+      });
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>{{NAME}} · Aperture · HOLDFAST</title>
+  <style>{{CSS}}</style>
+</head>
+<body class="page-console">
+  <header class="topbar">
+    <div class="topbar__inner">
+      <a class="brand" href="/" aria-label="HOLDFAST Drive">
+        <span class="brand__glyph" aria-hidden="true">{{SHIELD}}</span>
+        <span class="brand__word">HOLDFAST</span>
+      </a>
+      <div class="topbar__right">{{USERBOX}}</div>
+    </div>
+  </header>
+
+  <main class="console">
+    <div class="console__head console__head--row">
+      <div>
+        <h1 class="detail-title">{{NAME}}</h1>
+        <p class="sub">{{SUB}}</p>
+      </div>
+      <a class="btn btn-ghost btn-sm" href="/">Back to drive</a>
+    </div>
+
+    <div class="layout">
+      <section class="card">
+        <div class="card__body card__body--media">{{PREVIEW}}</div>
+      </section>
+
+      <section class="card">
+        <div class="card__head"><h2>Details</h2></div>
+        <div class="card__body">
+          {{META_LIST}}
+
+          <div class="field">
+            <label for="shareUrl">Share link (no sign-in required)</label>
+            <div class="share-row">
+              <input id="shareUrl" type="text" readonly value="{{SHARE_URL}}">
+              <button class="btn btn-secondary btn-sm" id="copyBtn" type="button" data-label="Copy">Copy</button>
+            </div>
+          </div>
+
+          <div class="actions actions--split">
+            <a class="btn btn-primary" href="/f/{{ID}}/raw">Download</a>
+            {{DELETE}}
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script>
+    (function () {
+      var btn = document.getElementById('copyBtn');
+      var url = document.getElementById('shareUrl');
+      if (!btn || !url) { return; }
+      btn.addEventListener('click', function () {
+        url.select();
+        var done = function () {
+          btn.textContent = 'Copied';
+          setTimeout(function () { btn.textContent = btn.getAttribute('data-label'); }, 1200);
+        };
+        if (navigator.clipboard) {
+          navigator.clipboard.writeText(url.value).then(done, function () { try { document.execCommand('copy'); done(); } catch (e) {} });
+        } else {
+          try { document.execCommand('copy'); done(); } catch (e) {}
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

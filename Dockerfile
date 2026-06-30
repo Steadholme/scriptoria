@@ -1,13 +1,16 @@
 # syntax=docker/dockerfile:1
 #
-# Multi-stage build for Scriptoria (blog/forum/wiki vhost demux over three vendored library crates).
+# Multi-stage build for Scriptoria (blog/forum/wiki/comments/paste/drive vhost demux over six
+# vendored library crates).
 #   - builder: rust:1.96-slim (Debian trixie).
 #   - runtime: debian:trixie-slim (matching glibc), non-root, ca-certificates.
 #
-# The three surfaces embed their templates + static CSS via include_str! at COMPILE time, so the
-# runtime image carries only the single statically-templated binary — no assets to ship. sqlx uses
-# rustls (ring) and the only FFI is the surfaces' own (none beyond glibc), so there is NO OpenSSL.
-# The HEALTHCHECK uses the built-in `scriptoria healthcheck` subcommand, so the image needs no curl.
+# The surfaces embed their templates + static CSS via include_str! at COMPILE time, so the runtime
+# image carries only the single statically-templated binary — no assets to ship. sqlx and Aperture's
+# Cairn S3 client (object_store -> reqwest) both use rustls (ring), and the only FFI is glibc, so
+# there is NO OpenSSL. ca-certificates is present so the S3 client can verify TLS to Cairn if it is
+# fronted by HTTPS. The HEALTHCHECK uses the built-in `scriptoria healthcheck` subcommand, so the
+# image needs no curl.
 
 FROM rust:1.96-slim AS builder
 WORKDIR /build
