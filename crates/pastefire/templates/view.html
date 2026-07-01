@@ -39,7 +39,7 @@
         </div>
       </div>
       <div class="card__body card__body--code">
-        <pre id="code" class="code-pre"><code>{{BODY}}</code></pre>
+        <div id="code" class="code-pre code-lines">{{BODY}}</div>
       </div>
     </section>
 
@@ -52,11 +52,36 @@
       var code = document.getElementById('code');
       if (!btn || !code || !navigator.clipboard) { if (btn) { btn.disabled = true; } return; }
       btn.addEventListener('click', function () {
-        navigator.clipboard.writeText(code.textContent).then(function () {
+        // Copy only the code cells (never the gutter line numbers), one line per row.
+        var cells = code.querySelectorAll('.ln-code');
+        var text = Array.prototype.map.call(cells, function (c) { return c.textContent; }).join('\n');
+        navigator.clipboard.writeText(text).then(function () {
           btn.textContent = 'Copied';
           setTimeout(function () { btn.textContent = btn.getAttribute('data-label'); }, 1200);
         });
       });
+    })();
+
+    // Line-range permalink: a "#L10" or "#L10-L20" fragment highlights that row range and
+    // scrolls it into view. Clicking a gutter number sets the fragment (default anchor
+    // behavior), which fires hashchange and re-applies the highlight.
+    (function () {
+      function applyHash() {
+        var m = /^#L(\d+)(?:-L(\d+))?$/.exec(location.hash);
+        if (!m) { return; }
+        var prev = document.querySelectorAll('.ln--hl');
+        Array.prototype.forEach.call(prev, function (el) { el.classList.remove('ln--hl'); });
+        var a = parseInt(m[1], 10), b = m[2] ? parseInt(m[2], 10) : a;
+        if (b < a) { var t = a; a = b; b = t; }
+        var first = null;
+        for (var n = a; n <= b; n++) {
+          var el = document.getElementById('L' + n);
+          if (el) { el.classList.add('ln--hl'); if (!first) { first = el; } }
+        }
+        if (first) { first.scrollIntoView({ block: 'center' }); }
+      }
+      window.addEventListener('hashchange', applyHash);
+      applyHash();
     })();
   </script>
 </body>

@@ -20,6 +20,7 @@ use serde::Deserialize;
 use crate::audit::AuditEvent;
 use crate::auth;
 use crate::config::{clamp_page_limit, DEFAULT_PAGE, MAX_PAGE};
+use crate::diff::{self, Op};
 use crate::error::AppError;
 use crate::graph::{self, PagePanel};
 use crate::markdown;
@@ -55,6 +56,26 @@ pub struct EditForm {
     pub title: String,
     #[serde(default)]
     pub body_md: String,
+}
+
+/// Query for `GET /history/{slug}`. With both `from` and `to` set to revision ids, the handler
+/// renders the line-level diff between those two revisions instead of the revision list.
+#[derive(Debug, Deserialize)]
+pub struct HistoryQuery {
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub to: Option<String>,
+}
+
+/// The revert form body (`POST /revert/{slug}`). `rev_id` names the revision whose body is
+/// re-saved as a NEW revision. The actor is taken from the gateway, NEVER from here.
+#[derive(Debug, Deserialize)]
+pub struct RevertForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub rev_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -398,13 +419,14 @@ pub async fn edit_submit(
 }
 
 // ---------------------------------------------------------------------------
-// GET /history/{slug}  — the revision list
+// GET /history/{slug}  — the revision list (or a two-revision diff)
 // ---------------------------------------------------------------------------
 
 pub async fn history(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(raw_slug): Path<String>,
+    Query(q): Query<HistoryQuery>,
 ) -> Result<Response, AppError> {
     let slug = slugify(&raw_slug);
     if slug.is_empty() {
@@ -416,12 +438,34 @@ pub async fn history(
 
     let page = state.store.get_page(&slug).await?;
     let title = page.as_ref().map(|p| p.title.clone()).unwrap_or_else(|| humanize(&slug));
+
+    // Diff view: both endpoints selected AND both resolve (scoped to this slug). An unknown/foreign
+    // id falls through to the plain revision list rather than erroring.
+    if let (Some(from_id), Some(to_id)) = (q.from.as_deref(), q.to.as_deref()) {
+        let from = state.store.get_revision(&slug, from_id).await?;
+        let to = state.store.get_revision(&slug, to_id).await?;
+        if let (Some(from), Some(to)) = (from, to) {
+            let content = render_diff(&slug, &title, &from, &to);
+            return Ok(Html(layout(&format!("Diff · {title}"), &headers, &content)).into_response());
+        }
+    }
+
     let revs = state.store.list_revisions(&slug).await?;
-    let content = render_history(&slug, &title, &revs, page.is_some());
-    Ok(Html(layout(&format!("History · {title}"), &headers, &content)).into_response())
+    // Mint a CSRF token so the per-revision revert buttons can double-submit (same idiom as the
+    // editor). The list is a GET, so we also set the cookie on the response.
+    let csrf = auth::new_csrf_token();
+    let content = render_history(&slug, &title, &revs, page.is_some(), &csrf);
+    let html = layout(&format!("History · {title}"), &headers, &content);
+    Ok(html_with_csrf_cookie(html, &csrf))
 }
 
-fn render_history(slug: &str, title: &str, revs: &[Revision], page_exists: bool) -> String {
+fn render_history(
+    slug: &str,
+    title: &str,
+    revs: &[Revision],
+    page_exists: bool,
+    csrf: &str,
+) -> String {
     let back = if page_exists {
         format!("<a class=\"btn btn-secondary btn-sm\" href=\"/w/{}\">Back to page</a>", esc(slug))
     } else {
@@ -429,22 +473,60 @@ fn render_history(slug: &str, title: &str, revs: &[Revision], page_exists: bool)
     };
 
     let rows = if revs.is_empty() {
-        "<tr><td class=\"empty\" colspan=\"3\">No revisions recorded for this page.</td></tr>".to_string()
+        "<tr><td class=\"empty\" colspan=\"4\">No revisions recorded for this page.</td></tr>".to_string()
     } else {
         revs.iter()
-            .map(|r| {
+            .enumerate()
+            .map(|(i, r)| {
+                // The newest revision IS the current page body — reverting to it is a no-op, so it
+                // shows a "current" badge instead of a revert button.
+                let action = if i == 0 {
+                    "<span class=\"badge\">current</span>".to_string()
+                } else {
+                    format!(
+                        "<form class=\"revert-form\" method=\"post\" action=\"/revert/{slug}\">\
+                           <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+                           <input type=\"hidden\" name=\"rev_id\" value=\"{rid}\">\
+                           <button class=\"btn btn-secondary btn-sm\" type=\"submit\">Revert to this</button>\
+                         </form>",
+                        slug = esc(slug),
+                        csrf = esc(csrf),
+                        rid = esc(&r.id),
+                    )
+                };
                 format!(
                     "<tr>\
                        <td class=\"h-when\"><time>{when}</time></td>\
                        <td class=\"h-editor\">{editor}</td>\
                        <td class=\"h-size\">{chars} chars</td>\
+                       <td class=\"h-act\">{action}</td>\
                      </tr>",
                     when = esc(&fmt_ts(r.ts)),
                     editor = esc(&r.editor_email),
                     chars = r.body_md.chars().count(),
+                    action = action,
                 )
             })
             .collect::<String>()
+    };
+
+    // Compare form: pick two revisions -> the line diff. Only offered when there are ≥2. Defaults
+    // to `from = second-newest`, `to = newest`, i.e. "what changed in the latest edit".
+    let compare = if revs.len() >= 2 {
+        let from_opts = rev_options(revs, &revs[1].id);
+        let to_opts = rev_options(revs, &revs[0].id);
+        format!(
+            "<form class=\"compare-form\" method=\"get\" action=\"/history/{slug}\">\
+               <label>From <select name=\"from\">{from_opts}</select></label>\
+               <label>To <select name=\"to\">{to_opts}</select></label>\
+               <button class=\"btn btn-secondary btn-sm\" type=\"submit\">Compare</button>\
+             </form>",
+            slug = esc(slug),
+            from_opts = from_opts,
+            to_opts = to_opts,
+        )
+    } else {
+        String::new()
     };
 
     format!(
@@ -452,16 +534,137 @@ fn render_history(slug: &str, title: &str, revs: &[Revision], page_exists: bool)
            <div><h1>History</h1><p class=\"muted\">{title}</p></div>\
            {back}\
          </div>\
+         {compare}\
          <section class=\"card\">\
            <table class=\"history\">\
-             <thead><tr><th>When (UTC)</th><th>Editor</th><th>Size</th></tr></thead>\
+             <thead><tr><th>When (UTC)</th><th>Editor</th><th>Size</th><th>Action</th></tr></thead>\
              <tbody>{rows}</tbody>\
            </table>\
          </section>",
         title = esc(title),
         back = back,
+        compare = compare,
         rows = rows,
     )
+}
+
+/// `<option>`s for a revision picker, marking `selected` as the pre-selected default.
+fn rev_options(revs: &[Revision], selected: &str) -> String {
+    revs.iter()
+        .map(|r| {
+            let sel = if r.id == selected { " selected" } else { "" };
+            format!(
+                "<option value=\"{id}\"{sel}>{when} · {editor}</option>",
+                id = esc(&r.id),
+                sel = sel,
+                when = esc(&fmt_ts(r.ts)),
+                editor = esc(&r.editor_email),
+            )
+        })
+        .collect()
+}
+
+/// Render the line-level diff between two revisions. Every line is escaped; the LCS keeps shared
+/// lines as context so only true `+`/`-` changes stand out.
+fn render_diff(slug: &str, title: &str, from: &Revision, to: &Revision) -> String {
+    let lines = diff::line_diff(&from.body_md, &to.body_md);
+    let adds = lines.iter().filter(|l| l.op == Op::Insert).count();
+    let dels = lines.iter().filter(|l| l.op == Op::Delete).count();
+
+    let body = if lines.is_empty() {
+        "<div class=\"diff__empty\">Both revisions are empty.</div>".to_string()
+    } else {
+        lines
+            .iter()
+            .map(|l| {
+                let (cls, sign) = match l.op {
+                    Op::Equal => ("diff__line diff__line--ctx", ' '),
+                    Op::Delete => ("diff__line diff__line--del", '-'),
+                    Op::Insert => ("diff__line diff__line--add", '+'),
+                };
+                format!(
+                    "<div class=\"{cls}\"><span class=\"diff__sign\">{sign}</span><span class=\"diff__text\">{text}</span></div>",
+                    cls = cls,
+                    sign = sign,
+                    text = esc(&l.text),
+                )
+            })
+            .collect::<String>()
+    };
+
+    format!(
+        "<div class=\"page-head\">\
+           <div><h1>Diff</h1><p class=\"muted\">{title}</p></div>\
+           <a class=\"btn btn-secondary btn-sm\" href=\"/history/{slug}\">Back to history</a>\
+         </div>\
+         <section class=\"card\">\
+           <p class=\"diff__summary\">Comparing {from_when} → {to_when} · \
+             <span class=\"diff__stat diff__stat--add\">+{adds}</span> \
+             <span class=\"diff__stat diff__stat--del\">−{dels}</span></p>\
+           <div class=\"diff\">{body}</div>\
+         </section>",
+        title = esc(title),
+        slug = esc(slug),
+        from_when = esc(&fmt_ts(from.ts)),
+        to_when = esc(&fmt_ts(to.ts)),
+        adds = adds,
+        dels = dels,
+        body = body,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// POST /revert/{slug}  — re-save an old revision's body as a new revision
+// ---------------------------------------------------------------------------
+
+pub async fn revert_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(raw_slug): Path<String>,
+    Form(form): Form<RevertForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::Forbidden(
+            "CSRF token missing or invalid — reload the history and try again.".to_string(),
+        ));
+    }
+
+    let slug = slugify(&raw_slug);
+    if slug.is_empty() {
+        return Ok(Redirect::to("/").into_response());
+    }
+
+    // The page must exist to revert it; keep its current title (revert only restores the body).
+    let Some(page) = state.store.get_page(&slug).await? else {
+        return Ok(Redirect::to(&format!("/w/{slug}")).into_response());
+    };
+
+    // Resolve the target revision scoped to this slug; a bogus/foreign id is a no-op back to
+    // history (never writes, never errors).
+    let Some(target) = state.store.get_revision(&slug, &form.rev_id).await? else {
+        return Ok(Redirect::to(&format!("/history/{slug}")).into_response());
+    };
+
+    // Identity is authoritative from the gateway; fall back only for direct dev hits.
+    let editor_email = auth::signed_in_email(&headers).unwrap_or_else(|| "anonymous".to_string());
+
+    // Append the restored body as a NEW revision — history stays append-only, nothing is rewritten.
+    state
+        .store
+        .save_page(SaveInput {
+            slug: slug.clone(),
+            title: page.title,
+            body_md: target.body_md,
+            editor_email: editor_email.clone(),
+            now: now_ms(),
+            revision_id: auth::random_hex(),
+        })
+        .await?;
+
+    // A revert is a deliberate rollback → notice severity. Value-free detail only.
+    state.audit.emit(AuditEvent::notice("page.revert", &editor_email, &slug, "revert"));
+
+    Ok(Redirect::to(&format!("/w/{slug}")).into_response())
 }
 
 // ---------------------------------------------------------------------------

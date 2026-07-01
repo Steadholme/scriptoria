@@ -35,8 +35,10 @@ fn file(id: &str, owner: &str, token: &str, created_at: i64) -> FileRec {
         size: 1234,
         bucket: "aperture".to_string(),
         object_key: id.to_string(),
-        share_token: token.to_string(),
+        share_token: Some(token.to_string()),
         created_at,
+        expires_at: None,
+        share_password_hash: None,
     }
 }
 
@@ -70,7 +72,7 @@ async fn pg_store_full_integration() {
     assert_eq!(got.size, 1234);
     assert_eq!(got.bucket, "aperture");
     assert_eq!(got.object_key, "aaaaaaaaaa");
-    assert_eq!(got.share_token, "tok-aaaa");
+    assert_eq!(got.share_token.as_deref(), Some("tok-aaaa"));
 
     // --- id collision -> create returns false (ON CONFLICT DO NOTHING) ------
     assert!(!store.create(&file("aaaaaaaaaa", "alice", "tok-diff", now + 5)).await.unwrap());
@@ -80,6 +82,24 @@ async fn pg_store_full_integration() {
     // --- fetch by share token (the public /s/{token} path) -----------------
     assert_eq!(store.get_by_token("tok-aaaa").await.unwrap().unwrap().id, "aaaaaaaaaa");
     assert!(store.get_by_token("nope").await.unwrap().is_none());
+
+    // --- share-link lifecycle: set expiry + password, then revoke ----------
+    assert!(store
+        .configure_share("aaaaaaaaaa", "alice", Some("tok-aaaa".into()), Some(now + 3600), Some("salt$hash".into()))
+        .await
+        .unwrap());
+    let cfg = store.get("aaaaaaaaaa").await.unwrap().unwrap();
+    assert_eq!(cfg.expires_at, Some(now + 3600));
+    assert_eq!(cfg.share_password_hash.as_deref(), Some("salt$hash"));
+    // Revoke clears the token to NULL; the public lookup misses and the row's token is None.
+    assert!(store.configure_share("aaaaaaaaaa", "alice", None, None, None).await.unwrap());
+    assert!(store.get_by_token("tok-aaaa").await.unwrap().is_none());
+    assert!(store.get("aaaaaaaaaa").await.unwrap().unwrap().share_token.is_none());
+    // A non-owner cannot configure the share link.
+    assert!(!store
+        .configure_share("aaaaaaaaaa", "bob", Some("tok-x".into()), None, None)
+        .await
+        .unwrap());
 
     // --- owner-scoped gallery list, newest-first ---------------------------
     store.create(&file("cccccccccc", "alice", "tok-cccc", now + 20)).await.unwrap();

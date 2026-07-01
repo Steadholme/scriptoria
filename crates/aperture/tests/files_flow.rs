@@ -116,6 +116,179 @@ fn upload_req(csrf: &str, cookie: &str, subject: &str, filename: &str, ctype: &s
         .unwrap()
 }
 
+/// A CSRF-cookie'd, SSO-identified `application/x-www-form-urlencoded` POST (share config / revoke).
+fn post_form(uri: &str, cookie: &str, subject: &str, body: String) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::COOKIE, format!("__Host-csrf={cookie}"))
+        .header("x-auth-subject", subject)
+        .header("x-auth-email", format!("{subject}@w33d.xyz"))
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// An unauthenticated `application/x-www-form-urlencoded` POST (the public share-unlock form).
+fn post_public(uri: &str, body: String) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// Upload a PNG as `subject` and return its `/f/{id}` id plus the fresh CSRF token.
+async fn upload_png(app: &axum::Router, subject: &str) -> (String, String) {
+    let home = send(app, get("/", Some(subject))).await;
+    let csrf = home.csrf_cookie().expect("csrf cookie");
+    let created = send(
+        app,
+        upload_req(&csrf, &csrf, subject, "shot.png", "image/png", &png_bytes()),
+    )
+    .await;
+    let id = created.location().trim_start_matches("/f/").to_string();
+    (id, csrf)
+}
+
+#[tokio::test]
+async fn share_expiry_returns_410_after_expiry() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let (id, csrf) = upload_png(&app, "alice").await;
+    let token = store
+        .get(&id)
+        .await
+        .unwrap()
+        .unwrap()
+        .share_token
+        .unwrap();
+
+    // Configure an expiry 1 hour out -> the public link still serves.
+    let set = send(
+        &app,
+        post_form(&format!("/f/{id}/share"), &csrf, "alice", format!("csrf_token={csrf}&expiry=3600")),
+    )
+    .await;
+    assert_eq!(set.status, StatusCode::FOUND);
+    assert_eq!(send(&app, get(&format!("/s/{token}"), None)).await.status, StatusCode::OK);
+
+    // Force the stored expiry into the past; the public fetch is now 410 Gone.
+    store
+        .configure_share(&id, "alice", Some(token.clone()), Some(1), None)
+        .await
+        .unwrap();
+    let gone = send(&app, get(&format!("/s/{token}"), None)).await;
+    assert_eq!(gone.status, StatusCode::GONE);
+    // The owner still reaches the file over SSO regardless of the share expiry.
+    assert_eq!(send(&app, get(&format!("/f/{id}/raw"), Some("alice"))).await.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn share_password_prompts_then_serves() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let (id, csrf) = upload_png(&app, "alice").await;
+    let token = store.get(&id).await.unwrap().unwrap().share_token.unwrap();
+
+    // Set a password on the share link.
+    let set = send(
+        &app,
+        post_form(
+            &format!("/f/{id}/share"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&expiry=never&password=hunter2"),
+        ),
+    )
+    .await;
+    assert_eq!(set.status, StatusCode::FOUND);
+
+    // A bare GET no longer serves the bytes — it renders a password prompt.
+    let prompt = send(&app, get(&format!("/s/{token}"), None)).await;
+    assert_eq!(prompt.status, StatusCode::OK);
+    assert!(prompt.text().contains("Password required"));
+    assert_ne!(prompt.body, png_bytes());
+
+    // Wrong password -> 401 + prompt again.
+    let wrong = send(&app, post_public(&format!("/s/{token}"), "password=nope".to_string())).await;
+    assert_eq!(wrong.status, StatusCode::UNAUTHORIZED);
+    assert!(wrong.text().contains("Incorrect password"));
+
+    // Correct password -> the bytes.
+    let ok = send(&app, post_public(&format!("/s/{token}"), "password=hunter2".to_string())).await;
+    assert_eq!(ok.status, StatusCode::OK);
+    assert_eq!(ok.body, png_bytes());
+}
+
+#[tokio::test]
+async fn share_revoke_clears_the_token() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let (id, csrf) = upload_png(&app, "alice").await;
+    let token = store.get(&id).await.unwrap().unwrap().share_token.unwrap();
+
+    // The link works before revoke.
+    assert_eq!(send(&app, get(&format!("/s/{token}"), None)).await.status, StatusCode::OK);
+
+    // Revoke -> 302, token cleared in the store, outstanding link now 404.
+    let rev = send(
+        &app,
+        post_form(&format!("/f/{id}/revoke"), &csrf, "alice", format!("csrf_token={csrf}")),
+    )
+    .await;
+    assert_eq!(rev.status, StatusCode::FOUND);
+    assert!(store.get(&id).await.unwrap().unwrap().share_token.is_none());
+    assert_eq!(send(&app, get(&format!("/s/{token}"), None)).await.status, StatusCode::NOT_FOUND);
+
+    // The detail page now offers to create a new link; doing so mints a fresh, working token.
+    let detail = send(&app, get(&format!("/f/{id}"), Some("alice"))).await;
+    assert!(detail.text().contains("Create share link"));
+    let csrf2 = detail.csrf_cookie().unwrap();
+    send(
+        &app,
+        post_form(&format!("/f/{id}/share"), &csrf2, "alice", format!("csrf_token={csrf2}&expiry=never")),
+    )
+    .await;
+    let new_token = store.get(&id).await.unwrap().unwrap().share_token.unwrap();
+    assert_ne!(new_token, token);
+    assert_eq!(send(&app, get(&format!("/s/{new_token}"), None)).await.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn share_config_requires_csrf() {
+    let state = build_dev_state();
+    let app = app(state);
+    let (id, csrf) = upload_png(&app, "alice").await;
+    // Wrong CSRF token field vs. cookie -> rejected.
+    let bad = send(
+        &app,
+        post_form(&format!("/f/{id}/share"), &csrf, "alice", "csrf_token=wrong&expiry=3600".to_string()),
+    )
+    .await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn share_config_is_owner_scoped() {
+    let state = build_dev_state();
+    let app = app(state);
+    let (id, _csrf) = upload_png(&app, "alice").await;
+    // Bob cannot configure Alice's share link (403), even with his own valid CSRF.
+    let bob_home = send(&app, get("/", Some("bob"))).await;
+    let bob_csrf = bob_home.csrf_cookie().unwrap();
+    let res = send(
+        &app,
+        post_form(&format!("/f/{id}/share"), &bob_csrf, "bob", format!("csrf_token={bob_csrf}&expiry=3600")),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+}
+
 #[tokio::test]
 async fn upload_detail_raw_share_delete_lifecycle() {
     let state = build_dev_state();
@@ -144,6 +317,7 @@ async fn upload_detail_raw_share_delete_lifecycle() {
 
     // The metadata row + blob both exist; the content type was sniffed to image/png.
     let rec = store.get(&id).await.unwrap().expect("metadata row");
+    let token = rec.share_token.clone().expect("fresh upload has a share token");
     assert_eq!(rec.owner_sub, "alice");
     assert_eq!(rec.name, "screenshot.png");
     assert_eq!(rec.content_type, "image/png");
@@ -155,7 +329,7 @@ async fn upload_detail_raw_share_delete_lifecycle() {
     assert_eq!(detail.status, StatusCode::OK);
     assert!(detail.text().contains("screenshot.png"));
     assert!(detail.text().contains(&format!("/f/{id}/raw")));
-    assert!(detail.text().contains(&format!("/s/{}", rec.share_token)));
+    assert!(detail.text().contains(&format!("/s/{token}")));
 
     // GET /f/{id}/raw streams the bytes inline as image/png.
     let raw = send(&app, get(&format!("/f/{id}/raw"), Some("alice"))).await;
@@ -171,7 +345,7 @@ async fn upload_detail_raw_share_delete_lifecycle() {
     assert!(home2.text().contains("1 file"));
 
     // Public share fetch: NO auth headers, still returns the bytes.
-    let shared = send(&app, get(&format!("/s/{}", rec.share_token), None)).await;
+    let shared = send(&app, get(&format!("/s/{token}"), None)).await;
     assert_eq!(shared.status, StatusCode::OK);
     assert_eq!(shared.body, png);
 
@@ -197,7 +371,7 @@ async fn upload_detail_raw_share_delete_lifecycle() {
 
     let gone = send(&app, get(&loc, Some("alice"))).await;
     assert_eq!(gone.status, StatusCode::NOT_FOUND);
-    let share_gone = send(&app, get(&format!("/s/{}", rec.share_token), None)).await;
+    let share_gone = send(&app, get(&format!("/s/{token}"), None)).await;
     assert_eq!(share_gone.status, StatusCode::NOT_FOUND);
 }
 

@@ -16,12 +16,15 @@
 //! - `GET /new?title=…` — convenience redirect to the editor for a slugified new page.
 //! - `GET /w/{slug}` — render a page's markdown; if missing, offer to create it.
 //! - `GET /edit/{slug}` / `POST /edit/{slug}` — edit; a save appends a revision + updates the page.
-//! - `GET /history/{slug}` — the revision list.
+//! - `GET /history/{slug}` — the revision list (or a line-level diff of two revisions via
+//!   `?from=<rev_id>&to=<rev_id>`); each older revision offers a CSRF-protected revert.
+//! - `POST /revert/{slug}` — re-save an old revision's body as a new revision (CSRF + audit).
 //! - `GET /coherence` — maintenance view: stale pages + contradiction candidates (additive).
 
 pub mod audit;
 pub mod auth;
 pub mod config;
+pub mod diff;
 pub mod error;
 pub mod graph;
 pub mod handlers;
@@ -60,6 +63,7 @@ pub fn app(state: AppState) -> Router {
             get(handlers::pages::edit_form).post(handlers::pages::edit_submit),
         )
         .route("/history/{slug}", get(handlers::pages::history))
+        .route("/revert/{slug}", axum::routing::post(handlers::pages::revert_submit))
         .route("/coherence", get(handlers::coherence::coherence))
         .fallback(handlers::pages::not_found)
         // Reject a forged gateway identity (spoofed X-Auth-* from a rogue in-network peer):

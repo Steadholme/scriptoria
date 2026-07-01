@@ -137,12 +137,45 @@ async fn pg_store_full_integration() {
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     assert_eq!(pg.count_threads("support").await.unwrap(), 1, "HTTP create persisted to PG");
 
+    // --- author edit/delete of own thread + reply (portable UPDATE/DELETE) -
+    // Edit the thread: title + original-post body update atomically, and the denormalised
+    // first_body_md (which powers similarity) stays in step.
+    pg.update_thread(&thread.id, "Edited Title", &first.id, "Edited **op** body.")
+        .await
+        .expect("update thread");
+    let edited = pg.get_thread(&thread.id).await.unwrap().unwrap();
+    assert_eq!(edited.title, "Edited Title");
+    let posts = pg.posts_in_thread(&thread.id).await.unwrap();
+    assert_eq!(posts[0].body_md, "Edited **op** body.", "OP body updated");
+    let digest = pg
+        .thread_digests(10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|d| d.id == thread.id)
+        .expect("digest for edited thread");
+    assert_eq!(digest.first_body_md, "Edited **op** body.", "first_body_md kept in step");
+
+    // Edit then delete the reply (a single-post UPDATE / DELETE).
+    pg.update_post(&reply.id, "Edited reply.").await.expect("update reply");
+    let posts = pg.posts_in_thread(&thread.id).await.unwrap();
+    assert_eq!(posts[1].body_md, "Edited reply.");
+    pg.delete_post(&reply.id).await.expect("delete reply");
+    assert_eq!(pg.count_posts(&thread.id).await.unwrap(), 1, "reply deleted");
+
+    // Delete the whole thread: thread + remaining posts go together.
+    pg.delete_thread(&thread.id).await.expect("delete thread");
+    assert_eq!(pg.count_threads("general").await.unwrap(), 0, "thread row gone");
+    assert_eq!(pg.count_posts(&thread.id).await.unwrap(), 0, "thread's posts gone");
+    assert!(pg.get_thread(&thread.id).await.unwrap().is_none());
+
     // Cleanup the throwaway tables.
     for tbl in ["posts", "threads", "categories"] {
         sqlx::query(&format!("DELETE FROM {tbl}")).execute(&raw).await.unwrap();
     }
     println!(
         "PG STORE INTEGRATION OK: migrate (idempotent) + seed (idempotent) + create_thread + \
-         add_reply (last_at bump) + ordering + HTTP create/render against Postgres"
+         add_reply (last_at bump) + ordering + update_thread/update_post/delete_post/delete_thread \
+         + HTTP create/render against Postgres"
     );
 }

@@ -12,7 +12,11 @@
 //! - `GET /f/{id}` — file detail / preview page (owner-only) [SSO]
 //! - `GET /f/{id}/raw` — stream the blob (inline image / attachment) (owner-only) [SSO]
 //! - `POST /delete/{id}` — delete your own file (blob + row) -> 302 `/` (CSRF) [SSO]
-//! - `GET /s/{token}` — fetch a shared file by unguessable token, NO SSO [PUBLIC `/s/` prefix]
+//! - `POST /f/{id}/share` — set the share link's expiry + optional password (CSRF) [SSO]
+//! - `POST /f/{id}/revoke` — revoke the share link (clears the token) (CSRF) [SSO]
+//! - `GET /s/{token}` — fetch a shared file by unguessable token, NO SSO (410 past expiry;
+//!   password prompt when protected) [PUBLIC `/s/` prefix]
+//! - `POST /s/{token}` — submit a protected share link's password, NO SSO [PUBLIC `/s/` prefix]
 
 pub mod audit;
 pub mod auth;
@@ -59,7 +63,12 @@ pub fn app(state: AppState) -> Router {
         .route("/f/{id}", get(handlers::files::detail))
         .route("/f/{id}/raw", get(handlers::files::raw))
         .route("/delete/{id}", post(handlers::files::delete))
-        .route("/s/{token}", get(handlers::files::share))
+        .route("/f/{id}/share", post(handlers::files::configure_share))
+        .route("/f/{id}/revoke", post(handlers::files::revoke_share))
+        .route(
+            "/s/{token}",
+            get(handlers::files::share).post(handlers::files::share_unlock),
+        )
         .layer(DefaultBodyLimit::max(body_limit))
         // Reject a forged gateway identity (spoofed X-Auth-* from a rogue in-network peer):
         // when GATEWAY_HMAC_KEY is set, an injected identity MUST carry a valid X-Auth-Sig.

@@ -167,6 +167,36 @@ pub fn get_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// Share-link password (salted SHA-256; portable, no extra deps)
+// ---------------------------------------------------------------------------
+
+/// Hash a share-link password as `{salt}${sha256_hex(salt ":" password)}` with a fresh random
+/// salt. Reuses the crate's existing SHA-256 primitive (no new dependency); the salt defeats
+/// precomputed/rainbow lookups for these low-value, link-scoped passwords.
+pub fn hash_share_password(password: &str) -> String {
+    let salt = random_alnum(16);
+    format!("{salt}${}", sha256_hex(&format!("{salt}:{password}")))
+}
+
+/// Constant-time verify a submitted share-link password against a stored `{salt}${hash}`. A stored
+/// value missing the `$` separator (never produced by [`hash_share_password`]) fails closed.
+pub fn verify_share_password(stored: &str, submitted: &str) -> bool {
+    match stored.split_once('$') {
+        Some((salt, digest)) => {
+            ct_eq(sha256_hex(&format!("{salt}:{submitted}")).as_bytes(), digest.as_bytes())
+        }
+        None => false,
+    }
+}
+
+fn sha256_hex(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    to_hex(&hasher.finalize())
+}
+
 /// Length-checked constant-time byte comparison (no early return on the first differing byte).
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -220,6 +250,18 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(HEADER_SUBJECT, HeaderValue::from_static("user-42"));
         assert!(gateway_identity_ok(&h));
+    }
+
+    #[test]
+    fn share_password_hash_roundtrip() {
+        let stored = hash_share_password("s3cret");
+        assert!(stored.contains('$'));
+        assert!(verify_share_password(&stored, "s3cret"));
+        assert!(!verify_share_password(&stored, "wrong"));
+        // A fresh hash uses a fresh salt => different ciphertext for the same password.
+        assert_ne!(stored, hash_share_password("s3cret"));
+        // Malformed stored value fails closed.
+        assert!(!verify_share_password("no-separator", "s3cret"));
     }
 
     #[test]

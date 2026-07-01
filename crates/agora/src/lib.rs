@@ -18,6 +18,10 @@
 //! - `GET  /new?cat=`        new-thread form (with live "similar existing threads" hints)
 //! - `POST /new`             create a thread
 //! - `POST /t/{id}/reply`    post a reply
+//! - `GET/POST /t/{id}/edit` edit one's OWN thread (title + original-post body)
+//! - `POST /t/{id}/delete`   delete one's OWN thread (and all its posts)
+//! - `GET/POST /t/{tid}/p/{pid}/edit`   edit one's OWN reply
+//! - `POST /t/{tid}/p/{pid}/delete`     delete one's OWN reply
 //! - `POST /api/similar`     (sso+CSRF) top-3 existing threads similar to a draft {title,body}
 //! - `GET  /api/thread/{id}/summary`  extractive summary (top sentences) of a thread
 
@@ -64,6 +68,16 @@ pub fn app(state: AppState) -> Router {
         .route("/c/{id}", get(handlers::forum::category))
         .route("/t/{id}", get(handlers::forum::thread))
         .route("/t/{id}/reply", post(handlers::forum::reply))
+        .route(
+            "/t/{id}/edit",
+            get(handlers::forum::edit_thread_form).post(handlers::forum::update_thread),
+        )
+        .route("/t/{id}/delete", post(handlers::forum::delete_thread))
+        .route(
+            "/t/{tid}/p/{pid}/edit",
+            get(handlers::forum::edit_reply_form).post(handlers::forum::update_reply),
+        )
+        .route("/t/{tid}/p/{pid}/delete", post(handlers::forum::delete_reply))
         .route("/new", get(handlers::forum::new_form).post(handlers::forum::create))
         .route("/api/similar", post(handlers::insight::similar))
         .route("/api/thread/{id}/summary", get(handlers::insight::summary))

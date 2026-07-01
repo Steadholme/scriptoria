@@ -54,6 +54,21 @@ pub trait Store: Send + Sync {
 
     /// Delete a file only if it belongs to `owner_sub`. Returns `true` when a row was removed.
     async fn delete(&self, id: &str, owner_sub: &str) -> Result<bool, StoreError>;
+
+    /// Configure a file's share link, ownership-scoped. Sets all three share columns atomically:
+    /// `share_token` (`Some(tok)` to (re)enable, `None` to REVOKE — the file then has no public
+    /// surface), `expires_at` (`None` = never), and `share_password_hash` (`None` = no password).
+    /// Returns `true` when the owner's row was updated. Callers pass a freshly-random token, so the
+    /// `UNIQUE(share_token)` constraint is not a practical concern; multiple revoked (`NULL`) rows
+    /// coexist because SQL treats NULLs as distinct.
+    async fn configure_share(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        share_token: Option<String>,
+        expires_at: Option<i64>,
+        share_password_hash: Option<String>,
+    ) -> Result<bool, StoreError>;
 }
 
 // --------------------------------------------------------------------------------------
@@ -77,11 +92,12 @@ impl InMemoryStore {
 impl Store for InMemoryStore {
     async fn create(&self, file: &FileRec) -> Result<bool, StoreError> {
         let mut files = self.files.lock().expect("files lock poisoned");
-        // Reject on any unique conflict (id OR share token), matching the Postgres constraints.
-        if files
-            .iter()
-            .any(|f| f.id == file.id || f.share_token == file.share_token)
-        {
+        // Reject on any unique conflict (id OR a non-null share token), matching the Postgres
+        // constraints (NULL share tokens are distinct, so revoked rows never collide).
+        if files.iter().any(|f| {
+            f.id == file.id
+                || (file.share_token.is_some() && f.share_token == file.share_token)
+        }) {
             return Ok(false);
         }
         files.push(file.clone());
@@ -95,7 +111,10 @@ impl Store for InMemoryStore {
 
     async fn get_by_token(&self, token: &str) -> Result<Option<FileRec>, StoreError> {
         let files = self.files.lock().expect("files lock poisoned");
-        Ok(files.iter().find(|f| f.share_token == token).cloned())
+        Ok(files
+            .iter()
+            .find(|f| f.share_token.as_deref() == Some(token))
+            .cloned())
     }
 
     async fn list_by_owner(
@@ -132,6 +151,29 @@ impl Store for InMemoryStore {
         files.retain(|f| !(f.id == id && f.owner_sub == owner_sub));
         Ok(files.len() != before)
     }
+
+    async fn configure_share(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        share_token: Option<String>,
+        expires_at: Option<i64>,
+        share_password_hash: Option<String>,
+    ) -> Result<bool, StoreError> {
+        let mut files = self.files.lock().expect("files lock poisoned");
+        match files
+            .iter_mut()
+            .find(|f| f.id == id && f.owner_sub == owner_sub)
+        {
+            Some(f) => {
+                f.share_token = share_token;
+                f.expires_at = expires_at;
+                f.share_password_hash = share_password_hash;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
 }
 
 // --------------------------------------------------------------------------------------
@@ -146,8 +188,8 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
 
 /// Column list shared by every SELECT, so the row decoder stays in lock-step with the query.
-const COLS: &str =
-    "id, owner_sub, name, content_type, size, bucket, object_key, share_token, created_at";
+const COLS: &str = "id, owner_sub, name, content_type, size, bucket, object_key, share_token, \
+     created_at, expires_at, share_password_hash";
 
 /// PostgreSQL-backed [`Store`]. Holds a pooled connection; the async trait methods drive sqlx
 /// natively, so no worker thread is ever blocked on a DB round-trip.
@@ -189,6 +231,20 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+        // A revoked share link clears `share_token` to NULL, so the column must be nullable. The
+        // UNIQUE constraint stays (SQL treats NULLs as distinct, so many revoked rows coexist).
+        // Idempotent: dropping NOT NULL when already dropped is a no-op. Standard SQL only.
+        sqlx::query("ALTER TABLE files ALTER COLUMN share_token DROP NOT NULL")
+            .execute(&self.pool)
+            .await?;
+        // Additive, idempotent columns for the share-link lifecycle. Pre-existing rows default to
+        // NULL (never expires / no password) — their current always-shareable behavior. Portable.
+        sqlx::query("ALTER TABLE files ADD COLUMN IF NOT EXISTS expires_at BIGINT")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("ALTER TABLE files ADD COLUMN IF NOT EXISTS share_password_hash TEXT")
+            .execute(&self.pool)
+            .await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_files_owner_created \
              ON files (owner_sub, created_at)",
@@ -209,6 +265,8 @@ impl PgStore {
             object_key: row.try_get("object_key")?,
             share_token: row.try_get("share_token")?,
             created_at: row.try_get("created_at")?,
+            expires_at: row.try_get("expires_at")?,
+            share_password_hash: row.try_get("share_password_hash")?,
         })
     }
 
@@ -217,8 +275,9 @@ impl PgStore {
         // signaling the handler to retry with fresh values. Single, race-free insert path.
         let result = sqlx::query(
             "INSERT INTO files \
-                 (id, owner_sub, name, content_type, size, bucket, object_key, share_token, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                 (id, owner_sub, name, content_type, size, bucket, object_key, share_token, \
+                  created_at, expires_at, share_password_hash) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
              ON CONFLICT DO NOTHING",
         )
         .bind(&file.id)
@@ -230,9 +289,33 @@ impl PgStore {
         .bind(&file.object_key)
         .bind(&file.share_token)
         .bind(file.created_at)
+        .bind(file.expires_at)
+        .bind(&file.share_password_hash)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    async fn configure_share_async(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        share_token: Option<String>,
+        expires_at: Option<i64>,
+        share_password_hash: Option<String>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE files SET share_token = $1, expires_at = $2, share_password_hash = $3 \
+             WHERE id = $4 AND owner_sub = $5",
+        )
+        .bind(&share_token)
+        .bind(expires_at)
+        .bind(&share_password_hash)
+        .bind(id)
+        .bind(owner_sub)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     async fn get_async(&self, id: &str) -> Result<Option<FileRec>, sqlx::Error> {
@@ -334,6 +417,19 @@ impl Store for PgStore {
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
+
+    async fn configure_share(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        share_token: Option<String>,
+        expires_at: Option<i64>,
+        share_password_hash: Option<String>,
+    ) -> Result<bool, StoreError> {
+        self.configure_share_async(id, owner_sub, share_token, expires_at, share_password_hash)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -349,8 +445,10 @@ mod tests {
             size: 3,
             bucket: "memory".into(),
             object_key: id.into(),
-            share_token: token.into(),
+            share_token: Some(token.into()),
             created_at,
+            expires_at: None,
+            share_password_hash: None,
         }
     }
 
@@ -442,5 +540,40 @@ mod tests {
         assert!(s.get("a").await.unwrap().is_some());
         assert!(s.delete("a", "u").await.unwrap());
         assert!(s.get("a").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn configure_share_updates_expiry_password_and_revokes() {
+        let s = InMemoryStore::new();
+        s.create(&file("a", "u", "tok-a", 1)).await.unwrap();
+
+        // Non-owner cannot configure.
+        assert!(!s
+            .configure_share("a", "intruder", Some("tok-a".into()), Some(999), None)
+            .await
+            .unwrap());
+
+        // Owner sets an expiry + password on the existing token.
+        assert!(s
+            .configure_share("a", "u", Some("tok-a".into()), Some(999), Some("salt$hash".into()))
+            .await
+            .unwrap());
+        let rec = s.get("a").await.unwrap().unwrap();
+        assert_eq!(rec.expires_at, Some(999));
+        assert_eq!(rec.share_password_hash.as_deref(), Some("salt$hash"));
+        assert!(rec.share_expired(999));
+
+        // Revoke: token cleared to None, and the public lookup misses.
+        assert!(s.configure_share("a", "u", None, None, None).await.unwrap());
+        assert!(s.get_by_token("tok-a").await.unwrap().is_none());
+        let rec = s.get("a").await.unwrap().unwrap();
+        assert!(rec.share_token.is_none());
+        assert!(rec.expires_at.is_none());
+        assert!(rec.share_password_hash.is_none());
+
+        // A second revoked file coexists (NULL tokens are distinct — no unique collision).
+        s.create(&file("b", "u", "tok-b", 2)).await.unwrap();
+        assert!(s.configure_share("b", "u", None, None, None).await.unwrap());
+        assert_eq!(s.list_by_owner("u", None, 50).await.unwrap().len(), 2);
     }
 }

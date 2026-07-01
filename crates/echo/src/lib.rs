@@ -14,7 +14,9 @@
 //! - `GET  /`               dashboard: all threads + counts + recent activity + moderation
 //! - `GET  /t/{key}`        a single thread view + composer
 //! - `POST /api/comment`    upsert thread by key + insert a comment (CSRF)
-//! - `POST /api/moderate`   hide / unhide a comment (CSRF)
+//! - `POST /api/comment/edit`   author self-edit of one's OWN comment (CSRF)
+//! - `POST /api/comment/delete` author self-delete of one's OWN comment (CSRF)
+//! - `POST /api/moderate`   hide / unhide a comment (CSRF + moderator group)
 //! - `GET  /embed/{key}`    a minimal, iframe-able thread + composer (X-Frame-Options SAMEORIGIN)
 
 pub mod audit;
@@ -52,6 +54,8 @@ pub fn app(state: AppState) -> Router {
         .route("/t/{key}", get(handlers::comments::thread_view))
         .route("/embed/{key}", get(handlers::comments::embed_view))
         .route("/api/comment", post(handlers::comments::post_comment))
+        .route("/api/comment/edit", post(handlers::comments::edit_comment))
+        .route("/api/comment/delete", post(handlers::comments::delete_comment))
         .route("/api/moderate", post(handlers::comments::moderate))
         // Reject a forged gateway identity (spoofed X-Auth-* from a rogue in-network peer):
         // when GATEWAY_HMAC_KEY is set, an injected identity MUST carry a valid X-Auth-Sig.

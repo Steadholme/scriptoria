@@ -37,13 +37,7 @@
         <div class="card__body">
           {{META_LIST}}
 
-          <div class="field">
-            <label for="shareUrl">Share link (no sign-in required)</label>
-            <div class="share-row">
-              <input id="shareUrl" type="text" readonly value="{{SHARE_URL}}">
-              <button class="btn btn-secondary btn-sm" id="copyBtn" type="button" data-label="Copy">Copy</button>
-            </div>
-          </div>
+          {{SHARE}}
 
           <div class="actions actions--split">
             <a class="btn btn-primary" href="/f/{{ID}}/raw">Download</a>

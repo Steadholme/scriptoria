@@ -71,6 +71,17 @@ pub trait Store: Send + Sync {
     async fn create_comment(&self, comment: &Comment) -> Result<(), StoreError>;
     /// Set a comment's `hidden` flag. Returns `true` when a row was actually updated.
     async fn set_comment_hidden(&self, id: &str, hidden: bool) -> Result<bool, StoreError>;
+    /// Author self-edit: update a comment's `body`, but ONLY when `author_sub` owns it. Returns
+    /// `true` when a row was actually updated (the comment exists AND belongs to `author_sub`).
+    async fn update_comment_body(
+        &self,
+        id: &str,
+        author_sub: &str,
+        body: &str,
+    ) -> Result<bool, StoreError>;
+    /// Author self-delete: delete a comment, but ONLY when `author_sub` owns it. Returns `true`
+    /// when a row was actually deleted.
+    async fn delete_comment(&self, id: &str, author_sub: &str) -> Result<bool, StoreError>;
     /// Number of comments in a thread (all, including hidden).
     async fn count_comments(&self, thread_id: &str) -> i64;
     /// The most recent comments across all threads, newest-first, capped at `limit` — backs the
@@ -174,6 +185,32 @@ impl Store for InMemoryStore {
             }
             None => Ok(false),
         }
+    }
+
+    async fn update_comment_body(
+        &self,
+        id: &str,
+        author_sub: &str,
+        body: &str,
+    ) -> Result<bool, StoreError> {
+        let mut comments = self.comments.lock().expect("comments lock poisoned");
+        match comments
+            .iter_mut()
+            .find(|c| c.id == id && c.author_sub == author_sub)
+        {
+            Some(c) => {
+                c.body = body.to_string();
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn delete_comment(&self, id: &str, author_sub: &str) -> Result<bool, StoreError> {
+        let mut comments = self.comments.lock().expect("comments lock poisoned");
+        let before = comments.len();
+        comments.retain(|c| !(c.id == id && c.author_sub == author_sub));
+        Ok(comments.len() != before)
     }
 
     async fn count_comments(&self, thread_id: &str) -> i64 {
@@ -407,6 +444,36 @@ impl PgStore {
         Ok(res.rows_affected() > 0)
     }
 
+    async fn update_comment_body_async(
+        &self,
+        id: &str,
+        author_sub: &str,
+        body: &str,
+    ) -> Result<bool, sqlx::Error> {
+        // Ownership is enforced atomically in the WHERE clause: a non-owner (or missing) id updates
+        // zero rows, so the handler cannot edit someone else's comment.
+        let res = sqlx::query("UPDATE comments SET body = $1 WHERE id = $2 AND author_sub = $3")
+            .bind(body)
+            .bind(id)
+            .bind(author_sub)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn delete_comment_async(
+        &self,
+        id: &str,
+        author_sub: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query("DELETE FROM comments WHERE id = $1 AND author_sub = $2")
+            .bind(id)
+            .bind(author_sub)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     async fn count_comments_async(&self, thread_id: &str) -> Result<i64, sqlx::Error> {
         let row = sqlx::query("SELECT COUNT(*) AS n FROM comments WHERE thread_id = $1")
             .bind(thread_id)
@@ -471,6 +538,23 @@ impl Store for PgStore {
 
     async fn set_comment_hidden(&self, id: &str, hidden: bool) -> Result<bool, StoreError> {
         self.set_comment_hidden_async(id, hidden)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn update_comment_body(
+        &self,
+        id: &str,
+        author_sub: &str,
+        body: &str,
+    ) -> Result<bool, StoreError> {
+        self.update_comment_body_async(id, author_sub, body)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn delete_comment(&self, id: &str, author_sub: &str) -> Result<bool, StoreError> {
+        self.delete_comment_async(id, author_sub)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
     }

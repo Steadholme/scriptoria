@@ -12,6 +12,8 @@
 //! - `GET  /healthz`        liveness (container HEALTHCHECK)
 //! - `GET  /`               index: posts newest-first (title + excerpt + date + author)
 //! - `GET  /p/{slug}`       full post (body markdown rendered to sanitized HTML)
+//! - `GET  /feed.xml`       RSS 2.0 of the published posts (newest-first)
+//! - `GET  /sitemap.xml`    sitemap of the index + published posts
 //! - `GET  /new`            compose form
 //! - `POST /new`            create a post (author from injected X-Auth-*, slug from title)
 //! - `GET  /edit/{slug}`    edit form (own post)
@@ -51,6 +53,9 @@ pub fn app(state: AppState) -> Router {
         .route("/healthz", get(handlers::health::healthz))
         .route("/", get(handlers::posts::index))
         .route("/p/{slug}", get(handlers::posts::view))
+        // Public discovery feeds derived from the published posts (read-only; no schema).
+        .route("/feed.xml", get(handlers::feed::feed_xml))
+        .route("/sitemap.xml", get(handlers::feed::sitemap_xml))
         .route(
             "/new",
             get(handlers::posts::new_form).post(handlers::posts::create),

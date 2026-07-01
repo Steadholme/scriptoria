@@ -38,16 +38,35 @@ pub struct FileRec {
     pub bucket: String,
     /// Object-store key holding the blob.
     pub object_key: String,
-    /// Unguessable public share token (`/s/{token}` fetches the blob WITHOUT SSO).
-    pub share_token: String,
+    /// Unguessable public share token (`/s/{token}` fetches the blob WITHOUT SSO). `None` once the
+    /// share link has been revoked — the file then has NO public surface at all.
+    pub share_token: Option<String>,
     /// Upload time, epoch seconds.
     pub created_at: i64,
+    /// Optional share-link expiry instant, epoch seconds. `None` = the share link never expires.
+    /// Past this instant the public `/s/{token}` fetch returns `410 Gone` (the OWNER still has full
+    /// SSO access via `/f/{id}`).
+    pub expires_at: Option<i64>,
+    /// Optional salted-hash of a share-link password (`{salt}${sha256_hex}`). `None` = no password.
+    /// When set, the public `/s/{token}` fetch prompts for the password before serving the blob.
+    pub share_password_hash: Option<String>,
 }
 
 impl FileRec {
     /// True when this file is a raster image we render inline.
     pub fn is_image(&self) -> bool {
         is_inline_image(&self.content_type)
+    }
+
+    /// True once `now` (epoch seconds) has reached the share-link expiry instant. A `None` expiry
+    /// never expires. Mirrors pastefire's `Paste::is_expired` idiom.
+    pub fn share_expired(&self, now: i64) -> bool {
+        matches!(self.expires_at, Some(exp) if now >= exp)
+    }
+
+    /// True when the share link is password-protected.
+    pub fn share_has_password(&self) -> bool {
+        self.share_password_hash.is_some()
     }
 }
 
@@ -63,5 +82,29 @@ mod tests {
         assert!(!is_inline_image("image/svg+xml"));
         assert!(!is_inline_image("text/html"));
         assert!(!is_inline_image("application/octet-stream"));
+    }
+
+    fn rec(expires_at: Option<i64>) -> FileRec {
+        FileRec {
+            id: "x".into(),
+            owner_sub: "u".into(),
+            name: "x.png".into(),
+            content_type: "image/png".into(),
+            size: 1,
+            bucket: "memory".into(),
+            object_key: "x".into(),
+            share_token: Some("tok".into()),
+            created_at: 0,
+            expires_at,
+            share_password_hash: None,
+        }
+    }
+
+    #[test]
+    fn share_expired_at_or_after_instant() {
+        assert!(!rec(None).share_expired(10_000)); // never expires
+        assert!(!rec(Some(1000)).share_expired(999));
+        assert!(rec(Some(1000)).share_expired(1000)); // inclusive
+        assert!(rec(Some(1000)).share_expired(1001));
     }
 }

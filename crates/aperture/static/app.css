@@ -284,6 +284,11 @@ hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
 .message-heading { margin: 8px 0; font-size: 22px; font-weight: 600; }
 .message-body { margin: 0 0 24px; color: var(--ink-2); }
 
+/* ---- share-link lifecycle ----------------------------------------------- */
+.share-form { margin-top: 16px; }
+.revoke-form { margin-top: 12px; }
+.form-error { margin: 0 0 12px; color: var(--down-ink); font-size: 13px; font-weight: 600; }
+
 /* ---- responsive --------------------------------------------------------- */
 @media (max-width: 640px) {
   .console__head--row { flex-direction: column; }

@@ -277,6 +277,25 @@ code { font-family: var(--mono); font-size: .92em; color: var(--ink); background
 .h-size { color: var(--ink-3); text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .history td.empty { text-align: center; color: var(--ink-3); padding: 40px 16px; }
 .history .c-title a { font-weight: 600; color: var(--accent-2); }
+.h-act { white-space: nowrap; text-align: right; }
+.revert-form { margin: 0; display: inline; }
+
+/* revision diff (compare form + line-level diff) */
+.compare-form { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; font-size: 12.5px; color: var(--ink-3); }
+.compare-form label { display: inline-flex; align-items: center; gap: 6px; }
+.compare-form select { font-family: var(--mono); font-size: 12px; padding: 5px 8px; border: 1px solid var(--border-2); border-radius: var(--radius-sm); background: var(--surface); color: var(--ink-2); max-width: 260px; }
+.diff__summary { padding: 14px 18px; margin: 0; border-bottom: 1px solid var(--border); color: var(--ink-3); font-size: 12.5px; }
+.diff__stat { font-family: var(--mono); font-weight: 600; }
+.diff__stat--add { color: var(--ok-ink); }
+.diff__stat--del { color: var(--down-ink); }
+.diff { font-family: var(--mono); font-size: 12.5px; line-height: 1.55; overflow: auto; }
+.diff__line { display: flex; gap: 10px; padding: 1px 18px; white-space: pre-wrap; word-break: break-word; }
+.diff__sign { flex: 0 0 auto; width: 1ch; color: var(--ink-3); user-select: none; }
+.diff__text { flex: 1 1 auto; }
+.diff__line--ctx { color: var(--ink-2); }
+.diff__line--add { background: var(--ok-soft); color: var(--ok-ink); }
+.diff__line--del { background: var(--down-soft); color: var(--down-ink); }
+.diff__empty { padding: 24px 18px; text-align: center; color: var(--ink-3); }
 
 /* empty / 404 state */
 .empty-state { padding: 56px 32px; text-align: center; }

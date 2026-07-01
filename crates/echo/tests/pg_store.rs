@@ -94,6 +94,27 @@ async fn pg_store_full_integration() {
     assert!(recent.len() >= 2);
     assert_eq!(recent[0].id, "cmt_pg_2", "newest-first in the feed");
 
+    // --- author self-edit / self-delete (ownership enforced by author_sub) --
+    assert!(
+        !pg.update_comment_body("cmt_pg_2", "u_alice", "nope").await.expect("edit"),
+        "non-owner edit updates no row"
+    );
+    assert!(
+        pg.update_comment_body("cmt_pg_2", "u_bob", "an edited reply").await.expect("edit"),
+        "owner edit updates the row"
+    );
+    assert_eq!(pg.get_comment("cmt_pg_2").await.expect("get").body, "an edited reply");
+    assert!(
+        !pg.delete_comment("cmt_pg_2", "u_alice").await.expect("del"),
+        "non-owner delete removes no row"
+    );
+    assert!(
+        pg.delete_comment("cmt_pg_2", "u_bob").await.expect("del"),
+        "owner delete removes the row"
+    );
+    assert!(pg.get_comment("cmt_pg_2").await.is_none(), "row is gone after self-delete");
+    assert_eq!(pg.count_comments("thr_pg_1").await, 1, "only the root remains");
+
     // --- full HTTP flow through the PG-backed app --------------------------
     let mut state: AppState = build_dev_state();
     state.store = pg.clone();

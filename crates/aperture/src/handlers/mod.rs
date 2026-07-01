@@ -30,6 +30,49 @@ pub const LOGOUT_URL: &str = "https://sso.w33d.xyz/_gw/auth/logout";
 /// Branded error page shell.
 const ERROR_HTML: &str = include_str!("../../templates/error.html");
 
+/// The share-link expiry menu: `(form value, label)`. A numeric value is a TTL in seconds;
+/// `never` keeps the share link forever. The fixed list is a trusted allow-list (reused from
+/// pastefire's expiry idiom). Escaped on render regardless.
+pub const EXPIRY_OPTIONS: &[(&str, &str)] = &[
+    ("never", "Never"),
+    ("3600", "1 hour"),
+    ("86400", "1 day"),
+    ("604800", "1 week"),
+    ("2592000", "30 days"),
+];
+
+/// Build the `<option>` list for the expiry `<select>`, pre-selecting `selected` (defaults to
+/// `never` when `selected` is not one of the allow-listed values).
+pub fn expiry_options(selected: &str) -> String {
+    let chosen = if EXPIRY_OPTIONS.iter().any(|(v, _)| *v == selected) {
+        selected
+    } else {
+        "never"
+    };
+    EXPIRY_OPTIONS
+        .iter()
+        .map(|(value, label)| {
+            let sel = if *value == chosen { " selected" } else { "" };
+            format!(
+                "<option value=\"{v}\"{sel}>{l}</option>",
+                v = esc(value),
+                l = esc(label),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// Resolve a submitted expiry form value into an absolute `expires_at` (epoch seconds). A positive
+/// integer is treated as a TTL added to `now`; `never`/blank/invalid -> no expiry (`None`). Mirrors
+/// pastefire's `parse_expiry`.
+pub fn parse_expiry(value: &str, now: i64) -> Option<i64> {
+    match value.trim().parse::<i64>() {
+        Ok(secs) if secs > 0 => Some(now + secs),
+        _ => None,
+    }
+}
+
 /// Format epoch seconds as a compact UTC timestamp `YYYY-MM-DD HH:MM:SSZ`.
 pub fn fmt_ts(secs: i64) -> String {
     match time::OffsetDateTime::from_unix_timestamp(secs) {
@@ -214,6 +257,22 @@ mod tests {
     #[test]
     fn escapes_html_metacharacters() {
         assert_eq!(esc("<script>&\"'"), "&lt;script&gt;&amp;&quot;&#x27;");
+    }
+
+    #[test]
+    fn parse_expiry_handles_never_and_ttl() {
+        assert_eq!(parse_expiry("never", 1000), None);
+        assert_eq!(parse_expiry("", 1000), None);
+        assert_eq!(parse_expiry("nonsense", 1000), None);
+        assert_eq!(parse_expiry("3600", 1000), Some(4600));
+        assert_eq!(parse_expiry("-5", 1000), None);
+    }
+
+    #[test]
+    fn expiry_options_preselects_and_defaults() {
+        assert!(expiry_options("86400").contains("value=\"86400\" selected"));
+        // Unknown selection falls back to `never`.
+        assert!(expiry_options("bogus").contains("value=\"never\" selected"));
     }
 
     #[test]

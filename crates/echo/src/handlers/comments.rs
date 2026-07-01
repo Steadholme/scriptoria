@@ -58,6 +58,30 @@ pub struct ModerateForm {
     pub csrf_token: String,
 }
 
+/// `POST /api/comment/edit` body — author self-edit of one's OWN comment.
+#[derive(Debug, Deserialize)]
+pub struct EditForm {
+    #[serde(default)]
+    pub comment_id: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub return_to: String,
+    #[serde(default)]
+    pub csrf_token: String,
+}
+
+/// `POST /api/comment/delete` body — author self-delete of one's OWN comment.
+#[derive(Debug, Deserialize)]
+pub struct DeleteForm {
+    #[serde(default)]
+    pub comment_id: String,
+    #[serde(default)]
+    pub return_to: String,
+    #[serde(default)]
+    pub csrf_token: String,
+}
+
 /// `GET /?before=<created_at>_<id>&limit=<n>` — keyset-pagination cursor + page size for the
 /// dashboard thread list. Both are optional; a bare `GET /` returns the newest page.
 #[derive(Debug, Deserialize)]
@@ -179,6 +203,7 @@ pub async fn thread_view(
 ) -> Response {
     let email = auth::display_email(&headers);
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
+    let viewer_sub = auth::author_sub(&headers).unwrap_or_default();
 
     let thread = state.store.get_thread(&key).await;
     let (title, comments, count) = match &thread {
@@ -191,7 +216,7 @@ pub async fn thread_view(
     };
 
     let return_to = format!("/t/{}", path_seg(&key));
-    let comments_html = render_comment_tree(&comments, &csrf, &key, &return_to, true);
+    let comments_html = render_comment_tree(&comments, &csrf, &key, &return_to, true, &viewer_sub);
     let composer = render_composer(&csrf, &key, "", &return_to, thread_url(&thread));
 
     let meta = format!(
@@ -223,6 +248,7 @@ pub async fn embed_view(
     Path(key): Path<String>,
 ) -> Response {
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
+    let viewer_sub = auth::author_sub(&headers).unwrap_or_default();
 
     let thread = state.store.get_thread(&key).await;
     let comments = match &thread {
@@ -231,8 +257,10 @@ pub async fn embed_view(
     };
 
     let return_to = format!("/embed/{}", path_seg(&key));
-    // No moderation controls in the embed — it is the end-user reading/posting surface.
-    let comments_html = render_comment_tree(&comments, &csrf, &key, &return_to, false);
+    // No moderation controls in the embed — it is the end-user reading/posting surface — but an
+    // author still gets self-edit/delete on their OWN comments.
+    let comments_html =
+        render_comment_tree(&comments, &csrf, &key, &return_to, false, &viewer_sub);
     let composer = render_composer(&csrf, &key, "", &return_to, thread_url(&thread));
 
     let body = EMBED_HTML
@@ -315,7 +343,9 @@ pub async fn post_comment(
 // Moderate
 // ---------------------------------------------------------------------------
 
-/// `POST /api/moderate` — hide or unhide a comment. Behind SSO; CSRF required.
+/// `POST /api/moderate` — hide or unhide a comment. Behind SSO; CSRF required. Additionally gated
+/// on moderator group membership (`X-Auth-Groups`): a merely-authenticated user gets 403, so a
+/// regular commenter can NO LONGER hide/unhide arbitrary comments.
 pub async fn moderate(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -323,6 +353,7 @@ pub async fn moderate(
 ) -> Result<Response, AppError> {
     let (sub, email) = auth::require_author(&headers)?;
     auth::verify_csrf(&headers, &form.csrf_token)?;
+    auth::require_moderator(&headers)?;
 
     let id = form.comment_id.trim();
     if id.is_empty() {
@@ -351,6 +382,77 @@ pub async fn moderate(
         id,
         if hidden { "hide" } else { "unhide" },
     ));
+
+    Ok(redirect(&local_redirect(&form.return_to, "/")))
+}
+
+// ---------------------------------------------------------------------------
+// Author self-edit / self-delete
+// ---------------------------------------------------------------------------
+
+/// `POST /api/comment/edit` — an author edits the body of their OWN comment. Behind SSO; CSRF
+/// required. Ownership is enforced by the store (`author_sub` match), so a mismatched/foreign
+/// comment updates nothing and returns 404 (the same shape as a missing comment — no ownership
+/// leak).
+pub async fn edit_comment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<EditForm>,
+) -> Result<Response, AppError> {
+    let (sub, email) = auth::require_author(&headers)?;
+    auth::verify_csrf(&headers, &form.csrf_token)?;
+
+    let id = form.comment_id.trim();
+    if id.is_empty() {
+        return Err(AppError::InvalidRequest("comment_id is required".to_string()));
+    }
+    let body = form.body.trim();
+    if body.is_empty() {
+        return Err(AppError::InvalidRequest("comment body is required".to_string()));
+    }
+    if body.chars().count() > MAX_BODY_CHARS {
+        return Err(AppError::InvalidRequest("comment body is too long".to_string()));
+    }
+
+    let updated = state.store.update_comment_body(id, &sub, body).await?;
+    if !updated {
+        return Err(AppError::NotFound("no such comment".to_string()));
+    }
+    tracing::info!(comment = %id, "comment edited by author");
+
+    let actor = if email.is_empty() { &sub } else { &email };
+    state
+        .audit
+        .emit(AuditEvent::info("echo.comment.edit", actor, id, "self-edit"));
+
+    Ok(redirect(&local_redirect(&form.return_to, "/")))
+}
+
+/// `POST /api/comment/delete` — an author deletes their OWN comment. Behind SSO; CSRF required.
+/// Ownership is enforced by the store; a foreign/missing comment deletes nothing and returns 404.
+pub async fn delete_comment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<DeleteForm>,
+) -> Result<Response, AppError> {
+    let (sub, email) = auth::require_author(&headers)?;
+    auth::verify_csrf(&headers, &form.csrf_token)?;
+
+    let id = form.comment_id.trim();
+    if id.is_empty() {
+        return Err(AppError::InvalidRequest("comment_id is required".to_string()));
+    }
+
+    let deleted = state.store.delete_comment(id, &sub).await?;
+    if !deleted {
+        return Err(AppError::NotFound("no such comment".to_string()));
+    }
+    tracing::info!(comment = %id, "comment deleted by author");
+
+    let actor = if email.is_empty() { &sub } else { &email };
+    state
+        .audit
+        .emit(AuditEvent::notice("echo.comment.delete", actor, id, "self-delete"));
 
     Ok(redirect(&local_redirect(&form.return_to, "/")))
 }
@@ -460,6 +562,7 @@ fn render_comment_tree(
     thread_key: &str,
     return_to: &str,
     moderate: bool,
+    viewer_sub: &str,
 ) -> String {
     if comments.is_empty() {
         return r#"<p class="muted comment-list__empty">No comments yet. Be the first to comment.</p>"#
@@ -475,11 +578,15 @@ fn render_comment_tree(
 
     let mut out = String::new();
     for c in comments.iter().filter(|c| c.parent_id.is_empty()) {
-        out.push_str(&render_comment(c, csrf, thread_key, return_to, moderate, false));
+        out.push_str(&render_comment(
+            c, csrf, thread_key, return_to, moderate, false, viewer_sub,
+        ));
         if let Some(kids) = replies.get(c.id.as_str()) {
             out.push_str(r#"<div class="replies">"#);
             for k in kids {
-                out.push_str(&render_comment(k, csrf, thread_key, return_to, moderate, true));
+                out.push_str(&render_comment(
+                    k, csrf, thread_key, return_to, moderate, true, viewer_sub,
+                ));
             }
             out.push_str("</div>");
         }
@@ -496,6 +603,7 @@ fn render_comment(
     return_to: &str,
     moderate: bool,
     is_reply: bool,
+    viewer_sub: &str,
 ) -> String {
     let body_html = if c.hidden {
         r#"<em class="comment__hidden">[comment hidden by a moderator]</em>"#.to_string()
@@ -504,6 +612,14 @@ fn render_comment(
     };
     let control = if moderate {
         moderation_control(c, csrf, return_to)
+    } else {
+        String::new()
+    };
+    // The viewer's own comment gets self-edit/delete controls — but not while a moderator has it
+    // hidden (editing wouldn't unhide it, and we don't re-expose a hidden body in the edit box).
+    let owner = !viewer_sub.is_empty() && c.author_sub == viewer_sub;
+    let self_ctl = if owner && !c.hidden {
+        self_controls(c, csrf, return_to)
     } else {
         String::new()
     };
@@ -520,13 +636,44 @@ fn render_comment(
     {control}
   </div>
   <div class="comment__body">{body}</div>
+  {self_ctl}
   {reply}
 </article>"#,
         author = esc(&author_label(c)),
         date = esc(&fmt_datetime(c.created_at)),
         control = control,
         body = body_html,
+        self_ctl = self_ctl,
         reply = reply_form,
+    )
+}
+
+/// The author's self-edit (collapsible composer prefilled with the raw body) + self-delete controls
+/// for their OWN comment. Reuses the reply/moderation form idioms; the body is HTML-escaped.
+fn self_controls(c: &Comment, csrf: &str, return_to: &str) -> String {
+    format!(
+        r#"<div class="self-controls">
+  <details class="reply-toggle edit-toggle">
+    <summary>Edit</summary>
+    <form class="composer-form composer-form--reply" method="post" action="/api/comment/edit">
+      <input type="hidden" name="csrf_token" value="{csrf}">
+      <input type="hidden" name="comment_id" value="{id}">
+      <input type="hidden" name="return_to" value="{ret}">
+      <textarea name="body" class="composer__body" required>{body}</textarea>
+      <div class="composer__actions"><button class="btn btn-primary btn-sm" type="submit">Save</button></div>
+    </form>
+  </details>
+  <form class="inline-form mod-form" method="post" action="/api/comment/delete">
+    <input type="hidden" name="csrf_token" value="{csrf}">
+    <input type="hidden" name="comment_id" value="{id}">
+    <input type="hidden" name="return_to" value="{ret}">
+    <button class="btn btn-ghost btn-sm" type="submit">Delete</button>
+  </form>
+</div>"#,
+        csrf = esc(csrf),
+        id = esc(&c.id),
+        ret = esc(return_to),
+        body = esc(&c.body),
     )
 }
 

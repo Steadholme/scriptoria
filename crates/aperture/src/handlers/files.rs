@@ -20,8 +20,8 @@ use crate::auth::{self, Identity};
 use crate::config::{clamp_page, Config};
 use crate::error::AppError;
 use crate::handlers::{
-    esc, fmt_ts, human_size, resolve_content_type, safe_filename, userbox, APP_CSS, FILE_SVG,
-    SHIELD_SVG,
+    esc, expiry_options, fmt_ts, human_size, parse_expiry, resolve_content_type, safe_filename,
+    userbox, APP_CSS, FILE_SVG, SHIELD_SVG,
 };
 use crate::model::FileRec;
 use crate::{now_secs, random_alnum, AppState};
@@ -32,9 +32,12 @@ const FILE_ID_LEN: usize = 10;
 const SHARE_TOKEN_LEN: usize = 32;
 /// Hard cap on a stored display file name (characters).
 const MAX_NAME_CHARS: usize = 255;
+/// Hard cap on a submitted share-link password (characters).
+const MAX_PASSWORD_CHARS: usize = 128;
 
 const GALLERY_HTML: &str = include_str!("../../templates/gallery.html");
 const DETAIL_HTML: &str = include_str!("../../templates/detail.html");
+const SHARE_PW_HTML: &str = include_str!("../../templates/share_password.html");
 
 // ---------------------------------------------------------------------------
 // GET / — the signed-in user's drive (gallery grid + upload dropzone)
@@ -175,8 +178,12 @@ pub async fn upload(
         size,
         bucket: state.blobs.bucket().to_string(),
         object_key: String::new(),
-        share_token: String::new(),
+        // A fresh upload is shareable immediately with no expiry and no password (the owner tunes
+        // the share-link lifecycle afterwards on the detail page). Backward compatible.
+        share_token: None,
         created_at: now,
+        expires_at: None,
+        share_password_hash: None,
     };
 
     // Reserve a unique row (id + share token) BEFORE writing the blob, retrying on the rare
@@ -185,7 +192,7 @@ pub async fn upload(
     for _ in 0..6 {
         rec.id = random_alnum(FILE_ID_LEN);
         rec.object_key = rec.id.clone();
-        rec.share_token = random_alnum(SHARE_TOKEN_LEN);
+        rec.share_token = Some(random_alnum(SHARE_TOKEN_LEN));
         if state.store.create(&rec).await? {
             reserved = true;
             break;
@@ -296,17 +303,159 @@ pub async fn delete(
 // ---------------------------------------------------------------------------
 
 /// `GET /s/{token}` — fetch a shared file by its unguessable token, WITHOUT SSO. Deploy marks the
-/// `/s/` prefix `auth=public`; this handler never consults identity or ownership. Inline for
-/// images, attachment otherwise.
+/// `/s/` prefix `auth=public`; this handler never consults identity or ownership. Honors the share
+/// lifecycle: a revoked token is 404, an expired link is 410 Gone, and a password-protected link
+/// renders a password prompt instead of the bytes. Inline for images, attachment otherwise.
 pub async fn share(
     State(state): State<AppState>,
     Path(token): Path<String>,
 ) -> Result<Response, AppError> {
-    let rec = state
+    let rec = load_shared(&state, &token).await?;
+    // Password-protected: never serve the bytes on a bare GET — prompt for the password first.
+    if rec.share_has_password() {
+        return Ok(render_share_prompt(&token, StatusCode::OK, None));
+    }
+    serve_shared(&state, &rec).await
+}
+
+/// Submitted share-link password (the public unlock form). The route is unauthenticated and this
+/// POST performs NO state change (it only reads a file after a password check), so it carries no
+/// CSRF token — there is no ambient session authority to protect.
+#[derive(Debug, Deserialize)]
+pub struct SharePasswordForm {
+    #[serde(default)]
+    pub password: String,
+}
+
+/// `POST /s/{token}` — verify the submitted password for a protected share link and, on success,
+/// serve the bytes. Wrong password re-renders the prompt (401). Same 404/410 lifecycle as the GET.
+pub async fn share_unlock(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+    Form(form): Form<SharePasswordForm>,
+) -> Result<Response, AppError> {
+    let rec = load_shared(&state, &token).await?;
+    match &rec.share_password_hash {
+        // Correct password (or the link is no longer protected) -> serve.
+        Some(hash) if auth::verify_share_password(hash, &form.password) => {
+            serve_shared(&state, &rec).await
+        }
+        None => serve_shared(&state, &rec).await,
+        Some(_) => Ok(render_share_prompt(
+            &token,
+            StatusCode::UNAUTHORIZED,
+            Some("Incorrect password."),
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /f/{id}/share, POST /f/{id}/revoke — share-link lifecycle (owner-only)
+// ---------------------------------------------------------------------------
+
+/// Share-link configuration form: an expiry allow-list value + an optional password. CSRF-checked.
+#[derive(Debug, Deserialize)]
+pub struct ShareConfigForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub expiry: String,
+    #[serde(default)]
+    pub password: String,
+}
+
+/// `POST /f/{id}/share` — (re)enable / update the share link: set its expiry and optional password,
+/// minting a fresh token when the link had been revoked. CSRF-checked, owner-scoped, then 302 to
+/// `/f/{id}`. Submitting a blank password CLEARS any existing password.
+pub async fn configure_share(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<ShareConfigForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let actor = auth::identity(&headers);
+    let rec = owned_file(&state, &id, &actor).await?;
+
+    let expires_at = parse_expiry(&form.expiry, now_secs());
+    let password = form.password.trim();
+    let password_hash = if password.is_empty() {
+        None
+    } else {
+        let capped: String = password.chars().take(MAX_PASSWORD_CHARS).collect();
+        Some(auth::hash_share_password(&capped))
+    };
+    // Reuse the live token when present; mint a fresh one when re-enabling after a revoke.
+    let token = rec
+        .share_token
+        .clone()
+        .unwrap_or_else(|| random_alnum(SHARE_TOKEN_LEN));
+
+    state
         .store
-        .get_by_token(&token)
-        .await?
-        .ok_or_else(|| AppError::NotFound("This share link is invalid or has been removed.".to_string()))?;
+        .configure_share(&id, &actor.subject, Some(token), expires_at, password_hash)
+        .await?;
+    tracing::info!(id = rec.id, owner = actor.subject, "share link configured");
+    state.audit.emit(AuditEvent::notice(
+        "file.share.update",
+        &actor.subject,
+        &rec.id,
+        if rec.is_image() { "image" } else { "file" },
+    ));
+    Ok(redirect_found(&format!("/f/{}", rec.id)))
+}
+
+/// `POST /f/{id}/revoke` — revoke the share link: clear the token (and its expiry/password), so the
+/// outstanding `/s/{token}` link stops working immediately. CSRF-checked, owner-scoped, then 302 to
+/// `/f/{id}`.
+pub async fn revoke_share(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<DeleteForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let actor = auth::identity(&headers);
+    let rec = owned_file(&state, &id, &actor).await?;
+
+    state
+        .store
+        .configure_share(&id, &actor.subject, None, None, None)
+        .await?;
+    tracing::info!(id = rec.id, owner = actor.subject, "share link revoked");
+    state.audit.emit(AuditEvent::notice(
+        "file.share.revoke",
+        &actor.subject,
+        &rec.id,
+        if rec.is_image() { "image" } else { "file" },
+    ));
+    Ok(redirect_found(&format!("/f/{}", rec.id)))
+}
+
+/// Load a file by share token for the PUBLIC path, enforcing the share lifecycle: a missing/revoked
+/// token is 404, an expired link is 410 Gone.
+async fn load_shared(state: &AppState, token: &str) -> Result<FileRec, AppError> {
+    let rec = state.store.get_by_token(token).await?.ok_or_else(|| {
+        AppError::NotFound("This share link is invalid or has been removed.".to_string())
+    })?;
+    if rec.share_expired(now_secs()) {
+        return Err(AppError::Gone(
+            "This share link has expired and is no longer available.".to_string(),
+        ));
+    }
+    Ok(rec)
+}
+
+/// Fetch the blob for a (validated) shared file, emit the public-share audit event, and serve it.
+async fn serve_shared(state: &AppState, rec: &FileRec) -> Result<Response, AppError> {
     let bytes = state.blobs.get(&rec.object_key).await?;
     // Public share fetch: no gateway identity on this route, so the affected file's owner is the
     // subject the event is attributed to.
@@ -316,7 +465,22 @@ pub async fn share(
         &rec.id,
         if rec.is_image() { "image" } else { "file" },
     ));
-    Ok(serve_blob(&rec, bytes))
+    Ok(serve_blob(rec, bytes))
+}
+
+/// Render the public share-link password prompt (`status` = 200 on first ask, 401 after a wrong
+/// password). `error` is an optional inline message.
+fn render_share_prompt(token: &str, status: StatusCode, error: Option<&str>) -> Response {
+    let error_html = match error {
+        Some(msg) => format!("<p class=\"form-error\">{}</p>", esc(msg)),
+        None => String::new(),
+    };
+    let html = SHARE_PW_HTML
+        .replace("{{CSS}}", APP_CSS)
+        .replace("{{SHIELD}}", SHIELD_SVG)
+        .replace("{{ERROR}}", &error_html)
+        .replace("{{TOKEN}}", &esc(token));
+    (status, Html(html)).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -484,7 +648,7 @@ fn render_detail(config: &Config, rec: &FileRec, viewer: &Identity, csrf: &str) 
         bucket = esc(&rec.bucket),
     );
 
-    let share_url = format!("{}/s/{}", config.public_base, rec.share_token);
+    let share = render_share_section(config, rec, csrf);
 
     let sub = format!(
         "{ctype} · {size} · {date}",
@@ -511,9 +675,87 @@ fn render_detail(config: &Config, rec: &FileRec, viewer: &Identity, csrf: &str) 
         .replace("{{SUB}}", &esc(&sub))
         .replace("{{PREVIEW}}", &preview)
         .replace("{{META_LIST}}", &meta_list)
-        .replace("{{SHARE_URL}}", &esc(&share_url))
+        .replace("{{SHARE}}", &share)
         .replace("{{ID}}", &esc(&rec.id))
         .replace("{{DELETE}}", &delete)
+}
+
+/// Build the share-link lifecycle section for the detail page. An active link shows its URL with a
+/// copy control, the expiry and password state, an update form, and a revoke button. A revoked link
+/// shows a "create share link" form instead. Every form is CSRF-protected and owner-scoped.
+fn render_share_section(config: &Config, rec: &FileRec, csrf: &str) -> String {
+    // The expiry <select> + optional password input, shared by the "update" and "create" forms.
+    let controls = format!(
+        "<div class=\"field\">\
+           <label for=\"expiry\">Link expires</label>\
+           <select id=\"expiry\" name=\"expiry\">{options}</select>\
+         </div>\
+         <div class=\"field\">\
+           <label for=\"password\">Password (optional)</label>\
+           <input id=\"password\" type=\"password\" name=\"password\" autocomplete=\"off\" \
+             placeholder=\"Leave blank for no password\">\
+         </div>",
+        options = expiry_options("never"),
+    );
+
+    match &rec.share_token {
+        Some(token) => {
+            let share_url = format!("{}/s/{}", config.public_base, token);
+            let expiry_status = match rec.expires_at {
+                Some(exp) => format!("Expires {}", esc(&fmt_ts(exp))),
+                None => "Never expires".to_string(),
+            };
+            let pw_status = if rec.share_has_password() {
+                "Password-protected"
+            } else {
+                "No password"
+            };
+            format!(
+                "<div class=\"field\">\
+                   <label for=\"shareUrl\">Share link (no sign-in required)</label>\
+                   <div class=\"share-row\">\
+                     <input id=\"shareUrl\" type=\"text\" readonly value=\"{url}\">\
+                     <button class=\"btn btn-secondary btn-sm\" id=\"copyBtn\" type=\"button\" data-label=\"Copy\">Copy</button>\
+                   </div>\
+                   <p class=\"muted\">{expiry_status} · {pw_status}</p>\
+                 </div>\
+                 <form class=\"share-form\" method=\"post\" action=\"/f/{id}/share\">\
+                   <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+                   {controls}\
+                   <div class=\"actions actions--split\">\
+                     <button class=\"btn btn-secondary\" type=\"submit\">Update share settings</button>\
+                   </div>\
+                 </form>\
+                 <form class=\"revoke-form\" method=\"post\" action=\"/f/{id}/revoke\" \
+                   onsubmit=\"return confirm('Revoke this share link? The current link will stop working.');\">\
+                   <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+                   <button class=\"btn btn-danger btn-sm\" type=\"submit\">Revoke share link</button>\
+                 </form>",
+                url = esc(&share_url),
+                expiry_status = expiry_status,
+                pw_status = pw_status,
+                id = esc(&rec.id),
+                csrf = esc(csrf),
+                controls = controls,
+            )
+        }
+        None => format!(
+            "<div class=\"field\">\
+               <label>Share link</label>\
+               <p class=\"muted\">This file is private — there is no active share link.</p>\
+             </div>\
+             <form class=\"share-form\" method=\"post\" action=\"/f/{id}/share\">\
+               <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+               {controls}\
+               <div class=\"actions actions--split\">\
+                 <button class=\"btn btn-primary\" type=\"submit\">Create share link</button>\
+               </div>\
+             </form>",
+            id = esc(&rec.id),
+            csrf = esc(csrf),
+            controls = controls,
+        ),
+    }
 }
 
 #[cfg(test)]

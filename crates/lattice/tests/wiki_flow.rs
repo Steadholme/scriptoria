@@ -9,6 +9,7 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use tower::ServiceExt;
 
+use lattice::store::Store;
 use lattice::{app, build_dev_state, AppState};
 
 #[tokio::test]
@@ -100,6 +101,125 @@ async fn full_create_edit_history_flow() {
     // Both editors appear in the history list.
     assert!(body.contains("alice@holdfast.local"));
     assert!(body.contains("bob@holdfast.local"));
+}
+
+#[tokio::test]
+async fn history_diff_and_revert_flow() {
+    let state = build_dev_state();
+
+    // Two saves -> two revisions.
+    let (_s, h1, _b) = call(&state, get("/edit/notes")).await;
+    let c1 = set_cookie(&h1).unwrap();
+    let t1 = cookie_value(&c1).unwrap();
+    let (s, _h, _b) = call(
+        &state,
+        post_form(
+            "/edit/notes",
+            &c1,
+            Some("alice@holdfast.local"),
+            &[("csrf_token", &t1), ("title", "Notes"), ("body_md", "line one\nline two\nline three")],
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::SEE_OTHER);
+
+    let (_s, h2, _b) = call(&state, get("/edit/notes")).await;
+    let c2 = set_cookie(&h2).unwrap();
+    let t2 = cookie_value(&c2).unwrap();
+    let (s, _h, _b) = call(
+        &state,
+        post_form(
+            "/edit/notes",
+            &c2,
+            Some("bob@holdfast.local"),
+            &[("csrf_token", &t2), ("title", "Notes"), ("body_md", "line one\nCHANGED two\nline three")],
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::SEE_OTHER);
+
+    // History lists a compare form + a revert button, and mints a CSRF cookie for the revert.
+    let (status, hist_headers, body) = call(&state, get("/history/notes")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("class=\"compare-form\""), "compare form present with 2 revisions");
+    assert!(body.contains("action=\"/revert/notes\""), "revert form present");
+    assert!(body.contains(">current</span>"), "newest revision marked current");
+    let revert_cookie = set_cookie(&hist_headers).expect("history mints a CSRF cookie");
+    let revert_csrf = cookie_value(&revert_cookie).unwrap();
+
+    // Pull the two revision ids straight out of the store (newest-first).
+    let revs = state.store.list_revisions("notes").await.unwrap();
+    assert_eq!(revs.len(), 2);
+    let newest = &revs[0];
+    let oldest = &revs[1];
+
+    // Diff view (from oldest -> newest): the changed line shows as - old / + new, context stays.
+    let (status, _h, diff) =
+        call(&state, get(&format!("/history/notes?from={}&to={}", oldest.id, newest.id))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(diff.contains("diff__line--del"), "a removed line is rendered");
+    assert!(diff.contains("diff__line--add"), "an added line is rendered");
+    assert!(diff.contains("CHANGED two"), "the new text appears");
+    assert!(diff.contains(">line one<"), "unchanged context line kept");
+
+    // Revert to the oldest revision: re-saves its body as a NEW revision.
+    let (status, headers, _b) = call(
+        &state,
+        post_form(
+            "/revert/notes",
+            &revert_cookie,
+            Some("carol@holdfast.local"),
+            &[("csrf_token", &revert_csrf), ("rev_id", &oldest.id)],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers).as_deref(), Some("/w/notes"));
+
+    // The page body is back to the old content, recorded by the reverting user as a 3rd revision.
+    let (_s, _h, page) = call(&state, get("/w/notes")).await;
+    assert!(page.contains("line two"), "reverted body restored");
+    assert!(!page.contains("CHANGED two"), "reverted away from the newer body");
+    let revs2 = state.store.list_revisions("notes").await.unwrap();
+    assert_eq!(revs2.len(), 3, "revert appends a new revision (append-only history)");
+    assert_eq!(revs2[0].editor_email, "carol@holdfast.local");
+    assert_eq!(revs2[0].body_md, "line one\nline two\nline three");
+}
+
+#[tokio::test]
+async fn revert_requires_csrf() {
+    let state = build_dev_state();
+    // Seed a page with a revision.
+    let (_s, h, _b) = call(&state, get("/edit/doc")).await;
+    let c = set_cookie(&h).unwrap();
+    let t = cookie_value(&c).unwrap();
+    call(
+        &state,
+        post_form(
+            "/edit/doc",
+            &c,
+            Some("alice@holdfast.local"),
+            &[("csrf_token", &t), ("title", "Doc"), ("body_md", "v1")],
+        ),
+    )
+    .await;
+    let revs = state.store.list_revisions("doc").await.unwrap();
+    let rid = revs[0].id.clone();
+
+    // POST with a token but NO cookie -> double-submit fails -> 403, no write.
+    let (status, _h, body) = call(
+        &state,
+        post_form(
+            "/revert/doc",
+            "",
+            Some("alice@holdfast.local"),
+            &[("csrf_token", "anything"), ("rev_id", &rid)],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body.contains("CSRF"));
+    assert_eq!(state.store.list_revisions("doc").await.unwrap().len(), 1, "no revision added");
 }
 
 #[tokio::test]

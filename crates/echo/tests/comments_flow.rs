@@ -100,7 +100,11 @@ async fn full_comments_flow_in_memory() {
         ("return_to", "/t/blog%2Fhello"),
         ("csrf_token", CSRF),
     ]);
-    let (status, _) = call(&state, post_csrf("/api/moderate", &body, Some(("u_mod", "mod@hf")))).await;
+    let (status, _) = call(
+        &state,
+        post_csrf_g("/api/moderate", &body, Some(("u_mod", "mod@hf")), Some("moderators")),
+    )
+    .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     let (_, view) = call(&state, get("/t/blog%2Fhello")).await;
     assert!(view.contains("[comment hidden by a moderator]"), "hidden body replaced");
@@ -112,14 +116,22 @@ async fn full_comments_flow_in_memory() {
         ("action", "unhide"),
         ("csrf_token", CSRF),
     ]);
-    let (status, _) = call(&state, post_csrf("/api/moderate", &body, Some(("u_mod", "mod@hf")))).await;
+    let (status, _) = call(
+        &state,
+        post_csrf_g("/api/moderate", &body, Some(("u_mod", "mod@hf")), Some("moderators")),
+    )
+    .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     let (_, view) = call(&state, get("/t/blog%2Fhello")).await;
     assert!(view.contains("First!"), "unhidden comment body restored");
 
     // --- moderation of a missing comment -> 404 ----------------------------
     let body = form(&[("comment_id", "cmt_nope"), ("action", "hide"), ("csrf_token", CSRF)]);
-    let (status, _) = call(&state, post_csrf("/api/moderate", &body, Some(("u_mod", "mod@hf")))).await;
+    let (status, _) = call(
+        &state,
+        post_csrf_g("/api/moderate", &body, Some(("u_mod", "mod@hf")), Some("moderators")),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "unknown comment -> 404");
 
     // --- empty body is rejected --------------------------------------------
@@ -172,6 +184,102 @@ async fn reply_to_reply_clamps_to_one_level() {
     assert_eq!(view.matches(r#"<div class="replies">"#).count(), 1, "only one nesting level");
 }
 
+#[tokio::test]
+async fn moderation_requires_moderator_group() {
+    let state = build_dev_state();
+
+    // a plain commenter posts.
+    let body = form(&[("thread_key", "k"), ("body", "hi"), ("csrf_token", CSRF)]);
+    call(&state, post_csrf("/api/comment", &body, Some(("u_alice", "alice@hf")))).await;
+    let (_, view) = call(&state, get("/t/k")).await;
+    let id = extract_comment_id(&view).expect("comment id");
+
+    // authenticated, correct CSRF, but NO moderator group -> 403 (the security fix).
+    let mbody = form(&[("comment_id", &id), ("action", "hide"), ("csrf_token", CSRF)]);
+    let (status, _) = call(&state, post_csrf("/api/moderate", &mbody, Some(("u_eve", "eve@hf")))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "non-moderator cannot moderate");
+
+    // the hide was rejected, so the comment is NOT hidden.
+    let (_, view) = call(&state, get("/t/k")).await;
+    assert!(
+        !view.contains("[comment hidden by a moderator]"),
+        "rejected hide must not hide the comment"
+    );
+
+    // a member of `moderators` succeeds.
+    let (status, _) = call(
+        &state,
+        post_csrf_g("/api/moderate", &mbody, Some(("u_mod", "mod@hf")), Some("moderators")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "moderator group authorizes moderation");
+    let (_, view) = call(&state, get("/t/k")).await;
+    assert!(view.contains("[comment hidden by a moderator]"), "moderator hid the comment");
+
+    // `infra-admins` (among other groups) is also authorized.
+    let ubody = form(&[("comment_id", &id), ("action", "unhide"), ("csrf_token", CSRF)]);
+    let (status, _) = call(
+        &state,
+        post_csrf_g("/api/moderate", &ubody, Some(("u_admin", "admin@hf")), Some("dev,infra-admins")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "infra-admins authorizes moderation");
+}
+
+#[tokio::test]
+async fn author_self_edit_and_delete() {
+    let state = build_dev_state();
+
+    // alice posts a comment.
+    let body = form(&[("thread_key", "k"), ("body", "original text"), ("csrf_token", CSRF)]);
+    call(&state, post_csrf("/api/comment", &body, Some(("u_alice", "alice@hf")))).await;
+    let (_, view) = call(&state, get("/t/k")).await;
+    let id = extract_comment_id(&view).expect("comment id");
+
+    // the owner (viewer == author) sees self-edit + self-delete controls.
+    let (_, owner_view) = call(&state, get_as("/t/k", "u_alice", "alice@hf")).await;
+    assert!(owner_view.contains("/api/comment/edit"), "owner sees edit control");
+    assert!(owner_view.contains("/api/comment/delete"), "owner sees delete control");
+
+    // a different signed-in user does NOT see self controls on alice's comment.
+    let (_, other_view) = call(&state, get_as("/t/k", "u_eve", "eve@hf")).await;
+    assert!(!other_view.contains("/api/comment/edit"), "non-owner sees no edit control");
+    assert!(!other_view.contains("/api/comment/delete"), "non-owner sees no delete control");
+
+    // a non-owner cannot edit -> 404 (ownership enforced by the store).
+    let ebody = form(&[("comment_id", &id), ("body", "hacked"), ("csrf_token", CSRF)]);
+    let (status, _) = call(&state, post_csrf("/api/comment/edit", &ebody, Some(("u_eve", "eve@hf")))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "non-owner edit rejected");
+    let (_, view) = call(&state, get("/t/k")).await;
+    assert!(view.contains("original text") && !view.contains("hacked"), "body unchanged");
+
+    // edit requires CSRF: a mismatched form token (cookie is CSRF) -> 401, even for the owner.
+    let bad = form(&[("comment_id", &id), ("body", "x"), ("csrf_token", "WRONG")]);
+    let (status, _) = call(&state, post_csrf("/api/comment/edit", &bad, Some(("u_alice", "alice@hf")))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "edit CSRF mismatch -> 401");
+
+    // the owner edits successfully.
+    let ebody = form(&[("comment_id", &id), ("body", "edited text"), ("csrf_token", CSRF)]);
+    let (status, _) = call(&state, post_csrf("/api/comment/edit", &ebody, Some(("u_alice", "alice@hf")))).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "owner edit ok");
+    let (_, view) = call(&state, get("/t/k")).await;
+    assert!(view.contains("edited text"), "edited body shown");
+    assert!(!view.contains("original text"), "old body gone");
+
+    // a non-owner cannot delete -> 404.
+    let dbody = form(&[("comment_id", &id), ("csrf_token", CSRF)]);
+    let (status, _) = call(&state, post_csrf("/api/comment/delete", &dbody, Some(("u_eve", "eve@hf")))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "non-owner delete rejected");
+    let (_, view) = call(&state, get("/t/k")).await;
+    assert!(view.contains("edited text"), "comment still present after rejected delete");
+
+    // the owner deletes their own comment.
+    let (status, _) = call(&state, post_csrf("/api/comment/delete", &dbody, Some(("u_alice", "alice@hf")))).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "owner delete ok");
+    let (_, view) = call(&state, get("/t/k")).await;
+    assert!(!view.contains("edited text"), "comment removed");
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
@@ -197,6 +305,17 @@ fn get(uri: &str) -> Request<Body> {
 
 /// Build a urlencoded POST carrying the test CSRF cookie + (optionally) gateway identity.
 fn post_csrf(uri: &str, body: &str, ident: Option<(&str, &str)>) -> Request<Body> {
+    post_csrf_g(uri, body, ident, None)
+}
+
+/// As [`post_csrf`], but also inject an `X-Auth-Groups` header (comma-separated) — used to exercise
+/// the moderator-group gate on `/api/moderate`.
+fn post_csrf_g(
+    uri: &str,
+    body: &str,
+    ident: Option<(&str, &str)>,
+    groups: Option<&str>,
+) -> Request<Body> {
     let mut b = Request::builder()
         .method("POST")
         .uri(uri)
@@ -205,7 +324,21 @@ fn post_csrf(uri: &str, body: &str, ident: Option<(&str, &str)>) -> Request<Body
     if let Some((sub, email)) = ident {
         b = b.header("x-auth-subject", sub).header("x-auth-email", email);
     }
+    if let Some(g) = groups {
+        b = b.header("x-auth-groups", g);
+    }
     b.body(Body::from(body.to_string())).unwrap()
+}
+
+/// A GET carrying gateway identity (so the render knows the viewer) + the test CSRF cookie.
+fn get_as(uri: &str, sub: &str, email: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header("x-auth-subject", sub)
+        .header("x-auth-email", email)
+        .header(header::COOKIE, format!("__Host-csrf={CSRF}"))
+        .body(Body::empty())
+        .unwrap()
 }
 
 fn form(pairs: &[(&str, &str)]) -> String {

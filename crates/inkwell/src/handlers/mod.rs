@@ -8,6 +8,7 @@
 //! brand gradient, indigo accent, cards, app-bar.
 
 pub mod ask;
+pub mod feed;
 pub mod health;
 pub mod posts;
 

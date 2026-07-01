@@ -38,6 +38,79 @@ pub fn highlight(language: &str, source: &str) -> String {
     }
 }
 
+/// Render `source` as a per-line code block: one row per source line, each carrying a stable
+/// `id="L{n}"` anchor, a clickable gutter number, and the syntax-highlighted line body. When
+/// `highlight` is `Some((start, end))` (1-based, inclusive) the rows in that range get the
+/// `ln--hl` class — the server side of the `?lines=` line-range permalink (the client hash
+/// handler in the view template applies the same class from a `#L10-L20` fragment).
+///
+/// Safety: the line bodies come from [`highlight`] (every character already HTML-escaped); the
+/// only interpolated numbers are row indices, so the output is never less safe than the plain
+/// `<pre>{escaped}</pre>` path.
+pub fn render_lines(language: &str, source: &str, highlight: Option<(usize, usize)>) -> String {
+    let html = self::highlight(language, source);
+    let mut lines = split_highlighted_lines(&html);
+    // A single trailing newline is a line terminator, not an extra empty line (GitHub-style):
+    // drop the phantom final row it produces so the gutter counts real lines.
+    if source.ends_with('\n') {
+        lines.pop();
+    }
+    let mut out = String::with_capacity(html.len() + lines.len() * 64 + 16);
+    for (idx, code) in lines.iter().enumerate() {
+        let n = idx + 1;
+        let hl = matches!(highlight, Some((a, b)) if n >= a && n <= b);
+        let cls = if hl { "ln ln--hl" } else { "ln" };
+        out.push_str(&format!(
+            "<div class=\"{cls}\" id=\"L{n}\">\
+               <a class=\"ln-no\" href=\"#L{n}\">{n}</a>\
+               <span class=\"ln-code\">{code}</span>\
+             </div>"
+        ));
+    }
+    out
+}
+
+/// Split highlighted HTML (as produced by [`highlight`]) into per-line fragments, keeping every
+/// line's `<span>` tags balanced. A block comment is the one token that can straddle a newline;
+/// when a line ends inside such a span the span is closed at the line break and reopened on the
+/// next line, so each returned fragment is independently well-formed. Highlighter spans never
+/// nest, so tracking a single open tag is sufficient.
+fn split_highlighted_lines(html: &str) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut open: Option<String> = None; // the full open tag currently in effect, if any
+    let bytes = html.as_bytes();
+    let mut i = 0;
+    while i < html.len() {
+        if html[i..].starts_with("<span") {
+            let rel = html[i..].find('>').map(|p| p + 1).unwrap_or(html.len() - i);
+            let tag = &html[i..i + rel];
+            cur.push_str(tag);
+            open = Some(tag.to_string());
+            i += rel;
+        } else if html[i..].starts_with("</span>") {
+            cur.push_str("</span>");
+            open = None;
+            i += "</span>".len();
+        } else if bytes[i] == b'\n' {
+            if open.is_some() {
+                cur.push_str("</span>");
+            }
+            lines.push(std::mem::take(&mut cur));
+            if let Some(tag) = &open {
+                cur.push_str(tag);
+            }
+            i += 1;
+        } else {
+            let ch_len = html[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+            cur.push_str(&html[i..i + ch_len]);
+            i += ch_len;
+        }
+    }
+    lines.push(cur);
+    lines
+}
+
 fn highlight_with(syntax: &Syntax, source: &str) -> String {
     let chars: Vec<char> = source.chars().collect();
     let n = chars.len();
@@ -404,6 +477,57 @@ mod tests {
     fn unterminated_string_does_not_panic() {
         let _ = highlight("rust", "let s = \"oops");
         let _ = highlight("rust", "/* never closed");
+    }
+
+    #[test]
+    fn render_lines_numbers_rows_and_anchors() {
+        let html = render_lines("plaintext", "one\ntwo\nthree", None);
+        assert!(html.contains("<div class=\"ln\" id=\"L1\">"));
+        assert!(html.contains("<div class=\"ln\" id=\"L2\">"));
+        assert!(html.contains("<div class=\"ln\" id=\"L3\">"));
+        assert!(html.contains("<a class=\"ln-no\" href=\"#L2\">2</a>"));
+        assert!(html.contains("<span class=\"ln-code\">two</span>"));
+    }
+
+    #[test]
+    fn render_lines_trailing_newline_is_not_an_extra_row() {
+        // "a\nb\n" is two lines, not three: the terminating newline yields no phantom row.
+        let html = render_lines("plaintext", "a\nb\n", None);
+        assert!(html.contains("id=\"L1\""));
+        assert!(html.contains("id=\"L2\""));
+        assert!(!html.contains("id=\"L3\""));
+    }
+
+    #[test]
+    fn render_lines_highlights_requested_range() {
+        let html = render_lines("plaintext", "a\nb\nc\nd", Some((2, 3)));
+        assert!(html.contains("<div class=\"ln\" id=\"L1\">"));
+        assert!(html.contains("<div class=\"ln ln--hl\" id=\"L2\">"));
+        assert!(html.contains("<div class=\"ln ln--hl\" id=\"L3\">"));
+        assert!(html.contains("<div class=\"ln\" id=\"L4\">"));
+    }
+
+    #[test]
+    fn render_lines_keeps_block_comment_spans_balanced_per_line() {
+        // A rust block comment straddling a newline must not leak an unclosed span into a row.
+        let html = render_lines("rust", "let x = 1; /* c1\nc2 */ let y = 2;", None);
+        let l1 = html.split("id=\"L1\"").nth(1).unwrap();
+        let l1 = &l1[..l1.find("</div>").unwrap()];
+        assert_eq!(
+            l1.matches("<span").count(),
+            l1.matches("</span>").count(),
+            "line 1 spans must be balanced: {l1}"
+        );
+        // The comment token is present on both lines and each row is self-contained.
+        assert!(l1.contains("<span class=\"tok-com\">/* c1</span>"));
+        assert!(html.contains("<span class=\"tok-com\">c2 */</span>"));
+    }
+
+    #[test]
+    fn render_lines_escapes_body() {
+        let html = render_lines("plaintext", "<script>\nok", None);
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(!html.contains("<script>"));
     }
 
     /// Remove every `<span ...>` and `</span>` tag (test helper only).

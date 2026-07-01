@@ -212,6 +212,8 @@ pub async fn thread(
     let posts = state.store.posts_in_thread(&id).await?;
     let category = state.store.get_category(&thread.category_id).await?;
 
+    // The authenticated subject (if any) decides which edit/delete controls render.
+    let viewer = auth::identity_subject(&headers);
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
 
     // Breadcrumb: Home / Category / Thread.
@@ -229,8 +231,25 @@ pub async fn thread(
         title = esc(&thread.title),
     );
 
+    // Thread-level controls (edit title + original post, delete whole thread) — author only.
+    let thread_actions = if viewer.as_deref() == Some(thread.author_sub.as_str()) {
+        format!(
+            r#"<div class="owner-actions">
+  <a class="btn btn-secondary btn-sm" href="/t/{tid}/edit">Edit thread</a>
+  <form class="inline-form" method="post" action="/t/{tid}/delete" onsubmit="return confirm('Delete this thread and all its replies? This cannot be undone.');">
+    <input type="hidden" name="csrf" value="{csrf}">
+    <button class="btn btn-danger btn-sm" type="submit">Delete thread</button>
+  </form>
+</div>"#,
+            tid = esc(&thread.id),
+            csrf = esc(&csrf),
+        )
+    } else {
+        String::new()
+    };
+
     let summary_html = render_summary(&posts);
-    let posts_html = render_posts(&posts, now);
+    let posts_html = render_posts(&posts, now, viewer.as_deref(), &thread.id, &csrf);
 
     let reply_form = format!(
         r#"<section class="card pad">
@@ -253,6 +272,7 @@ pub async fn thread(
 <div class="thread-head">
   <h1>{title}</h1>
   <p class="muted">Started by <strong>{author}</strong> · {when} · {replies}</p>
+  {actions}
 </div>
 {summary}
 <section class="posts">{posts}</section>
@@ -262,6 +282,7 @@ pub async fn thread(
         author = esc(&thread.author_email),
         when = esc(&fmt_ts(thread.created_at)),
         replies = esc(&replies_label(posts.len() as i64)),
+        actions = thread_actions,
         summary = summary_html,
         posts = posts_html,
         reply = reply_form,
@@ -468,8 +489,307 @@ pub async fn reply(
 }
 
 // ===========================================================================
+// GET/POST /t/{id}/edit — edit one's OWN thread (title + original-post body)
+// ===========================================================================
+
+/// Form body for editing a thread: title + original-post body. Identity is NEVER read from the
+/// form — only from the gateway headers.
+#[derive(Debug, Deserialize)]
+pub struct EditThreadForm {
+    #[serde(default)]
+    pub csrf: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+}
+
+/// Minimal form body for a delete: just the CSRF token (identity comes from the gateway).
+#[derive(Debug, Deserialize)]
+pub struct DeleteForm {
+    #[serde(default)]
+    pub csrf: String,
+}
+
+pub async fn edit_thread_form(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let author = auth::require_author(&headers)?;
+    let thread = state
+        .store
+        .get_thread(&id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("thread not found".to_string()))?;
+    if thread.author_sub != author.sub {
+        return Err(AppError::Forbidden("you can only edit your own threads".to_string()));
+    }
+    let posts = state.store.posts_in_thread(&id).await?;
+    let op_body = posts.first().map(|p| p.body_md.as_str()).unwrap_or("");
+    let (csrf, set_cookie) = auth::ensure_csrf(&headers);
+
+    let content = render_edit_form(
+        "Edit thread",
+        &format!("/t/{}/edit", esc(&thread.id)),
+        &csrf,
+        Some(&thread.title),
+        op_body,
+        &format!("/t/{}", esc(&thread.id)),
+    );
+    let html = render_page("Edit thread", &email_display(&headers), &content);
+    Ok(html_response(html, set_cookie))
+}
+
+pub async fn update_thread(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<EditThreadForm>,
+) -> Result<Response, AppError> {
+    auth::verify_csrf(&headers, &form.csrf)?;
+    let author = auth::require_author(&headers)?;
+
+    let thread = state
+        .store
+        .get_thread(&id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("thread not found".to_string()))?;
+    if thread.author_sub != author.sub {
+        return Err(AppError::Forbidden("you can only edit your own threads".to_string()));
+    }
+
+    let title = form.title.trim();
+    if title.is_empty() {
+        return Err(AppError::InvalidRequest("thread title is required".to_string()));
+    }
+    if title.chars().count() > MAX_TITLE {
+        return Err(AppError::InvalidRequest("thread title is too long".to_string()));
+    }
+    let body = form.body.trim();
+    if body.is_empty() {
+        return Err(AppError::InvalidRequest("post body is required".to_string()));
+    }
+    if body.chars().count() > MAX_BODY {
+        return Err(AppError::InvalidRequest("post body is too long".to_string()));
+    }
+
+    // The original post is the oldest post in the thread (first in display order).
+    let posts = state.store.posts_in_thread(&id).await?;
+    let op_id = posts
+        .first()
+        .map(|p| p.id.clone())
+        .ok_or_else(|| AppError::NotFound("thread has no original post".to_string()))?;
+
+    state.store.update_thread(&id, title, &op_id, body).await?;
+    tracing::info!(thread = id, author = thread.author_email, "thread updated");
+
+    let actor = if thread.author_email.is_empty() {
+        &thread.author_sub
+    } else {
+        &thread.author_email
+    };
+    state
+        .audit
+        .emit(AuditEvent::info("thread.update", actor, &thread.id, &thread.category_id));
+
+    Ok(redirect_to(&format!("/t/{id}")))
+}
+
+pub async fn delete_thread(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<DeleteForm>,
+) -> Result<Response, AppError> {
+    auth::verify_csrf(&headers, &form.csrf)?;
+    let author = auth::require_author(&headers)?;
+
+    let thread = state
+        .store
+        .get_thread(&id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("thread not found".to_string()))?;
+    if thread.author_sub != author.sub {
+        return Err(AppError::Forbidden("you can only delete your own threads".to_string()));
+    }
+
+    state.store.delete_thread(&id).await?;
+    tracing::info!(thread = id, author = thread.author_email, "thread deleted");
+
+    let actor = if thread.author_email.is_empty() {
+        &thread.author_sub
+    } else {
+        &thread.author_email
+    };
+    state
+        .audit
+        .emit(AuditEvent::notice("thread.delete", actor, &thread.id, &thread.category_id));
+
+    // Bounce back to the thread's category (or home if it is gone).
+    Ok(redirect_to(&format!("/c/{}", thread.category_id)))
+}
+
+// ===========================================================================
+// GET/POST /t/{tid}/p/{pid}/edit + POST /t/{tid}/p/{pid}/delete — one's OWN reply
+// ===========================================================================
+
+/// Form body for editing a reply: just the body. Identity comes from the gateway headers.
+#[derive(Debug, Deserialize)]
+pub struct EditReplyForm {
+    #[serde(default)]
+    pub csrf: String,
+    #[serde(default)]
+    pub body: String,
+}
+
+/// Resolve a reply for an author-gated mutation. Loads the thread's posts, rejects when the post
+/// is missing / not in this thread (404), is the ORIGINAL post (that is edited/deleted via the
+/// thread controls, which also keep the denormalised `first_body_md` in step — 403), or is not
+/// authored by `author_sub` (403). Returns the target post on success.
+fn locate_own_reply(posts: &[Post], pid: &str, author_sub: &str) -> Result<Post, AppError> {
+    if posts.first().map(|p| p.id == pid).unwrap_or(false) {
+        return Err(AppError::Forbidden(
+            "the original post is edited or deleted via the thread itself".to_string(),
+        ));
+    }
+    let post = posts
+        .iter()
+        .find(|p| p.id == pid)
+        .ok_or_else(|| AppError::NotFound("reply not found".to_string()))?;
+    if post.author_sub != author_sub {
+        return Err(AppError::Forbidden("you can only edit your own replies".to_string()));
+    }
+    Ok(post.clone())
+}
+
+pub async fn edit_reply_form(
+    State(state): State<AppState>,
+    Path((tid, pid)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let author = auth::require_author(&headers)?;
+    let posts = state.store.posts_in_thread(&tid).await?;
+    let post = locate_own_reply(&posts, &pid, &author.sub)?;
+    let (csrf, set_cookie) = auth::ensure_csrf(&headers);
+
+    let content = render_edit_form(
+        "Edit reply",
+        &format!("/t/{}/p/{}/edit", esc(&tid), esc(&pid)),
+        &csrf,
+        None,
+        &post.body_md,
+        &format!("/t/{}", esc(&tid)),
+    );
+    let html = render_page("Edit reply", &email_display(&headers), &content);
+    Ok(html_response(html, set_cookie))
+}
+
+pub async fn update_reply(
+    State(state): State<AppState>,
+    Path((tid, pid)): Path<(String, String)>,
+    headers: HeaderMap,
+    Form(form): Form<EditReplyForm>,
+) -> Result<Response, AppError> {
+    auth::verify_csrf(&headers, &form.csrf)?;
+    let author = auth::require_author(&headers)?;
+
+    let posts = state.store.posts_in_thread(&tid).await?;
+    let post = locate_own_reply(&posts, &pid, &author.sub)?;
+
+    let body = form.body.trim();
+    if body.is_empty() {
+        return Err(AppError::InvalidRequest("reply body is required".to_string()));
+    }
+    if body.chars().count() > MAX_BODY {
+        return Err(AppError::InvalidRequest("reply body is too long".to_string()));
+    }
+
+    state.store.update_post(&pid, body).await?;
+    tracing::info!(thread = tid, post = pid, "reply updated");
+
+    let actor = if post.author_email.is_empty() {
+        &post.author_sub
+    } else {
+        &post.author_email
+    };
+    state.audit.emit(AuditEvent::info("reply.update", actor, &pid, &tid));
+
+    Ok(redirect_to(&format!("/t/{tid}")))
+}
+
+pub async fn delete_reply(
+    State(state): State<AppState>,
+    Path((tid, pid)): Path<(String, String)>,
+    headers: HeaderMap,
+    Form(form): Form<DeleteForm>,
+) -> Result<Response, AppError> {
+    auth::verify_csrf(&headers, &form.csrf)?;
+    let author = auth::require_author(&headers)?;
+
+    let posts = state.store.posts_in_thread(&tid).await?;
+    let post = locate_own_reply(&posts, &pid, &author.sub)?;
+
+    state.store.delete_post(&pid).await?;
+    tracing::info!(thread = tid, post = pid, "reply deleted");
+
+    let actor = if post.author_email.is_empty() {
+        &post.author_sub
+    } else {
+        &post.author_email
+    };
+    state.audit.emit(AuditEvent::notice("reply.delete", actor, &pid, &tid));
+
+    Ok(redirect_to(&format!("/t/{tid}")))
+}
+
+// ===========================================================================
 // Render helpers
 // ===========================================================================
+
+/// Render the shared edit-form card (thread or reply). `title_value` is `Some` for a thread
+/// (renders a Title input) and `None` for a reply (body only). Every interpolated value is
+/// HTML-escaped.
+fn render_edit_form(
+    heading: &str,
+    action: &str,
+    csrf: &str,
+    title_value: Option<&str>,
+    body_value: &str,
+    cancel_href: &str,
+) -> String {
+    let title_input = match title_value {
+        Some(v) => format!(
+            r#"<label for="ed-title">Title</label>
+    <input id="ed-title" type="text" name="title" maxlength="{maxt}" required value="{value}">"#,
+            maxt = MAX_TITLE,
+            value = esc(v),
+        ),
+        None => String::new(),
+    };
+    format!(
+        r#"<nav class="crumbs"><a href="/">Home</a><span class="crumbs__sep">/</span><span>{heading}</span></nav>
+<div class="page-head"><div><h1>{heading}</h1></div></div>
+<section class="card pad">
+  <form class="form" method="post" action="{action}">
+    <input type="hidden" name="csrf" value="{csrf}">
+    {title_input}
+    <label for="ed-body">Body <span class="muted">(Markdown supported)</span></label>
+    <textarea id="ed-body" name="body" rows="10" required>{body}</textarea>
+    <div class="form__actions">
+      <button class="btn btn-primary" type="submit">Save changes</button>
+      <a class="btn btn-secondary" href="{cancel}">Cancel</a>
+    </div>
+  </form>
+</section>"#,
+        heading = esc(heading),
+        action = action,
+        csrf = esc(csrf),
+        title_input = title_input,
+        body = esc(body_value),
+        cancel = cancel_href,
+    )
+}
 
 /// Render a list of threads as rows. When `cat_names` is provided (home page) each row also
 /// names its category; otherwise (category page) it is omitted.
@@ -541,8 +861,16 @@ fn render_summary(posts: &[Post]) -> String {
 }
 
 /// Render the posts of a thread. The first post is flagged as the original post (`is-op`);
-/// each body is rendered through the markdown sanitiser.
-fn render_posts(posts: &[Post], now: i64) -> String {
+/// each body is rendered through the markdown sanitiser. A REPLY (never the original post —
+/// that is edited/deleted via the thread controls) gets inline Edit/Delete controls when
+/// `viewer` is its author.
+fn render_posts(
+    posts: &[Post],
+    now: i64,
+    viewer: Option<&str>,
+    thread_id: &str,
+    csrf: &str,
+) -> String {
     if posts.is_empty() {
         return r#"<div class="empty">This thread has no posts.</div>"#.to_string();
     }
@@ -554,6 +882,23 @@ fn render_posts(posts: &[Post], now: i64) -> String {
         } else {
             ""
         };
+        // Own-reply controls: not on the original post (i == 0), only for the author.
+        let controls = if i > 0 && viewer == Some(p.author_sub.as_str()) {
+            format!(
+                r#"<div class="owner-actions post__actions">
+  <a class="btn btn-ghost btn-sm" href="/t/{tid}/p/{pid}/edit">Edit</a>
+  <form class="inline-form" method="post" action="/t/{tid}/p/{pid}/delete" onsubmit="return confirm('Delete this reply? This cannot be undone.');">
+    <input type="hidden" name="csrf" value="{csrf}">
+    <button class="btn btn-danger btn-sm" type="submit">Delete</button>
+  </form>
+</div>"#,
+                tid = esc(thread_id),
+                pid = esc(&p.id),
+                csrf = esc(csrf),
+            )
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
             r#"<article class="post{op}">
   <header class="post__meta">
@@ -563,6 +908,7 @@ fn render_posts(posts: &[Post], now: i64) -> String {
     {tag}
   </header>
   <div class="markdown">{body}</div>
+  {controls}
 </article>"#,
             op = op,
             author = esc(&p.author_email),
@@ -570,6 +916,7 @@ fn render_posts(posts: &[Post], now: i64) -> String {
             ago = esc(&rel_time(p.created_at, now)),
             tag = tag,
             body = markdown::render(&p.body_md),
+            controls = controls,
         ));
     }
     out

@@ -193,14 +193,25 @@ pub async fn create(
 // GET /p/{id} — view a paste
 // ---------------------------------------------------------------------------
 
-/// `GET /p/{id}` — render the paste (honoring expiry), syntax-highlighted, with a "similar
-/// pastes" panel. The delete control is shown only to the author. A burn-after-read paste is
+/// Query string for the view: an optional `?lines=<start>[-<end>]` line-range to highlight, the
+/// server side of the line-range permalink (the client `#L10-L20` hash handler applies the same
+/// highlight without a round-trip).
+#[derive(Debug, Deserialize)]
+pub struct ViewQuery {
+    #[serde(default)]
+    pub lines: Option<String>,
+}
+
+/// `GET /p/{id}` — render the paste (honoring expiry), syntax-highlighted with a numbered line
+/// gutter, with a "similar pastes" panel. An optional `?lines=<start>[-<end>]` highlights that
+/// row range. The delete control is shown only to the author. A burn-after-read paste is
 /// deleted after this render when the viewer is NOT its author (so the author can still open it
 /// to copy the share link; the first recipient read consumes it).
 pub async fn view(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Query(q): Query<ViewQuery>,
 ) -> Result<Response, AppError> {
     let viewer = auth::identity(&headers);
     let now = now_secs();
@@ -221,8 +232,18 @@ pub async fn view(
     // Similar pastes: rank the author's other live, non-burn pastes by BoW cosine overlap.
     let similar = similar_pastes(&state, &paste, now).await;
 
+    let highlight_lines = q.lines.as_deref().and_then(parse_lines);
+
     let csrf = auth::new_csrf_token();
-    let html = render_view(&paste, &viewer, is_owner, burned, &similar, &csrf);
+    let html = render_view(
+        &paste,
+        &viewer,
+        is_owner,
+        burned,
+        &similar,
+        &csrf,
+        highlight_lines,
+    );
 
     // Burn-after-read: this recipient's read consumes the paste. Best-effort, never fatal — a
     // failed purge leaves the paste readable rather than 500-ing on a successful render.
@@ -420,6 +441,24 @@ fn parse_before(raw: &str) -> Option<(i64, String)> {
     Some((ts, id.to_string()))
 }
 
+/// Parse a `?lines=<start>[-<end>]` line-range (1-based, inclusive) into a normalized
+/// `(start, end)` with `start <= end`. Accepts an optional `L` prefix on either bound (so a
+/// `#L10-L20` hash pasted into the query still parses). A malformed or zero range yields `None`,
+/// so a bad value simply renders the paste with no highlight instead of erroring.
+fn parse_lines(raw: &str) -> Option<(usize, usize)> {
+    let s = raw.trim().trim_start_matches('L');
+    let (a, b) = match s.split_once('-') {
+        Some((x, y)) => (x, y.trim_start_matches('L')),
+        None => (s, s),
+    };
+    let a: usize = a.trim().parse().ok()?;
+    let b: usize = b.trim().parse().ok()?;
+    if a == 0 || b == 0 {
+        return None;
+    }
+    Some(if a <= b { (a, b) } else { (b, a) })
+}
+
 /// The "Load older" control, rendered ONLY when a FULL page came back (so an older page may
 /// exist). The link carries the next backward cursor `?before=<created_at>_<id>` computed from
 /// the last (oldest) row of this page; an explicit `?limit=` is preserved so paging stays at the
@@ -525,6 +564,7 @@ fn render_view(
     burned: bool,
     similar: &[(f64, Paste)],
     csrf: &str,
+    highlight_lines: Option<(usize, usize)>,
 ) -> String {
     let title = if paste.title.trim().is_empty() {
         "Untitled paste".to_string()
@@ -586,9 +626,13 @@ fn render_view(
         .replace("{{BURN_NOTICE}}", &burn_notice)
         .replace("{{ID}}", &esc(&paste.id))
         .replace("{{DELETE}}", &delete_block)
-        // Syntax-highlighted body. `highlight` HTML-escapes every character (and falls back to
-        // plain `esc` for plaintext/unknown languages), so this is never less safe than before.
-        .replace("{{BODY}}", &highlight::highlight(&paste.language, &paste.body))
+        // Syntax-highlighted body, rendered as numbered line rows (each with an `id="L{n}"`
+        // anchor). `render_lines` HTML-escapes every character (falling back to plain `esc` for
+        // plaintext/unknown languages), so this is never less safe than before.
+        .replace(
+            "{{BODY}}",
+            &highlight::render_lines(&paste.language, &paste.body, highlight_lines),
+        )
         .replace("{{SIMILAR}}", &render_similar(similar))
 }
 
@@ -630,4 +674,34 @@ fn render_similar(similar: &[(f64, Paste)]) -> String {
            <div class=\"card__body\"><ul class=\"paste-list\">{items}</ul></div>\
          </section>"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_lines;
+
+    #[test]
+    fn parse_lines_single_and_range() {
+        assert_eq!(parse_lines("10"), Some((10, 10)));
+        assert_eq!(parse_lines("10-20"), Some((10, 20)));
+    }
+
+    #[test]
+    fn parse_lines_normalizes_reversed_range() {
+        assert_eq!(parse_lines("20-10"), Some((10, 20)));
+    }
+
+    #[test]
+    fn parse_lines_tolerates_l_prefix() {
+        assert_eq!(parse_lines("L10-L20"), Some((10, 20)));
+    }
+
+    #[test]
+    fn parse_lines_rejects_bad_input() {
+        assert_eq!(parse_lines("0"), None);
+        assert_eq!(parse_lines("0-5"), None);
+        assert_eq!(parse_lines("abc"), None);
+        assert_eq!(parse_lines(""), None);
+        assert_eq!(parse_lines("5-"), None);
+    }
 }

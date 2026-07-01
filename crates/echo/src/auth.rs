@@ -49,6 +49,49 @@ pub fn display_email(headers: &HeaderMap) -> String {
     author_email(headers).unwrap_or_else(|| "—".to_string())
 }
 
+/// Group names that authorize moderation. Membership in ANY of these lets a user hide/unhide.
+pub const MODERATOR_GROUPS: &[&str] = &["moderators", "infra-admins"];
+
+/// The authenticated user's groups, parsed from the comma-separated `X-Auth-Groups` header
+/// (injected AND HMAC-verified by the gateway, so it is trustworthy). Empty when absent/blank.
+pub fn author_groups(headers: &HeaderMap) -> Vec<String> {
+    header_value(headers, HEADER_GROUPS)
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether the authenticated user belongs to `group` (exact match against `X-Auth-Groups`).
+pub fn has_group(headers: &HeaderMap, group: &str) -> bool {
+    author_groups(headers).iter().any(|g| g == group)
+}
+
+/// Whether the authenticated user is in ANY [`MODERATOR_GROUPS`] entry.
+pub fn is_moderator(headers: &HeaderMap) -> bool {
+    let groups = author_groups(headers);
+    MODERATOR_GROUPS
+        .iter()
+        .any(|m| groups.iter().any(|g| g == m))
+}
+
+/// Require moderator group membership for a moderation action. `Forbidden` (403) when the
+/// authenticated user carries no moderator group — closes the hole where ANY signed-in user could
+/// hide/unhide ANY comment.
+pub fn require_moderator(headers: &HeaderMap) -> Result<(), AppError> {
+    if is_moderator(headers) {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(
+            "moderation requires a moderator group".to_string(),
+        ))
+    }
+}
+
 /// Require an authenticated identity. Returns `(subject, email)`, or `Unauthorized` when no SSO
 /// identity is present — defense in depth behind the gateway.
 pub fn require_author(headers: &HeaderMap) -> Result<(String, String), AppError> {
@@ -278,6 +321,32 @@ mod tests {
             sign_identity("test-key", "usr_bob", "", 2),
             "930f82fb1224e69c9c5bc46e545c3b108b1eeb6c9078c7a33fc24f30c595f658"
         );
+    }
+
+    #[test]
+    fn has_group_and_require_moderator() {
+        // no X-Auth-Groups -> no groups, not a moderator, require_moderator rejects.
+        let mut none = HeaderMap::new();
+        none.insert(HEADER_SUBJECT, HeaderValue::from_static("u_eve"));
+        assert!(author_groups(&none).is_empty());
+        assert!(!has_group(&none, "moderators"));
+        assert!(!is_moderator(&none));
+        assert!(require_moderator(&none).is_err());
+
+        // comma-separated groups, with whitespace, parse and match by exact name.
+        let mut mods = HeaderMap::new();
+        mods.insert(HEADER_GROUPS, HeaderValue::from_static("dev, infra-admins ,x"));
+        assert!(has_group(&mods, "infra-admins"));
+        assert!(has_group(&mods, "dev"));
+        assert!(!has_group(&mods, "moderators"));
+        assert!(is_moderator(&mods), "infra-admins authorizes moderation");
+        assert!(require_moderator(&mods).is_ok());
+
+        // a non-moderator group alone does not authorize.
+        let mut other = HeaderMap::new();
+        other.insert(HEADER_GROUPS, HeaderValue::from_static("readers,writers"));
+        assert!(!is_moderator(&other));
+        assert!(require_moderator(&other).is_err());
     }
 
     #[test]

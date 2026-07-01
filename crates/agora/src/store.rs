@@ -70,6 +70,27 @@ pub trait Store: Send + Sync {
     async fn create_thread(&self, thread: &Thread, first_post: &Post) -> Result<(), StoreError>;
     /// Append a reply and bump the parent thread's `last_at` to the reply's timestamp.
     async fn add_reply(&self, post: &Post) -> Result<(), StoreError>;
+
+    /// Edit a thread's title AND its original-post body, atomically. `op_post_id` is the
+    /// thread's original post; its `body_md` and the denormalised `first_body_md` (which powers
+    /// compose-time similarity) are updated together so they never desync. Author authorisation
+    /// is enforced by the caller.
+    async fn update_thread(
+        &self,
+        thread_id: &str,
+        title: &str,
+        op_post_id: &str,
+        body_md: &str,
+    ) -> Result<(), StoreError>;
+    /// Delete a thread and ALL of its posts, atomically. Author authorisation is enforced by the
+    /// caller.
+    async fn delete_thread(&self, thread_id: &str) -> Result<(), StoreError>;
+    /// Update a single post's body (used to edit a reply). Author authorisation is enforced by
+    /// the caller.
+    async fn update_post(&self, post_id: &str, body_md: &str) -> Result<(), StoreError>;
+    /// Delete a single post (used to delete a reply). Author authorisation is enforced by the
+    /// caller.
+    async fn delete_post(&self, post_id: &str) -> Result<(), StoreError>;
 }
 
 // --------------------------------------------------------------------------------------
@@ -233,6 +254,51 @@ impl Store for InMemoryStore {
         if let Some(t) = threads.iter_mut().find(|t| t.id == post.thread_id) {
             t.last_at = post.created_at;
         }
+        Ok(())
+    }
+
+    async fn update_thread(
+        &self,
+        thread_id: &str,
+        title: &str,
+        op_post_id: &str,
+        body_md: &str,
+    ) -> Result<(), StoreError> {
+        // Lock order threads-then-posts matches `create_thread`/`delete_thread` (no deadlock).
+        {
+            let mut threads = self.threads.lock().expect("threads lock poisoned");
+            if let Some(t) = threads.iter_mut().find(|t| t.id == thread_id) {
+                t.title = title.to_string();
+            }
+        }
+        let mut posts = self.posts.lock().expect("posts lock poisoned");
+        if let Some(p) = posts.iter_mut().find(|p| p.id == op_post_id) {
+            p.body_md = body_md.to_string();
+        }
+        Ok(())
+    }
+
+    async fn delete_thread(&self, thread_id: &str) -> Result<(), StoreError> {
+        {
+            let mut threads = self.threads.lock().expect("threads lock poisoned");
+            threads.retain(|t| t.id != thread_id);
+        }
+        let mut posts = self.posts.lock().expect("posts lock poisoned");
+        posts.retain(|p| p.thread_id != thread_id);
+        Ok(())
+    }
+
+    async fn update_post(&self, post_id: &str, body_md: &str) -> Result<(), StoreError> {
+        let mut posts = self.posts.lock().expect("posts lock poisoned");
+        if let Some(p) = posts.iter_mut().find(|p| p.id == post_id) {
+            p.body_md = body_md.to_string();
+        }
+        Ok(())
+    }
+
+    async fn delete_post(&self, post_id: &str) -> Result<(), StoreError> {
+        let mut posts = self.posts.lock().expect("posts lock poisoned");
+        posts.retain(|p| p.id != post_id);
         Ok(())
     }
 }
@@ -538,6 +604,61 @@ impl PgStore {
         tx.commit().await?;
         Ok(())
     }
+
+    async fn update_thread_async(
+        &self,
+        thread_id: &str,
+        title: &str,
+        op_post_id: &str,
+        body_md: &str,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        // Keep the denormalised `first_body_md` in step with the original post's body.
+        sqlx::query("UPDATE threads SET title = $1, first_body_md = $2 WHERE id = $3")
+            .bind(title)
+            .bind(body_md)
+            .bind(thread_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE posts SET body_md = $1 WHERE id = $2")
+            .bind(body_md)
+            .bind(op_post_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn delete_thread_async(&self, thread_id: &str) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM posts WHERE thread_id = $1")
+            .bind(thread_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM threads WHERE id = $1")
+            .bind(thread_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn update_post_async(&self, post_id: &str, body_md: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE posts SET body_md = $1 WHERE id = $2")
+            .bind(body_md)
+            .bind(post_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_post_async(&self, post_id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM posts WHERE id = $1")
+            .bind(post_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -596,6 +717,30 @@ impl Store for PgStore {
 
     async fn add_reply(&self, post: &Post) -> Result<(), StoreError> {
         self.add_reply_async(post).await.map_err(backend)
+    }
+
+    async fn update_thread(
+        &self,
+        thread_id: &str,
+        title: &str,
+        op_post_id: &str,
+        body_md: &str,
+    ) -> Result<(), StoreError> {
+        self.update_thread_async(thread_id, title, op_post_id, body_md)
+            .await
+            .map_err(backend)
+    }
+
+    async fn delete_thread(&self, thread_id: &str) -> Result<(), StoreError> {
+        self.delete_thread_async(thread_id).await.map_err(backend)
+    }
+
+    async fn update_post(&self, post_id: &str, body_md: &str) -> Result<(), StoreError> {
+        self.update_post_async(post_id, body_md).await.map_err(backend)
+    }
+
+    async fn delete_post(&self, post_id: &str) -> Result<(), StoreError> {
+        self.delete_post_async(post_id).await.map_err(backend)
     }
 }
 

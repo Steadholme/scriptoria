@@ -250,6 +250,13 @@ hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
 .badge-op { margin-left: auto; }
 .summary .badge-op { margin-left: 0; }
 
+/* author edit/delete controls (thread head + per-reply). The delete form sits inline so its
+   button lines up beside the edit link. */
+.owner-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.thread-head .owner-actions { margin-top: 12px; }
+.post__actions { margin-top: 14px; }
+.inline-form { display: inline; margin: 0; }
+
 /* card padding variant used by reply/compose/summary cards */
 .card.pad { padding: 22px; }
 

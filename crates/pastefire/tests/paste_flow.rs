@@ -289,6 +289,78 @@ async fn view_is_syntax_highlighted_for_known_language() {
 }
 
 #[tokio::test]
+async fn view_renders_line_gutter_with_anchors() {
+    let app = app(build_dev_state());
+    let page = send(&app, get("/", Some("alice"))).await;
+    let csrf = page.csrf_cookie().unwrap();
+
+    let created = send(
+        &app,
+        post_form(
+            "/",
+            &[
+                ("csrf_token", &csrf),
+                ("title", "three liner"),
+                ("language", "plaintext"),
+                ("body", "line one\nline two\nline three"),
+                ("expiry", "never"),
+            ],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    let loc = created.location();
+    let view = send(&app, get(&loc, Some("alice"))).await;
+    assert_eq!(view.status, StatusCode::OK);
+    // Each source line gets a stable anchor id and a clickable gutter number.
+    assert!(view.body.contains("<div class=\"ln\" id=\"L1\">"));
+    assert!(view.body.contains("<div class=\"ln\" id=\"L3\">"));
+    assert!(view.body.contains("<a class=\"ln-no\" href=\"#L2\">2</a>"));
+    assert!(view.body.contains("<span class=\"ln-code\">line two</span>"));
+    // No phantom fourth line for a body without a trailing newline.
+    assert!(!view.body.contains("id=\"L4\""));
+}
+
+#[tokio::test]
+async fn view_lines_param_highlights_range() {
+    let app = app(build_dev_state());
+    let page = send(&app, get("/", Some("alice"))).await;
+    let csrf = page.csrf_cookie().unwrap();
+
+    let created = send(
+        &app,
+        post_form(
+            "/",
+            &[
+                ("csrf_token", &csrf),
+                ("title", "highlight me"),
+                ("language", "plaintext"),
+                ("body", "a\nb\nc\nd"),
+                ("expiry", "never"),
+            ],
+            &csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    let id = created.location().trim_start_matches("/p/").to_string();
+
+    // ?lines=2-3 marks exactly rows 2 and 3 with the highlight class, server-side.
+    let view = send(&app, get(&format!("/p/{id}?lines=2-3"), Some("alice"))).await;
+    assert_eq!(view.status, StatusCode::OK);
+    assert!(view.body.contains("<div class=\"ln\" id=\"L1\">"));
+    assert!(view.body.contains("<div class=\"ln ln--hl\" id=\"L2\">"));
+    assert!(view.body.contains("<div class=\"ln ln--hl\" id=\"L3\">"));
+    assert!(view.body.contains("<div class=\"ln\" id=\"L4\">"));
+
+    // A malformed range degrades gracefully to no highlight (still a valid view).
+    let bad = send(&app, get(&format!("/p/{id}?lines=nonsense"), Some("alice"))).await;
+    assert_eq!(bad.status, StatusCode::OK);
+    assert!(!bad.body.contains("<div class=\"ln ln--hl\""));
+}
+
+#[tokio::test]
 async fn similar_pastes_panel_links_related_snippet() {
     let app = app(build_dev_state());
     let page = send(&app, get("/", Some("alice"))).await;

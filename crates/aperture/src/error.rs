@@ -23,6 +23,10 @@ pub enum AppError {
     #[error("not_found: {0}")]
     NotFound(String),
 
+    /// The resource existed but is no longer available (an expired share link).
+    #[error("gone: {0}")]
+    Gone(String),
+
     /// Unexpected internal failure (metadata or object-store I/O).
     #[error("server_error: {0}")]
     Internal(String),
@@ -35,6 +39,7 @@ impl AppError {
             AppError::BadRequest(d) => (StatusCode::BAD_REQUEST, "Request rejected", d.clone()),
             AppError::Forbidden(d) => (StatusCode::FORBIDDEN, "Not allowed", d.clone()),
             AppError::NotFound(d) => (StatusCode::NOT_FOUND, "Not found", d.clone()),
+            AppError::Gone(d) => (StatusCode::GONE, "Link expired", d.clone()),
             AppError::Internal(d) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Something went wrong",

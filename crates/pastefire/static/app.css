@@ -224,6 +224,14 @@ hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
 .code-pre { margin: 0; font-family: var(--mono); font-size: 12.5px; line-height: 1.6; color: var(--ink); background: var(--surface); border: 0; border-radius: 0 0 var(--radius) var(--radius); padding: 18px 20px; overflow: auto; }
 .code-pre code { font-family: inherit; }
 
+/* numbered line gutter + per-line anchors (rendered by highlight::render_lines) */
+.code-lines { padding: 12px 0; counter-reset: none; }
+.ln { display: flex; align-items: baseline; padding: 0 20px; }
+.ln:target, .ln--hl { background: var(--accent-soft); }
+.ln-no { flex: 0 0 auto; width: 3.2em; margin-right: 16px; text-align: right; color: var(--ink-3); font-variant-numeric: tabular-nums; user-select: none; -webkit-user-select: none; }
+.ln-no:hover { color: var(--accent); }
+.ln-code { flex: 1 1 auto; white-space: pre; min-height: 1.6em; }
+
 /* syntax-highlight tokens (emitted by highlight.rs) */
 .tok-kw  { color: var(--accent-2); font-weight: 550; }
 .tok-str { color: var(--ok-ink); }
