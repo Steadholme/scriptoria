@@ -23,39 +23,101 @@ const LOGOUT_URL: &str = "https://sso.w33d.xyz/_gw/auth/logout";
 /// the handler.
 pub fn layout(page_title: &str, headers: &HeaderMap, content: &str) -> String {
     let email = auth::signed_in_email(headers);
+    let active = if page_title == "Coherence" {
+        "coherence"
+    } else if page_title.starts_with("Create") {
+        "new"
+    } else {
+        "home"
+    };
     LAYOUT
         .replace("{{STYLE}}", APP_CSS)
         .replace("{{PAGE_TITLE}}", &esc(page_title))
-        .replace("{{USERBOX}}", &userbox(email.as_deref()))
+        .replace("{{APPBAR}}", &app_bar(active, email.as_deref()))
         .replace("{{CONTENT}}", content)
 }
 
-/// The right side of the shared HOLDFAST app-bar: an "All apps" link back to the apex portal, a
-/// user chip (avatar initial + signed-in email) when a gateway identity is known, and the
-/// cross-subdomain logout link. Public/no-session renders keep the All-apps link without a chip.
-fn userbox(email: Option<&str>) -> String {
-    const ALLAPPS: &str = concat!(
-        "<a class=\"allapps\" href=\"https://w33d.xyz\" title=\"All apps\">",
-        "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\">",
-        "<rect x=\"3\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/>",
-        "<rect x=\"3\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/></svg>All apps</a>",
+/// The Lattice (Wiki) app-tile icon — a Lucide-style `book-open` glyph.
+pub const APP_ICON: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>"##;
+
+/// The full Odyssey v2 app-bar: the Wiki app-tile + name ("HOLDFAST Lattice" retained in the
+/// brand aria-label), the wiki nav (current marked `.is-active`), then the "All apps" waffle and
+/// the avatar user-menu. Public/no-session renders keep a minimal, no-identity avatar.
+fn app_bar(active: &str, email: Option<&str>) -> String {
+    let nav = format!(
+        concat!(
+            r#"<nav class="appbar__nav" aria-label="Lattice">"#,
+            r#"<a class="appnav{a_home}" href="/"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 22V12h6v10"/></svg>Home</a>"#,
+            r#"<a class="appnav{a_new}" href="/new"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="M12 5v14"/></svg>New page</a>"#,
+            r#"<a class="appnav{a_coh}" href="/coherence"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>Coherence</a>"#,
+            r#"</nav>"#,
+        ),
+        a_home = if active == "home" { " is-active" } else { "" },
+        a_new = if active == "new" { " is-active" } else { "" },
+        a_coh = if active == "coherence" { " is-active" } else { "" },
     );
-    let chip = match email {
-        Some(e) if !e.is_empty() => {
-            let initial = e
-                .chars()
-                .next()
-                .map(|c| c.to_uppercase().to_string())
-                .unwrap_or_else(|| "H".to_string());
-            format!(
-                "<span class=\"userchip\"><span class=\"userchip__avatar\" aria-hidden=\"true\">{}</span><span class=\"user-email\" title=\"Signed in as\">{}</span></span>",
-                esc(&initial),
-                esc(e),
-            )
-        }
-        _ => String::new(),
+    format!(
+        r#"<header class="appbar">
+  <a class="appbar__brand" href="/" aria-label="HOLDFAST Lattice home">
+    <span class="app-tile" aria-hidden="true">{icon}</span>
+    <span class="appbar__name"><b>Wiki</b><span>wiki.w33d.xyz</span></span>
+  </a>
+  {nav}
+  <span class="appbar__spacer"></span>
+  <div class="appbar__right">{right}</div>
+</header>"#,
+        icon = APP_ICON,
+        nav = nav,
+        right = user_menu(email),
+    )
+}
+
+/// The app-bar's right cluster: the "All apps" waffle and the avatar user-menu (Account / All apps
+/// / the preserved cross-subdomain gateway Sign-out). Legacy `allapps`/`userchip` hooks are kept.
+/// `None`/empty identity → a minimal, no-identity avatar (never breaks rendering).
+fn user_menu(email: Option<&str>) -> String {
+    let e = email.unwrap_or("");
+    let has_id = !e.is_empty();
+    let (avatar, name_html, head_name, head_sub) = if has_id {
+        let initial = e
+            .chars()
+            .find(|c| c.is_alphanumeric())
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_else(|| "U".to_string());
+        (
+            esc(&initial),
+            format!("<span class=\"usermenu__name\">{}</span>", esc(e)),
+            esc(e),
+            "Signed in".to_string(),
+        )
+    } else {
+        (
+            r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="width:16px;height:16px"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>"##.to_string(),
+            String::new(),
+            "Account".to_string(),
+            "Not signed in".to_string(),
+        )
     };
-    format!("{ALLAPPS}{chip}<a class=\"btn btn-ghost btn-sm\" href=\"{LOGOUT_URL}\">Log out</a>")
+    format!(
+        r#"<a class="iconbtn allapps" href="https://w33d.xyz" title="All apps" aria-label="All apps"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></a>
+    <div class="usermenu userchip">
+      <button class="usermenu__btn" type="button" aria-haspopup="true" aria-label="Account menu">
+        <span class="avatar" aria-hidden="true">{avatar}</span>
+        {name}
+        <svg class="usermenu__caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+      </button>
+      <div class="usermenu__pop" role="menu">
+        <div class="usermenu__head"><span class="avatar" aria-hidden="true">{avatar}</span><div><b>{head_name}</b><span>{head_sub}</span></div></div>
+        <a class="menuitem" href="https://account.w33d.xyz" role="menuitem"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>Account</a>
+        <a class="menuitem" href="https://w33d.xyz" role="menuitem"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>All apps</a>
+        <a class="menuitem menuitem--danger" href="{LOGOUT_URL}" role="menuitem"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/></svg>Sign out</a>
+      </div>
+    </div>"#,
+        avatar = avatar,
+        name = name_html,
+        head_name = head_name,
+        head_sub = head_sub,
+    )
 }
 
 /// A standalone HOLDFAST-styled error page (used by [`crate::error::AppError`]).
@@ -131,9 +193,11 @@ mod tests {
         assert!(html.contains("me@holdfast.local"));
         assert!(html.contains("HOLDFAST"));
         assert!(html.contains("sso.w33d.xyz/_gw/auth/logout"));
-        // Shared app-bar chrome: the "All apps" link back to the apex portal + the user chip.
-        assert!(html.contains("class=\"allapps\""));
+        // Odyssey v2 app-bar chrome: the "All apps" waffle back to the apex portal + the avatar
+        // user-menu. The legacy `allapps`/`userchip` hooks are retained on the new elements.
+        assert!(html.contains("class=\"appbar\""));
+        assert!(html.contains("allapps"));
         assert!(html.contains("https://w33d.xyz"));
-        assert!(html.contains("class=\"userchip\""));
+        assert!(html.contains("userchip"));
     }
 }

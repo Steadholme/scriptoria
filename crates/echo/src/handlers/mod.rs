@@ -31,51 +31,85 @@ pub fn esc(s: &str) -> String {
         .replace('\'', "&#x27;")
 }
 
-/// Render the shared app-bar: shield + HOLDFAST wordmark + page title on the left; an "All apps"
-/// pill back to the apex portal, the signed-in user chip (avatar initial + email), and a Logout
-/// link to the gateway on the right. Matches the estate's portal/Sanctum chrome.
+/// The Echo (Comments) app-tile icon — a Lucide-style `messages-square` glyph.
+pub const APP_ICON: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 9a2 2 0 0 1-2 2H6l-4 4V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2z"/><path d="M18 9h2a2 2 0 0 1 2 2v11l-4-4h-6a2 2 0 0 1-2-2v-1"/></svg>"##;
+
+/// Render the shared Odyssey v2 app-bar: the Comments app-tile + name, the moderator nav (current
+/// marked `.is-active`), then the "All apps" waffle and the avatar user-menu (Account / All apps /
+/// the preserved gateway Sign-out). `page_title` selects the active nav item; `email` empty or `—`
+/// → a minimal, no-identity avatar (never breaks rendering).
 pub fn topbar(page_title: &str, email: &str) -> String {
+    let a_dash = if page_title == "Admin" { "" } else { " is-active" };
+    let nav = format!(
+        concat!(
+            r#"<nav class="appbar__nav" aria-label="Echo">"#,
+            r#"<a class="appnav{a_dash}" href="/"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/></svg>Dashboard</a>"#,
+            r#"</nav>"#,
+        ),
+        a_dash = a_dash,
+    );
     format!(
-        r#"<header class="topbar">
-  <div class="topbar__inner">
-    <a class="brand" href="/" aria-label="HOLDFAST Echo">
-      <span class="brand__glyph" aria-hidden="true">{shield}</span>
-      <span class="brand__word">HOLDFAST</span>
-    </a>
-    <div class="topbar__right">
-      <span class="topbar__title">{title}</span>
-      {allapps}
-      {chip}
-      <a class="btn btn-ghost btn-sm" href="{logout}">Log out</a>
-    </div>
-  </div>
+        r#"<header class="appbar">
+  <a class="appbar__brand" href="/" aria-label="HOLDFAST Echo home">
+    <span class="app-tile" aria-hidden="true">{icon}</span>
+    <span class="appbar__name"><b>Comments</b><span>comments.w33d.xyz</span></span>
+  </a>
+  {nav}
+  <span class="appbar__spacer"></span>
+  <div class="appbar__right">{right}</div>
 </header>"#,
-        shield = SHIELD_SVG,
-        title = esc(page_title),
-        allapps = ALLAPPS_PILL,
-        chip = userchip(email),
-        logout = LOGOUT_URL,
+        icon = APP_ICON,
+        nav = nav,
+        right = user_menu(email),
     )
 }
 
-/// The "All apps" pill linking back to the apex portal — shared chrome across every service.
-const ALLAPPS_PILL: &str = r##"<a class="allapps" href="https://w33d.xyz" title="All apps"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>All apps</a>"##;
-
-/// The signed-in user chip (avatar initial + email). Empty / placeholder emails render no chip.
-fn userchip(email: &str) -> String {
+/// The app-bar's right cluster: the "All apps" waffle to the apex portal and the avatar user-menu.
+/// Legacy `allapps`/`userchip` hooks are retained on the new elements. `email` empty or `—` → a
+/// minimal, no-identity avatar. The Sign-out preserves the exact gateway logout route/method.
+pub fn user_menu(email: &str) -> String {
     let e = email.trim();
-    if e.is_empty() || e == "—" {
-        return String::new();
-    }
-    let initial = e
-        .chars()
-        .next()
-        .map(|c| c.to_uppercase().to_string())
-        .unwrap_or_else(|| "H".to_string());
+    let has_id = !e.is_empty() && e != "—";
+    let (avatar, name_html, head_name, head_sub) = if has_id {
+        let initial = e
+            .chars()
+            .find(|c| c.is_alphanumeric())
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_else(|| "U".to_string());
+        (
+            esc(&initial),
+            format!("<span class=\"usermenu__name\">{}</span>", esc(e)),
+            esc(e),
+            "Signed in".to_string(),
+        )
+    } else {
+        (
+            r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="width:16px;height:16px"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>"##.to_string(),
+            String::new(),
+            "Account".to_string(),
+            "Not signed in".to_string(),
+        )
+    };
     format!(
-        r#"<span class="userchip"><span class="userchip__avatar" aria-hidden="true">{initial}</span><span class="user-email">{email}</span></span>"#,
-        initial = esc(&initial),
-        email = esc(e),
+        r#"<a class="iconbtn allapps" href="https://w33d.xyz" title="All apps" aria-label="All apps"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></a>
+    <div class="usermenu userchip">
+      <button class="usermenu__btn" type="button" aria-haspopup="true" aria-label="Account menu">
+        <span class="avatar" aria-hidden="true">{avatar}</span>
+        {name}
+        <svg class="usermenu__caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+      </button>
+      <div class="usermenu__pop" role="menu">
+        <div class="usermenu__head"><span class="avatar" aria-hidden="true">{avatar}</span><div><b>{head_name}</b><span>{head_sub}</span></div></div>
+        <a class="menuitem" href="https://account.w33d.xyz" role="menuitem"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>Account</a>
+        <a class="menuitem" href="https://w33d.xyz" role="menuitem"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>All apps</a>
+        <a class="menuitem menuitem--danger" href="{logout}" role="menuitem"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/></svg>Sign out</a>
+      </div>
+    </div>"#,
+        avatar = avatar,
+        name = name_html,
+        head_name = head_name,
+        head_sub = head_sub,
+        logout = LOGOUT_URL,
     )
 }
 
