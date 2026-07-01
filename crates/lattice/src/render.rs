@@ -14,7 +14,7 @@ const APP_CSS: &str = include_str!("../static/app.css");
 const LAYOUT: &str = include_str!("../templates/layout.html");
 
 /// Cross-subdomain SSO logout (terminated at the Keystone IdP behind the gateway).
-const LOGOUT_URL: &str = "https://id.w33d.xyz/_gw/auth/logout";
+const LOGOUT_URL: &str = "https://sso.w33d.xyz/_gw/auth/logout";
 
 /// Wrap inner `content` HTML in the full HOLDFAST shell.
 ///
@@ -130,7 +130,7 @@ mod tests {
         assert!(html.contains("<p>hi</p>"));
         assert!(html.contains("me@holdfast.local"));
         assert!(html.contains("HOLDFAST"));
-        assert!(html.contains("id.w33d.xyz/_gw/auth/logout"));
+        assert!(html.contains("sso.w33d.xyz/_gw/auth/logout"));
         // Shared app-bar chrome: the "All apps" link back to the apex portal + the user chip.
         assert!(html.contains("class=\"allapps\""));
         assert!(html.contains("https://w33d.xyz"));
