@@ -58,7 +58,28 @@ pub fn app(state: AppState) -> Router {
         .route("/delete/{id}", post(handlers::files::delete))
         .route("/s/{token}", get(handlers::files::share))
         .layer(DefaultBodyLimit::max(body_limit))
+        // Reject a forged gateway identity (spoofed X-Auth-* from a rogue in-network peer):
+        // when GATEWAY_HMAC_KEY is set, an injected identity MUST carry a valid X-Auth-Sig.
+        // No-op when the key is unset or no identity is present (share route / dev).
+        .layer(axum::middleware::from_fn(require_gateway_sig))
         .with_state(state)
+}
+
+/// Middleware enforcing [`auth::gateway_identity_ok`] — 401 on a missing/invalid signature.
+async fn require_gateway_sig(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if auth::gateway_identity_ok(req.headers()) {
+        next.run(req).await
+    } else {
+        (
+            axum::http::StatusCode::UNAUTHORIZED,
+            "invalid or missing gateway identity signature",
+        )
+            .into_response()
+    }
 }
 
 /// Construct dev state: dev [`Config`] + empty in-memory metadata + in-memory blobs. Used by
