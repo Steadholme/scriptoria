@@ -226,6 +226,8 @@ body.page-console { background: var(--bg); padding: 0; }
 .card-post__meta .card__edit { color: var(--accent-2); text-decoration: none; }
 .card-post__meta .card__edit:hover { text-decoration: underline; }
 .card-post__excerpt { font-size: 14.5px; line-height: 1.65; color: var(--ink-2); margin: 0; }
+.card-post__cover { margin: 0 0 12px; }
+.card-post__cover img { display: block; width: 100%; max-height: 260px; object-fit: cover; border-radius: var(--radius-md); border: 1px solid var(--border); }
 
 /* Draft badge — a neutral, restrained variant of the kit's .badge */
 .badge-draft { background: var(--bg-2); color: var(--ink-3); }
@@ -250,6 +252,8 @@ body.page-console { background: var(--bg); padding: 0; }
 .back-link { display: inline-block; font-size: 13px; color: var(--ink-3); text-decoration: none; margin-bottom: 22px; }
 .back-link:hover { color: var(--accent-2); }
 .article { background: transparent; }
+.article__cover { margin: 0 0 24px; }
+.article__cover img { display: block; width: 100%; max-height: 420px; object-fit: cover; border-radius: var(--radius-md); border: 1px solid var(--border); }
 .article__head { border-bottom: 1px solid var(--border); padding-bottom: 22px; margin-bottom: 28px; }
 .article__title { font-size: 30px; font-weight: 600; letter-spacing: -.015em; line-height: 1.2; color: var(--ink); margin: 0 0 12px; }
 .article__meta { font-size: 13px; color: var(--ink-3); }

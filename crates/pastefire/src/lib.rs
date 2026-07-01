@@ -10,9 +10,15 @@
 //! - `GET /` — new-paste form + "my recent pastes" (SSO author)
 //! - `POST /` — create a paste -> 302 `/p/{id}` (CSRF-checked)
 //! - `GET /p/{id}` — view a paste, syntax-highlighted + "similar pastes" (honors expiry; a
-//!   burn-after-read paste self-destructs on its first non-author view)
+//!   burn-after-read paste self-destructs on its first non-author view; a password-protected
+//!   paste shows a prompt to non-owners)
+//! - `GET /p/{id}/history` — the paste's revision history (access-gated like the paste)
+//! - `GET /p/{id}/rev/{revision}` — a single archived revision, read-only
 //! - `GET /raw/{id}` — the raw body as `text/plain` (honors expiry + burn)
 //! - `POST /delete/{id}` — delete your own paste -> 302 `/` (CSRF-checked)
+//! - `POST /unlock/{id}` — submit the password to reveal a protected paste (CSRF-checked)
+//! - `GET/POST /edit/{id}` — owner edits their paste, prior version appended to history (CSRF)
+//! - `POST /fork/{id}` — fork a paste into a new one crediting the source (CSRF-checked)
 
 pub mod audit;
 pub mod auth;
@@ -51,8 +57,16 @@ pub fn app(state: AppState) -> Router {
         .route("/healthz", get(handlers::health::healthz))
         .route("/", get(handlers::paste::new_form).post(handlers::paste::create))
         .route("/p/{id}", get(handlers::paste::view))
+        .route("/p/{id}/history", get(handlers::paste::history))
+        .route("/p/{id}/rev/{revision}", get(handlers::paste::view_revision))
         .route("/raw/{id}", get(handlers::paste::raw))
         .route("/delete/{id}", post(handlers::paste::delete))
+        .route("/unlock/{id}", post(handlers::paste::unlock))
+        .route(
+            "/edit/{id}",
+            get(handlers::paste::edit_form).post(handlers::paste::edit),
+        )
+        .route("/fork/{id}", post(handlers::paste::fork))
         // Reject a forged gateway identity (spoofed X-Auth-* from a rogue in-network peer):
         // when GATEWAY_HMAC_KEY is set, an injected identity MUST carry a valid X-Auth-Sig.
         // No-op when the key is unset or no identity is present (health/public/dev).

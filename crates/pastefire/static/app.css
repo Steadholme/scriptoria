@@ -216,8 +216,12 @@ hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
 .lang-badge--lg { font-size: 12px; padding: 4px 10px; }
 
 /* view: the code tool cluster + owner-only delete sit inline */
-.code-tools { display: flex; align-items: center; gap: 8px; }
-.delete-form { display: inline-flex; margin: 0; }
+.code-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.delete-form, .inline-form { display: inline-flex; margin: 0; }
+
+/* "Forked from …" credit + optional-field hint */
+.sub--credit { margin-top: 4px; font-size: 12px; }
+.field-hint { color: var(--ink-3); font-weight: 400; font-size: 12px; }
 
 /* code body — flush within the card, scrollable, monospace */
 .card__body--code { padding: 0; }

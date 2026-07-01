@@ -239,6 +239,7 @@ hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
 
 /* posts */
 .posts { display: flex; flex-direction: column; gap: 16px; margin-bottom: 32px; }
+.pagination { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 32px; }
 .post { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--sh-xs); padding: 18px 22px; }
 .post.is-op { border-color: var(--accent-border); background: var(--accent-soft); }
 .post__meta { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; font-size: 13px; color: var(--ink-3); }

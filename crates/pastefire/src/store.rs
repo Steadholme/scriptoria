@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::config::MAX_PAGE;
-use crate::model::Paste;
+use crate::model::{Paste, PasteRevision};
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
 #[derive(Debug, Error)]
@@ -54,6 +54,33 @@ pub trait Store: Send + Sync {
     /// removed (existed AND owned), `false` otherwise.
     async fn delete(&self, id: &str, author_sub: &str) -> Result<bool, StoreError>;
 
+    /// Overwrite a paste's editable content (`title`/`body`/`language`), ownership-scoped: only
+    /// the author's own row is updated. Returns `true` when a row was updated. The paste's
+    /// identity, timestamps, expiry, burn flag and password are untouched.
+    async fn update_paste(
+        &self,
+        id: &str,
+        author_sub: &str,
+        title: &str,
+        body: &str,
+        language: &str,
+    ) -> Result<bool, StoreError>;
+
+    /// Append a historical revision. Idempotent on `(paste_id, revision)` — re-inserting the same
+    /// revision number is a no-op returning `false` (a fresh insert returns `true`).
+    async fn add_revision(&self, rev: &PasteRevision) -> Result<bool, StoreError>;
+
+    /// All revisions for a paste, oldest-first (`revision ASC`). Empty when the paste was never
+    /// edited. The count `+ 1` is the next revision number for a fresh edit.
+    async fn list_revisions(&self, paste_id: &str) -> Result<Vec<PasteRevision>, StoreError>;
+
+    /// Fetch a single historical revision by `(paste_id, revision)`.
+    async fn get_revision(
+        &self,
+        paste_id: &str,
+        revision: i64,
+    ) -> Result<Option<PasteRevision>, StoreError>;
+
     /// Candidate pool for the "similar pastes" panel: an author's own non-expired,
     /// non-burn pastes, newest-first, capped at `limit`. Burn pastes are excluded because
     /// they are single-read and must not be surfaced as suggestions. `now` is epoch seconds;
@@ -75,6 +102,7 @@ pub trait Store: Send + Sync {
 #[derive(Default)]
 pub struct InMemoryStore {
     pastes: Mutex<Vec<Paste>>,
+    revisions: Mutex<Vec<PasteRevision>>,
 }
 
 impl InMemoryStore {
@@ -138,6 +166,61 @@ impl Store for InMemoryStore {
         Ok(pastes.len() != before)
     }
 
+    async fn update_paste(
+        &self,
+        id: &str,
+        author_sub: &str,
+        title: &str,
+        body: &str,
+        language: &str,
+    ) -> Result<bool, StoreError> {
+        let mut pastes = self.pastes.lock().expect("pastes lock poisoned");
+        match pastes
+            .iter_mut()
+            .find(|p| p.id == id && p.author_sub == author_sub)
+        {
+            Some(p) => {
+                p.title = title.to_string();
+                p.body = body.to_string();
+                p.language = language.to_string();
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn add_revision(&self, rev: &PasteRevision) -> Result<bool, StoreError> {
+        let mut revs = self.revisions.lock().expect("revisions lock poisoned");
+        if revs
+            .iter()
+            .any(|r| r.paste_id == rev.paste_id && r.revision == rev.revision)
+        {
+            return Ok(false);
+        }
+        revs.push(rev.clone());
+        Ok(true)
+    }
+
+    async fn list_revisions(&self, paste_id: &str) -> Result<Vec<PasteRevision>, StoreError> {
+        let revs = self.revisions.lock().expect("revisions lock poisoned");
+        let mut out: Vec<PasteRevision> =
+            revs.iter().filter(|r| r.paste_id == paste_id).cloned().collect();
+        out.sort_by_key(|r| r.revision);
+        Ok(out)
+    }
+
+    async fn get_revision(
+        &self,
+        paste_id: &str,
+        revision: i64,
+    ) -> Result<Option<PasteRevision>, StoreError> {
+        let revs = self.revisions.lock().expect("revisions lock poisoned");
+        Ok(revs
+            .iter()
+            .find(|r| r.paste_id == paste_id && r.revision == revision)
+            .cloned())
+    }
+
     async fn list_for_similarity(
         &self,
         author_sub: &str,
@@ -174,8 +257,11 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
 
 /// Column list shared by every SELECT, so the row decoder stays in lock-step with the query.
-const COLS: &str =
-    "id, title, body, language, author_sub, author_email, created_at, expires_at, burn_after_read";
+const COLS: &str = "id, title, body, language, author_sub, author_email, created_at, expires_at, \
+     burn_after_read, source_id, password_hash";
+
+/// Column list for the `paste_revisions` history table, shared by its SELECTs.
+const REV_COLS: &str = "paste_id, revision, title, body, language, created_at";
 
 /// PostgreSQL-backed [`Store`]. Holds a pooled connection; the async trait methods drive sqlx
 /// natively, so no worker thread is ever blocked on a DB round-trip.
@@ -224,9 +310,32 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+        // Additive, idempotent columns for fork-crediting + optional password protection. Both
+        // nullable (NULL = original paste / no password). Standard SQL only — portable to FusionDB.
+        sqlx::query("ALTER TABLE pastes ADD COLUMN IF NOT EXISTS source_id TEXT")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("ALTER TABLE pastes ADD COLUMN IF NOT EXISTS password_hash TEXT")
+            .execute(&self.pool)
+            .await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_pastes_author_created \
              ON pastes (author_sub, created_at)",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Append-only revision history. Composite PRIMARY KEY makes the append idempotent at the
+        // `(paste_id, revision)` level; the PK's leftmost `paste_id` also backs the history lookup.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS paste_revisions (\
+                 paste_id TEXT NOT NULL, \
+                 revision BIGINT NOT NULL, \
+                 title TEXT NOT NULL, \
+                 body TEXT NOT NULL, \
+                 language TEXT NOT NULL, \
+                 created_at BIGINT NOT NULL, \
+                 PRIMARY KEY (paste_id, revision)\
+             )",
         )
         .execute(&self.pool)
         .await?;
@@ -244,6 +353,19 @@ impl PgStore {
             created_at: row.try_get("created_at")?,
             expires_at: row.try_get("expires_at")?,
             burn_after_read: row.try_get("burn_after_read")?,
+            source_id: row.try_get("source_id")?,
+            password_hash: row.try_get("password_hash")?,
+        })
+    }
+
+    fn revision_from_row(row: &sqlx::postgres::PgRow) -> Result<PasteRevision, sqlx::Error> {
+        Ok(PasteRevision {
+            paste_id: row.try_get("paste_id")?,
+            revision: row.try_get("revision")?,
+            title: row.try_get("title")?,
+            body: row.try_get("body")?,
+            language: row.try_get("language")?,
+            created_at: row.try_get("created_at")?,
         })
     }
 
@@ -253,8 +375,8 @@ impl PgStore {
         let result = sqlx::query(
             "INSERT INTO pastes \
                  (id, title, body, language, author_sub, author_email, created_at, expires_at, \
-                  burn_after_read) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                  burn_after_read, source_id, password_hash) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
              ON CONFLICT (id) DO NOTHING",
         )
         .bind(&paste.id)
@@ -266,6 +388,8 @@ impl PgStore {
         .bind(paste.created_at)
         .bind(paste.expires_at)
         .bind(paste.burn_after_read)
+        .bind(&paste.source_id)
+        .bind(&paste.password_hash)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
@@ -330,6 +454,75 @@ impl PgStore {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn update_paste_async(
+        &self,
+        id: &str,
+        author_sub: &str,
+        title: &str,
+        body: &str,
+        language: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE pastes SET title = $3, body = $4, language = $5 \
+             WHERE id = $1 AND author_sub = $2",
+        )
+        .bind(id)
+        .bind(author_sub)
+        .bind(title)
+        .bind(body)
+        .bind(language)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn add_revision_async(&self, rev: &PasteRevision) -> Result<bool, sqlx::Error> {
+        // ON CONFLICT DO NOTHING makes the append idempotent on (paste_id, revision).
+        let result = sqlx::query(
+            "INSERT INTO paste_revisions \
+                 (paste_id, revision, title, body, language, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (paste_id, revision) DO NOTHING",
+        )
+        .bind(&rev.paste_id)
+        .bind(rev.revision)
+        .bind(&rev.title)
+        .bind(&rev.body)
+        .bind(&rev.language)
+        .bind(rev.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn list_revisions_async(
+        &self,
+        paste_id: &str,
+    ) -> Result<Vec<PasteRevision>, sqlx::Error> {
+        let rows = sqlx::query(&format!(
+            "SELECT {REV_COLS} FROM paste_revisions WHERE paste_id = $1 ORDER BY revision ASC"
+        ))
+        .bind(paste_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::revision_from_row).collect()
+    }
+
+    async fn get_revision_async(
+        &self,
+        paste_id: &str,
+        revision: i64,
+    ) -> Result<Option<PasteRevision>, sqlx::Error> {
+        let row = sqlx::query(&format!(
+            "SELECT {REV_COLS} FROM paste_revisions WHERE paste_id = $1 AND revision = $2"
+        ))
+        .bind(paste_id)
+        .bind(revision)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(Self::revision_from_row).transpose()
+    }
+
     async fn list_for_similarity_async(
         &self,
         author_sub: &str,
@@ -383,6 +576,41 @@ impl Store for PgStore {
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
+    async fn update_paste(
+        &self,
+        id: &str,
+        author_sub: &str,
+        title: &str,
+        body: &str,
+        language: &str,
+    ) -> Result<bool, StoreError> {
+        self.update_paste_async(id, author_sub, title, body, language)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn add_revision(&self, rev: &PasteRevision) -> Result<bool, StoreError> {
+        self.add_revision_async(rev)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn list_revisions(&self, paste_id: &str) -> Result<Vec<PasteRevision>, StoreError> {
+        self.list_revisions_async(paste_id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn get_revision(
+        &self,
+        paste_id: &str,
+        revision: i64,
+    ) -> Result<Option<PasteRevision>, StoreError> {
+        self.get_revision_async(paste_id, revision)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
     async fn list_for_similarity(
         &self,
         author_sub: &str,
@@ -410,6 +638,8 @@ mod tests {
             created_at,
             expires_at,
             burn_after_read: false,
+            source_id: None,
+            password_hash: None,
         }
     }
 
@@ -508,5 +738,53 @@ mod tests {
         let pool = s.list_for_similarity("u", 200, 100).await.unwrap();
         let ids: Vec<&str> = pool.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, vec!["d", "a"]); // newest-first; expired, burn, other-author dropped
+    }
+
+    fn revision(paste_id: &str, revision: i64) -> PasteRevision {
+        PasteRevision {
+            paste_id: paste_id.into(),
+            revision,
+            title: format!("t{revision}"),
+            body: format!("b{revision}"),
+            language: "plaintext".into(),
+            created_at: 1000 + revision,
+        }
+    }
+
+    #[tokio::test]
+    async fn update_paste_is_ownership_scoped() {
+        let s = InMemoryStore::new();
+        s.create(&paste("a", "u", 1, None)).await.unwrap();
+        // A non-owner update touches nothing.
+        assert!(!s.update_paste("a", "intruder", "x", "y", "rust").await.unwrap());
+        assert_eq!(s.get("a").await.unwrap().unwrap().body, "b");
+        // The owner's update overwrites just the editable content.
+        assert!(s.update_paste("a", "u", "new title", "new body", "rust").await.unwrap());
+        let got = s.get("a").await.unwrap().unwrap();
+        assert_eq!(got.title, "new title");
+        assert_eq!(got.body, "new body");
+        assert_eq!(got.language, "rust");
+        assert_eq!(got.author_sub, "u"); // identity untouched
+    }
+
+    #[tokio::test]
+    async fn add_revision_is_idempotent_and_lists_in_order() {
+        let s = InMemoryStore::new();
+        assert!(s.add_revision(&revision("a", 1)).await.unwrap());
+        assert!(s.add_revision(&revision("a", 2)).await.unwrap());
+        // Re-appending revision 1 is a no-op.
+        assert!(!s.add_revision(&revision("a", 1)).await.unwrap());
+        // A different paste's revisions are isolated.
+        assert!(s.add_revision(&revision("b", 1)).await.unwrap());
+
+        let revs = s.list_revisions("a").await.unwrap();
+        let nums: Vec<i64> = revs.iter().map(|r| r.revision).collect();
+        assert_eq!(nums, vec![1, 2]);
+        assert_eq!(s.list_revisions("b").await.unwrap().len(), 1);
+        assert!(s.list_revisions("missing").await.unwrap().is_empty());
+
+        let r2 = s.get_revision("a", 2).await.unwrap().unwrap();
+        assert_eq!(r2.body, "b2");
+        assert!(s.get_revision("a", 99).await.unwrap().is_none());
     }
 }

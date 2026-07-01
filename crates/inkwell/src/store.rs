@@ -37,6 +37,11 @@ pub struct Post {
     /// when the post has no tags. Parsed/slugged by [`crate::tags`] for the tag chips and the
     /// `/tag/{slug}` listing. Additive: pre-existing rows read back as NULL -> empty string.
     pub tags: String,
+    /// Optional cover image URL — an Aperture share link (`https://drive.w33d.xyz/s/{token}`),
+    /// validated to an estate host before storage so the rendered `<img src>` can never point at
+    /// an arbitrary third-party host. Backed by a nullable TEXT column; empty string when the post
+    /// has no cover. Additive: pre-existing rows read back as NULL -> empty string.
+    pub cover_url: String,
 }
 
 /// Single-row site settings, editable from /admin and applied to the index/head. Kept in its own
@@ -198,6 +203,7 @@ impl Store for InMemoryStore {
                 existing.updated_at = post.updated_at;
                 existing.featured = post.featured;
                 existing.tags = post.tags.clone();
+                existing.cover_url = post.cover_url.clone();
                 Ok(())
             }
             None => Err(StoreError::Backend(format!("no post with slug {}", post.slug))),
@@ -327,6 +333,11 @@ impl PgStore {
         // Additive nullable tags column (comma-separated). IF NOT EXISTS keeps the migration
         // idempotent and backward compatible — existing rows read back as NULL -> empty string.
         sqlx::query("ALTER TABLE posts ADD COLUMN IF NOT EXISTS tags TEXT")
+            .execute(&self.pool)
+            .await?;
+        // Additive nullable cover-image URL (an Aperture share link). IF NOT EXISTS keeps the
+        // migration idempotent and backward compatible — existing rows read back as NULL -> "".
+        sqlx::query("ALTER TABLE posts ADD COLUMN IF NOT EXISTS cover_url TEXT")
             .execute(&self.pool)
             .await?;
         // Backs the newest-first index scan.
@@ -465,6 +476,8 @@ impl PgStore {
             featured: row.try_get("featured")?,
             // Nullable column: a pre-migration row (or a post with no tags) reads back as NULL.
             tags: row.try_get::<Option<String>, _>("tags")?.unwrap_or_default(),
+            // Nullable column: a pre-migration row (or a post with no cover) reads back as NULL.
+            cover_url: row.try_get::<Option<String>, _>("cover_url")?.unwrap_or_default(),
         })
     }
 
@@ -507,7 +520,8 @@ impl PgStore {
     ) -> Result<Vec<Post>, sqlx::Error> {
         let limit = limit.clamp(1, MAX_PAGE);
         const COLS: &str = "SELECT id, slug, title, body_md, author_sub, author_email, \
-                            created_at, updated_at, published, featured, tags FROM posts";
+                            created_at, updated_at, published, featured, tags, cover_url \
+                            FROM posts";
         // The `ORDER BY created_at DESC, id DESC` IS the keyset. With a cursor, add the standard
         // "strictly older" tuple comparison before the ORDER BY so paging never skips a tie.
         let rows = match before {
@@ -535,7 +549,7 @@ impl PgStore {
     async fn get_post_async(&self, slug: &str) -> Result<Option<Post>, sqlx::Error> {
         let row = sqlx::query(
             "SELECT id, slug, title, body_md, author_sub, author_email, created_at, updated_at, \
-                    published, featured, tags \
+                    published, featured, tags, cover_url \
              FROM posts WHERE slug = $1",
         )
         .bind(slug)
@@ -551,8 +565,8 @@ impl PgStore {
         sqlx::query(
             "INSERT INTO posts \
                  (id, slug, title, body_md, author_sub, author_email, created_at, updated_at, \
-                  published, featured, tags) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                  published, featured, tags, cover_url) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(&p.id)
         .bind(&p.slug)
@@ -565,6 +579,7 @@ impl PgStore {
         .bind(p.published)
         .bind(p.featured)
         .bind(&p.tags)
+        .bind(&p.cover_url)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -573,8 +588,8 @@ impl PgStore {
     async fn update_post_async(&self, p: &Post) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE posts SET title = $1, body_md = $2, published = $3, updated_at = $4, \
-                    featured = $5, tags = $6 \
-             WHERE slug = $7",
+                    featured = $5, tags = $6, cover_url = $7 \
+             WHERE slug = $8",
         )
         .bind(&p.title)
         .bind(&p.body_md)
@@ -582,6 +597,7 @@ impl PgStore {
         .bind(p.updated_at)
         .bind(p.featured)
         .bind(&p.tags)
+        .bind(&p.cover_url)
         .bind(&p.slug)
         .execute(&self.pool)
         .await?;
@@ -708,6 +724,7 @@ mod tests {
             published: true,
             featured: false,
             tags: String::new(),
+            cover_url: String::new(),
         }
     }
 
@@ -803,6 +820,27 @@ mod tests {
         edited.tags = "gateway".to_string();
         store.update_post(&edited).await.unwrap();
         assert_eq!(store.get_post("p1").await.unwrap().tags, "gateway", "tags replaced on update");
+    }
+
+    /// The nullable `cover_url` field persists through create + update (a cover-less post
+    /// round-trips as the empty string, mirroring the tags column's NULL -> "" contract).
+    #[tokio::test]
+    async fn cover_url_persists_through_create_and_update() {
+        let store = InMemoryStore::new();
+        let mut p = post("p1", 1);
+        assert!(store.get_post("p1").await.is_none(), "not created yet");
+        p.cover_url = "https://drive.w33d.xyz/s/abc123".to_string();
+        store.create_post(&p).await.unwrap();
+        assert_eq!(
+            store.get_post("p1").await.unwrap().cover_url,
+            "https://drive.w33d.xyz/s/abc123",
+            "cover stored on create",
+        );
+
+        let mut edited = store.get_post("p1").await.unwrap();
+        edited.cover_url = String::new();
+        store.update_post(&edited).await.unwrap();
+        assert_eq!(store.get_post("p1").await.unwrap().cover_url, "", "cover cleared on update");
     }
 
     /// A caller asking for more than [`MAX_PAGE`] rows is clamped, so a single page stays bounded.

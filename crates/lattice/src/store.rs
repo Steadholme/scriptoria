@@ -91,6 +91,11 @@ pub trait Store: Send + Sync {
     /// endpoints of a comparison, and the revert target, this way). Scoped to `slug` so a
     /// revision id can never be redirected onto another page.
     async fn get_revision(&self, slug: &str, id: &str) -> Result<Option<Revision>, StoreError>;
+
+    /// The current head (newest) revision of a page, if any. Edit-conflict detection compares
+    /// the revision the editor was opened against with this — a mismatch means someone else saved
+    /// in between. Reuses the revisions table; `None` for a page with no history yet.
+    async fn head_revision(&self, slug: &str) -> Result<Option<Revision>, StoreError>;
 }
 
 // --------------------------------------------------------------------------------------
@@ -193,6 +198,17 @@ impl Store for InMemoryStore {
             .revisions
             .iter()
             .find(|r| r.slug == slug && r.id == id)
+            .cloned())
+    }
+
+    async fn head_revision(&self, slug: &str) -> Result<Option<Revision>, StoreError> {
+        let data = self.data.lock().expect("lattice store lock poisoned");
+        // Newest-first order matches `list_revisions` / the Pg `ORDER BY ts DESC, id DESC`.
+        Ok(data
+            .revisions
+            .iter()
+            .filter(|r| r.slug == slug)
+            .max_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id)))
             .cloned())
     }
 }
@@ -418,6 +434,17 @@ impl PgStore {
         .await?;
         row.as_ref().map(Self::revision_from_row).transpose()
     }
+
+    async fn head_revision_async(&self, slug: &str) -> Result<Option<Revision>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT id, slug, body_md, editor_email, ts \
+             FROM revisions WHERE slug = $1 ORDER BY ts DESC, id DESC LIMIT 1",
+        )
+        .bind(slug)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(Self::revision_from_row).transpose()
+    }
 }
 
 #[async_trait]
@@ -458,6 +485,12 @@ impl Store for PgStore {
 
     async fn get_revision(&self, slug: &str, id: &str) -> Result<Option<Revision>, StoreError> {
         self.get_revision_async(slug, id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn head_revision(&self, slug: &str) -> Result<Option<Revision>, StoreError> {
+        self.head_revision_async(slug)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
@@ -520,6 +553,25 @@ mod tests {
         assert!(store.get_revision("other", &oldest.id).await.unwrap().is_none());
         // Unknown id -> None (never an error).
         assert!(store.get_revision("home", "nope").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn head_revision_tracks_newest_per_slug() {
+        let store = InMemoryStore::new();
+        assert!(store.head_revision("home").await.unwrap().is_none(), "no history yet");
+
+        store.save_page(input("home", "Home", "v1", "a@x.co", 100)).await.unwrap();
+        let h1 = store.head_revision("home").await.unwrap().unwrap();
+        assert_eq!(h1.body_md, "v1");
+
+        store.save_page(input("home", "Home", "v2", "b@x.co", 200)).await.unwrap();
+        let h2 = store.head_revision("home").await.unwrap().unwrap();
+        assert_eq!(h2.body_md, "v2", "head advances to the newest revision");
+        assert_eq!(h2.id, store.list_revisions("home").await.unwrap()[0].id, "matches list head");
+
+        // Scoped to the slug: another page's history is invisible.
+        store.save_page(input("other", "Other", "z", "c@x.co", 300)).await.unwrap();
+        assert_eq!(store.head_revision("home").await.unwrap().unwrap().body_md, "v2");
     }
 
     #[tokio::test]

@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>History · {{TITLE}} · Pastefire · HOLDFAST</title>
+  <style>{{CSS}}</style>
+</head>
+<body class="page-console">
+  <header class="topbar">
+    <div class="topbar__inner">
+      <a class="brand" href="/" aria-label="HOLDFAST Pastefire">
+        <span class="brand__glyph" aria-hidden="true">{{SHIELD}}</span>
+        <span class="brand__word">HOLDFAST</span>
+      </a>
+      <div class="topbar__right">{{USERBOX}}</div>
+    </div>
+  </header>
+
+  <main class="console">
+    <div class="console__head console__head--row">
+      <div>
+        <h1>Revision history</h1>
+        <p class="sub">{{TITLE}}</p>
+      </div>
+      <a class="btn btn-ghost btn-sm" href="/p/{{ID}}">Back to current</a>
+    </div>
+
+    <section class="card">
+      <div class="card__head"><h2>Versions</h2></div>
+      <div class="card__body">
+        <ul class="paste-list">
+          {{REVISIONS}}
+        </ul>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

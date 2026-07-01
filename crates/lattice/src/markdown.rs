@@ -18,7 +18,7 @@
 //! `wikilink` class (and `wikilink--new` when the target page doesn't exist yet) so the UI can
 //! style classic "red links" that invite creation.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use pulldown_cmark::{html, CowStr, Event, Options, Parser, Tag, TagEnd};
@@ -28,6 +28,27 @@ use crate::slug::slugify;
 
 const WIKI_PREFIX: &str = "/w/";
 
+/// One heading captured during rendering, used to build the on-page table of contents. `id`
+/// matches the `id="…"` anchor stamped onto the rendered heading (so `#id` links jump to it);
+/// both are derived from the same slugified heading text, disambiguated per document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TocEntry {
+    /// Heading level 1..=6 (`# ` == 1).
+    pub level: u8,
+    /// The heading's plain text (already unescaped; escape at render time).
+    pub text: String,
+    /// The unique anchor id stamped on the heading (slug-safe: alnum + hyphens).
+    pub id: String,
+}
+
+/// The result of rendering a page body: sanitized HTML (headings carry `id` anchors) plus the
+/// ordered list of headings for the table-of-contents box.
+#[derive(Clone, Debug, Default)]
+pub struct Rendered {
+    pub html: String,
+    pub toc: Vec<TocEntry>,
+}
+
 fn options() -> Options {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
@@ -36,9 +57,10 @@ fn options() -> Options {
     opts
 }
 
-/// Render `body_md` to sanitized HTML. `existing` is the set of slugs that currently have a
-/// page, used to mark wiki-links to missing pages.
-pub fn render(body_md: &str, existing: &HashSet<String>) -> String {
+/// Render `body_md` to sanitized HTML plus its table of contents. `existing` is the set of slugs
+/// that currently have a page, used to mark wiki-links to missing pages. Every heading is stamped
+/// with a unique `id` anchor and captured in [`Rendered::toc`].
+pub fn render(body_md: &str, existing: &HashSet<String>) -> Rendered {
     let opts = options();
     let protected = protected_ranges(body_md, opts);
     let expanded = expand_wikilinks_source(body_md, &protected);
@@ -72,9 +94,71 @@ pub fn render(body_md: &str, existing: &HashSet<String>) -> String {
         }
     }
 
+    // Stamp a unique id on each heading (so `push_html` emits `<h2 id="…">`) and capture the TOC.
+    let toc = assign_heading_ids(&mut events);
+
     let mut out = String::new();
     html::push_html(&mut out, events.into_iter());
-    out
+    Rendered { html: out, toc }
+}
+
+/// Walk the event stream, giving every heading a unique slug `id` (rewriting the `Tag::Heading`
+/// in place so the HTML renderer emits the anchor) and collecting the ordered [`TocEntry`] list.
+/// The id and the TOC link are derived from the SAME slugified text, so `#id` always resolves.
+fn assign_heading_ids(events: &mut [Event]) -> Vec<TocEntry> {
+    let mut toc = Vec::new();
+    let mut used: HashMap<String, u32> = HashMap::new();
+    let mut i = 0;
+    while i < events.len() {
+        let level = match &events[i] {
+            Event::Start(Tag::Heading { level, .. }) => *level as u8,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        // Gather the visible text between the heading's Start and End (our wiki-link anchors ride
+        // as InlineHtml and are skipped; their label flows as Text, so it is included).
+        let mut text = String::new();
+        let mut j = i + 1;
+        while j < events.len() {
+            match &events[j] {
+                Event::End(TagEnd::Heading(_)) => break,
+                Event::Text(t) | Event::Code(t) => text.push_str(t),
+                _ => {}
+            }
+            j += 1;
+        }
+        let text = text.trim().to_string();
+        let id = unique_heading_id(&text, &mut used);
+        if let Event::Start(Tag::Heading { id: hid, .. }) = &mut events[i] {
+            *hid = Some(CowStr::from(id.clone()));
+        }
+        toc.push(TocEntry { level, text, id });
+        i = j + 1;
+    }
+    toc
+}
+
+/// Slugify heading text into an anchor id, disambiguating repeats within one document
+/// (`overview`, `overview-1`, …). Empty/symbol-only headings fall back to `section`.
+fn unique_heading_id(text: &str, used: &mut HashMap<String, u32>) -> String {
+    let base = {
+        let s = slugify(text);
+        if s.is_empty() {
+            "section".to_string()
+        } else {
+            s
+        }
+    };
+    let n = used.entry(base.clone()).or_insert(0);
+    let id = if *n == 0 {
+        base.clone()
+    } else {
+        format!("{base}-{n}")
+    };
+    *n += 1;
+    id
 }
 
 /// Byte ranges covered by inline code spans and code blocks — `[[ ]]` inside these is left as
@@ -165,28 +249,28 @@ mod tests {
 
     #[test]
     fn renders_basic_markdown() {
-        let html = render("# Title\n\nsome **bold** text", &existing(&[]));
-        assert!(html.contains("<h1>Title</h1>"));
+        let html = render("# Title\n\nsome **bold** text", &existing(&[])).html;
+        assert!(html.contains("<h1 id=\"title\">Title</h1>"));
         assert!(html.contains("<strong>bold</strong>"));
     }
 
     #[test]
     fn neutralizes_raw_html() {
-        let html = render("<script>alert(1)</script>\n\nhi", &existing(&[]));
+        let html = render("<script>alert(1)</script>\n\nhi", &existing(&[])).html;
         assert!(!html.contains("<script>"), "script tag must be escaped: {html}");
         assert!(html.contains("&lt;script&gt;"));
     }
 
     #[test]
     fn neutralizes_inline_html_event_attributes() {
-        let html = render("a <img src=x onerror=alert(1)> b", &existing(&[]));
+        let html = render("a <img src=x onerror=alert(1)> b", &existing(&[])).html;
         assert!(!html.contains("<img"), "inline html must be escaped: {html}");
         assert!(html.contains("&lt;img"));
     }
 
     #[test]
     fn wikilink_to_existing_page() {
-        let html = render("see [[Home]] please", &existing(&["home"]));
+        let html = render("see [[Home]] please", &existing(&["home"])).html;
         assert!(
             html.contains(r#"<a class="wikilink" href="/w/home">Home</a>"#),
             "{html}"
@@ -195,43 +279,79 @@ mod tests {
 
     #[test]
     fn wikilink_to_missing_page_gets_new_class() {
-        let html = render("see [[Brand New]]", &existing(&[]));
+        let html = render("see [[Brand New]]", &existing(&[])).html;
         assert!(html.contains(r#"href="/w/brand-new""#), "{html}");
         assert!(html.contains("wikilink--new"), "{html}");
     }
 
     #[test]
     fn wikilink_with_pipe_label() {
-        let html = render("[[runbook|the runbook]]", &existing(&["runbook"]));
+        let html = render("[[runbook|the runbook]]", &existing(&["runbook"])).html;
         assert!(html.contains(r#"href="/w/runbook""#));
         assert!(html.contains(">the runbook</a>"));
     }
 
     #[test]
     fn wikilink_label_is_escaped() {
-        let html = render("[[slug|<b>x</b>]]", &existing(&["slug"]));
+        let html = render("[[slug|<b>x</b>]]", &existing(&["slug"])).html;
         assert!(!html.contains("<b>x</b>"));
         assert!(html.contains("&lt;b&gt;x&lt;/b&gt;"));
     }
 
     #[test]
     fn wikilinks_left_alone_in_code() {
-        let html = render("`[[not a link]]`\n\n```\n[[also not]]\n```", &existing(&[]));
+        let html = render("`[[not a link]]`\n\n```\n[[also not]]\n```", &existing(&[])).html;
         assert!(!html.contains("/w/not-a-link"), "inline code untouched: {html}");
         assert!(!html.contains("/w/also-not"), "fenced code untouched: {html}");
     }
 
     #[test]
     fn empty_wikilink_is_literal() {
-        let html = render("[[   ]] end", &existing(&[]));
+        let html = render("[[   ]] end", &existing(&[])).html;
         assert!(!html.contains("<a "));
         assert!(html.contains("[["));
     }
 
     #[test]
     fn ordinary_external_links_are_untouched() {
-        let html = render("[docs](https://example.com)", &existing(&[]));
+        let html = render("[docs](https://example.com)", &existing(&[])).html;
         assert!(html.contains(r#"href="https://example.com""#));
         assert!(!html.contains("wikilink"));
+    }
+
+    #[test]
+    fn headings_get_anchor_ids_and_toc() {
+        let out = render("# Overview\n\ntext\n\n## Details\n\nmore", &existing(&[]));
+        assert!(out.html.contains("<h1 id=\"overview\">Overview</h1>"), "{}", out.html);
+        assert!(out.html.contains("<h2 id=\"details\">Details</h2>"), "{}", out.html);
+        assert_eq!(out.toc.len(), 2);
+        assert_eq!(out.toc[0], TocEntry { level: 1, text: "Overview".into(), id: "overview".into() });
+        assert_eq!(out.toc[1], TocEntry { level: 2, text: "Details".into(), id: "details".into() });
+    }
+
+    #[test]
+    fn duplicate_heading_text_gets_unique_ids() {
+        let out = render("## Notes\n\na\n\n## Notes\n\nb", &existing(&[]));
+        assert_eq!(out.toc.len(), 2);
+        assert_eq!(out.toc[0].id, "notes");
+        assert_eq!(out.toc[1].id, "notes-1");
+        assert!(out.html.contains("id=\"notes\""));
+        assert!(out.html.contains("id=\"notes-1\""));
+    }
+
+    #[test]
+    fn heading_id_derives_from_wikilink_label() {
+        // A wiki-link inside a heading contributes its visible label to the anchor text.
+        let out = render("## See [[Runbook]]", &existing(&["runbook"]));
+        assert_eq!(out.toc.len(), 1);
+        assert_eq!(out.toc[0].id, "see-runbook");
+        assert!(out.html.contains("id=\"see-runbook\""));
+    }
+
+    #[test]
+    fn symbol_only_heading_falls_back_to_section() {
+        let out = render("### ***", &existing(&[]));
+        assert_eq!(out.toc.len(), 1);
+        assert_eq!(out.toc[0].id, "section");
     }
 }

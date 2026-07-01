@@ -280,6 +280,87 @@ async fn author_self_edit_and_delete() {
     assert!(!view.contains("edited text"), "comment removed");
 }
 
+#[tokio::test]
+async fn reactions_toggle_count_and_guards() {
+    let state = build_dev_state();
+
+    // Seed a comment.
+    let body = form(&[("thread_key", "k"), ("body", "reactme"), ("csrf_token", CSRF)]);
+    call(&state, post_csrf("/api/comment", &body, Some(("u_alice", "alice@hf")))).await;
+    let (_, view) = call(&state, get("/t/k")).await;
+    let id = extract_comment_id(&view).expect("comment id");
+
+    // The reaction bar renders with a zero count and the react endpoint.
+    assert!(view.contains("/api/comment/react"), "reaction bar present");
+    assert!(view.contains(r#"aria-pressed="false""#), "not yet reacted");
+
+    // No identity -> 401.
+    let rbody = form(&[("comment_id", &id), ("kind", "up"), ("csrf_token", CSRF)]);
+    let (status, _) = call(&state, post_csrf("/api/comment/react", &rbody, None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "react needs SSO identity");
+
+    // Bad CSRF -> 401.
+    let bad = form(&[("comment_id", &id), ("kind", "up"), ("csrf_token", "WRONG")]);
+    let (status, _) = call(&state, post_csrf("/api/comment/react", &bad, Some(("u_bob", "bob@hf")))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "react needs CSRF");
+
+    // Unknown kind -> 400.
+    let junk = form(&[("comment_id", &id), ("kind", "explode"), ("csrf_token", CSRF)]);
+    let (status, _) = call(&state, post_csrf("/api/comment/react", &junk, Some(("u_bob", "bob@hf")))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unknown kind rejected");
+
+    // Missing comment -> 404.
+    let miss = form(&[("comment_id", "cmt_nope"), ("kind", "up"), ("csrf_token", CSRF)]);
+    let (status, _) = call(&state, post_csrf("/api/comment/react", &miss, Some(("u_bob", "bob@hf")))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "react on missing comment -> 404");
+
+    // Bob reacts "up" -> count 1.
+    let rbody = form(&[("comment_id", &id), ("kind", "up"), ("csrf_token", CSRF)]);
+    let (status, _) = call(&state, post_csrf("/api/comment/react", &rbody, Some(("u_bob", "bob@hf")))).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "react ok");
+    // Bob's own view shows his reaction as pressed.
+    let (_, bview) = call(&state, get_as("/t/k", "u_bob", "bob@hf")).await;
+    assert!(bview.contains(r#"aria-pressed="true""#), "bob sees his reaction on");
+    assert!(bview.contains(r#"<span class="react-btn__count">1</span>"#), "count is 1");
+
+    // Toggling again removes it -> count 0.
+    let (status, _) = call(&state, post_csrf("/api/comment/react", &rbody, Some(("u_bob", "bob@hf")))).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "toggle-off ok");
+    let (_, bview) = call(&state, get_as("/t/k", "u_bob", "bob@hf")).await;
+    assert!(bview.contains(r#"<span class="react-btn__count">0</span>"#), "count back to 0");
+    assert!(!bview.contains(r#"aria-pressed="true""#), "no longer pressed");
+}
+
+#[tokio::test]
+async fn sort_control_and_most_reacted_order() {
+    let state = build_dev_state();
+
+    // Two top-level comments; the second gets an upvote.
+    let b1 = form(&[("thread_key", "k"), ("body", "AAA-first"), ("csrf_token", CSRF)]);
+    call(&state, post_csrf("/api/comment", &b1, Some(("u1", "u1@hf")))).await;
+    let b2 = form(&[("thread_key", "k"), ("body", "BBB-second"), ("csrf_token", CSRF)]);
+    call(&state, post_csrf("/api/comment", &b2, Some(("u2", "u2@hf")))).await;
+
+    // The default view carries the sort tabs.
+    let (_, view) = call(&state, get("/t/k")).await;
+    assert!(view.contains(r#"class="sort-control"#), "sort control rendered");
+    assert!(view.contains("?sort=reacted"), "most-reacted tab present");
+    assert!(view.contains("?sort=newest"), "newest tab present");
+
+    // Grab the second comment's id (default sort is oldest -> index 1 is the second post).
+    let second_id = extract_nth_comment_id(&view, 1).expect("second id");
+    let rbody = form(&[("comment_id", &second_id), ("kind", "heart"), ("csrf_token", CSRF)]);
+    call(&state, post_csrf("/api/comment/react", &rbody, Some(("u3", "u3@hf")))).await;
+
+    // Under most-reacted, the upvoted second comment ranks first.
+    let (_, reacted) = call(&state, get("/t/k?sort=reacted")).await;
+    let pos_second = reacted.find("BBB-second").expect("second present");
+    let pos_first = reacted.find("AAA-first").expect("first present");
+    assert!(pos_second < pos_first, "most-reacted puts the reacted comment first");
+    // The active tab is marked on.
+    assert!(reacted.contains("sort-tab sort-tab--on"), "active sort styled on");
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------

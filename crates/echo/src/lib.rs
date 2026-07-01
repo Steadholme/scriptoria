@@ -12,10 +12,11 @@
 //! Endpoints:
 //! - `GET  /healthz`        liveness (container HEALTHCHECK; no auth)
 //! - `GET  /`               dashboard: all threads + counts + recent activity + moderation
-//! - `GET  /t/{key}`        a single thread view + composer
+//! - `GET  /t/{key}`        a single thread view + composer (?sort=, ?before= keyset page)
 //! - `POST /api/comment`    upsert thread by key + insert a comment (CSRF)
 //! - `POST /api/comment/edit`   author self-edit of one's OWN comment (CSRF)
 //! - `POST /api/comment/delete` author self-delete of one's OWN comment (CSRF)
+//! - `POST /api/comment/react`  toggle a reaction on a comment (CSRF)
 //! - `POST /api/moderate`   hide / unhide a comment (CSRF + moderator group)
 //! - `GET  /embed/{key}`    a minimal, iframe-able thread + composer (X-Frame-Options SAMEORIGIN)
 //! - `GET  /admin`          moderation panel: all comments + bulk controls + author blocklist (admin)
@@ -60,6 +61,7 @@ pub fn app(state: AppState) -> Router {
         .route("/api/comment", post(handlers::comments::post_comment))
         .route("/api/comment/edit", post(handlers::comments::edit_comment))
         .route("/api/comment/delete", post(handlers::comments::delete_comment))
+        .route("/api/comment/react", post(handlers::comments::react))
         .route("/api/moderate", post(handlers::comments::moderate))
         // Admin panel subtree — every route is gated by `require_admin` (403 for non-admins).
         .route("/admin", get(handlers::admin::dashboard))

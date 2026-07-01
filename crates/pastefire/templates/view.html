@@ -23,6 +23,7 @@
       <div>
         <h1>{{TITLE}}</h1>
         <p class="sub">{{META}}</p>
+        {{SOURCE}}
       </div>
       <a class="btn btn-ghost btn-sm" href="/">New paste</a>
     </div>
@@ -34,8 +35,7 @@
         <span class="lang-badge lang-badge--lg">{{LANG_LABEL}}</span>
         <div class="code-tools">
           <button class="btn btn-secondary btn-sm" id="copyBtn" type="button" data-label="Copy">Copy</button>
-          <a class="btn btn-ghost btn-sm" href="/raw/{{ID}}">View raw</a>
-          {{DELETE}}
+          {{TOOLS}}
         </div>
       </div>
       <div class="card__body card__body--code">

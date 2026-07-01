@@ -14,7 +14,9 @@
 //! - `GET  /healthz`         liveness (container HEALTHCHECK)
 //! - `GET  /`                categories (with thread counts) + recent threads
 //! - `GET  /c/{id}`          threads in a category
-//! - `GET  /t/{id}`          a thread: original post + replies (markdown rendered) + reply form
+//! - `GET  /t/{id}`          a thread: original post + a keyset page of replies (markdown
+//!                           rendered) + reply form. `?before=`/`?after=` page older/newer,
+//!                           `?latest=1` jumps to the newest page.
 //! - `GET  /new?cat=`        new-thread form (with live "similar existing threads" hints)
 //! - `POST /new`             create a thread
 //! - `POST /t/{id}/reply`    post a reply

@@ -35,6 +35,10 @@ pub struct PostForm {
     /// Comma-separated tags (normalized on save via [`crate::tags::normalize`]).
     #[serde(default)]
     pub tags: String,
+    /// Optional cover image, pasted as an Aperture share URL. Validated to an estate host on save
+    /// via [`sanitize_cover`]; empty (or omitted) means no cover.
+    #[serde(default)]
+    pub cover_url: String,
     #[serde(default)]
     pub published: Option<String>,
     #[serde(default)]
@@ -267,6 +271,7 @@ pub async fn view(
         .replace("{{TOPBAR}}", &topbar("Reading", &email))
         .replace("{{TITLE_TEXT}}", &esc(&post.title))
         .replace("{{TITLE}}", &esc(&post.title))
+        .replace("{{COVER}}", &render_cover(&post.cover_url, "article__cover", &post.title))
         .replace("{{META}}", &esc(&meta))
         .replace("{{TAGS}}", &tag_chips(&post.tags))
         .replace("{{ACTIONS}}", &actions)
@@ -293,6 +298,7 @@ pub async fn new_form(State(_state): State<AppState>, headers: HeaderMap) -> Res
         title_value: "",
         body_value: "",
         tags_value: "",
+        cover_value: "",
         published: true,
         submit_label: "Publish",
         cancel_href: "/",
@@ -315,6 +321,7 @@ pub async fn create(
         return Err(AppError::InvalidRequest("title is required".to_string()));
     }
     let body_md = form.body.trim().to_string();
+    let cover_url = sanitize_cover(&form.cover_url)?;
     let now = now_secs();
     let fallback = now_nanos().to_string();
     let slug = unique_slug(state.store.as_ref(), title, &fallback).await;
@@ -331,6 +338,7 @@ pub async fn create(
         published: form.published.is_some(),
         featured: false,
         tags: crate::tags::normalize(&form.tags),
+        cover_url,
     };
     state.store.create_post(&post).await?;
     tracing::info!(slug = %slug, "post created");
@@ -380,6 +388,7 @@ pub async fn edit_form(
         title_value: &post.title,
         body_value: &post.body_md,
         tags_value: &post.tags,
+        cover_value: &post.cover_url,
         published: post.published,
         submit_label: "Save changes",
         cancel_href: &format!("/p/{}", esc(&post.slug)),
@@ -414,6 +423,7 @@ pub async fn update(
     post.title = title.to_string();
     post.body_md = form.body.trim().to_string();
     post.tags = crate::tags::normalize(&form.tags);
+    post.cover_url = sanitize_cover(&form.cover_url)?;
     post.published = form.published.is_some();
     post.updated_at = now_secs();
     state.store.update_post(&post).await?;
@@ -474,6 +484,38 @@ pub async fn delete(
 /// A post is visible when it is published, or when the viewer is its author (own drafts).
 fn visible_to(post: &Post, viewer_sub: Option<&str>) -> bool {
     post.published || viewer_sub == Some(post.author_sub.as_str())
+}
+
+/// Validate a submitted cover URL. Empty is fine (no cover); otherwise it MUST be an estate image
+/// URL (an Aperture share link), so the rendered `<img src>` can never point at an arbitrary host.
+/// Fails loud with a 400 rather than silently dropping a mistyped URL.
+fn sanitize_cover(raw: &str) -> Result<String, AppError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if markdown::is_estate_image_url(trimmed) {
+        Ok(trimmed.to_string())
+    } else {
+        Err(AppError::InvalidRequest(
+            "cover image must be an Aperture share URL (https://drive.w33d.xyz/s/…)".to_string(),
+        ))
+    }
+}
+
+/// Render a stored cover image as a sanitized `<img>` wrapped in `wrapper_class`. Re-checks the
+/// estate host (defense-in-depth) and escapes both the URL and the alt text; returns the empty
+/// string when there is no cover, so the block is simply omitted.
+fn render_cover(cover_url: &str, wrapper_class: &str, alt: &str) -> String {
+    if cover_url.is_empty() || !markdown::is_estate_image_url(cover_url) {
+        return String::new();
+    }
+    format!(
+        r#"<div class="{cls}"><img src="{src}" alt="{alt}" loading="lazy"></div>"#,
+        cls = wrapper_class,
+        src = esc(cover_url),
+        alt = esc(alt),
+    )
 }
 
 /// How many related posts to show beneath an article.
@@ -558,11 +600,13 @@ fn render_card(post: &Post, viewer_sub: Option<&str>) -> String {
     };
     format!(
         r#"<article class="card-post">
+  {cover}
   <h2 class="card-post__title"><a href="/p/{slug}">{title}</a>{featured}{badge}</h2>
   <div class="card-post__meta">{date} · {author}{owner}</div>
   <p class="card-post__excerpt">{excerpt}</p>
   {tags}
 </article>"#,
+        cover = render_cover(&post.cover_url, "card-post__cover", &post.title),
         slug = esc(&post.slug),
         title = esc(&post.title),
         featured = featured_badge,
@@ -585,6 +629,7 @@ struct EditorView<'a> {
     title_value: &'a str,
     body_value: &'a str,
     tags_value: &'a str,
+    cover_value: &'a str,
     published: bool,
     submit_label: &'a str,
     cancel_href: &'a str,
@@ -618,6 +663,7 @@ fn render_editor(v: EditorView<'_>) -> String {
         .replace("{{TITLE_VALUE}}", &esc(v.title_value))
         .replace("{{BODY_VALUE}}", &esc(v.body_value))
         .replace("{{TAGS_VALUE}}", &esc(v.tags_value))
+        .replace("{{COVER_VALUE}}", &esc(v.cover_value))
         .replace(
             "{{PUBLISHED_CHECKED}}",
             if v.published { "checked" } else { "" },

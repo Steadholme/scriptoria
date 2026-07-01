@@ -162,6 +162,49 @@ async fn index_pages_backward_via_load_older() {
     assert!(!page2.contains("Load older"), "partial last page has no further cursor");
 }
 
+#[tokio::test]
+async fn cover_image_renders_on_card_and_article_and_rejects_foreign_host() {
+    let state = build_dev_state();
+    let cover = "https://drive.w33d.xyz/s/covertok";
+
+    // Create a post with an estate cover URL + an inline estate <img> in the body.
+    let md = r#"Body with <img src="https://drive.w33d.xyz/s/inline" alt="inline"> media."#;
+    let body = form(&[
+        ("title", "With Cover"),
+        ("body", md),
+        ("cover_url", cover),
+        ("published", "on"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, _) = call(&state, post_csrf("/new", &body, Some(("u_alice", "alice@hf")))).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "create with cover succeeds");
+
+    // The index card shows the cover image.
+    let (_, idx) = call(&state, get("/")).await;
+    assert!(idx.contains(r#"class="card-post__cover""#), "card renders the cover wrapper");
+    assert!(idx.contains(cover), "card cover points at the estate share URL");
+
+    // The article header shows the cover, and the inline estate <img> survives sanitization.
+    let (status, article) = call(&state, get("/p/with-cover")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(article.contains(r#"class="article__cover""#), "article renders the cover wrapper");
+    assert!(
+        article.contains(r#"<img src="https://drive.w33d.xyz/s/inline""#),
+        "inline estate img survives sanitized markdown",
+    );
+
+    // A non-estate cover URL is rejected (fail-loud 400), never silently rendered.
+    let body = form(&[
+        ("title", "Bad Cover"),
+        ("body", "x"),
+        ("cover_url", "https://evil.example.com/x.png"),
+        ("published", "on"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, _) = call(&state, post_csrf("/new", &body, Some(("u_alice", "alice@hf")))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "non-estate cover rejected");
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------

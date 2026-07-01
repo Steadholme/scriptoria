@@ -242,6 +242,8 @@ async fn expired_paste_is_not_viewable() {
         created_at: now - 100,
         expires_at: Some(now - 1),
         burn_after_read: false,
+        source_id: None,
+        password_hash: None,
     };
     state.store.create(&paste).await.unwrap();
     let app = app(state);
@@ -495,6 +497,8 @@ async fn recent_list_paginates_backward_with_load_older_link() {
                 created_at,
                 expires_at: None,
                 burn_after_read: false,
+                source_id: None,
+                password_hash: None,
             })
             .await
             .unwrap();
@@ -557,6 +561,237 @@ async fn recent_list_default_page_has_no_load_older_when_short() {
     assert!(!listing.body.contains("Load older"));
 }
 
+/// Create a paste as `subject` via the router, returning `(paste_id, fresh_csrf_cookie)`.
+async fn create_paste(
+    app: &axum::Router,
+    subject: &str,
+    fields: &[(&str, &str)],
+) -> (String, String) {
+    let page = send(app, get("/", Some(subject))).await;
+    let csrf = page.csrf_cookie().unwrap();
+    let mut all = vec![("csrf_token", csrf.as_str())];
+    all.extend_from_slice(fields);
+    let created = send(app, post_form("/", &all, &csrf, Some(subject))).await;
+    assert_eq!(created.status, StatusCode::FOUND, "create should 302");
+    let id = created.location().trim_start_matches("/p/").to_string();
+    (id, csrf)
+}
+
+#[tokio::test]
+async fn edit_appends_revision_and_updates_current() {
+    let app = app(build_dev_state());
+    let (id, _) = create_paste(
+        &app,
+        "alice",
+        &[
+            ("title", "v1 title"),
+            ("language", "plaintext"),
+            ("body", "first version"),
+            ("expiry", "never"),
+        ],
+    )
+    .await;
+
+    // The owner view offers an Edit control; a brand-new paste has no History link yet.
+    let view = send(&app, get(&format!("/p/{id}"), Some("alice"))).await;
+    assert!(view.body.contains(&format!("/edit/{id}")));
+    assert!(!view.body.contains(&format!("/p/{id}/history")));
+
+    // A non-owner cannot open the edit form.
+    let forbid = send(&app, get(&format!("/edit/{id}"), Some("bob"))).await;
+    assert_eq!(forbid.status, StatusCode::FORBIDDEN);
+
+    // Edit it: the current row becomes v2, and v1 is archived as revision 1.
+    let ecsrf = view.csrf_cookie().unwrap();
+    let edited = send(
+        &app,
+        post_form(
+            &format!("/edit/{id}"),
+            &[
+                ("csrf_token", &ecsrf),
+                ("title", "v2 title"),
+                ("language", "rust"),
+                ("body", "second version"),
+            ],
+            &ecsrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(edited.status, StatusCode::FOUND);
+    assert_eq!(edited.location(), format!("/p/{id}"));
+
+    // Current view shows v2; a History link is now present.
+    let v2 = send(&app, get(&format!("/p/{id}"), Some("alice"))).await;
+    assert!(v2.body.contains("second version"));
+    assert!(v2.body.contains("v2 title"));
+    assert!(v2.body.contains(&format!("/p/{id}/history")));
+
+    // History lists the current version + revision 1.
+    let hist = send(&app, get(&format!("/p/{id}/history"), Some("alice"))).await;
+    assert_eq!(hist.status, StatusCode::OK);
+    assert!(hist.body.contains("Current version"));
+    assert!(hist.body.contains(&format!("/p/{id}/rev/1")));
+
+    // The archived revision still holds v1's content.
+    let rev = send(&app, get(&format!("/p/{id}/rev/1"), Some("alice"))).await;
+    assert_eq!(rev.status, StatusCode::OK);
+    assert!(rev.body.contains("first version"));
+    assert!(rev.body.contains("archived version"));
+
+    // A no-op edit (identical content) does not create a spurious second revision.
+    let v2b = send(&app, get(&format!("/p/{id}"), Some("alice"))).await;
+    let noop_csrf = v2b.csrf_cookie().unwrap();
+    let noop = send(
+        &app,
+        post_form(
+            &format!("/edit/{id}"),
+            &[
+                ("csrf_token", &noop_csrf),
+                ("title", "v2 title"),
+                ("language", "rust"),
+                ("body", "second version"),
+            ],
+            &noop_csrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(noop.status, StatusCode::FOUND);
+    let hist2 = send(&app, get(&format!("/p/{id}/history"), Some("alice"))).await;
+    assert!(!hist2.body.contains(&format!("/p/{id}/rev/2")), "no spurious revision 2");
+}
+
+#[tokio::test]
+async fn fork_credits_source_and_is_owned_by_forker() {
+    let app = app(build_dev_state());
+    let (id, _) = create_paste(
+        &app,
+        "alice",
+        &[
+            ("title", "shared snippet"),
+            ("language", "rust"),
+            ("body", "fn shared() {}"),
+            ("expiry", "never"),
+        ],
+    )
+    .await;
+
+    // Bob views the paste and forks it.
+    let view = send(&app, get(&format!("/p/{id}"), Some("bob"))).await;
+    assert!(view.body.contains(&format!("/fork/{id}")));
+    let csrf = view.csrf_cookie().unwrap();
+    let forked = send(
+        &app,
+        post_form(&format!("/fork/{id}"), &[("csrf_token", &csrf)], &csrf, Some("bob")),
+    )
+    .await;
+    assert_eq!(forked.status, StatusCode::FOUND);
+    let fork_id = forked.location().trim_start_matches("/p/").to_string();
+    assert_ne!(fork_id, id, "fork gets a new id");
+
+    // The fork holds the copied content, credits the source, and is owned by Bob (he can delete it).
+    let fview = send(&app, get(&format!("/p/{fork_id}"), Some("bob"))).await;
+    assert_eq!(fview.status, StatusCode::OK);
+    // `fn` is wrapped in a highlight span; the identifier is rendered verbatim.
+    assert!(fview.body.contains("shared()"));
+    assert!(fview.body.contains(&format!("Forked from <a href=\"/p/{id}\">")));
+    assert!(fview.body.contains(&format!("/delete/{fork_id}")));
+
+    // The original is untouched and still owned by Alice.
+    let orig = send(&app, get(&format!("/p/{id}"), Some("alice"))).await;
+    assert!(orig.body.contains(&format!("/delete/{id}")));
+}
+
+#[tokio::test]
+async fn password_protected_paste_prompts_and_unlocks() {
+    let app = app(build_dev_state());
+    let (id, _) = create_paste(
+        &app,
+        "alice",
+        &[
+            ("title", "secret config"),
+            ("language", "plaintext"),
+            ("body", "SECRET-TOKEN-42"),
+            ("expiry", "never"),
+            ("password", "hunter2"),
+        ],
+    )
+    .await;
+
+    // The owner sees the content directly (no prompt).
+    let owner = send(&app, get(&format!("/p/{id}"), Some("alice"))).await;
+    assert_eq!(owner.status, StatusCode::OK);
+    assert!(owner.body.contains("SECRET-TOKEN-42"));
+
+    // A non-owner is prompted, and the body is NOT in the prompt page.
+    let bob = send(&app, get(&format!("/p/{id}"), Some("bob"))).await;
+    assert_eq!(bob.status, StatusCode::OK);
+    assert!(bob.body.contains("Password required"));
+    assert!(!bob.body.contains("SECRET-TOKEN-42"));
+    let csrf = bob.csrf_cookie().unwrap();
+
+    // The raw route also refuses a non-owner (no bypass of the prompt).
+    let raw_denied = send(&app, get(&format!("/raw/{id}"), Some("bob"))).await;
+    assert_eq!(raw_denied.status, StatusCode::FORBIDDEN);
+
+    // A wrong password is rejected; the body stays hidden.
+    let wrong = send(
+        &app,
+        post_form(
+            &format!("/unlock/{id}"),
+            &[("csrf_token", &csrf), ("password", "nope")],
+            &csrf,
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(wrong.status, StatusCode::BAD_REQUEST);
+    assert!(wrong.body.contains("Incorrect password"));
+    assert!(!wrong.body.contains("SECRET-TOKEN-42"));
+
+    // The correct password reveals the content.
+    let ok = send(
+        &app,
+        post_form(
+            &format!("/unlock/{id}"),
+            &[("csrf_token", &csrf), ("password", "hunter2")],
+            &csrf,
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(ok.status, StatusCode::OK);
+    assert!(ok.body.contains("SECRET-TOKEN-42"));
+}
+
+#[tokio::test]
+async fn cannot_fork_a_protected_paste_as_non_owner() {
+    let app = app(build_dev_state());
+    let (id, _) = create_paste(
+        &app,
+        "alice",
+        &[
+            ("title", "locked"),
+            ("language", "plaintext"),
+            ("body", "do-not-copy"),
+            ("expiry", "never"),
+            ("password", "pw"),
+        ],
+    )
+    .await;
+
+    // Bob (a non-owner) must not exfiltrate a protected body by forking it.
+    let page = send(&app, get("/", Some("bob"))).await;
+    let csrf = page.csrf_cookie().unwrap();
+    let denied = send(
+        &app,
+        post_form(&format!("/fork/{id}"), &[("csrf_token", &csrf)], &csrf, Some("bob")),
+    )
+    .await;
+    assert_eq!(denied.status, StatusCode::FORBIDDEN);
+}
+
 #[tokio::test]
 async fn cannot_delete_another_users_paste() {
     let state: AppState = build_dev_state();
@@ -573,6 +808,8 @@ async fn cannot_delete_another_users_paste() {
             created_at: now,
             expires_at: None,
             burn_after_read: false,
+            source_id: None,
+            password_hash: None,
         })
         .await
         .unwrap();

@@ -11,15 +11,17 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Form;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::auth;
 use crate::audit::AuditEvent;
-use crate::config::{clamp_page, MAX_BODY_CHARS, RECENT_LIMIT};
+use crate::config::{
+    clamp_page, is_reaction_kind, COMMENT_PAGE, MAX_BODY_CHARS, REACTION_KINDS, RECENT_LIMIT,
+};
 use crate::error::AppError;
 use crate::handlers::{esc, fmt_datetime, topbar, APP_CSS};
 use crate::markdown;
-use crate::store::{Comment, Thread};
+use crate::store::{Comment, CommentCursor, Reaction, Sort, Thread};
 use crate::{now_nanos, now_secs, rand_suffix, AppState};
 
 const DASHBOARD_HTML: &str = include_str!("../../templates/dashboard.html");
@@ -82,6 +84,20 @@ pub struct DeleteForm {
     pub csrf_token: String,
 }
 
+/// `POST /api/comment/react` body — toggle one reaction on one comment. Identity is the gateway
+/// subject; `kind` must be a known [`REACTION_KINDS`] id.
+#[derive(Debug, Deserialize)]
+pub struct ReactForm {
+    #[serde(default)]
+    pub comment_id: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub return_to: String,
+    #[serde(default)]
+    pub csrf_token: String,
+}
+
 /// `GET /?before=<created_at>_<id>&limit=<n>` — keyset-pagination cursor + page size for the
 /// dashboard thread list. Both are optional; a bare `GET /` returns the newest page.
 #[derive(Debug, Deserialize)]
@@ -90,6 +106,18 @@ pub struct DashboardQuery {
     pub before: Option<String>,
     #[serde(default)]
     pub limit: Option<i64>,
+}
+
+/// `GET /t/{key}?sort=<newest|oldest|reacted>&before=<cursor>` (also `/embed/{key}`) — the sort
+/// order + keyset cursor for a thread's top-level comments. Both optional; the bare view is the
+/// newest page. The `before` cursor is `<created_at>_<id>` for the time sorts and
+/// `<reactions>~<created_at>_<id>` for most-reacted (see [`parse_comment_before`]).
+#[derive(Debug, Deserialize)]
+pub struct ThreadQuery {
+    #[serde(default)]
+    pub sort: Option<String>,
+    #[serde(default)]
+    pub before: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -200,28 +228,37 @@ pub async fn thread_view(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(key): Path<String>,
+    Query(q): Query<ThreadQuery>,
 ) -> Response {
     let email = auth::display_email(&headers);
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
     let viewer_sub = auth::author_sub(&headers).unwrap_or_default();
 
-    let thread = state.store.get_thread(&key).await;
-    let (title, comments, count) = match &thread {
-        Some(t) => {
-            let cs = state.store.list_comments(&t.id).await;
-            let n = cs.len();
-            (display_title(t), cs, n)
-        }
-        None => (key.clone(), Vec::new(), 0),
+    let return_to = format!("/t/{}", path_seg(&key));
+    let page = load_thread_page(&state, &key, &q, &viewer_sub).await;
+    let thread = page.thread;
+    let title = match &thread {
+        Some(t) => display_title(t),
+        None => key.clone(),
     };
 
-    let return_to = format!("/t/{}", path_seg(&key));
-    let comments_html = render_comment_tree(&comments, &csrf, &key, &return_to, true, &viewer_sub);
+    let sort_html = sort_control(page.sort, &return_to);
+    let comments_html = render_comment_tree(
+        &page.comments,
+        &page.reactions,
+        &csrf,
+        &key,
+        &return_to,
+        true,
+        &viewer_sub,
+    );
+    let more_html = render_load_more(&return_to, page.sort, page.next.as_ref());
     let composer = render_composer(&csrf, &key, "", &return_to, thread_url(&thread));
 
     let meta = format!(
         "{count} comment{plural}{url}",
-        plural = if count == 1 { "" } else { "s" },
+        count = page.total,
+        plural = if page.total == 1 { "" } else { "s" },
         url = thread_meta_url(&thread),
     );
 
@@ -231,7 +268,9 @@ pub async fn thread_view(
         .replace("{{TITLE_TEXT}}", &esc(&title))
         .replace("{{TITLE}}", &esc(&title))
         .replace("{{META}}", &meta)
+        .replace("{{SORT}}", &sort_html)
         .replace("{{COMMENTS}}", &comments_html)
+        .replace("{{MORE}}", &more_html)
         .replace("{{COMPOSER}}", &composer);
     html_with_cookie(body, set_cookie)
 }
@@ -246,29 +285,116 @@ pub async fn embed_view(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(key): Path<String>,
+    Query(q): Query<ThreadQuery>,
 ) -> Response {
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
     let viewer_sub = auth::author_sub(&headers).unwrap_or_default();
 
-    let thread = state.store.get_thread(&key).await;
-    let comments = match &thread {
-        Some(t) => state.store.list_comments(&t.id).await,
-        None => Vec::new(),
-    };
-
     let return_to = format!("/embed/{}", path_seg(&key));
+    let page = load_thread_page(&state, &key, &q, &viewer_sub).await;
+
+    let sort_html = sort_control(page.sort, &return_to);
     // No moderation controls in the embed — it is the end-user reading/posting surface — but an
-    // author still gets self-edit/delete on their OWN comments.
-    let comments_html =
-        render_comment_tree(&comments, &csrf, &key, &return_to, false, &viewer_sub);
-    let composer = render_composer(&csrf, &key, "", &return_to, thread_url(&thread));
+    // author still gets self-edit/delete + reactions on their OWN comments.
+    let comments_html = render_comment_tree(
+        &page.comments,
+        &page.reactions,
+        &csrf,
+        &key,
+        &return_to,
+        false,
+        &viewer_sub,
+    );
+    let more_html = render_load_more(&return_to, page.sort, page.next.as_ref());
+    let composer = render_composer(&csrf, &key, "", &return_to, thread_url(&page.thread));
 
     let body = EMBED_HTML
         .replace("{{CSS}}", APP_CSS)
+        .replace("{{SORT}}", &sort_html)
         .replace("{{COMMENTS}}", &comments_html)
+        .replace("{{MORE}}", &more_html)
         .replace("{{COMPOSER}}", &composer);
 
     embed_response(body, set_cookie)
+}
+
+// ---------------------------------------------------------------------------
+// Shared thread-page load (sort + keyset page + reactions)
+// ---------------------------------------------------------------------------
+
+/// One rendered page of a thread: the thread row (if any), the ordered top-level comments PLUS
+/// their replies, the folded reaction state, the effective sort, the total comment count for the
+/// meta line, and the next keyset cursor (`Some` only when a full page came back).
+struct ThreadPage {
+    thread: Option<Thread>,
+    comments: Vec<Comment>,
+    reactions: Reactions,
+    sort: Sort,
+    total: i64,
+    next: Option<CommentCursor>,
+}
+
+/// Load one sorted, keyset-paginated page of a thread's comments + their reactions. A key with no
+/// thread yet yields an empty page (its composer will create the thread on first post).
+async fn load_thread_page(
+    state: &AppState,
+    key: &str,
+    q: &ThreadQuery,
+    viewer_sub: &str,
+) -> ThreadPage {
+    let sort = Sort::parse(q.sort.as_deref().unwrap_or(""));
+    let before = parse_comment_before(q.before.as_deref(), sort);
+    let limit = clamp_page(COMMENT_PAGE);
+
+    let thread = state.store.get_thread(key).await;
+    let Some(t) = &thread else {
+        return ThreadPage {
+            thread: None,
+            comments: Vec::new(),
+            reactions: Reactions::empty(),
+            sort,
+            total: 0,
+            next: None,
+        };
+    };
+
+    let total = state.store.count_comments(&t.id).await;
+    let (tops, replies) = state.store.list_thread_page(&t.id, sort, before, limit).await;
+
+    // Fold the reactions of every comment on this page (top-level + replies) into counts + the
+    // viewer's own state.
+    let ids: Vec<String> = tops
+        .iter()
+        .chain(replies.iter())
+        .map(|c| c.id.clone())
+        .collect();
+    let rows = state.store.reactions_for(&ids).await;
+    let reactions = Reactions::build(&rows, viewer_sub);
+
+    // A FULL page of top-level comments means older ones may remain: derive the next cursor from
+    // the last (page-terminal) top-level comment. For most-reacted the cursor also carries its
+    // total reaction count.
+    let next = if tops.len() as i64 == limit {
+        tops.last().map(|c| CommentCursor {
+            reactions: reactions.total(&c.id),
+            created_at: c.created_at,
+            id: c.id.clone(),
+        })
+    } else {
+        None
+    };
+
+    let mut comments = tops;
+    comments.extend(replies);
+
+    ThreadPage {
+        thread,
+        comments,
+        reactions,
+        sort,
+        total,
+        next,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -463,6 +589,60 @@ pub async fn delete_comment(
 }
 
 // ---------------------------------------------------------------------------
+// React (toggle)
+// ---------------------------------------------------------------------------
+
+/// `POST /api/comment/react` — toggle one reaction (`kind`) on one comment for the gateway
+/// identity. Behind SSO; CSRF required. Idempotent: a second POST with the same `kind` removes the
+/// reaction. A blocked author may not react; an unknown `kind` or missing comment is rejected.
+pub async fn react(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ReactForm>,
+) -> Result<Response, AppError> {
+    let (sub, email) = auth::require_author(&headers)?;
+    auth::verify_csrf(&headers, &form.csrf_token)?;
+
+    if state.store.is_blocked(&sub).await {
+        return Err(AppError::Forbidden("author is blocked".to_string()));
+    }
+
+    let comment_id = form.comment_id.trim();
+    if comment_id.is_empty() {
+        return Err(AppError::InvalidRequest("comment_id is required".to_string()));
+    }
+    let kind = form.kind.trim();
+    if !is_reaction_kind(kind) {
+        return Err(AppError::InvalidRequest(format!("unknown reaction kind {kind}")));
+    }
+    // The reaction must attach to a real comment (else a 404, same shape as a missing comment).
+    if state.store.get_comment(comment_id).await.is_none() {
+        return Err(AppError::NotFound("no such comment".to_string()));
+    }
+
+    let added = state
+        .store
+        .toggle_reaction(&Reaction {
+            comment_id: comment_id.to_string(),
+            user_sub: sub.clone(),
+            kind: kind.to_string(),
+            created_at: now_secs(),
+        })
+        .await?;
+    tracing::info!(comment = %comment_id, kind, added, "reaction toggled");
+
+    let actor = if email.is_empty() { &sub } else { &email };
+    state.audit.emit(AuditEvent::info(
+        "echo.comment.react",
+        actor,
+        comment_id,
+        if added { kind } else { "removed" },
+    ));
+
+    Ok(redirect(&local_redirect(&form.return_to, "/")))
+}
+
+// ---------------------------------------------------------------------------
 // Render helpers
 // ---------------------------------------------------------------------------
 
@@ -563,6 +743,7 @@ fn render_activity_item(
 /// its replies. `moderate` toggles the hide/unhide controls (on in the admin views, off in embed).
 fn render_comment_tree(
     comments: &[Comment],
+    rx: &Reactions,
     csrf: &str,
     thread_key: &str,
     return_to: &str,
@@ -584,13 +765,13 @@ fn render_comment_tree(
     let mut out = String::new();
     for c in comments.iter().filter(|c| c.parent_id.is_empty()) {
         out.push_str(&render_comment(
-            c, csrf, thread_key, return_to, moderate, false, viewer_sub,
+            c, rx, csrf, thread_key, return_to, moderate, false, viewer_sub,
         ));
         if let Some(kids) = replies.get(c.id.as_str()) {
             out.push_str(r#"<div class="replies">"#);
             for k in kids {
                 out.push_str(&render_comment(
-                    k, csrf, thread_key, return_to, moderate, true, viewer_sub,
+                    k, rx, csrf, thread_key, return_to, moderate, true, viewer_sub,
                 ));
             }
             out.push_str("</div>");
@@ -601,8 +782,10 @@ fn render_comment_tree(
 
 /// One rendered comment. Hidden comments show a neutral placeholder instead of their body. A
 /// top-level comment (not `is_reply`) gets a compact reply composer.
+#[allow(clippy::too_many_arguments)]
 fn render_comment(
     c: &Comment,
+    rx: &Reactions,
     csrf: &str,
     thread_key: &str,
     return_to: &str,
@@ -628,6 +811,12 @@ fn render_comment(
     } else {
         String::new()
     };
+    // Reactions ride under a visible comment only (a hidden body carries no react bar).
+    let reactions = if c.hidden {
+        String::new()
+    } else {
+        reaction_bar(c, rx, csrf, return_to)
+    };
     let reply_form = if is_reply {
         String::new()
     } else {
@@ -641,6 +830,7 @@ fn render_comment(
     {control}
   </div>
   <div class="comment__body">{body}</div>
+  {reactions}
   {self_ctl}
   {reply}
 </article>"#,
@@ -648,9 +838,171 @@ fn render_comment(
         date = esc(&fmt_datetime(c.created_at)),
         control = control,
         body = body_html,
+        reactions = reactions,
         self_ctl = self_ctl,
         reply = reply_form,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Reactions: folded per-comment state + the render bar
+// ---------------------------------------------------------------------------
+
+/// The reaction state for the comments on one rendered page, folded from the raw rows: per
+/// `(comment_id, kind)` count, the viewer's own `(comment_id, kind)` set, and the per-comment
+/// totals (for the most-reacted keyset cursor).
+struct Reactions {
+    counts: HashMap<(String, String), i64>,
+    mine: HashSet<(String, String)>,
+    totals: HashMap<String, i64>,
+}
+
+impl Reactions {
+    fn empty() -> Self {
+        Reactions {
+            counts: HashMap::new(),
+            mine: HashSet::new(),
+            totals: HashMap::new(),
+        }
+    }
+
+    fn build(rows: &[Reaction], viewer_sub: &str) -> Self {
+        let mut counts: HashMap<(String, String), i64> = HashMap::new();
+        let mut mine: HashSet<(String, String)> = HashSet::new();
+        let mut totals: HashMap<String, i64> = HashMap::new();
+        for r in rows {
+            *counts.entry((r.comment_id.clone(), r.kind.clone())).or_insert(0) += 1;
+            *totals.entry(r.comment_id.clone()).or_insert(0) += 1;
+            if !viewer_sub.is_empty() && r.user_sub == viewer_sub {
+                mine.insert((r.comment_id.clone(), r.kind.clone()));
+            }
+        }
+        Reactions { counts, mine, totals }
+    }
+
+    fn count(&self, comment_id: &str, kind: &str) -> i64 {
+        self.counts
+            .get(&(comment_id.to_string(), kind.to_string()))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn reacted(&self, comment_id: &str, kind: &str) -> bool {
+        self.mine.contains(&(comment_id.to_string(), kind.to_string()))
+    }
+
+    /// Total reactions across all kinds on `comment_id` (backs the most-reacted cursor).
+    fn total(&self, comment_id: &str) -> i64 {
+        self.totals.get(comment_id).copied().unwrap_or(0)
+    }
+}
+
+/// The reaction bar under a comment: one toggle button per [`REACTION_KINDS`] entry showing the
+/// glyph + live count, with the viewer's active reactions styled "on". Each button is its own
+/// CSRF-protected POST to `/api/comment/react`.
+fn reaction_bar(c: &Comment, rx: &Reactions, csrf: &str, return_to: &str) -> String {
+    let mut buttons = String::new();
+    for (kind, glyph, label) in REACTION_KINDS {
+        let n = rx.count(&c.id, kind);
+        let on = rx.reacted(&c.id, kind);
+        buttons.push_str(&format!(
+            r#"<form class="inline-form react-form" method="post" action="/api/comment/react">
+  <input type="hidden" name="csrf_token" value="{csrf}">
+  <input type="hidden" name="comment_id" value="{id}">
+  <input type="hidden" name="kind" value="{kind}">
+  <input type="hidden" name="return_to" value="{ret}">
+  <button class="react-btn{on_cls}" type="submit" title="{label}" aria-pressed="{pressed}"><span class="react-btn__glyph" aria-hidden="true">{glyph}</span><span class="react-btn__count">{n}</span></button>
+</form>"#,
+            csrf = esc(csrf),
+            id = esc(&c.id),
+            kind = kind,
+            ret = esc(return_to),
+            on_cls = if on { " react-btn--on" } else { "" },
+            label = esc(label),
+            pressed = if on { "true" } else { "false" },
+            glyph = glyph,
+            n = n,
+        ));
+    }
+    format!(r#"<div class="reactions">{buttons}</div>"#)
+}
+
+// ---------------------------------------------------------------------------
+// Sort control + comment pagination
+// ---------------------------------------------------------------------------
+
+/// The newest / oldest / most-reacted sort tabs for a thread view. `base` is the view's own path
+/// (`/t/<seg>` or `/embed/<seg>`); each tab links to `base?sort=<value>` (paging resets on a sort
+/// change). The active sort is styled "on".
+fn sort_control(current: Sort, base: &str) -> String {
+    let tab = |s: Sort, label: &str| {
+        let cls = if s == current {
+            "sort-tab sort-tab--on"
+        } else {
+            "sort-tab"
+        };
+        format!(
+            r#"<a class="{cls}" href="{base}?sort={val}">{label}</a>"#,
+            cls = cls,
+            base = esc(base),
+            val = s.as_str(),
+            label = label,
+        )
+    };
+    format!(
+        r#"<nav class="sort-control" aria-label="Sort comments">{n}{o}{r}</nav>"#,
+        n = tab(Sort::Newest, "Newest"),
+        o = tab(Sort::Oldest, "Oldest"),
+        r = tab(Sort::MostReacted, "Most reacted"),
+    )
+}
+
+/// The "Load more comments" link, rendered ONLY when a next cursor exists (a full page came back).
+/// Links to `base?sort=<sort>&before=<cursor>` so the next request pages one step further.
+fn render_load_more(base: &str, sort: Sort, next: Option<&CommentCursor>) -> String {
+    match next {
+        Some(cur) => format!(
+            r#"<nav class="pagination"><a class="btn btn-secondary btn-sm" href="{base}?sort={sort}&before={before}">Load more comments</a></nav>"#,
+            base = esc(base),
+            sort = sort.as_str(),
+            before = esc(&format_comment_cursor(cur, sort)),
+        ),
+        None => String::new(),
+    }
+}
+
+/// Serialize a [`CommentCursor`] for a `?before=` link. Time sorts use `<created_at>_<id>`;
+/// most-reacted prefixes the total reaction count as `<reactions>~<created_at>_<id>`.
+fn format_comment_cursor(cur: &CommentCursor, sort: Sort) -> String {
+    match sort {
+        Sort::MostReacted => format!("{}~{}_{}", cur.reactions, cur.created_at, cur.id),
+        _ => format!("{}_{}", cur.created_at, cur.id),
+    }
+}
+
+/// Parse a `?before=` comment cursor for `sort`. Returns `None` for a missing/blank/malformed
+/// cursor (which falls back to the first page). The optional `<reactions>~` prefix carries the
+/// most-reacted count; `<created_at>` is a plain integer split on the FIRST `_`, so the id keeps
+/// its own underscores.
+fn parse_comment_before(before: Option<&str>, _sort: Sort) -> Option<CommentCursor> {
+    let raw = before?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let (reactions, rest) = match raw.split_once('~') {
+        Some((r, rest)) => (r.parse().ok()?, rest),
+        None => (0i64, raw),
+    };
+    let (ts, id) = rest.split_once('_')?;
+    let ts: i64 = ts.parse().ok()?;
+    if id.is_empty() {
+        return None;
+    }
+    Some(CommentCursor {
+        reactions,
+        created_at: ts,
+        id: id.to_string(),
+    })
 }
 
 /// The author's self-edit (collapsible composer prefilled with the raw body) + self-delete controls

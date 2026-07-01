@@ -9,6 +9,8 @@ use axum::body::Body;
 use axum::http::{header, HeaderMap, Request, StatusCode};
 use tower::ServiceExt;
 
+use agora::handlers::forum::REPLIES_PER_PAGE;
+use agora::model::Post;
 use agora::{app, build_dev_state, AppState};
 
 #[tokio::test]
@@ -327,6 +329,99 @@ async fn original_post_cannot_be_edited_or_deleted_via_reply_route() {
 
     // The original post survives.
     assert_eq!(state.store.posts_in_thread(&tid).await.unwrap().len(), 1);
+}
+
+// --- reply pagination (keyset ?before / ?after / ?latest) ------------------------------
+
+/// Seed a thread with `count` replies whose bodies are `reply-body-NNN` and whose `created_at`
+/// strictly increase (so the keyset order is deterministic — HTTP replies would collide on the
+/// same epoch SECOND). Inserted straight through the store, past the HTTP layer.
+async fn seed_replies(state: &AppState, tid: &str, count: usize) {
+    let base = state.store.first_post_in_thread(tid).await.unwrap().unwrap().created_at + 10;
+    for i in 0..count {
+        let post = Post {
+            id: format!("p_seed_{i:04}"),
+            thread_id: tid.to_string(),
+            body_md: format!("reply-body-{i:03}"),
+            author_sub: BOB_SUB.to_string(),
+            author_email: BOB_EMAIL.to_string(),
+            created_at: base + i as i64,
+        };
+        state.store.add_reply(&post).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn thread_default_page_shows_oldest_replies_with_forward_nav() {
+    let state = build_dev_state().await;
+    let tok = "csrftoken123";
+    let location = create_thread(&state, tok, "Paged", "OP body.").await;
+    let tid = location.strip_prefix("/t/").unwrap().to_string();
+    let count = REPLIES_PER_PAGE as usize + 5;
+    seed_replies(&state, &tid, count).await;
+
+    // Bare GET → the FIRST (oldest) page: oldest reply present, newest absent (it's on a later
+    // page), and the total reply count is shown.
+    let (status, _h, page) = send(&state, get(&location)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("reply-body-000"), "oldest reply on the first page");
+    assert!(
+        !page.contains(&format!("reply-body-{:03}", count - 1)),
+        "newest reply is NOT on the first page"
+    );
+    assert!(page.contains(&format!("{count} replies")), "reply count shown");
+    // Forward-only nav on the first page: newer + jump-to-latest, no older link.
+    assert!(page.contains("?after="), "Load newer link present");
+    assert!(page.contains("?latest=1"), "Jump to latest link present");
+    assert!(!page.contains("?before="), "no Load older on the first page");
+}
+
+#[tokio::test]
+async fn thread_jump_to_latest_shows_newest_replies_with_backward_nav() {
+    let state = build_dev_state().await;
+    let tok = "csrftoken123";
+    let location = create_thread(&state, tok, "Paged", "OP body.").await;
+    let tid = location.strip_prefix("/t/").unwrap().to_string();
+    let count = REPLIES_PER_PAGE as usize + 5;
+    seed_replies(&state, &tid, count).await;
+
+    let (status, _h, page) = send(&state, get(&format!("{location}?latest=1"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        page.contains(&format!("reply-body-{:03}", count - 1)),
+        "newest reply on the latest page"
+    );
+    assert!(!page.contains("reply-body-000"), "oldest reply is NOT on the latest page");
+    // The original post is still pinned at the top of every page.
+    assert!(page.contains("Original post"), "OP pinned on the latest page");
+    // Backward-only nav on the latest page: older link, no newer / jump-to-latest.
+    assert!(page.contains("?before="), "Load older link present");
+    assert!(!page.contains("?after="), "no Load newer on the latest page");
+    assert!(!page.contains("?latest=1"), "no Jump to latest on the latest page");
+}
+
+#[tokio::test]
+async fn thread_before_cursor_pages_to_older_replies() {
+    let state = build_dev_state().await;
+    let tok = "csrftoken123";
+    let location = create_thread(&state, tok, "Paged", "OP body.").await;
+    let tid = location.strip_prefix("/t/").unwrap().to_string();
+    seed_replies(&state, &tid, REPLIES_PER_PAGE as usize + 5).await;
+
+    // Cursor at the 3rd-oldest reply (id `p_seed_0003`, created_at base+3): `?before=` returns the
+    // replies strictly OLDER than it — indices 0..=2 only.
+    let base = state.store.first_post_in_thread(&tid).await.unwrap().unwrap().created_at + 10;
+    let cursor = format!("{ts}_p_seed_0003", ts = base + 3);
+    let (status, _h, page) = send(&state, get(&format!("{location}?before={cursor}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("reply-body-000"), "older page includes reply 0");
+    assert!(page.contains("reply-body-002"), "older page includes reply 2");
+    assert!(!page.contains("reply-body-003"), "cursor reply excluded (strictly older)");
+    // Only 3 replies are older than the cursor (< one page), so no further Load older; but newer
+    // replies exist, so forward nav + jump-to-latest are offered.
+    assert!(!page.contains("?before="), "no Load older beyond the oldest replies");
+    assert!(page.contains("?after="), "Load newer link present");
+    assert!(page.contains("?latest=1"), "Jump to latest link present");
 }
 
 // --- helpers ---------------------------------------------------------------------------

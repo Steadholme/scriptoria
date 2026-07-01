@@ -26,9 +26,13 @@ pub fn render_html(src: &str) -> String {
 /// Neutralize the only two event classes that can carry an XSS payload.
 fn sanitize_event(event: Event<'_>) -> Event<'_> {
     match event {
-        // Raw HTML -> escaped text (push_html escapes Text via escape_html).
-        Event::Html(h) => Event::Text(h),
-        Event::InlineHtml(h) => Event::Text(h),
+        // Raw HTML: an `<img>` whose `src` is an estate share URL is rebuilt as a SANITIZED tag
+        // (src + alt only) and passed through; everything else is escaped to inert text (so a
+        // `<script>` renders as literal characters). See [`estate_img`].
+        Event::Html(h) | Event::InlineHtml(h) => match estate_img(&h) {
+            Some(clean) => Event::Html(CowStr::Boxed(clean.into_boxed_str())),
+            None => Event::Text(h),
+        },
         Event::Start(Tag::Link {
             link_type,
             dest_url,
@@ -63,6 +67,94 @@ fn sanitize_url(url: CowStr<'_>) -> CowStr<'_> {
     } else {
         CowStr::Borrowed("#")
     }
+}
+
+/// Hosts whose images may render inline / as a cover. Aperture — the estate's file service —
+/// serves public share links (`https://drive.w33d.xyz/s/{token}`) here; nothing else is allowed,
+/// so a body can never pull an `<img>` from an arbitrary third-party (tracking / XSS) host.
+pub const ESTATE_IMAGE_HOSTS: &[&str] = &["drive.w33d.xyz"];
+
+/// True when `url` is an `https://` URL whose host is EXACTLY an estate media host (see
+/// [`ESTATE_IMAGE_HOSTS`]). The exact-match on the host span (everything up to the first `/`,
+/// `?` or `#`) rejects an embedded userinfo (`drive.w33d.xyz@evil.com`) or an explicit port, so
+/// only a bare estate origin passes. Used to gate both the cover image and inline `<img>` tags.
+pub fn is_estate_image_url(url: &str) -> bool {
+    let rest = match url.strip_prefix("https://") {
+        Some(r) => r,
+        None => return false,
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    ESTATE_IMAGE_HOSTS.iter().any(|h| host.eq_ignore_ascii_case(h))
+}
+
+/// If `raw` is a single `<img>` tag whose `src` is an estate image URL, return a SANITIZED
+/// replacement carrying ONLY `src`, `alt`, and `loading="lazy"` — every event handler (`onerror`),
+/// `style`, `srcset`, … attribute is dropped, so no XSS payload can ride along. Returns `None` for
+/// anything else, so the caller falls back to escaping the raw HTML to inert text.
+fn estate_img(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if !trimmed.to_ascii_lowercase().starts_with("<img") {
+        return None;
+    }
+    let src = extract_attr(trimmed, "src")?;
+    if !is_estate_image_url(&src) {
+        return None;
+    }
+    let alt = extract_attr(trimmed, "alt").unwrap_or_default();
+    Some(format!(
+        "<img src=\"{}\" alt=\"{}\" loading=\"lazy\">",
+        attr_escape(&src),
+        attr_escape(&alt),
+    ))
+}
+
+/// Extract the quoted value of attribute `name` (already lowercase) from a raw HTML `tag`,
+/// case-insensitive on the name and requiring a whitespace boundary before it. Handles single- or
+/// double-quoted values; returns `None` when the attribute is absent or unquoted. `to_ascii_lower`
+/// preserves byte length, so offsets found in the lowercased haystack index the original `tag`.
+fn extract_attr(tag: &str, name: &str) -> Option<String> {
+    let hay = tag.to_ascii_lowercase();
+    let bytes = tag.as_bytes();
+    let mut search = 0;
+    while let Some(rel) = hay[search..].find(name) {
+        let i = search + rel;
+        search = i + name.len();
+        // The attribute name must follow whitespace (never mid-token / inside a value).
+        if !tag[..i].chars().next_back().is_some_and(|c| c.is_whitespace()) {
+            continue;
+        }
+        // Optional spaces, then '='.
+        let after = &hay[i + name.len()..];
+        let eq_off = match after.find(|c: char| !c.is_whitespace()) {
+            Some(o) => o,
+            None => return None,
+        };
+        if after.as_bytes()[eq_off] != b'=' {
+            continue;
+        }
+        // Skip spaces after '=' to the opening quote.
+        let mut j = i + name.len() + eq_off + 1;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let quote = *bytes.get(j)?;
+        if quote != b'"' && quote != b'\'' {
+            return None;
+        }
+        j += 1;
+        let end_rel = tag[j..].find(quote as char)?;
+        return Some(tag[j..j + end_rel].to_string());
+    }
+    None
+}
+
+/// Escape a value for interpolation into a double-quoted HTML attribute (the estate `<img>` we
+/// rebuild is emitted as raw HTML, so `push_html` won't escape it for us).
+fn attr_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn is_safe_url(url: &str) -> bool {
@@ -178,6 +270,41 @@ mod tests {
         assert!(html.contains("href=\"https://example.com\""));
         assert!(html.contains("href=\"/local\""));
         assert!(html.contains("href=\"#frag\""));
+    }
+
+    #[test]
+    fn permits_estate_inline_img() {
+        let html = render_html(r#"before <img src="https://drive.w33d.xyz/s/tok123" alt="A cat"> after"#);
+        assert!(html.contains(r#"<img src="https://drive.w33d.xyz/s/tok123""#), "estate img survives");
+        assert!(html.contains(r#"alt="A cat""#), "alt preserved");
+        assert!(html.contains(r#"loading="lazy""#), "lazy-loading injected");
+    }
+
+    #[test]
+    fn strips_onerror_from_estate_img() {
+        let html = render_html(
+            r#"<img src="https://drive.w33d.xyz/s/tok" alt="x" onerror="alert(1)">"#,
+        );
+        assert!(html.contains(r#"<img src="https://drive.w33d.xyz/s/tok""#), "estate img rebuilt");
+        assert!(!html.contains("onerror"), "event handler dropped from the rebuilt tag");
+    }
+
+    #[test]
+    fn escapes_non_estate_img() {
+        let html = render_html(r#"<img src="https://evil.example.com/x.png">"#);
+        assert!(!html.contains("<img src=\"https://evil"), "non-estate raw img must not survive");
+        assert!(html.contains("&lt;img"), "rendered as escaped text");
+    }
+
+    #[test]
+    fn estate_url_gate() {
+        assert!(is_estate_image_url("https://drive.w33d.xyz/s/abc"));
+        assert!(is_estate_image_url("https://DRIVE.W33D.XYZ/s/abc"), "host match is case-insensitive");
+        assert!(!is_estate_image_url("http://drive.w33d.xyz/s/abc"), "must be https");
+        assert!(!is_estate_image_url("https://drive.w33d.xyz.evil.com/s/abc"), "suffix host rejected");
+        assert!(!is_estate_image_url("https://drive.w33d.xyz@evil.com/s/abc"), "userinfo rejected");
+        assert!(!is_estate_image_url("https://evil.com/x.png"));
+        assert!(!is_estate_image_url("/local/x.png"));
     }
 
     #[test]

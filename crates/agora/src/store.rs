@@ -32,6 +32,24 @@ pub enum StoreError {
     Backend(String),
 }
 
+/// Which keyset page of a thread's replies to fetch, over the shared `(created_at, id)` cursor.
+/// Every page is anchored on the same portable `(created_at DESC, id DESC)` idiom the content
+/// crates use; the handler always normalises the returned rows to ascending (oldest→newest)
+/// display order.
+///
+/// - `First`  — the OLDEST replies (natural reading order), no cursor.
+/// - `After`  — replies strictly NEWER than the cursor (paging forward / "Load newer").
+/// - `Before` — replies strictly OLDER than the cursor (paging back / "Load older"), reusing the
+///   `(created_at DESC, id DESC)` walk.
+/// - `Latest` — the NEWEST replies ("jump to latest"), same DESC walk with no lower bound.
+#[derive(Clone, Debug)]
+pub enum ReplyAnchor {
+    First,
+    After(i64, String),
+    Before(i64, String),
+    Latest,
+}
+
 /// Pluggable forum store. All methods are `async` and `.await`ed on the serving runtime.
 #[async_trait]
 pub trait Store: Send + Sync {
@@ -76,6 +94,23 @@ pub trait Store: Send + Sync {
     async fn get_post(&self, id: &str) -> Result<Option<Post>, StoreError>;
     /// All posts in a thread, oldest first (original post first, then replies).
     async fn posts_in_thread(&self, thread_id: &str) -> Result<Vec<Post>, StoreError>;
+
+    /// The thread's original post (the OLDEST post, `id`-tiebroken), if any. Fetched on its own so
+    /// the thread page can pin the OP at the top while paginating only the replies below it.
+    async fn first_post_in_thread(&self, thread_id: &str) -> Result<Option<Post>, StoreError>;
+
+    /// One keyset page of a thread's replies (every post EXCEPT the original, identified by
+    /// `op_id`), selected by `anchor` over the `(created_at, id)` cursor and capped at `limit`.
+    /// Rows come back in FETCH order: ascending for [`ReplyAnchor::First`]/[`ReplyAnchor::After`],
+    /// descending for [`ReplyAnchor::Before`]/[`ReplyAnchor::Latest`] (the caller reverses the
+    /// descending pages for display). The same portable predicate as the content crates.
+    async fn replies_page(
+        &self,
+        thread_id: &str,
+        op_id: &str,
+        anchor: &ReplyAnchor,
+        limit: i64,
+    ) -> Result<Vec<Post>, StoreError>;
 
     /// Create a thread together with its original post, atomically.
     async fn create_thread(&self, thread: &Thread, first_post: &Post) -> Result<(), StoreError>;
@@ -341,6 +376,56 @@ impl Store for InMemoryStore {
             .cloned()
             .collect();
         v.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+        Ok(v)
+    }
+
+    async fn first_post_in_thread(&self, thread_id: &str) -> Result<Option<Post>, StoreError> {
+        Ok(self
+            .posts
+            .lock()
+            .expect("posts lock poisoned")
+            .iter()
+            .filter(|p| p.thread_id == thread_id)
+            .min_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)))
+            .cloned())
+    }
+
+    async fn replies_page(
+        &self,
+        thread_id: &str,
+        op_id: &str,
+        anchor: &ReplyAnchor,
+        limit: i64,
+    ) -> Result<Vec<Post>, StoreError> {
+        // Replies are every post in the thread except the original (`op_id`).
+        let mut v: Vec<Post> = self
+            .posts
+            .lock()
+            .expect("posts lock poisoned")
+            .iter()
+            .filter(|p| p.thread_id == thread_id && p.id != op_id)
+            .cloned()
+            .collect();
+        // Same keyset predicate as the SQL path: strictly newer/older than the composite cursor.
+        match anchor {
+            ReplyAnchor::First | ReplyAnchor::Latest => {}
+            ReplyAnchor::After(ts, id) => {
+                v.retain(|p| p.created_at > *ts || (p.created_at == *ts && p.id.as_str() > id.as_str()));
+            }
+            ReplyAnchor::Before(ts, id) => {
+                v.retain(|p| p.created_at < *ts || (p.created_at == *ts && p.id.as_str() < id.as_str()));
+            }
+        }
+        // First/After walk ascending; Before/Latest walk descending — matching the SQL ORDER BY.
+        match anchor {
+            ReplyAnchor::First | ReplyAnchor::After(..) => {
+                v.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+            }
+            ReplyAnchor::Before(..) | ReplyAnchor::Latest => {
+                v.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+            }
+        }
+        v.truncate(limit.max(0) as usize);
         Ok(v)
     }
 
@@ -886,6 +971,91 @@ impl PgStore {
         rows.iter().map(Self::post_from_row).collect()
     }
 
+    async fn first_post_in_thread_async(&self, thread_id: &str) -> Result<Option<Post>, sqlx::Error> {
+        let sql = format!(
+            "SELECT {} FROM posts WHERE thread_id = $1 ORDER BY created_at ASC, id ASC LIMIT 1",
+            Self::POST_COLS
+        );
+        let row = sqlx::query(&sql)
+            .bind(thread_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(Self::post_from_row).transpose()
+    }
+
+    async fn replies_page_async(
+        &self,
+        thread_id: &str,
+        op_id: &str,
+        anchor: &ReplyAnchor,
+        limit: i64,
+    ) -> Result<Vec<Post>, sqlx::Error> {
+        // Replies = every post in the thread except the original (`id <> op_id`). The keyset
+        // predicate is the portable expanded form (no row-value comparison), matching the content
+        // crates; First/After walk ascending, Before/Latest walk descending.
+        let rows = match anchor {
+            ReplyAnchor::First => {
+                let sql = format!(
+                    "SELECT {} FROM posts WHERE thread_id = $1 AND id <> $2 \
+                     ORDER BY created_at ASC, id ASC LIMIT $3",
+                    Self::POST_COLS
+                );
+                sqlx::query(&sql)
+                    .bind(thread_id)
+                    .bind(op_id)
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+            ReplyAnchor::Latest => {
+                let sql = format!(
+                    "SELECT {} FROM posts WHERE thread_id = $1 AND id <> $2 \
+                     ORDER BY created_at DESC, id DESC LIMIT $3",
+                    Self::POST_COLS
+                );
+                sqlx::query(&sql)
+                    .bind(thread_id)
+                    .bind(op_id)
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+            ReplyAnchor::After(ts, id) => {
+                let sql = format!(
+                    "SELECT {} FROM posts WHERE thread_id = $1 AND id <> $2 \
+                     AND (created_at > $3 OR (created_at = $3 AND id > $4)) \
+                     ORDER BY created_at ASC, id ASC LIMIT $5",
+                    Self::POST_COLS
+                );
+                sqlx::query(&sql)
+                    .bind(thread_id)
+                    .bind(op_id)
+                    .bind(ts)
+                    .bind(id)
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+            ReplyAnchor::Before(ts, id) => {
+                let sql = format!(
+                    "SELECT {} FROM posts WHERE thread_id = $1 AND id <> $2 \
+                     AND (created_at < $3 OR (created_at = $3 AND id < $4)) \
+                     ORDER BY created_at DESC, id DESC LIMIT $5",
+                    Self::POST_COLS
+                );
+                sqlx::query(&sql)
+                    .bind(thread_id)
+                    .bind(op_id)
+                    .bind(ts)
+                    .bind(id)
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+        };
+        rows.iter().map(Self::post_from_row).collect()
+    }
+
     async fn create_thread_async(
         &self,
         thread: &Thread,
@@ -1239,6 +1409,22 @@ impl Store for PgStore {
 
     async fn posts_in_thread(&self, thread_id: &str) -> Result<Vec<Post>, StoreError> {
         self.posts_in_thread_async(thread_id).await.map_err(backend)
+    }
+
+    async fn first_post_in_thread(&self, thread_id: &str) -> Result<Option<Post>, StoreError> {
+        self.first_post_in_thread_async(thread_id).await.map_err(backend)
+    }
+
+    async fn replies_page(
+        &self,
+        thread_id: &str,
+        op_id: &str,
+        anchor: &ReplyAnchor,
+        limit: i64,
+    ) -> Result<Vec<Post>, StoreError> {
+        self.replies_page_async(thread_id, op_id, anchor, limit)
+            .await
+            .map_err(backend)
     }
 
     async fn create_thread(&self, thread: &Thread, first_post: &Post) -> Result<(), StoreError> {

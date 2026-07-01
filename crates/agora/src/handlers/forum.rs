@@ -22,10 +22,14 @@ use crate::handlers::{
     email_display, esc, fmt_ts, rel_time, render_page, replies_label,
 };
 use crate::model::{Post, ReactionCount, Thread};
+use crate::store::ReplyAnchor;
 use crate::{markdown, new_id, now_secs, AppState};
 
 /// Most-recent threads shown on the home page.
 const RECENT_LIMIT: i64 = 20;
+/// Replies rendered per keyset page on the thread view. A large thread renders (and reaction-
+/// queries) only one page of replies at a time; the OP is always pinned on top, separately.
+pub const REPLIES_PER_PAGE: i64 = 20;
 /// Threads listed on a category page.
 const CATEGORY_LIMIT: i64 = 200;
 /// Caps on user input (defense against absurd payloads; the store columns are TEXT).
@@ -208,9 +212,23 @@ pub async fn category(
 // GET /t/{id} — a thread: original post + replies (markdown) + reply form
 // ===========================================================================
 
+/// Keyset cursor + page anchor for the thread view's reply list. All optional; a bare
+/// `GET /t/{id}` shows the first (oldest) page. `?before=<created_at>_<id>` pages to older
+/// replies, `?after=<created_at>_<id>` to newer, and `?latest=1` jumps to the newest page.
+#[derive(Debug, Deserialize, Default)]
+pub struct ThreadQuery {
+    #[serde(default)]
+    pub before: Option<String>,
+    #[serde(default)]
+    pub after: Option<String>,
+    #[serde(default)]
+    pub latest: Option<String>,
+}
+
 pub async fn thread(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<ThreadQuery>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let now = now_secs();
@@ -219,8 +237,65 @@ pub async fn thread(
         .get_thread(&id)
         .await?
         .ok_or_else(|| AppError::NotFound("thread not found".to_string()))?;
-    let posts = state.store.posts_in_thread(&id).await?;
     let category = state.store.get_category(&thread.category_id).await?;
+
+    // Reply count (every post minus the original) — shown in the head + as the reply-list total.
+    let post_count = state.store.count_posts(&id).await?;
+
+    // Keyset-paginated reply list. The original post is pinned at the top on its own; the replies
+    // below it are ONE page under the shared `(created_at, id)` idiom, so a huge thread renders —
+    // and reaction-queries — only a page of replies at a time. We fetch one extra row to learn
+    // whether more replies exist in the fetch direction, then normalise every page to ascending
+    // (oldest→newest) display order.
+    let op = state.store.first_post_in_thread(&id).await?;
+    let op_id = op.as_ref().map(|p| p.id.clone()).unwrap_or_default();
+    let anchor = resolve_anchor(&q);
+    let mut fetched = state
+        .store
+        .replies_page(&id, &op_id, &anchor, REPLIES_PER_PAGE + 1)
+        .await?;
+    let has_more = fetched.len() as i64 > REPLIES_PER_PAGE;
+    fetched.truncate(REPLIES_PER_PAGE as usize);
+    let (replies, has_older, has_newer) = match anchor {
+        // Ascending fetches: already oldest→newest. First has nothing older (OP is the floor);
+        // After was reached from an older page, so older replies exist.
+        ReplyAnchor::First => (fetched, false, has_more),
+        ReplyAnchor::After(..) => (fetched, true, has_more),
+        // Descending fetches: reverse to oldest→newest. Before/Latest were walked newest-first, so
+        // `has_more` means more OLDER replies; Before was reached from a newer page.
+        ReplyAnchor::Before(..) => {
+            fetched.reverse();
+            (fetched, has_more, true)
+        }
+        ReplyAnchor::Latest => {
+            fetched.reverse();
+            (fetched, has_more, false)
+        }
+    };
+    // Cursors come from the visible page bounds (ascending: first = oldest, last = newest).
+    let older_cursor = if has_older {
+        replies.first().map(|p| (p.created_at, p.id.clone()))
+    } else {
+        None
+    };
+    let newer_cursor = if has_newer {
+        replies.last().map(|p| (p.created_at, p.id.clone()))
+    } else {
+        None
+    };
+    let pagination = render_reply_pagination(
+        &thread.id,
+        older_cursor.as_ref(),
+        newer_cursor.as_ref(),
+        has_newer,
+    );
+
+    // Display list: the original post first, then this page of replies.
+    let mut posts: Vec<Post> = Vec::with_capacity(replies.len() + 1);
+    if let Some(op_post) = op {
+        posts.push(op_post);
+    }
+    posts.extend(replies);
 
     // The authenticated subject (if any) decides which edit/delete controls render.
     let viewer = auth::identity_subject(&headers);
@@ -340,17 +415,19 @@ pub async fn thread(
 </div>
 {summary}
 <section class="posts">{posts}</section>
+{pagination}
 {reply}"#,
         crumbs = crumbs,
         title = esc(&thread.title),
         badges = badges,
         author = esc(&thread.author_email),
         when = esc(&fmt_ts(thread.created_at)),
-        replies = esc(&replies_label(posts.len() as i64)),
+        replies = esc(&replies_label(post_count)),
         actions = thread_actions,
         admin_actions = admin_actions,
         summary = summary_html,
         posts = posts_html,
+        pagination = pagination,
         reply = reply_form,
     );
 
@@ -1144,6 +1221,74 @@ pub(crate) fn order_posts_accepted_first(posts: &[Post], accepted_post_id: &str)
         ordered.insert(1, accepted);
     }
     ordered
+}
+
+/// Resolve the requested reply page from the query cursors. `latest` wins, then `before` (older),
+/// then `after` (newer); a missing/malformed cursor falls back to the first (oldest) page — the
+/// default view, so a bare `GET /t/{id}` is unchanged.
+fn resolve_anchor(q: &ThreadQuery) -> ReplyAnchor {
+    if q.latest.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false) {
+        return ReplyAnchor::Latest;
+    }
+    if let Some((ts, id)) = parse_cursor(q.before.as_deref()) {
+        return ReplyAnchor::Before(ts, id);
+    }
+    if let Some((ts, id)) = parse_cursor(q.after.as_deref()) {
+        return ReplyAnchor::After(ts, id);
+    }
+    ReplyAnchor::First
+}
+
+/// Parse a `<created_at>_<id>` keyset cursor. `created_at` is a plain integer that never contains
+/// `_`, so we split on the FIRST `_`; the post id (`p_<hex>`) keeps its own underscore intact.
+/// Returns `None` for a missing/blank/malformed cursor (which falls back to the default page).
+fn parse_cursor(cursor: Option<&str>) -> Option<(i64, String)> {
+    let (ts, id) = cursor?.trim().split_once('_')?;
+    let ts: i64 = ts.parse().ok()?;
+    if id.is_empty() {
+        return None;
+    }
+    Some((ts, id.to_string()))
+}
+
+/// Render the reply-list pagination nav: "Load older" (`?before=`) when older replies exist,
+/// "Load newer" (`?after=`) when newer replies exist, and a "Jump to latest" (`?latest=1`) link
+/// whenever the newest page is not already shown. Returns an empty string when the whole reply
+/// list fits on one page (so small threads render exactly as before). Every value is HTML-escaped.
+fn render_reply_pagination(
+    thread_id: &str,
+    older: Option<&(i64, String)>,
+    newer: Option<&(i64, String)>,
+    show_latest: bool,
+) -> String {
+    let mut links = String::new();
+    if let Some((ts, id)) = older {
+        links.push_str(&format!(
+            r#"<a class="btn btn-secondary btn-sm" href="/t/{tid}?before={ts}_{cid}">← Load older</a>"#,
+            tid = esc(thread_id),
+            ts = ts,
+            cid = esc(id),
+        ));
+    }
+    if let Some((ts, id)) = newer {
+        links.push_str(&format!(
+            r#"<a class="btn btn-secondary btn-sm" href="/t/{tid}?after={ts}_{cid}">Load newer →</a>"#,
+            tid = esc(thread_id),
+            ts = ts,
+            cid = esc(id),
+        ));
+    }
+    if show_latest {
+        links.push_str(&format!(
+            r#"<a class="btn btn-ghost btn-sm" href="/t/{tid}?latest=1">Jump to latest</a>"#,
+            tid = esc(thread_id),
+        ));
+    }
+    if links.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<nav class="pagination">{links}</nav>"#)
+    }
 }
 
 /// Render the reaction button row for a post: one CSRF-guarded toggle form per allowed kind (in

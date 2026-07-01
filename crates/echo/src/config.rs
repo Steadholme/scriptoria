@@ -18,6 +18,23 @@ pub const COMMENT_LIMIT: usize = 500;
 pub const RECENT_LIMIT: usize = 30;
 /// Hard cap on a comment body, in characters (defense against unbounded input).
 pub const MAX_BODY_CHARS: usize = 16 * 1024;
+/// How many TOP-LEVEL comments a thread/embed view renders per keyset page (their replies come
+/// along with them). Long threads page BACKWARD with `?before=` from the "Load more" control.
+pub const COMMENT_PAGE: i64 = 20;
+
+/// Allowed reaction kinds as `(id, glyph, accessible label)`. A toggle POST with any other `kind`
+/// is rejected, so the `kind` column stays bounded and the UI is predictable. `id`/`glyph` are
+/// constants (never user input) and safe to inline; the label is HTML-escaped on render anyway.
+pub const REACTION_KINDS: &[(&str, &str, &str)] = &[
+    ("up", "\u{1F44D}", "Upvote"),
+    ("heart", "\u{2764}", "Heart"),
+    ("celebrate", "\u{1F389}", "Celebrate"),
+];
+
+/// Whether `kind` is a known reaction kind (see [`REACTION_KINDS`]).
+pub fn is_reaction_kind(kind: &str) -> bool {
+    REACTION_KINDS.iter().any(|(k, _, _)| *k == kind)
+}
 
 /// Runtime configuration. Cheap to clone; shared read-only behind `Arc`.
 #[derive(Clone, Debug)]

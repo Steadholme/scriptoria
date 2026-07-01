@@ -35,6 +35,8 @@ fn paste(id: &str, author: &str, created_at: i64, expires_at: Option<i64>) -> Pa
         created_at,
         expires_at,
         burn_after_read: false,
+        source_id: None,
+        password_hash: None,
     }
 }
 
@@ -108,6 +110,69 @@ async fn pg_store_full_integration() {
     assert!(pool_ids.contains(&"bbbbbb22"), "live non-burn paste in pool");
     assert!(!pool_ids.contains(&"burnaa11"), "burn paste excluded from pool");
     assert!(!pool_ids.contains(&"cccccc33"), "expired paste excluded from pool");
+
+    // --- edit: update_paste + append-only revision history -----------------
+    use pastefire::model::PasteRevision;
+    // Snapshot bbbbbb22's current content as revision 1, then overwrite the row.
+    let pre = store.get("bbbbbb22").await.unwrap().unwrap();
+    assert!(store
+        .add_revision(&PasteRevision {
+            paste_id: "bbbbbb22".to_string(),
+            revision: 1,
+            title: pre.title.clone(),
+            body: pre.body.clone(),
+            language: pre.language.clone(),
+            created_at: now,
+        })
+        .await
+        .unwrap());
+    // Idempotent: re-appending revision 1 is a no-op.
+    assert!(!store
+        .add_revision(&PasteRevision {
+            paste_id: "bbbbbb22".to_string(),
+            revision: 1,
+            title: pre.title.clone(),
+            body: pre.body.clone(),
+            language: pre.language.clone(),
+            created_at: now,
+        })
+        .await
+        .unwrap());
+    // Ownership-scoped update: bob cannot edit alice's paste; alice can.
+    assert!(!store
+        .update_paste("bbbbbb22", "bob", "hacked", "hacked", "rust")
+        .await
+        .unwrap());
+    assert!(store
+        .update_paste("bbbbbb22", "alice", "edited title", "edited body", "go")
+        .await
+        .unwrap());
+    let edited = store.get("bbbbbb22").await.unwrap().unwrap();
+    assert_eq!(edited.title, "edited title");
+    assert_eq!(edited.body, "edited body");
+    assert_eq!(edited.language, "go");
+
+    let revs = store.list_revisions("bbbbbb22").await.unwrap();
+    assert_eq!(revs.len(), 1, "one archived revision");
+    assert_eq!(revs[0].revision, 1);
+    assert_eq!(revs[0].body, pre.body, "revision holds the pre-edit body");
+    let r1 = store.get_revision("bbbbbb22", 1).await.unwrap().unwrap();
+    assert_eq!(r1.title, pre.title);
+    assert!(store.get_revision("bbbbbb22", 99).await.unwrap().is_none());
+
+    // --- fork: source_id round-trips ---------------------------------------
+    let mut forked = paste("forkaa11", "bob", now + 60, None);
+    forked.source_id = Some("bbbbbb22".to_string());
+    assert!(store.create(&forked).await.unwrap());
+    let got_fork = store.get("forkaa11").await.unwrap().unwrap();
+    assert_eq!(got_fork.source_id.as_deref(), Some("bbbbbb22"));
+
+    // --- password_hash round-trips -----------------------------------------
+    let mut locked = paste("lockaa11", "alice", now + 70, None);
+    locked.password_hash = Some(pastefire::auth::hash_password("s3cret"));
+    assert!(store.create(&locked).await.unwrap());
+    let got_locked = store.get("lockaa11").await.unwrap().unwrap();
+    assert!(pastefire::auth::verify_password("s3cret", got_locked.password_hash.as_deref().unwrap()));
 
     // --- ownership-scoped delete -------------------------------------------
     assert!(!store.delete("aaaaaa11", "bob").await.unwrap(), "bob cannot delete alice's");

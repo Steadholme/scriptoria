@@ -21,7 +21,7 @@ use crate::handlers::{
     esc, expiry_options, fmt_ts, language_label, language_options, parse_expiry, userbox, APP_CSS,
     LANGUAGES, SHIELD_SVG,
 };
-use crate::model::Paste;
+use crate::model::{Paste, PasteRevision};
 use crate::{highlight, now_secs, random_alnum, similar, AppState};
 
 /// Length of the short random paste id (62-symbol alphabet => ~48 bits at 8 chars; the
@@ -30,6 +30,9 @@ const PASTE_ID_LEN: usize = 8;
 
 const NEW_HTML: &str = include_str!("../../templates/new.html");
 const VIEW_HTML: &str = include_str!("../../templates/view.html");
+const EDIT_HTML: &str = include_str!("../../templates/edit.html");
+const UNLOCK_HTML: &str = include_str!("../../templates/unlock.html");
+const HISTORY_HTML: &str = include_str!("../../templates/history.html");
 
 // ---------------------------------------------------------------------------
 // GET / — new-paste form + "my recent pastes"
@@ -90,6 +93,10 @@ pub struct CreateForm {
     /// (empty) reads as `false` — existing POSTs that never send this field keep their behavior.
     #[serde(default)]
     pub burn: String,
+    /// Optional password. Blank => no protection; non-blank => the paste is salted-SHA-256
+    /// password-protected and a non-owner must supply it to view.
+    #[serde(default)]
+    pub password: String,
 }
 
 /// Interpret a checkbox form value: present and non-empty (e.g. `on`) => checked.
@@ -149,6 +156,8 @@ pub async fn create(
         created_at: now,
         expires_at: parse_expiry(&form.expiry, now),
         burn_after_read: checkbox_on(&form.burn),
+        source_id: None,
+        password_hash: password_hash(&form.password),
     };
 
     // Allocate a unique id: generate, try to insert, retry on the rare collision.
@@ -216,46 +225,49 @@ pub async fn view(
     let viewer = auth::identity(&headers);
     let now = now_secs();
 
-    let paste = match state.store.get(&id).await? {
-        Some(p) if !p.is_expired(now) => p,
-        Some(_) => {
-            return Err(AppError::NotFound(
-                "This paste has expired and is no longer available.".to_string(),
-            ))
-        }
-        None => return Err(AppError::NotFound("No paste exists at that link.".to_string())),
-    };
-
+    let paste = load_live(&state, &id, now).await?;
     let is_owner = paste.author_sub == viewer.subject;
-    let burned = paste.burn_after_read && !is_owner;
 
-    // Similar pastes: rank the author's other live, non-burn pastes by BoW cosine overlap.
-    let similar = similar_pastes(&state, &paste, now).await;
-
-    let highlight_lines = q.lines.as_deref().and_then(parse_lines);
-
-    let csrf = auth::new_csrf_token();
-    let html = render_view(
-        &paste,
-        &viewer,
-        is_owner,
-        burned,
-        &similar,
-        &csrf,
-        highlight_lines,
-    );
-
-    // Burn-after-read: this recipient's read consumes the paste. Best-effort, never fatal — a
-    // failed purge leaves the paste readable rather than 500-ing on a successful render.
-    if burned {
-        if let Err(e) = state.store.delete(&paste.id, &paste.author_sub).await {
-            tracing::warn!(id = paste.id, error = %e, "burn-after-read purge failed");
-        } else {
-            tracing::info!(id = paste.id, viewer = viewer.subject, "paste burned after read");
-        }
+    // Password gate: a non-owner of a protected paste sees a password prompt (body withheld, and
+    // — importantly — a burn paste is NOT consumed until the password actually reveals it).
+    if paste.password_hash.is_some() && !is_owner {
+        let csrf = auth::new_csrf_token();
+        let html = render_unlock(&viewer, &paste.id, &csrf, None);
+        return Ok(html_with_csrf(StatusCode::OK, html, &csrf));
     }
 
+    let highlight_lines = q.lines.as_deref().and_then(parse_lines);
+    let csrf = auth::new_csrf_token();
+    let html = render_paste_view(&state, &paste, &viewer, is_owner, &csrf, highlight_lines, now).await;
+
+    // Burn-after-read: this recipient's read consumes the paste (see [`maybe_burn`]).
+    maybe_burn(&state, &paste, &viewer, is_owner).await;
+
     Ok(html_with_csrf(StatusCode::OK, html, &csrf))
+}
+
+/// Fetch a live (existing, non-expired) paste or map to the right 404. Shared by every read path.
+async fn load_live(state: &AppState, id: &str, now: i64) -> Result<Paste, AppError> {
+    match state.store.get(id).await? {
+        Some(p) if !p.is_expired(now) => Ok(p),
+        Some(_) => Err(AppError::NotFound(
+            "This paste has expired and is no longer available.".to_string(),
+        )),
+        None => Err(AppError::NotFound("No paste exists at that link.".to_string())),
+    }
+}
+
+/// Consume a burn-after-read paste once a non-author has actually seen its body. Best-effort,
+/// never fatal — a failed purge leaves the paste readable rather than failing a good render.
+async fn maybe_burn(state: &AppState, paste: &Paste, viewer: &Identity, is_owner: bool) {
+    if !paste.burn_after_read || is_owner {
+        return;
+    }
+    if let Err(e) = state.store.delete(&paste.id, &paste.author_sub).await {
+        tracing::warn!(id = paste.id, error = %e, "burn-after-read purge failed");
+    } else {
+        tracing::info!(id = paste.id, viewer = viewer.subject, "paste burned after read");
+    }
 }
 
 /// Number of "similar pastes" surfaced on the view.
@@ -313,6 +325,15 @@ pub async fn raw(
     let now = now_secs();
     match state.store.get(&id).await? {
         Some(p) if !p.is_expired(now) => {
+            // A protected paste's raw body is owner-only — a non-owner must open it in the browser
+            // and enter the password (the raw route has no unlock UI). This closes the obvious
+            // bypass of fetching `/raw` to sidestep the prompt.
+            if p.password_hash.is_some() && p.author_sub != viewer.subject {
+                return Err(AppError::Forbidden(
+                    "This paste is password-protected — open it from its main page to unlock."
+                        .to_string(),
+                ));
+            }
             let body = p.body.clone();
             if p.burn_after_read && p.author_sub != viewer.subject {
                 if let Err(e) = state.store.delete(&p.id, &p.author_sub).await {
@@ -383,6 +404,289 @@ pub async fn delete(
         )),
         None => Err(AppError::NotFound("No paste exists at that link.".to_string())),
     }
+}
+
+// ---------------------------------------------------------------------------
+// POST /unlock/{id} — supply the password to view a protected paste
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct UnlockForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub password: String,
+}
+
+/// `POST /unlock/{id}` — verify the paste password and, on success, render the paste inline (the
+/// reveal is stateless: a later reload re-prompts). CSRF-checked. An owner / an unprotected paste
+/// needs no password and is simply redirected to the normal view.
+pub async fn unlock(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<UnlockForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let viewer = auth::identity(&headers);
+    let now = now_secs();
+    let paste = load_live(&state, &id, now).await?;
+    let is_owner = paste.author_sub == viewer.subject;
+
+    // No password (or the owner) => nothing to unlock; go to the normal view.
+    let Some(hash) = paste.password_hash.as_deref().filter(|_| !is_owner) else {
+        return Ok(redirect_found(&format!("/p/{}", paste.id)));
+    };
+
+    if !auth::verify_password(&form.password, hash) {
+        let csrf = auth::new_csrf_token();
+        let html = render_unlock(&viewer, &paste.id, &csrf, Some("Incorrect password. Try again."));
+        return Ok(html_with_csrf(StatusCode::BAD_REQUEST, html, &csrf));
+    }
+
+    let csrf = auth::new_csrf_token();
+    let html = render_paste_view(&state, &paste, &viewer, is_owner, &csrf, None, now).await;
+    // The reveal to this non-owner consumes a burn-after-read paste.
+    maybe_burn(&state, &paste, &viewer, is_owner).await;
+    Ok(html_with_csrf(StatusCode::OK, html, &csrf))
+}
+
+// ---------------------------------------------------------------------------
+// GET/POST /edit/{id} — owner edits their paste (append-only history)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct EditForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub language: String,
+    #[serde(default)]
+    pub body: String,
+}
+
+/// `GET /edit/{id}` — render the edit form pre-filled with the current content. Owner-only.
+pub async fn edit_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Response, AppError> {
+    let who = auth::identity(&headers);
+    let now = now_secs();
+    let paste = load_live(&state, &id, now).await?;
+    if paste.author_sub != who.subject {
+        return Err(AppError::Forbidden(
+            "You can only edit your own pastes.".to_string(),
+        ));
+    }
+    let csrf = auth::new_csrf_token();
+    let html = render_edit(
+        &who,
+        &paste.id,
+        None,
+        &paste.title,
+        &paste.language,
+        &paste.body,
+        &csrf,
+    );
+    Ok(html_with_csrf(StatusCode::OK, html, &csrf))
+}
+
+/// `POST /edit/{id}` — CSRF-checked, ownership-scoped edit. The pre-edit content is appended to
+/// `paste_revisions` (idempotently) and the paste row is overwritten with the new content; an edit
+/// that changes nothing is a no-op (no spurious revision). Then 302 to `/p/{id}`.
+pub async fn edit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<EditForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and submit again.".to_string(),
+        ));
+    }
+    let who = auth::identity(&headers);
+    let now = now_secs();
+    let paste = load_live(&state, &id, now).await?;
+    if paste.author_sub != who.subject {
+        return Err(AppError::Forbidden(
+            "You can only edit your own pastes.".to_string(),
+        ));
+    }
+
+    let new_title: String = form.title.trim().chars().take(MAX_TITLE_CHARS).collect();
+    let new_language = normalize_language(&form.language);
+
+    if let Some(msg) = body_problem(&form.body) {
+        let csrf = auth::new_csrf_token();
+        let html = render_edit(&who, &paste.id, Some(msg), &new_title, &new_language, &form.body, &csrf);
+        return Ok(html_with_csrf(StatusCode::BAD_REQUEST, html, &csrf));
+    }
+
+    // Idempotent no-op: an edit that changes nothing writes no revision and does not touch the row.
+    if new_title == paste.title && form.body == paste.body && new_language == paste.language {
+        return Ok(redirect_found(&format!("/p/{}", paste.id)));
+    }
+
+    // Snapshot the PRE-edit content as the next revision (append-only, idempotent on the number).
+    let next = state.store.list_revisions(&id).await?.len() as i64 + 1;
+    let rev = crate::model::PasteRevision {
+        paste_id: paste.id.clone(),
+        revision: next,
+        title: paste.title.clone(),
+        body: paste.body.clone(),
+        language: paste.language.clone(),
+        created_at: now,
+    };
+    state.store.add_revision(&rev).await?;
+    state
+        .store
+        .update_paste(&id, &who.subject, &new_title, &form.body, &new_language)
+        .await?;
+
+    tracing::info!(id = paste.id, author = who.subject, revision = next, "paste edited");
+    let actor = if who.email.is_empty() { &who.subject } else { &who.email };
+    state.audit.emit(AuditEvent::info(
+        "paste.edit",
+        actor,
+        &paste.id,
+        &format!("revision {next}"),
+    ));
+
+    Ok(redirect_found(&format!("/p/{}", paste.id)))
+}
+
+// ---------------------------------------------------------------------------
+// POST /fork/{id} — copy a paste into a new one crediting the source
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct ForkForm {
+    #[serde(default)]
+    pub csrf_token: String,
+}
+
+/// `POST /fork/{id}` — CSRF-checked. Copy a live paste's content into a brand-new paste owned by
+/// the current user, crediting the source via `source_id`. A password-protected source can only be
+/// forked by its owner (a non-owner must not exfiltrate a protected body by forking it). The fork
+/// is a fresh, unprotected, non-burn, never-expiring copy. Then 302 to `/p/{new_id}`.
+pub async fn fork(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<ForkForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let who = auth::identity(&headers);
+    let now = now_secs();
+    let source = load_live(&state, &id, now).await?;
+    let is_owner = source.author_sub == who.subject;
+
+    if source.password_hash.is_some() && !is_owner {
+        return Err(AppError::Forbidden(
+            "This paste is password-protected and cannot be forked.".to_string(),
+        ));
+    }
+
+    let mut paste = Paste {
+        id: String::new(),
+        title: source.title.clone(),
+        body: source.body.clone(),
+        language: source.language.clone(),
+        author_sub: who.subject.clone(),
+        author_email: who.email.clone(),
+        created_at: now,
+        expires_at: None,
+        burn_after_read: false,
+        source_id: Some(source.id.clone()),
+        password_hash: None,
+    };
+
+    let mut created = false;
+    for _ in 0..6 {
+        paste.id = random_alnum(PASTE_ID_LEN);
+        if state.store.create(&paste).await? {
+            created = true;
+            break;
+        }
+    }
+    if !created {
+        return Err(AppError::Internal(
+            "could not allocate a unique paste id".to_string(),
+        ));
+    }
+
+    tracing::info!(id = paste.id, source = source.id, author = who.subject, "paste forked");
+    let actor = if who.email.is_empty() { &who.subject } else { &who.email };
+    state
+        .audit
+        .emit(AuditEvent::info("paste.fork", actor, &paste.id, &source.id));
+
+    Ok(redirect_found(&format!("/p/{}", paste.id)))
+}
+
+// ---------------------------------------------------------------------------
+// GET /p/{id}/history + GET /p/{id}/rev/{revision} — revision history & viewing
+// ---------------------------------------------------------------------------
+
+/// Same access gate the raw/history/revision paths use: the owner always, and any viewer of an
+/// unprotected paste. A non-owner of a protected paste is refused (they must use the main view,
+/// which handles the password prompt) — so a protected body never leaks via a side route.
+fn access_or_forbidden(paste: &Paste, viewer: &Identity) -> Result<(), AppError> {
+    if paste.author_sub == viewer.subject || paste.password_hash.is_none() {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(
+            "This paste is password-protected — open it from its main page to unlock.".to_string(),
+        ))
+    }
+}
+
+/// `GET /p/{id}/history` — the paste's revision history, newest first, each linking to that
+/// version. Access-gated like the paste itself.
+pub async fn history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Response, AppError> {
+    let viewer = auth::identity(&headers);
+    let now = now_secs();
+    let paste = load_live(&state, &id, now).await?;
+    access_or_forbidden(&paste, &viewer)?;
+    let revisions = state.store.list_revisions(&id).await?;
+    let html = render_history(&viewer, &paste, &revisions);
+    Ok((StatusCode::OK, Html(html)).into_response())
+}
+
+/// `GET /p/{id}/rev/{revision}` — a single historical version, read-only, with a banner marking it
+/// as archived. Access-gated like the paste itself.
+pub async fn view_revision(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, revision)): Path<(String, i64)>,
+) -> Result<Response, AppError> {
+    let viewer = auth::identity(&headers);
+    let now = now_secs();
+    let paste = load_live(&state, &id, now).await?;
+    access_or_forbidden(&paste, &viewer)?;
+    let rev = state
+        .store
+        .get_revision(&id, revision)
+        .await?
+        .ok_or_else(|| AppError::NotFound("No such revision of this paste.".to_string()))?;
+    let html = render_revision(&viewer, &paste.id, &rev);
+    Ok((StatusCode::OK, Html(html)).into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -557,7 +861,120 @@ fn render_recent(recent: &[Paste]) -> String {
         .join("")
 }
 
-fn render_view(
+/// Optional-password -> stored hash. Blank (all-whitespace) password => `None` (no protection).
+fn password_hash(raw: &str) -> Option<String> {
+    if raw.trim().is_empty() {
+        None
+    } else {
+        Some(auth::hash_password(raw))
+    }
+}
+
+/// A paste title, or the "Untitled paste" placeholder when blank.
+fn title_or_untitled(title: &str) -> String {
+    if title.trim().is_empty() {
+        "Untitled paste".to_string()
+    } else {
+        title.to_string()
+    }
+}
+
+/// The inline error alert (or empty string when there is no error).
+fn error_block(error: Option<&str>) -> String {
+    match error {
+        Some(msg) => format!(
+            "<div class=\"alert alert-danger\" role=\"alert\">{}</div>",
+            esc(msg)
+        ),
+        None => String::new(),
+    }
+}
+
+/// Gather the similar panel + revision count, then render the full paste view. Shared by the
+/// direct view (`GET /p/{id}`) and the post-unlock reveal (`POST /unlock/{id}`).
+async fn render_paste_view(
+    state: &AppState,
+    paste: &Paste,
+    viewer: &Identity,
+    is_owner: bool,
+    csrf: &str,
+    highlight_lines: Option<(usize, usize)>,
+    now: i64,
+) -> String {
+    let similar = similar_pastes(state, paste, now).await;
+    let revision_count = state
+        .store
+        .list_revisions(&paste.id)
+        .await
+        .unwrap_or_default()
+        .len();
+    let burned = paste.burn_after_read && !is_owner;
+    render_view_html(
+        paste,
+        viewer,
+        is_owner,
+        burned,
+        &similar,
+        csrf,
+        highlight_lines,
+        revision_count,
+    )
+}
+
+/// The per-paste action buttons (`{{TOOLS}}`). Raw/history/fork honor the password gate; edit and
+/// delete are owner-only. Each POST control carries the double-submit CSRF token.
+fn view_tools(paste: &Paste, is_owner: bool, csrf: &str, revision_count: usize) -> String {
+    let id = esc(&paste.id);
+    let accessible = is_owner || paste.password_hash.is_none();
+    let mut out = String::new();
+    if accessible {
+        out.push_str(&format!(
+            "<a class=\"btn btn-ghost btn-sm\" href=\"/raw/{id}\">View raw</a>"
+        ));
+    }
+    if revision_count > 0 && accessible {
+        out.push_str(&format!(
+            "<a class=\"btn btn-ghost btn-sm\" href=\"/p/{id}/history\">History</a>"
+        ));
+    }
+    if accessible {
+        out.push_str(&format!(
+            "<form class=\"inline-form\" method=\"post\" action=\"/fork/{id}\">\
+               <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+               <button class=\"btn btn-ghost btn-sm\" type=\"submit\">Fork</button>\
+             </form>",
+            csrf = esc(csrf),
+        ));
+    }
+    if is_owner {
+        out.push_str(&format!(
+            "<a class=\"btn btn-secondary btn-sm\" href=\"/edit/{id}\">Edit</a>"
+        ));
+        out.push_str(&format!(
+            "<form class=\"delete-form\" method=\"post\" action=\"/delete/{id}\" \
+               onsubmit=\"return confirm('Delete this paste? This cannot be undone.');\">\
+               <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+               <button class=\"btn btn-danger btn-sm\" type=\"submit\">Delete</button>\
+             </form>",
+            csrf = esc(csrf),
+        ));
+    }
+    out
+}
+
+/// The "Forked from …" credit line (`{{SOURCE}}`), or empty for an original paste.
+fn source_credit(paste: &Paste) -> String {
+    match &paste.source_id {
+        Some(src) => format!(
+            "<p class=\"sub sub--credit\">Forked from <a href=\"/p/{id}\">{id}</a></p>",
+            id = esc(src),
+        ),
+        None => String::new(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_view_html(
     paste: &Paste,
     viewer: &Identity,
     is_owner: bool,
@@ -565,12 +982,8 @@ fn render_view(
     similar: &[(f64, Paste)],
     csrf: &str,
     highlight_lines: Option<(usize, usize)>,
+    revision_count: usize,
 ) -> String {
-    let title = if paste.title.trim().is_empty() {
-        "Untitled paste".to_string()
-    } else {
-        paste.title.clone()
-    };
     let expiry = match paste.expires_at {
         Some(exp) => format!("Expires {}", fmt_ts(exp)),
         None => "Never expires".to_string(),
@@ -580,12 +993,18 @@ fn render_view(
     } else {
         ""
     };
+    let lock_meta = if paste.password_hash.is_some() {
+        " · Password-protected"
+    } else {
+        ""
+    };
     let meta = format!(
-        "Created {created} by {author} · {expiry}{burn}",
+        "Created {created} by {author} · {expiry}{burn}{lock}",
         created = esc(&fmt_ts(paste.created_at)),
         author = esc(&paste.author_email),
         expiry = esc(&expiry),
         burn = burn_meta,
+        lock = lock_meta,
     );
 
     // A one-time notice shown to the recipient whose read just consumed a burn paste.
@@ -601,39 +1020,171 @@ fn render_view(
         String::new()
     };
 
-    // The delete control is owner-only; it carries the double-submit CSRF token.
-    let delete_block = if is_owner {
-        format!(
-            "<form class=\"delete-form\" method=\"post\" action=\"/delete/{id}\" \
-               onsubmit=\"return confirm('Delete this paste? This cannot be undone.');\">\
-               <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
-               <button class=\"btn btn-danger btn-sm\" type=\"submit\">Delete</button>\
-             </form>",
-            id = esc(&paste.id),
-            csrf = esc(csrf),
-        )
-    } else {
-        String::new()
-    };
+    let tools = view_tools(paste, is_owner, csrf, revision_count);
+    // Syntax-highlighted body, rendered as numbered line rows (each with an `id="L{n}"` anchor).
+    // `render_lines` HTML-escapes every character, so this is never less safe than plain `esc`.
+    let body_html = highlight::render_lines(&paste.language, &paste.body, highlight_lines);
+    fill_view(
+        &viewer.email,
+        &title_or_untitled(&paste.title),
+        &language_label(&paste.language),
+        &meta,
+        &burn_notice,
+        &source_credit(paste),
+        &paste.id,
+        &tools,
+        &body_html,
+        &render_similar(similar),
+    )
+}
 
+/// Fill `view.html` from already-prepared (escaped where user-controlled) fragments. Shared by the
+/// live view and the read-only revision view.
+#[allow(clippy::too_many_arguments)]
+fn fill_view(
+    viewer_email: &str,
+    title: &str,
+    lang_label: &str,
+    meta: &str,
+    banner: &str,
+    source: &str,
+    id: &str,
+    tools: &str,
+    body_html: &str,
+    similar: &str,
+) -> String {
     VIEW_HTML
         .replace("{{CSS}}", APP_CSS)
         .replace("{{SHIELD}}", SHIELD_SVG)
-        .replace("{{USERBOX}}", &userbox("View paste", Some(&viewer.email)))
-        .replace("{{TITLE}}", &esc(&title))
-        .replace("{{LANG_LABEL}}", &esc(&language_label(&paste.language)))
-        .replace("{{META}}", &meta)
-        .replace("{{BURN_NOTICE}}", &burn_notice)
+        .replace("{{USERBOX}}", &userbox("View paste", Some(viewer_email)))
+        .replace("{{TITLE}}", &esc(title))
+        .replace("{{LANG_LABEL}}", &esc(lang_label))
+        .replace("{{META}}", meta)
+        .replace("{{BURN_NOTICE}}", banner)
+        .replace("{{SOURCE}}", source)
+        .replace("{{ID}}", &esc(id))
+        .replace("{{TOOLS}}", tools)
+        .replace("{{BODY}}", body_html)
+        .replace("{{SIMILAR}}", similar)
+}
+
+/// Render a single archived revision, read-only, with a banner and minimal tools.
+fn render_revision(viewer: &Identity, paste_id: &str, rev: &PasteRevision) -> String {
+    let meta = format!(
+        "Revision {n} · archived {ts}",
+        n = rev.revision,
+        ts = esc(&fmt_ts(rev.created_at)),
+    );
+    let banner = format!(
+        "<div class=\"alert alert-warn\" role=\"alert\">You are viewing revision {n}, an archived \
+         version of this paste. <a href=\"/p/{id}\">View the current version</a>.</div>",
+        n = rev.revision,
+        id = esc(paste_id),
+    );
+    let tools = format!(
+        "<a class=\"btn btn-ghost btn-sm\" href=\"/p/{id}\">Current version</a>\
+         <a class=\"btn btn-ghost btn-sm\" href=\"/p/{id}/history\">History</a>",
+        id = esc(paste_id),
+    );
+    let body_html = highlight::render_lines(&rev.language, &rev.body, None);
+    fill_view(
+        &viewer.email,
+        &title_or_untitled(&rev.title),
+        &language_label(&rev.language),
+        &meta,
+        &banner,
+        "",
+        paste_id,
+        &tools,
+        &body_html,
+        "",
+    )
+}
+
+/// Render the password-prompt page for a protected paste (non-owner view). CSRF token echoed into
+/// the unlock form.
+fn render_unlock(viewer: &Identity, id: &str, csrf: &str, error: Option<&str>) -> String {
+    UNLOCK_HTML
+        .replace("{{CSS}}", APP_CSS)
+        .replace("{{SHIELD}}", SHIELD_SVG)
+        .replace("{{USERBOX}}", &userbox("Locked paste", Some(&viewer.email)))
+        .replace("{{ERROR}}", &error_block(error))
+        .replace("{{ID}}", &esc(id))
+        .replace("{{CSRF}}", &esc(csrf))
+}
+
+/// Render the edit form pre-filled with the current (or resubmitted) content.
+#[allow(clippy::too_many_arguments)]
+fn render_edit(
+    who: &Identity,
+    id: &str,
+    error: Option<&str>,
+    title: &str,
+    language: &str,
+    body: &str,
+    csrf: &str,
+) -> String {
+    EDIT_HTML
+        .replace("{{CSS}}", APP_CSS)
+        .replace("{{SHIELD}}", SHIELD_SVG)
+        .replace("{{USERBOX}}", &userbox("Edit paste", Some(&who.email)))
+        .replace("{{ID}}", &esc(id))
+        .replace("{{ERROR}}", &error_block(error))
+        .replace("{{CSRF}}", &esc(csrf))
+        .replace("{{TITLE}}", &esc(title))
+        .replace("{{LANGUAGE_OPTIONS}}", &language_options(language))
+        .replace("{{BODY}}", &esc(body))
+}
+
+/// Render the revision-history page: the current version plus every archived revision, newest
+/// first, each linking to that version.
+fn render_history(viewer: &Identity, paste: &Paste, revisions: &[PasteRevision]) -> String {
+    HISTORY_HTML
+        .replace("{{CSS}}", APP_CSS)
+        .replace("{{SHIELD}}", SHIELD_SVG)
+        .replace("{{USERBOX}}", &userbox("Paste history", Some(&viewer.email)))
         .replace("{{ID}}", &esc(&paste.id))
-        .replace("{{DELETE}}", &delete_block)
-        // Syntax-highlighted body, rendered as numbered line rows (each with an `id="L{n}"`
-        // anchor). `render_lines` HTML-escapes every character (falling back to plain `esc` for
-        // plaintext/unknown languages), so this is never less safe than before.
-        .replace(
-            "{{BODY}}",
-            &highlight::render_lines(&paste.language, &paste.body, highlight_lines),
-        )
-        .replace("{{SIMILAR}}", &render_similar(similar))
+        .replace("{{TITLE}}", &esc(&title_or_untitled(&paste.title)))
+        .replace("{{REVISIONS}}", &render_history_items(paste, revisions))
+}
+
+/// The `<li>` items for the history list: the current version at the top, then revisions newest
+/// first (or an "unedited" note when there are none).
+fn render_history_items(paste: &Paste, revisions: &[PasteRevision]) -> String {
+    let id = esc(&paste.id);
+    let mut out = format!(
+        "<li class=\"paste-item\">\
+           <a class=\"paste-item__title\" href=\"/p/{id}\">Current version</a>\
+           <span class=\"paste-item__meta\">\
+             <span class=\"lang-badge\">{lang}</span>\
+             <span>created {created}</span>\
+           </span>\
+         </li>",
+        lang = esc(&language_label(&paste.language)),
+        created = esc(&fmt_ts(paste.created_at)),
+    );
+    if revisions.is_empty() {
+        out.push_str(
+            "<li class=\"paste-item paste-item--empty\">No earlier versions — this paste has not \
+             been edited.</li>",
+        );
+        return out;
+    }
+    for rev in revisions.iter().rev() {
+        out.push_str(&format!(
+            "<li class=\"paste-item\">\
+               <a class=\"paste-item__title\" href=\"/p/{id}/rev/{n}\">Revision {n}</a>\
+               <span class=\"paste-item__meta\">\
+                 <span class=\"lang-badge\">{lang}</span>\
+                 <span>archived {ts}</span>\
+               </span>\
+             </li>",
+            n = rev.revision,
+            lang = esc(&language_label(&rev.language)),
+            ts = esc(&fmt_ts(rev.created_at)),
+        ));
+    }
+    out
 }
 
 /// Render the "Similar pastes" panel, or an empty string when there are no scored matches (the

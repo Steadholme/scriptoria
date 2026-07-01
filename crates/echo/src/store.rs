@@ -52,6 +52,57 @@ pub struct BlockedAuthor {
     pub created_at: i64,
 }
 
+/// A single reaction (maps 1:1 to a `comment_reactions` row): one `user_sub` reacting to one
+/// `comment_id` with one `kind`. The `(comment_id, user_sub, kind)` triple is UNIQUE, so a repeat
+/// react is a no-op insert and the toggle simply removes the existing row.
+#[derive(Clone, Debug)]
+pub struct Reaction {
+    pub comment_id: String,
+    pub user_sub: String,
+    pub kind: String,
+    pub created_at: i64,
+}
+
+/// Ordering for a thread's top-level comments. `MostReacted` ranks by total reaction count, then
+/// falls back to newest-first for stable ties.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sort {
+    Newest,
+    Oldest,
+    MostReacted,
+}
+
+impl Sort {
+    /// Parse the `?sort=` query value. Anything unrecognized (including a bare view with no
+    /// `?sort=`) falls back to `Oldest` — the chronological order the thread view has always
+    /// rendered, so the default page is unchanged.
+    pub fn parse(s: &str) -> Sort {
+        match s.trim() {
+            "newest" => Sort::Newest,
+            "reacted" | "most-reacted" | "most_reacted" => Sort::MostReacted,
+            _ => Sort::Oldest,
+        }
+    }
+
+    /// The stable token used in `?sort=` links.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Sort::Newest => "newest",
+            Sort::Oldest => "oldest",
+            Sort::MostReacted => "reacted",
+        }
+    }
+}
+
+/// A keyset cursor into a thread's top-level comments. `reactions` is the cursor comment's total
+/// reaction count — used ONLY by [`Sort::MostReacted`] (0/ignored for the time-ordered sorts).
+#[derive(Clone, Debug)]
+pub struct CommentCursor {
+    pub reactions: i64,
+    pub created_at: i64,
+    pub id: String,
+}
+
 /// Storage failure surfaced to the handler layer.
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -75,6 +126,24 @@ pub trait Store: Send + Sync {
     async fn upsert_thread(&self, thread: &Thread) -> Result<Thread, StoreError>;
     /// All comments in a thread, oldest-first (`created_at` ASC), capped at [`COMMENT_LIMIT`].
     async fn list_comments(&self, thread_id: &str) -> Vec<Comment>;
+    /// One keyset page of a thread's TOP-LEVEL comments under `sort`, together with ALL replies of
+    /// exactly those parents (replies stay oldest-first). `before` is the [`CommentCursor`] of the
+    /// last row of the previous page (`None` returns the first page); `limit` is clamped like the
+    /// thread list. Returns `(top_level_page, replies_of_page)`.
+    async fn list_thread_page(
+        &self,
+        thread_id: &str,
+        sort: Sort,
+        before: Option<CommentCursor>,
+        limit: i64,
+    ) -> (Vec<Comment>, Vec<Comment>);
+    /// Every reaction row attached to any of `comment_ids` — the handler folds these into per-kind
+    /// counts + the viewer's own reaction state. Empty input returns empty (no query).
+    async fn reactions_for(&self, comment_ids: &[String]) -> Vec<Reaction>;
+    /// Idempotent toggle of one `(comment_id, user_sub, kind)` reaction: removes it and returns
+    /// `false` ("now un-reacted") when it already existed, otherwise inserts it and returns `true`
+    /// ("now reacted").
+    async fn toggle_reaction(&self, reaction: &Reaction) -> Result<bool, StoreError>;
     /// One comment by id.
     async fn get_comment(&self, id: &str) -> Option<Comment>;
     /// Insert a new comment.
@@ -124,6 +193,7 @@ pub struct InMemoryStore {
     threads: Mutex<Vec<Thread>>,
     comments: Mutex<Vec<Comment>>,
     blocked: Mutex<Vec<BlockedAuthor>>,
+    reactions: Mutex<Vec<Reaction>>,
 }
 
 impl InMemoryStore {
@@ -184,6 +254,100 @@ impl Store for InMemoryStore {
         v.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
         v.truncate(COMMENT_LIMIT);
         v
+    }
+
+    async fn list_thread_page(
+        &self,
+        thread_id: &str,
+        sort: Sort,
+        before: Option<CommentCursor>,
+        limit: i64,
+    ) -> (Vec<Comment>, Vec<Comment>) {
+        let limit = clamp_page(limit) as usize;
+        let comments = self.comments.lock().expect("comments lock poisoned");
+        let reactions = self.reactions.lock().expect("reactions lock poisoned");
+        // Total reaction count for a comment id (mirrors the SQL COUNT(*) over comment_reactions).
+        let rcount = |id: &str| reactions.iter().filter(|r| r.comment_id == id).count() as i64;
+
+        let mut tops: Vec<Comment> = comments
+            .iter()
+            .filter(|c| c.thread_id == thread_id && c.parent_id.is_empty())
+            .cloned()
+            .collect();
+        // Same ordering the SQL path uses for each sort.
+        match sort {
+            Sort::Newest => {
+                tops.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)))
+            }
+            Sort::Oldest => {
+                tops.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)))
+            }
+            Sort::MostReacted => tops.sort_by(|a, b| {
+                rcount(&b.id)
+                    .cmp(&rcount(&a.id))
+                    .then_with(|| b.created_at.cmp(&a.created_at))
+                    .then_with(|| b.id.cmp(&a.id))
+            }),
+        }
+        // Keyset predicate: strictly "after" the cursor under the sort's ordering.
+        if let Some(cur) = &before {
+            tops.retain(|c| match sort {
+                Sort::Newest => {
+                    c.created_at < cur.created_at
+                        || (c.created_at == cur.created_at && c.id.as_str() < cur.id.as_str())
+                }
+                Sort::Oldest => {
+                    c.created_at > cur.created_at
+                        || (c.created_at == cur.created_at && c.id.as_str() > cur.id.as_str())
+                }
+                Sort::MostReacted => {
+                    let rc = rcount(&c.id);
+                    rc < cur.reactions
+                        || (rc == cur.reactions && c.created_at < cur.created_at)
+                        || (rc == cur.reactions
+                            && c.created_at == cur.created_at
+                            && c.id.as_str() < cur.id.as_str())
+                }
+            });
+        }
+        tops.truncate(limit);
+
+        let parent_ids: Vec<&str> = tops.iter().map(|c| c.id.as_str()).collect();
+        let mut replies: Vec<Comment> = comments
+            .iter()
+            .filter(|c| !c.parent_id.is_empty() && parent_ids.contains(&c.parent_id.as_str()))
+            .cloned()
+            .collect();
+        replies.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+        (tops, replies)
+    }
+
+    async fn reactions_for(&self, comment_ids: &[String]) -> Vec<Reaction> {
+        if comment_ids.is_empty() {
+            return Vec::new();
+        }
+        self.reactions
+            .lock()
+            .expect("reactions lock poisoned")
+            .iter()
+            .filter(|r| comment_ids.iter().any(|id| id == &r.comment_id))
+            .cloned()
+            .collect()
+    }
+
+    async fn toggle_reaction(&self, reaction: &Reaction) -> Result<bool, StoreError> {
+        let mut reactions = self.reactions.lock().expect("reactions lock poisoned");
+        if let Some(pos) = reactions.iter().position(|r| {
+            r.comment_id == reaction.comment_id
+                && r.user_sub == reaction.user_sub
+                && r.kind == reaction.kind
+        }) {
+            reactions.remove(pos);
+            Ok(false)
+        } else {
+            reactions.push(reaction.clone());
+            Ok(true)
+        }
     }
 
     async fn get_comment(&self, id: &str) -> Option<Comment> {
@@ -331,6 +495,16 @@ pub struct PgStore {
     pool: PgPool,
 }
 
+/// Build a comma-separated `$1, $2, …, $n` placeholder list for a dynamic `IN (...)` clause. The
+/// count is bounded by the page/reply set, and only positional binds follow — no value is ever
+/// interpolated, so this stays injection-safe.
+fn bind_placeholders(n: usize) -> String {
+    (1..=n)
+        .map(|i| format!("${i}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 impl PgStore {
     /// Open a pooled connection. Async; call from within a Tokio runtime.
     pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
@@ -396,6 +570,26 @@ impl PgStore {
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_comments_author \
              ON comments (author_sub)",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Per-comment reactions. The (comment_id, user_sub, kind) UNIQUE makes a repeat react a
+        // no-op insert (idempotent) and lets the toggle remove the exact row.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS comment_reactions (\
+                 comment_id TEXT NOT NULL, \
+                 user_sub TEXT NOT NULL, \
+                 kind TEXT NOT NULL, \
+                 created_at BIGINT NOT NULL, \
+                 UNIQUE (comment_id, user_sub, kind)\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Backs the per-comment reaction COUNT(*) + the most-reacted ordering join.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_reactions_comment \
+             ON comment_reactions (comment_id)",
         )
         .execute(&self.pool)
         .await?;
@@ -502,6 +696,184 @@ impl PgStore {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(Self::comment_from_row).collect()
+    }
+
+    // The 8 comment columns, aliased `c.`, for the join in the paged top-level query.
+    const PAGE_COLS: &'static str =
+        "c.id, c.thread_id, c.author_sub, c.author_email, c.body, c.created_at, c.hidden, c.parent_id";
+    // Left-join the per-comment reaction count as r.n (COALESCE'd to 0 for un-reacted comments).
+    const PAGE_JOIN: &'static str = "FROM comments c \
+         LEFT JOIN (SELECT comment_id, COUNT(*) AS n FROM comment_reactions GROUP BY comment_id) r \
+         ON r.comment_id = c.id \
+         WHERE c.thread_id = $1 AND c.parent_id = ''";
+
+    async fn list_thread_page_async(
+        &self,
+        thread_id: &str,
+        sort: Sort,
+        before: Option<CommentCursor>,
+        limit: i64,
+    ) -> Result<(Vec<Comment>, Vec<Comment>), sqlx::Error> {
+        let limit = clamp_page(limit);
+        let cols = Self::PAGE_COLS;
+        let join = Self::PAGE_JOIN;
+        // Build the sort's ORDER BY + keyset WHERE. Aliases aren't legal in WHERE, so the reaction
+        // count uses the full COALESCE(r.n, 0) expression there.
+        let rows = match (sort, &before) {
+            (Sort::Newest, None) => {
+                sqlx::query(&format!(
+                    "SELECT {cols} {join} ORDER BY c.created_at DESC, c.id DESC LIMIT $2"
+                ))
+                .bind(thread_id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Sort::Newest, Some(cur)) => {
+                sqlx::query(&format!(
+                    "SELECT {cols} {join} \
+                     AND (c.created_at < $2 OR (c.created_at = $2 AND c.id < $3)) \
+                     ORDER BY c.created_at DESC, c.id DESC LIMIT $4"
+                ))
+                .bind(thread_id)
+                .bind(cur.created_at)
+                .bind(&cur.id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Sort::Oldest, None) => {
+                sqlx::query(&format!(
+                    "SELECT {cols} {join} ORDER BY c.created_at ASC, c.id ASC LIMIT $2"
+                ))
+                .bind(thread_id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Sort::Oldest, Some(cur)) => {
+                sqlx::query(&format!(
+                    "SELECT {cols} {join} \
+                     AND (c.created_at > $2 OR (c.created_at = $2 AND c.id > $3)) \
+                     ORDER BY c.created_at ASC, c.id ASC LIMIT $4"
+                ))
+                .bind(thread_id)
+                .bind(cur.created_at)
+                .bind(&cur.id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Sort::MostReacted, None) => {
+                sqlx::query(&format!(
+                    "SELECT {cols} {join} \
+                     ORDER BY COALESCE(r.n, 0) DESC, c.created_at DESC, c.id DESC LIMIT $2"
+                ))
+                .bind(thread_id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Sort::MostReacted, Some(cur)) => {
+                sqlx::query(&format!(
+                    "SELECT {cols} {join} \
+                     AND (COALESCE(r.n, 0) < $2 \
+                          OR (COALESCE(r.n, 0) = $2 AND c.created_at < $3) \
+                          OR (COALESCE(r.n, 0) = $2 AND c.created_at = $3 AND c.id < $4)) \
+                     ORDER BY COALESCE(r.n, 0) DESC, c.created_at DESC, c.id DESC LIMIT $5"
+                ))
+                .bind(thread_id)
+                .bind(cur.reactions)
+                .bind(cur.created_at)
+                .bind(&cur.id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        let tops: Vec<Comment> = rows
+            .iter()
+            .map(Self::comment_from_row)
+            .collect::<Result<_, _>>()?;
+
+        let parent_ids: Vec<String> = tops.iter().map(|c| c.id.clone()).collect();
+        let replies = self.replies_for_async(&parent_ids).await?;
+        Ok((tops, replies))
+    }
+
+    async fn replies_for_async(&self, parent_ids: &[String]) -> Result<Vec<Comment>, sqlx::Error> {
+        if parent_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = bind_placeholders(parent_ids.len());
+        let sql = format!(
+            "SELECT id, thread_id, author_sub, author_email, body, created_at, hidden, parent_id \
+             FROM comments WHERE parent_id IN ({placeholders}) \
+             ORDER BY created_at ASC, id ASC"
+        );
+        let mut q = sqlx::query(&sql);
+        for id in parent_ids {
+            q = q.bind(id);
+        }
+        let rows = q.fetch_all(&self.pool).await?;
+        rows.iter().map(Self::comment_from_row).collect()
+    }
+
+    async fn reactions_for_async(
+        &self,
+        comment_ids: &[String],
+    ) -> Result<Vec<Reaction>, sqlx::Error> {
+        if comment_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = bind_placeholders(comment_ids.len());
+        let sql = format!(
+            "SELECT comment_id, user_sub, kind, created_at \
+             FROM comment_reactions WHERE comment_id IN ({placeholders})"
+        );
+        let mut q = sqlx::query(&sql);
+        for id in comment_ids {
+            q = q.bind(id);
+        }
+        let rows = q.fetch_all(&self.pool).await?;
+        rows.iter().map(Self::reaction_from_row).collect()
+    }
+
+    fn reaction_from_row(row: &sqlx::postgres::PgRow) -> Result<Reaction, sqlx::Error> {
+        Ok(Reaction {
+            comment_id: row.try_get("comment_id")?,
+            user_sub: row.try_get("user_sub")?,
+            kind: row.try_get("kind")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+
+    async fn toggle_reaction_async(&self, r: &Reaction) -> Result<bool, sqlx::Error> {
+        // Toggle in two portable steps: a DELETE that hits the row means it existed (=> now off);
+        // otherwise INSERT it (=> now on). ON CONFLICT DO NOTHING keeps a concurrent double-react
+        // idempotent.
+        let del = sqlx::query(
+            "DELETE FROM comment_reactions WHERE comment_id = $1 AND user_sub = $2 AND kind = $3",
+        )
+        .bind(&r.comment_id)
+        .bind(&r.user_sub)
+        .bind(&r.kind)
+        .execute(&self.pool)
+        .await?;
+        if del.rows_affected() > 0 {
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO comment_reactions (comment_id, user_sub, kind, created_at) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT (comment_id, user_sub, kind) DO NOTHING",
+        )
+        .bind(&r.comment_id)
+        .bind(&r.user_sub)
+        .bind(&r.kind)
+        .bind(r.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(true)
     }
 
     async fn get_comment_async(&self, id: &str) -> Result<Option<Comment>, sqlx::Error> {
@@ -696,6 +1068,34 @@ impl Store for PgStore {
         })
     }
 
+    async fn list_thread_page(
+        &self,
+        thread_id: &str,
+        sort: Sort,
+        before: Option<CommentCursor>,
+        limit: i64,
+    ) -> (Vec<Comment>, Vec<Comment>) {
+        self.list_thread_page_async(thread_id, sort, before, limit)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "pg list_thread_page failed");
+                (Vec::new(), Vec::new())
+            })
+    }
+
+    async fn reactions_for(&self, comment_ids: &[String]) -> Vec<Reaction> {
+        self.reactions_for_async(comment_ids).await.unwrap_or_else(|e| {
+            tracing::error!(error = %e, "pg reactions_for failed");
+            Vec::new()
+        })
+    }
+
+    async fn toggle_reaction(&self, reaction: &Reaction) -> Result<bool, StoreError> {
+        self.toggle_reaction_async(reaction)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
     async fn get_comment(&self, id: &str) -> Option<Comment> {
         self.get_comment_async(id).await.unwrap_or_else(|e| {
             tracing::error!(error = %e, "pg get_comment failed");
@@ -857,5 +1257,117 @@ mod tests {
         assert_eq!(clamp_page(-5), DEFAULT_PAGE);
         assert_eq!(clamp_page(10), 10);
         assert_eq!(clamp_page(10_000), MAX_PAGE);
+    }
+
+    fn comment(id: &str, thread_id: &str, parent_id: &str, created_at: i64) -> Comment {
+        Comment {
+            id: id.to_string(),
+            thread_id: thread_id.to_string(),
+            author_sub: format!("u_{id}"),
+            author_email: String::new(),
+            body: id.to_string(),
+            created_at,
+            hidden: false,
+            parent_id: parent_id.to_string(),
+        }
+    }
+
+    fn cids(v: &[Comment]) -> Vec<&str> {
+        v.iter().map(|c| c.id.as_str()).collect()
+    }
+
+    // toggle_reaction flips on/off idempotently and reactions_for reflects the live rows.
+    #[tokio::test]
+    async fn toggle_reaction_is_idempotent() {
+        let store = InMemoryStore::new();
+        let r = |kind: &str, who: &str| Reaction {
+            comment_id: "c1".into(),
+            user_sub: who.into(),
+            kind: kind.into(),
+            created_at: 1,
+        };
+        // First toggle adds (=> true, now reacted).
+        assert!(store.toggle_reaction(&r("up", "alice")).await.unwrap());
+        // A different user reacting "up" is a distinct row.
+        assert!(store.toggle_reaction(&r("up", "bob")).await.unwrap());
+        let rows = store.reactions_for(&["c1".to_string()]).await;
+        assert_eq!(rows.len(), 2, "two distinct up reactions");
+        // Re-toggling alice's "up" removes it (=> false, now un-reacted).
+        assert!(!store.toggle_reaction(&r("up", "alice")).await.unwrap());
+        let rows = store.reactions_for(&["c1".to_string()]).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].user_sub, "bob");
+        // Unknown comment ids return nothing.
+        assert!(store.reactions_for(&["nope".to_string()]).await.is_empty());
+    }
+
+    // Top-level pagination walks a full page under each sort; replies of the page's parents ride
+    // along, and most-reacted ranks by total reaction count with a newest-first tie-break.
+    #[tokio::test]
+    async fn thread_page_sorts_and_keyset() {
+        let store = InMemoryStore::new();
+        // Four top-level comments at distinct timestamps + one reply under t2.
+        for (id, ts) in [("t1", 10), ("t2", 20), ("t3", 30), ("t4", 40)] {
+            store.create_comment(&comment(id, "th", "", ts)).await.unwrap();
+        }
+        store.create_comment(&comment("r2", "th", "t2", 25)).await.unwrap();
+        // Reactions: t2 gets 3, t4 gets 1, t1/t3 get 0.
+        for who in ["a", "b", "c"] {
+            store
+                .toggle_reaction(&Reaction {
+                    comment_id: "t2".into(),
+                    user_sub: who.into(),
+                    kind: "up".into(),
+                    created_at: 1,
+                })
+                .await
+                .unwrap();
+        }
+        store
+            .toggle_reaction(&Reaction {
+                comment_id: "t4".into(),
+                user_sub: "a".into(),
+                kind: "up".into(),
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+
+        // Oldest: chronological; the reply rides with its parent t2.
+        let (tops, replies) = store.list_thread_page("th", Sort::Oldest, None, 10).await;
+        assert_eq!(cids(&tops), ["t1", "t2", "t3", "t4"]);
+        assert_eq!(cids(&replies), ["r2"], "reply of a page parent comes along");
+
+        // Newest: reverse chronological.
+        let (tops, _) = store.list_thread_page("th", Sort::Newest, None, 10).await;
+        assert_eq!(cids(&tops), ["t4", "t3", "t2", "t1"]);
+
+        // Most-reacted: t2(3) > t4(1) > {t3,t1}(0) with newest-first tie-break (t3 before t1).
+        let (tops, _) = store.list_thread_page("th", Sort::MostReacted, None, 10).await;
+        assert_eq!(cids(&tops), ["t2", "t4", "t3", "t1"]);
+
+        // Keyset walk under Oldest with a page size of 2.
+        let (p1, _) = store.list_thread_page("th", Sort::Oldest, None, 2).await;
+        assert_eq!(cids(&p1), ["t1", "t2"]);
+        let last = p1.last().unwrap();
+        let cur = CommentCursor {
+            reactions: 0,
+            created_at: last.created_at,
+            id: last.id.clone(),
+        };
+        let (p2, _) = store.list_thread_page("th", Sort::Oldest, Some(cur), 2).await;
+        assert_eq!(cids(&p2), ["t3", "t4"]);
+
+        // Keyset walk under MostReacted: cursor carries the reaction count of the last row.
+        let (p1, _) = store.list_thread_page("th", Sort::MostReacted, None, 2).await;
+        assert_eq!(cids(&p1), ["t2", "t4"]);
+        let last = p1.last().unwrap();
+        let cur = CommentCursor {
+            reactions: 1, // t4's total
+            created_at: last.created_at,
+            id: last.id.clone(),
+        };
+        let (p2, _) = store.list_thread_page("th", Sort::MostReacted, Some(cur), 2).await;
+        assert_eq!(cids(&p2), ["t3", "t1"]);
     }
 }

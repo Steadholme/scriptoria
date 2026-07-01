@@ -48,6 +48,8 @@ pub struct IndexQuery {
 }
 
 /// The edit form body (`POST /edit/{slug}`). The editor/author is NEVER taken from here.
+/// `base_rev` is the head revision id the editor was loaded against — the save is rejected as a
+/// conflict when it no longer matches the current head (someone else saved in between).
 #[derive(Debug, Deserialize)]
 pub struct EditForm {
     #[serde(default)]
@@ -56,6 +58,8 @@ pub struct EditForm {
     pub title: String,
     #[serde(default)]
     pub body_md: String,
+    #[serde(default)]
+    pub base_rev: String,
 }
 
 /// Query for `GET /history/{slug}`. With both `from` and `to` set to revision ids, the handler
@@ -203,10 +207,10 @@ pub async fn view(
     match state.store.get_page(&slug).await? {
         Some(page) => {
             let existing: HashSet<String> = state.store.all_slugs().await?.into_iter().collect();
-            let body_html = markdown::render(&page.body_md, &existing);
+            let rendered = markdown::render(&page.body_md, &existing);
             // Backlink graph + keyword-related neighbours, computed locally from the page set.
             let panel = graph::Corpus::build(state.store.list_pages(None, MAX_PAGE).await?).panel(&slug);
-            let content = render_view(&page, &body_html, &panel);
+            let content = render_view(&page, &rendered.html, &rendered.toc, &panel);
             Ok(Html(layout(&page.title, &headers, &content)).into_response())
         }
         None => {
@@ -217,7 +221,7 @@ pub async fn view(
     }
 }
 
-fn render_view(page: &Page, body_html: &str, panel: &PagePanel) -> String {
+fn render_view(page: &Page, body_html: &str, toc: &[markdown::TocEntry], panel: &PagePanel) -> String {
     format!(
         "<article class=\"card page\">\
            <div class=\"page__bar\">\
@@ -230,14 +234,42 @@ fn render_view(page: &Page, body_html: &str, panel: &PagePanel) -> String {
                <a class=\"btn btn-primary btn-sm\" href=\"/edit/{slug}\">Edit</a>\
              </div>\
            </div>\
+           {toc}\
            <div class=\"prose\">{body}</div>\
          </article>{relations}",
         title = esc(&page.title),
         email = esc(&page.updated_by_email),
         time = esc(&fmt_ts(page.updated_at)),
         slug = esc(&page.slug),
+        toc = render_toc(toc),
         body = body_html,
         relations = render_relations(panel),
+    )
+}
+
+/// The on-page "Contents" box. Rendered only for pages with at least two headings — a single
+/// heading is not worth a TOC. Each entry links to the heading's `#id` anchor; the level drives
+/// an indent class. All heading text is escaped; the id is slug-safe but escaped defensively.
+fn render_toc(toc: &[markdown::TocEntry]) -> String {
+    if toc.len() < 2 {
+        return String::new();
+    }
+    let items: String = toc
+        .iter()
+        .map(|e| {
+            format!(
+                "<li class=\"toc__item toc__item--l{level}\"><a href=\"#{id}\">{text}</a></li>",
+                level = e.level.clamp(1, 6),
+                id = esc(&e.id),
+                text = esc(&e.text),
+            )
+        })
+        .collect();
+    format!(
+        "<nav class=\"toc\" aria-label=\"Table of contents\">\
+           <p class=\"toc__title\">Contents</p>\
+           <ul class=\"toc__list\">{items}</ul>\
+         </nav>"
     )
 }
 
@@ -318,14 +350,24 @@ pub async fn edit_form(
         None => (humanize(&slug), String::new(), false),
     };
 
+    // The head revision the editor is loaded against. On save we compare it to the current head:
+    // a mismatch means someone else edited in between, so the save is rejected as a conflict.
+    // Empty for a brand-new page with no history yet.
+    let base_rev = state
+        .store
+        .head_revision(&slug)
+        .await?
+        .map(|r| r.id)
+        .unwrap_or_default();
+
     let csrf = auth::new_csrf_token();
-    let content = render_editor(&slug, &title, &body, &csrf, exists);
+    let content = render_editor(&slug, &title, &body, &csrf, exists, &base_rev);
     let page_title = format!("{} {}", if exists { "Edit" } else { "Create" }, title);
     let html = layout(&page_title, &headers, &content);
     Ok(html_with_csrf_cookie(html, &csrf))
 }
 
-fn render_editor(slug: &str, title: &str, body: &str, csrf: &str, exists: bool) -> String {
+fn render_editor(slug: &str, title: &str, body: &str, csrf: &str, exists: bool, base_rev: &str) -> String {
     format!(
         "<form class=\"card editor\" method=\"post\" action=\"/edit/{slug}\">\
            <div class=\"editor__head\">\
@@ -333,6 +375,7 @@ fn render_editor(slug: &str, title: &str, body: &str, csrf: &str, exists: bool) 
              <code>/w/{slug}</code>\
            </div>\
            <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+           <input type=\"hidden\" name=\"base_rev\" value=\"{base_rev}\">\
            <div class=\"editor__field\">\
              <label for=\"title\">Title</label>\
              <input id=\"title\" type=\"text\" name=\"title\" value=\"{title}\" autocomplete=\"off\" required>\
@@ -350,6 +393,7 @@ fn render_editor(slug: &str, title: &str, body: &str, csrf: &str, exists: bool) 
         slug = esc(slug),
         verb = if exists { "Edit" } else { "Create" },
         csrf = esc(csrf),
+        base_rev = esc(base_rev),
         title = esc(title),
         body = esc(body),
     )
@@ -388,6 +432,17 @@ pub async fn edit_submit(
         }
     };
 
+    // Edit-conflict detection: the form carries the head revision id the editor was loaded
+    // against. If the current head has moved on (a concurrent save), REJECT with a friendly
+    // conflict page showing both versions — nothing is written, no audit event is emitted.
+    let head = state.store.head_revision(&slug).await?;
+    let current_head = head.as_ref().map(|r| r.id.as_str()).unwrap_or("");
+    if form.base_rev != current_head {
+        let content = render_conflict(&slug, &title, &form.body_md, head.as_ref());
+        let html = layout(&format!("Edit conflict · {title}"), &headers, &content);
+        return Ok((StatusCode::CONFLICT, Html(html)).into_response());
+    }
+
     let saved = state
         .store
         .save_page(SaveInput {
@@ -416,6 +471,51 @@ pub async fn edit_submit(
     ));
 
     Ok(Redirect::to(&format!("/w/{slug}")).into_response())
+}
+
+/// The friendly edit-conflict page (HTTP 409). Shows the version that landed while the operator
+/// was editing side-by-side with the rejected submission, so nothing is lost — they copy what
+/// they need and reload the editor (which re-reads the new head). Both bodies are escaped.
+fn render_conflict(slug: &str, title: &str, yours: &str, head: Option<&Revision>) -> String {
+    let (theirs, their_meta) = match head {
+        Some(r) => (
+            r.body_md.as_str(),
+            format!("saved by {} · {}", esc(&r.editor_email), esc(&fmt_ts(r.ts))),
+        ),
+        // No head means the page was created concurrently (base_rev was empty, head is now set is
+        // the usual case; this arm only fires if head vanished) — degrade gracefully.
+        None => ("", "the current version".to_string()),
+    };
+    format!(
+        "<section class=\"card conflict\">\
+           <div class=\"page-head\">\
+             <div><h1>Edit conflict</h1><p class=\"muted\">{title}</p></div>\
+             <a class=\"btn btn-primary btn-sm\" href=\"/edit/{slug}\">Reload editor</a>\
+           </div>\
+           <p class=\"conflict__lead\">Someone else saved <code>/w/{slug}</code> while you were \
+             editing, so your changes were <strong>not</strong> applied. Copy anything you need \
+             from your version below, then reload the editor to start from the latest text.</p>\
+           <div class=\"conflict__cols\">\
+             <div class=\"conflict__col\">\
+               <h2 class=\"conflict__label\">Their version <span class=\"muted\">({their_meta})</span></h2>\
+               <pre class=\"conflict__body\">{theirs}</pre>\
+             </div>\
+             <div class=\"conflict__col\">\
+               <h2 class=\"conflict__label\">Your version <span class=\"muted\">(not saved)</span></h2>\
+               <pre class=\"conflict__body\">{yours}</pre>\
+             </div>\
+           </div>\
+           <div class=\"conflict__actions\">\
+             <a class=\"btn btn-secondary\" href=\"/w/{slug}\">View current page</a>\
+             <a class=\"btn btn-primary\" href=\"/edit/{slug}\">Reload editor</a>\
+           </div>\
+         </section>",
+        title = esc(title),
+        slug = esc(slug),
+        their_meta = their_meta,
+        theirs = esc(theirs),
+        yours = esc(yours),
+    )
 }
 
 // ---------------------------------------------------------------------------

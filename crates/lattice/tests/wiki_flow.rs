@@ -80,15 +80,17 @@ async fn full_create_edit_history_flow() {
     assert!(body.contains("alice@holdfast.local"));
     assert!(body.contains("chars"));
 
-    // A second edit by a different editor records a second revision and updates the page.
+    // A second edit by a different editor records a second revision and updates the page. The
+    // editor loads the current head into `base_rev`; passing it back means no conflict.
     let (_s, headers2, _b) = call(&state, get("/edit/home")).await;
     let cookie2 = set_cookie(&headers2).unwrap();
     let csrf2 = cookie_value(&cookie2).unwrap();
+    let base2 = state.store.head_revision("home").await.unwrap().unwrap().id;
     let save2 = post_form(
         "/edit/home",
         &cookie2,
         Some("bob@holdfast.local"),
-        &[("csrf_token", &csrf2), ("title", "Home"), ("body_md", "Updated body.")],
+        &[("csrf_token", &csrf2), ("base_rev", &base2), ("title", "Home"), ("body_md", "Updated body.")],
     );
     let (status, _h, _b) = call(&state, save2).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
@@ -126,13 +128,14 @@ async fn history_diff_and_revert_flow() {
     let (_s, h2, _b) = call(&state, get("/edit/notes")).await;
     let c2 = set_cookie(&h2).unwrap();
     let t2 = cookie_value(&c2).unwrap();
+    let base2 = state.store.head_revision("notes").await.unwrap().unwrap().id;
     let (s, _h, _b) = call(
         &state,
         post_form(
             "/edit/notes",
             &c2,
             Some("bob@holdfast.local"),
-            &[("csrf_token", &t2), ("title", "Notes"), ("body_md", "line one\nCHANGED two\nline three")],
+            &[("csrf_token", &t2), ("base_rev", &base2), ("title", "Notes"), ("body_md", "line one\nCHANGED two\nline three")],
         ),
     )
     .await;
@@ -274,6 +277,148 @@ async fn stored_html_is_sanitized() {
     let (_s, _h, body) = call(&state, get("/w/xss")).await;
     assert!(!body.contains("<script>alert(1)</script>"), "script must be escaped");
     assert!(body.contains("&lt;script&gt;"));
+}
+
+#[tokio::test]
+async fn toc_and_heading_anchors_render() {
+    let state = build_dev_state();
+    let (_s, headers, _b) = call(&state, get("/edit/guide")).await;
+    let cookie = set_cookie(&headers).unwrap();
+    let csrf = cookie_value(&cookie).unwrap();
+    let (status, _h, _b) = call(
+        &state,
+        post_form(
+            "/edit/guide",
+            &cookie,
+            Some("alice@holdfast.local"),
+            &[
+                ("csrf_token", &csrf),
+                ("base_rev", ""),
+                ("title", "Guide"),
+                ("body_md", "# Overview\n\nintro\n\n## Setup\n\nsteps\n\n## Setup\n\nmore"),
+            ],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let (status, _h, body) = call(&state, get("/w/guide")).await;
+    assert_eq!(status, StatusCode::OK);
+    // Heading anchors are stamped, and duplicate headings get unique ids.
+    assert!(body.contains("<h1 id=\"overview\">Overview</h1>"), "{body}");
+    assert!(body.contains("id=\"setup\""), "{body}");
+    assert!(body.contains("id=\"setup-1\""), "duplicate heading disambiguated: {body}");
+    // The TOC box links to those anchors.
+    assert!(body.contains("class=\"toc\""), "toc box rendered: {body}");
+    assert!(body.contains("href=\"#overview\""), "{body}");
+    assert!(body.contains("href=\"#setup-1\""), "{body}");
+}
+
+#[tokio::test]
+async fn edit_conflict_is_rejected_with_both_versions() {
+    let state = build_dev_state();
+
+    // Seed the page (base_rev empty -> creates the first revision).
+    let (_s, h0, _b) = call(&state, get("/edit/spec")).await;
+    let c0 = set_cookie(&h0).unwrap();
+    let t0 = cookie_value(&c0).unwrap();
+    let (s, _h, _b) = call(
+        &state,
+        post_form(
+            "/edit/spec",
+            &c0,
+            Some("alice@holdfast.local"),
+            &[("csrf_token", &t0), ("base_rev", ""), ("title", "Spec"), ("body_md", "original")],
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::SEE_OTHER);
+
+    // Two editors open the editor against the SAME head revision.
+    let head = state.store.head_revision("spec").await.unwrap().unwrap();
+    let base = head.id.clone();
+
+    // Editor A saves first -> head advances.
+    let (_s, ha, _b) = call(&state, get("/edit/spec")).await;
+    let ca = set_cookie(&ha).unwrap();
+    let ta = cookie_value(&ca).unwrap();
+    let (s, _h, _b) = call(
+        &state,
+        post_form(
+            "/edit/spec",
+            &ca,
+            Some("alice@holdfast.local"),
+            &[("csrf_token", &ta), ("base_rev", &base), ("title", "Spec"), ("body_md", "alice update")],
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::SEE_OTHER, "first save wins");
+
+    // Editor B submits against the now-stale base -> conflict (no write).
+    let (_s, hb, _b) = call(&state, get("/edit/spec")).await; // fresh cookie for CSRF
+    let cb = set_cookie(&hb).unwrap();
+    let tb = cookie_value(&cb).unwrap();
+    let (status, _h, body) = call(
+        &state,
+        post_form(
+            "/edit/spec",
+            &cb,
+            Some("bob@holdfast.local"),
+            &[("csrf_token", &tb), ("base_rev", &base), ("title", "Spec"), ("body_md", "bob update")],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "stale base_rev is rejected");
+    assert!(body.contains("Edit conflict"), "{body}");
+    assert!(body.contains("alice update"), "shows the version that landed: {body}");
+    assert!(body.contains("bob update"), "shows the rejected submission: {body}");
+
+    // Bob's write did NOT land: the page + history still hold alice's version only.
+    let (_s, _h, page) = call(&state, get("/w/spec")).await;
+    assert!(page.contains("alice update"));
+    assert!(!page.contains("bob update"));
+    // original + alice update == 2 revisions (bob's rejected).
+    assert_eq!(state.store.list_revisions("spec").await.unwrap().len(), 2, "conflict wrote nothing");
+}
+
+#[tokio::test]
+async fn matching_base_rev_saves_normally() {
+    let state = build_dev_state();
+    // Create.
+    let (_s, h0, _b) = call(&state, get("/edit/doc2")).await;
+    let c0 = set_cookie(&h0).unwrap();
+    let t0 = cookie_value(&c0).unwrap();
+    call(
+        &state,
+        post_form(
+            "/edit/doc2",
+            &c0,
+            Some("alice@holdfast.local"),
+            &[("csrf_token", &t0), ("base_rev", ""), ("title", "Doc2"), ("body_md", "v1")],
+        ),
+    )
+    .await;
+
+    // Reopen the editor: the hidden base_rev now carries the current head id.
+    let (_s, h1, edit_body) = call(&state, get("/edit/doc2")).await;
+    let head = state.store.head_revision("doc2").await.unwrap().unwrap();
+    assert!(edit_body.contains(&format!("name=\"base_rev\" value=\"{}\"", head.id)), "editor carries head rev");
+    let c1 = set_cookie(&h1).unwrap();
+    let t1 = cookie_value(&c1).unwrap();
+
+    // Save against the fresh base -> succeeds.
+    let (status, _h, _b) = call(
+        &state,
+        post_form(
+            "/edit/doc2",
+            &c1,
+            Some("alice@holdfast.local"),
+            &[("csrf_token", &t1), ("base_rev", &head.id), ("title", "Doc2"), ("body_md", "v2")],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "up-to-date save is applied");
+    assert_eq!(state.store.list_revisions("doc2").await.unwrap().len(), 2);
 }
 
 #[tokio::test]

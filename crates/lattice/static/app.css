@@ -249,6 +249,22 @@ code { font-family: var(--mono); font-size: .92em; color: var(--ink); background
 .prose th { background: var(--surface-2); font-weight: 600; }
 .prose img { max-width: 100%; height: auto; border-radius: var(--radius-sm); }
 .prose hr { border: 0; border-top: 1px solid var(--border); margin: 24px 0; }
+/* Keep an anchored heading clear of the top edge when jumped to via a #toc link. */
+.prose h1, .prose h2, .prose h3, .prose h4, .prose h5, .prose h6 { scroll-margin-top: 84px; }
+
+/* table of contents box (rendered above the prose for pages with 2+ headings) */
+.toc { border: 1px solid var(--border); background: var(--surface-2); border-radius: var(--radius-sm); padding: 14px 18px; margin: 0 0 24px; }
+.toc__title { margin: 0 0 8px; font-size: 11.5px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--ink-3); }
+.toc__list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 3px; }
+.toc__item { font-size: 13px; line-height: 1.4; }
+.toc__item a { color: var(--accent-2); }
+.toc__item a:hover { color: var(--accent); }
+.toc__item--l1 { padding-left: 0; font-weight: 600; }
+.toc__item--l2 { padding-left: 14px; }
+.toc__item--l3 { padding-left: 28px; }
+.toc__item--l4 { padding-left: 42px; }
+.toc__item--l5 { padding-left: 56px; }
+.toc__item--l6 { padding-left: 70px; }
 
 /* [[wiki-links]]: existing = accent, missing = invites creation */
 .wikilink { color: var(--accent-2); font-weight: 600; }
@@ -316,6 +332,17 @@ code { font-family: var(--mono); font-size: .92em; color: var(--ink); background
 .relations__list li { font-size: 13px; }
 .relations__list a { color: var(--accent-2); font-weight: 500; }
 .relations__list a:hover { color: var(--accent); }
+
+/* edit-conflict page (two versions side-by-side; nothing was saved) */
+.conflict { padding: 26px 32px; }
+.conflict__lead { color: var(--ink-2); font-size: 14px; margin: 0 0 20px; }
+.conflict__cols { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+.conflict__col { min-width: 0; }
+.conflict__label { margin: 0 0 8px; font-size: 12.5px; font-weight: 600; color: var(--ink-2); }
+.conflict__label .muted { font-weight: 400; }
+.conflict__body { background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px 14px; margin: 0; font-family: var(--mono); font-size: 12.5px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; max-height: 420px; overflow: auto; }
+.conflict__actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 22px; }
+@media (max-width: 720px) { .conflict__cols { grid-template-columns: 1fr; } }
 
 /* coherence report */
 .coherence-block { margin-bottom: 32px; }

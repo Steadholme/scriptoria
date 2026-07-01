@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
-use echo::store::{Comment, PgStore, Store, Thread};
+use echo::store::{Comment, PgStore, Reaction, Sort, Store, Thread};
 use echo::{app, build_dev_state, now_secs, AppState};
 use tower::ServiceExt;
 
@@ -114,6 +114,24 @@ async fn pg_store_full_integration() {
     );
     assert!(pg.get_comment("cmt_pg_2").await.is_none(), "row is gone after self-delete");
     assert_eq!(pg.count_comments("thr_pg_1").await, 1, "only the root remains");
+
+    // --- reactions: idempotent toggle + counts + most-reacted page ---------
+    let react = |who: &str, kind: &str| Reaction {
+        comment_id: "cmt_pg_1".to_string(),
+        user_sub: who.to_string(),
+        kind: kind.to_string(),
+        created_at: now,
+    };
+    assert!(pg.toggle_reaction(&react("u_alice", "up")).await.expect("react"), "added");
+    assert!(pg.toggle_reaction(&react("u_bob", "up")).await.expect("react"), "added");
+    // A repeat by the same user+kind toggles OFF.
+    assert!(!pg.toggle_reaction(&react("u_alice", "up")).await.expect("untoggle"), "removed");
+    let rx = pg.reactions_for(&["cmt_pg_1".to_string()]).await;
+    assert_eq!(rx.len(), 1, "one reaction remains after alice toggled off");
+    assert_eq!(rx[0].user_sub, "u_bob");
+    // The paged top-level view surfaces the (reacted) root.
+    let (tops, _replies) = pg.list_thread_page("thr_pg_1", Sort::MostReacted, None, 10).await;
+    assert!(tops.iter().any(|c| c.id == "cmt_pg_1"), "root present in most-reacted page");
 
     // --- full HTTP flow through the PG-backed app --------------------------
     let mut state: AppState = build_dev_state();

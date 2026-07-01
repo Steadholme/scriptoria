@@ -27,6 +27,31 @@ pub struct Paste {
     /// someone OTHER than its author (the author can still open it to copy the share link).
     /// Defaults to false, so every pre-existing paste keeps its current "persists" behavior.
     pub burn_after_read: bool,
+    /// Id of the paste this was forked from; `None` for an original paste. Rendered as a "Forked
+    /// from …" credit on the view. Purely informational — the fork is an independent copy.
+    pub source_id: Option<String>,
+    /// Salted SHA-256 password hash (`sha256$salt$hex`); `None` = no password. When set, a viewer
+    /// who is NOT the author must supply the correct password before the body is revealed.
+    pub password_hash: Option<String>,
+}
+
+/// One historical version of a paste's editable content. Each owner edit snapshots the paste's
+/// PRE-edit content here (the `pastes` row always holds the CURRENT version), so `paste_revisions`
+/// is an append-only history. `revision` is a per-paste monotonic counter starting at 1.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PasteRevision {
+    /// The paste this revision belongs to (`pastes.id`).
+    pub paste_id: String,
+    /// Per-paste revision number (1, 2, 3, …); unique within `paste_id`.
+    pub revision: i64,
+    /// Snapshotted title at the time this version was superseded.
+    pub title: String,
+    /// Snapshotted body.
+    pub body: String,
+    /// Snapshotted language token.
+    pub language: String,
+    /// When this snapshot was archived (epoch seconds) — i.e. when the edit that superseded it ran.
+    pub created_at: i64,
 }
 
 impl Paste {
@@ -53,6 +78,8 @@ mod tests {
             created_at: 1000,
             expires_at,
             burn_after_read: false,
+            source_id: None,
+            password_hash: None,
         }
     }
 

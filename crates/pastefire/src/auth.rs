@@ -112,6 +112,40 @@ fn sign_identity(key: &str, subject: &str, groups: &str, window: i64) -> String 
     to_hex(&mac.finalize().into_bytes())
 }
 
+// ---------------------------------------------------------------------------
+// Optional paste password protection (salted SHA-256)
+// ---------------------------------------------------------------------------
+
+/// Hash a paste password with a fresh random salt, returning `sha256$<salt>$<hex>` for storage in
+/// the nullable `password_hash` column. The salt defends identical passwords across pastes from
+/// producing the same digest. (SHA-256 is not a slow KDF, but paste passwords are a lightweight
+/// share-gate on an internal tool, not an account credential.)
+pub fn hash_password(password: &str) -> String {
+    let salt = random_alnum(16);
+    format!("sha256${salt}${}", sha256_hex(&salt, password))
+}
+
+/// Constant-time verify a candidate `password` against a stored `sha256$<salt>$<hex>` value.
+/// Returns `false` for any malformed/unknown-scheme stored value.
+pub fn verify_password(password: &str, stored: &str) -> bool {
+    let mut parts = stored.splitn(3, '$');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("sha256"), Some(salt), Some(hex)) if !salt.is_empty() => {
+            ct_eq(sha256_hex(salt, password).as_bytes(), hex.as_bytes())
+        }
+        _ => false,
+    }
+}
+
+/// Hex SHA-256 of `salt` concatenated with `password`.
+fn sha256_hex(salt: &str, password: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(salt.as_bytes());
+    h.update(password.as_bytes());
+    to_hex(&h.finalize())
+}
+
 fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -232,5 +266,23 @@ mod tests {
         assert!(verify_csrf(&h, &token));
         assert!(!verify_csrf(&h, "not-the-token"));
         assert!(!verify_csrf(&HeaderMap::new(), &token));
+    }
+
+    #[test]
+    fn password_hash_roundtrip() {
+        let stored = hash_password("correct horse");
+        assert!(stored.starts_with("sha256$"));
+        assert!(verify_password("correct horse", &stored));
+        assert!(!verify_password("wrong", &stored));
+        // A fresh hash uses a fresh salt, so the same password hashes differently each time.
+        assert_ne!(hash_password("x"), hash_password("x"));
+    }
+
+    #[test]
+    fn verify_password_rejects_malformed() {
+        assert!(!verify_password("x", ""));
+        assert!(!verify_password("x", "plain"));
+        assert!(!verify_password("x", "md5$salt$deadbeef"));
+        assert!(!verify_password("x", "sha256$$deadbeef"));
     }
 }
