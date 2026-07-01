@@ -92,15 +92,42 @@ pub fn require_moderator(headers: &HeaderMap) -> Result<(), AppError> {
     }
 }
 
-/// Group names that authorize the `/admin` panel. Membership in ANY of these unlocks it.
+/// The two GLOBAL admin groups. Membership in either has ALWAYS unlocked the `/admin` panel, and
+/// ALWAYS will. Kept as the default seed for [`admin_groups`]. (Comment moderation is a separate
+/// gate, already delegable via the `moderators` group — see [`MODERATOR_GROUPS`].)
 pub const ADMIN_GROUPS: &[&str] = &["admins", "infra-admins"];
 
-/// Whether the authenticated user is in ANY [`ADMIN_GROUPS`] entry.
+/// Default product-scoped admin group folded in beside the globals — see [`admin_groups`].
+const DEFAULT_PRODUCT_ADMIN_GROUP: &str = "comments-admins";
+
+/// The effective admin group set: the two globals in [`ADMIN_GROUPS`] PLUS one product-scoped
+/// group. This makes Echo's `/admin` panel DELEGABLE — an operator placed in the product group
+/// (default `comments-admins`, overridable via `ECHO_ADMIN_GROUP`) reaches `/admin` WITHOUT
+/// holding the global `admins`/`infra-admins`. Resolved once at first use. Purely additive: the
+/// two globals are ALWAYS present, so nothing that authorized before loses access, and it changes
+/// no behavior until an operator assigns someone to the product group via Census.
+fn admin_groups() -> &'static [String] {
+    static GROUPS: OnceLock<Vec<String>> = OnceLock::new();
+    GROUPS
+        .get_or_init(|| {
+            let product = std::env::var("ECHO_ADMIN_GROUP")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| DEFAULT_PRODUCT_ADMIN_GROUP.to_string());
+            let mut groups: Vec<String> = ADMIN_GROUPS.iter().map(|g| (*g).to_string()).collect();
+            if !groups.iter().any(|g| g == &product) {
+                groups.push(product);
+            }
+            groups
+        })
+        .as_slice()
+}
+
+/// Whether the authenticated user is in ANY [`admin_groups`] entry (the two globals plus the
+/// product-scoped delegated group).
 pub fn is_admin(headers: &HeaderMap) -> bool {
-    let groups = author_groups(headers);
-    ADMIN_GROUPS
-        .iter()
-        .any(|m| groups.iter().any(|g| g == m))
+    admin_groups().iter().any(|a| has_group(headers, a))
 }
 
 /// Require admin group membership for the `/admin` subtree. `Forbidden` (403) when the
@@ -399,6 +426,21 @@ mod tests {
         infra.insert(HEADER_GROUPS, HeaderValue::from_static("infra-admins"));
         assert!(is_admin(&infra));
         assert!(require_admin(&infra).is_ok());
+
+        // Delegated admin: the product-scoped group (default "comments-admins") ALSO authorizes
+        // `/admin`, WITHOUT the caller holding a global admin group.
+        let mut delegated = HeaderMap::new();
+        delegated.insert(HEADER_GROUPS, HeaderValue::from_static("comments-admins"));
+        assert!(!has_group(&delegated, "admins"));
+        assert!(!has_group(&delegated, "infra-admins"));
+        assert!(is_admin(&delegated), "the product admin group authorizes the panel");
+        assert!(require_admin(&delegated).is_ok());
+
+        // a random, unrelated group is still rejected (403).
+        let mut rando = HeaderMap::new();
+        rando.insert(HEADER_GROUPS, HeaderValue::from_static("some-random-group"));
+        assert!(!is_admin(&rando));
+        assert!(require_admin(&rando).is_err());
     }
 
     #[test]

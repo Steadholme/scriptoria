@@ -19,9 +19,37 @@ pub const HEADER_SUBJECT: &str = "x-auth-subject";
 pub const HEADER_EMAIL: &str = "x-auth-email";
 pub const HEADER_GROUPS: &str = "x-auth-groups";
 
-/// Group names that authorize the /admin panel. Membership in ANY of these unlocks the
-/// all-posts management surface + site settings; everyone else gets a 403.
+/// The two GLOBAL admin groups. Membership in either has ALWAYS unlocked the /admin panel (the
+/// all-posts management surface + site settings), and ALWAYS will. Kept as the default seed for
+/// [`admin_groups`].
 pub const ADMIN_GROUPS: &[&str] = &["admins", "infra-admins"];
+
+/// Default product-scoped admin group folded in beside the globals — see [`admin_groups`].
+const DEFAULT_PRODUCT_ADMIN_GROUP: &str = "blog-admins";
+
+/// The effective admin group set: the two globals in [`ADMIN_GROUPS`] PLUS one product-scoped
+/// group. This makes Inkwell administration DELEGABLE — an operator placed in the product group
+/// (default `blog-admins`, overridable via `INKWELL_ADMIN_GROUP`) reaches /admin WITHOUT holding
+/// the global `admins`/`infra-admins`. Resolved once at first use. Purely additive: the two
+/// globals are ALWAYS present, so nothing that authorized before loses access, and it changes no
+/// behavior until an operator assigns someone to the product group via Census.
+fn admin_groups() -> &'static [String] {
+    static GROUPS: OnceLock<Vec<String>> = OnceLock::new();
+    GROUPS
+        .get_or_init(|| {
+            let product = std::env::var("INKWELL_ADMIN_GROUP")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| DEFAULT_PRODUCT_ADMIN_GROUP.to_string());
+            let mut groups: Vec<String> = ADMIN_GROUPS.iter().map(|g| (*g).to_string()).collect();
+            if !groups.iter().any(|g| g == &product) {
+                groups.push(product);
+            }
+            groups
+        })
+        .as_slice()
+}
 /// HMAC binding the injected identity to a 1-minute window (set by Sluice when GATEWAY_HMAC_KEY
 /// is configured). See [`gateway_identity_ok`].
 pub const HEADER_SIG: &str = "x-auth-sig";
@@ -77,12 +105,10 @@ pub fn has_group(headers: &HeaderMap, group: &str) -> bool {
     author_groups(headers).iter().any(|g| g == group)
 }
 
-/// Whether the authenticated user is in ANY [`ADMIN_GROUPS`] entry.
+/// Whether the authenticated user is in ANY [`admin_groups`] entry (the two globals plus the
+/// product-scoped delegated group).
 pub fn is_admin(headers: &HeaderMap) -> bool {
-    let groups = author_groups(headers);
-    ADMIN_GROUPS
-        .iter()
-        .any(|a| groups.iter().any(|g| g == a))
+    admin_groups().iter().any(|a| has_group(headers, a))
 }
 
 /// Require admin group membership for the /admin subtree. `Forbidden` (403) when the
@@ -337,6 +363,22 @@ mod tests {
         a2.insert(HEADER_GROUPS, "admins".parse().unwrap());
         assert!(is_admin(&a2));
         assert!(require_admin(&a2).is_ok());
+
+        // Delegated admin: the product-scoped group (default "blog-admins") ALSO authorizes the
+        // panel, WITHOUT the caller holding a global admin group — the scoped operator Census
+        // grants can run /admin but is not a global admin.
+        let mut delegated = HeaderMap::new();
+        delegated.insert(HEADER_GROUPS, "blog-admins".parse().unwrap());
+        assert!(!has_group(&delegated, "admins"));
+        assert!(!has_group(&delegated, "infra-admins"));
+        assert!(is_admin(&delegated), "the product admin group authorizes the panel");
+        assert!(require_admin(&delegated).is_ok());
+
+        // A random, unrelated group is still rejected (403).
+        let mut rando = HeaderMap::new();
+        rando.insert(HEADER_GROUPS, "some-random-group".parse().unwrap());
+        assert!(!is_admin(&rando));
+        assert!(require_admin(&rando).is_err());
     }
 
     #[test]

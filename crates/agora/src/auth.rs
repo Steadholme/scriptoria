@@ -70,8 +70,36 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
 // Groups + admin gating (same idiom as echo's has_group / is_moderator)
 // ---------------------------------------------------------------------------
 
-/// Group names that authorize the admin panel. Membership in ANY of these unlocks `/admin`.
+/// The two GLOBAL admin groups. Membership in either has ALWAYS unlocked `/admin`, and ALWAYS
+/// will. Kept as the default seed for [`admin_groups`].
 pub const ADMIN_GROUPS: &[&str] = &["admins", "infra-admins"];
+
+/// Default product-scoped admin group folded in beside the globals — see [`admin_groups`].
+const DEFAULT_PRODUCT_ADMIN_GROUP: &str = "forum-admins";
+
+/// The effective admin group set: the two globals in [`ADMIN_GROUPS`] PLUS one product-scoped
+/// group. This makes Agora administration DELEGABLE — an operator placed in the product group
+/// (default `forum-admins`, overridable via `AGORA_ADMIN_GROUP`) reaches `/admin` WITHOUT holding
+/// the global `admins`/`infra-admins`. Resolved once at first use. Purely additive: the two
+/// globals are ALWAYS present, so nothing that authorized before loses access, and it changes no
+/// behavior until an operator assigns someone to the product group via Census.
+fn admin_groups() -> &'static [String] {
+    static GROUPS: OnceLock<Vec<String>> = OnceLock::new();
+    GROUPS
+        .get_or_init(|| {
+            let product = std::env::var("AGORA_ADMIN_GROUP")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| DEFAULT_PRODUCT_ADMIN_GROUP.to_string());
+            let mut groups: Vec<String> = ADMIN_GROUPS.iter().map(|g| (*g).to_string()).collect();
+            if !groups.iter().any(|g| g == &product) {
+                groups.push(product);
+            }
+            groups
+        })
+        .as_slice()
+}
 
 /// The authenticated user's groups, parsed from the comma-separated `X-Auth-Groups` header
 /// (injected AND HMAC-verified by the gateway, so it is trustworthy). Empty when absent/blank.
@@ -92,12 +120,10 @@ pub fn has_group(headers: &HeaderMap, group: &str) -> bool {
     author_groups(headers).iter().any(|g| g == group)
 }
 
-/// Whether the authenticated user is in ANY [`ADMIN_GROUPS`] entry.
+/// Whether the authenticated user is in ANY [`admin_groups`] entry (the two globals plus the
+/// product-scoped delegated group).
 pub fn is_admin(headers: &HeaderMap) -> bool {
-    let groups = author_groups(headers);
-    ADMIN_GROUPS
-        .iter()
-        .any(|a| groups.iter().any(|g| g == a))
+    admin_groups().iter().any(|a| has_group(headers, a))
 }
 
 /// Require admin group membership for an `/admin` route. `Forbidden` (403) when the
@@ -329,6 +355,21 @@ mod tests {
         other.insert(HEADER_GROUPS, HeaderValue::from_static("readers,writers"));
         assert!(!is_admin(&other));
         assert!(require_admin(&other).is_err());
+
+        // Delegated admin: the product-scoped group (default "forum-admins") ALSO authorizes
+        // `/admin`, WITHOUT the caller holding a global admin group.
+        let mut delegated = HeaderMap::new();
+        delegated.insert(HEADER_GROUPS, HeaderValue::from_static("forum-admins"));
+        assert!(!has_group(&delegated, "admins"));
+        assert!(!has_group(&delegated, "infra-admins"));
+        assert!(is_admin(&delegated), "the product admin group authorizes the panel");
+        assert!(require_admin(&delegated).is_ok());
+
+        // a random, unrelated group is still rejected (403).
+        let mut rando = HeaderMap::new();
+        rando.insert(HEADER_GROUPS, HeaderValue::from_static("some-random-group"));
+        assert!(!is_admin(&rando));
+        assert!(require_admin(&rando).is_err());
     }
 
     #[test]
