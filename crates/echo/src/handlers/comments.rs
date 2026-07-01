@@ -6,7 +6,7 @@
 //! markdown, rendered to SANITIZED HTML. Replies nest exactly one level: a reply to a reply is
 //! re-parented onto the original top-level comment.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Form;
@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use crate::auth;
 use crate::audit::AuditEvent;
-use crate::config::{MAX_BODY_CHARS, RECENT_LIMIT};
+use crate::config::{clamp_page, MAX_BODY_CHARS, RECENT_LIMIT};
 use crate::error::AppError;
 use crate::handlers::{esc, fmt_datetime, topbar, APP_CSS};
 use crate::markdown;
@@ -58,17 +58,38 @@ pub struct ModerateForm {
     pub csrf_token: String,
 }
 
+/// `GET /?before=<created_at>_<id>&limit=<n>` — keyset-pagination cursor + page size for the
+/// dashboard thread list. Both are optional; a bare `GET /` returns the newest page.
+#[derive(Debug, Deserialize)]
+pub struct DashboardQuery {
+    #[serde(default)]
+    pub before: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
 // ---------------------------------------------------------------------------
 // Dashboard
 // ---------------------------------------------------------------------------
 
-/// `GET /` — the moderation dashboard: every thread with its comment count, plus a recent-activity
-/// feed with inline hide/unhide controls.
-pub async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Response {
+/// `GET /` — the moderation dashboard: one keyset page of threads (newest-first) with their comment
+/// counts, plus a recent-activity feed with inline hide/unhide controls. `?before=<created_at>_<id>`
+/// pages BACKWARD into older threads; `?limit=` overrides the page size (clamped). A bare `GET /`
+/// returns the newest page, so the default view is unchanged.
+pub async fn dashboard(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<DashboardQuery>,
+) -> Response {
     let email = auth::display_email(&headers);
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
 
-    let threads = state.store.list_threads().await;
+    let before = parse_before(q.before.as_deref());
+    // Clamp here too so the FULL-page check below compares against the exact size the store used
+    // (`clamp_page` is idempotent, so the store re-clamping is a no-op).
+    let limit = clamp_page(q.limit.unwrap_or(0));
+    let threads = state.store.list_threads(before, limit).await;
+
     // thread_id -> (key, title) so the activity feed can link a comment back to its thread.
     let mut by_id: HashMap<String, (String, String)> = HashMap::new();
 
@@ -91,6 +112,15 @@ pub async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
         rows = rows
     );
 
+    // A FULL page (len == limit) means there may be older threads: derive the next cursor from the
+    // last (oldest) row on this page. A short/empty page ends the walk (no link).
+    let next_cursor = if threads.len() as i64 == limit {
+        threads.last().map(|t| (t.created_at, t.id.clone()))
+    } else {
+        None
+    };
+    let threads_more = render_load_older(next_cursor.as_ref());
+
     let recent = state.store.recent_comments(RECENT_LIMIT).await;
     let mut feed = String::new();
     for c in &recent {
@@ -104,8 +134,36 @@ pub async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
         .replace("{{CSS}}", APP_CSS)
         .replace("{{TOPBAR}}", &topbar("Dashboard", &email))
         .replace("{{THREADS}}", &threads_table)
+        .replace("{{THREADS_MORE}}", &threads_more)
         .replace("{{RECENT}}", &feed);
     html_with_cookie(body, set_cookie)
+}
+
+/// Parse a `?before=<created_at>_<id>` keyset cursor. `created_at` is a plain integer that never
+/// contains `_`, so we split on the FIRST `_`; the id (`thr_<nanos>_<hex>`) keeps its own
+/// underscores intact. Returns `None` for a missing/blank/malformed cursor (which falls back to
+/// the newest page — the default view).
+fn parse_before(before: Option<&str>) -> Option<(i64, String)> {
+    let (ts, id) = before?.trim().split_once('_')?;
+    let ts: i64 = ts.parse().ok()?;
+    if id.is_empty() {
+        return None;
+    }
+    Some((ts, id.to_string()))
+}
+
+/// The "Load older" link for the dashboard thread list, rendered ONLY when a next cursor exists
+/// (i.e. a full page came back). Links to `?before=<created_at>_<id>` so the next request pages
+/// one step older.
+fn render_load_older(next: Option<&(i64, String)>) -> String {
+    match next {
+        Some((ts, id)) => format!(
+            r#"<nav class="pagination"><a class="btn btn-secondary btn-sm" href="?before={ts}_{id}">Load older</a></nav>"#,
+            ts = ts,
+            id = esc(id),
+        ),
+        None => String::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -84,9 +84,27 @@ async fn pg_store_full_integration() {
     // --- owner-scoped gallery list, newest-first ---------------------------
     store.create(&file("cccccccccc", "alice", "tok-cccc", now + 20)).await.unwrap();
     store.create(&file("dddddddddd", "bob", "tok-dddd", now + 30)).await.unwrap();
-    let mine = store.list_by_owner("alice").await.unwrap();
+    let mine = store.list_by_owner("alice", None, 50).await.unwrap();
     let ids: Vec<&str> = mine.iter().map(|f| f.id.as_str()).collect();
     assert_eq!(ids, vec!["cccccccccc", "aaaaaaaaaa"], "other owner excluded, newest first");
+
+    // --- keyset backward pagination over the portable SQL path -------------
+    let page1 = store.list_by_owner("alice", None, 1).await.unwrap();
+    assert_eq!(
+        page1.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+        vec!["cccccccccc"],
+        "first page = newest only"
+    );
+    let cur = page1.last().unwrap();
+    let page2 = store
+        .list_by_owner("alice", Some((cur.created_at, cur.id.clone())), 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        page2.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+        vec!["aaaaaaaaaa"],
+        "before-cursor pages into the older row"
+    );
 
     // --- ownership-scoped delete -------------------------------------------
     assert!(!store.delete("aaaaaaaaaa", "bob").await.unwrap(), "bob cannot delete alice's");

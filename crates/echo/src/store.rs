@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::config::{COMMENT_LIMIT, LIST_LIMIT};
+use crate::config::{clamp_page, COMMENT_LIMIT};
 
 /// A comment thread (maps 1:1 to a `threads` row). A thread is keyed by an opaque `key` (the
 /// embedding page's stable identifier, e.g. `blog/hello-world`).
@@ -53,8 +53,10 @@ pub enum StoreError {
 /// Pluggable comment store.
 #[async_trait]
 pub trait Store: Send + Sync {
-    /// All threads, newest-first (`created_at` DESC), capped at [`LIST_LIMIT`].
-    async fn list_threads(&self) -> Vec<Thread>;
+    /// One keyset page of threads, newest-first (`created_at` DESC, `id` DESC). `before` is the
+    /// `(created_at, id)` of the last row of the previous page (the exclusive upper bound);
+    /// `None` returns the newest page. `limit` is clamped to `[1, MAX_PAGE]` (see [`clamp_page`]).
+    async fn list_threads(&self, before: Option<(i64, String)>, limit: i64) -> Vec<Thread>;
     /// One thread by its unique key.
     async fn get_thread(&self, key: &str) -> Option<Thread>;
     /// Upsert a thread by key: insert `thread` when its key is free, otherwise leave the existing
@@ -96,11 +98,23 @@ impl InMemoryStore {
 impl Store for InMemoryStore {
     // The std `Mutex` is fine throughout: each critical section is fully synchronous (no `.await`
     // inside), so a guard is never held across a yield point.
-    async fn list_threads(&self) -> Vec<Thread> {
+    async fn list_threads(&self, before: Option<(i64, String)>, limit: i64) -> Vec<Thread> {
+        let limit = clamp_page(limit) as usize;
         let threads = self.threads.lock().expect("threads lock poisoned");
-        let mut v: Vec<Thread> = threads.clone();
+        // Same keyset predicate as the SQL path: strictly "older than" the cursor under the
+        // (created_at DESC, id DESC) ordering, i.e. created_at < ts OR (created_at == ts AND id < id).
+        let mut v: Vec<Thread> = threads
+            .iter()
+            .filter(|t| match &before {
+                Some((ts, id)) => {
+                    t.created_at < *ts || (t.created_at == *ts && t.id.as_str() < id.as_str())
+                }
+                None => true,
+            })
+            .cloned()
+            .collect();
         v.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
-        v.truncate(LIST_LIMIT);
+        v.truncate(limit);
         v
     }
 
@@ -272,14 +286,38 @@ impl PgStore {
         })
     }
 
-    async fn list_threads_async(&self) -> Result<Vec<Thread>, sqlx::Error> {
-        let rows = sqlx::query(
-            "SELECT id, key, title, url, created_at \
-             FROM threads ORDER BY created_at DESC, id DESC LIMIT $1",
-        )
-        .bind(LIST_LIMIT as i64)
-        .fetch_all(&self.pool)
-        .await?;
+    async fn list_threads_async(
+        &self,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<Thread>, sqlx::Error> {
+        let limit = clamp_page(limit);
+        // Portable keyset page: the table is already ORDER BY (created_at DESC, id DESC), so the
+        // cursor is simply "strictly before" that composite key. No cursor -> the newest page.
+        let rows = match before {
+            None => {
+                sqlx::query(
+                    "SELECT id, key, title, url, created_at \
+                     FROM threads ORDER BY created_at DESC, id DESC LIMIT $1",
+                )
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            Some((ts, id)) => {
+                sqlx::query(
+                    "SELECT id, key, title, url, created_at \
+                     FROM threads \
+                     WHERE (created_at < $1 OR (created_at = $1 AND id < $2)) \
+                     ORDER BY created_at DESC, id DESC LIMIT $3",
+                )
+                .bind(ts)
+                .bind(id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
         rows.iter().map(Self::thread_from_row).collect()
     }
 
@@ -391,8 +429,8 @@ impl PgStore {
 
 #[async_trait]
 impl Store for PgStore {
-    async fn list_threads(&self) -> Vec<Thread> {
-        self.list_threads_async().await.unwrap_or_else(|e| {
+    async fn list_threads(&self, before: Option<(i64, String)>, limit: i64) -> Vec<Thread> {
+        self.list_threads_async(before, limit).await.unwrap_or_else(|e| {
             tracing::error!(error = %e, "pg list_threads failed");
             Vec::new()
         })
@@ -449,5 +487,76 @@ impl Store for PgStore {
             tracing::error!(error = %e, "pg recent_comments failed");
             Vec::new()
         })
+    }
+}
+
+// --------------------------------------------------------------------------------------
+// Tests (in-memory keyset pagination — database-free).
+// --------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{DEFAULT_PAGE, MAX_PAGE};
+
+    fn thread(id: &str, created_at: i64) -> Thread {
+        Thread {
+            id: id.to_string(),
+            key: format!("k/{id}"),
+            title: String::new(),
+            url: String::new(),
+            created_at,
+        }
+    }
+
+    fn ids(v: &[Thread]) -> Vec<&str> {
+        v.iter().map(|t| t.id.as_str()).collect()
+    }
+
+    // A full page walk over distinct timestamps: newest-first, cursor threads through every row.
+    #[tokio::test]
+    async fn list_threads_keyset_walks_all_pages() {
+        let store = InMemoryStore::new();
+        for (id, ts) in [("t1", 10), ("t2", 20), ("t3", 30), ("t4", 40), ("t5", 50)] {
+            store.upsert_thread(&thread(id, ts)).await.unwrap();
+        }
+
+        // no cursor -> newest page.
+        let page1 = store.list_threads(None, 2).await;
+        assert_eq!(ids(&page1), ["t5", "t4"]);
+
+        // cursor from the last row of page1 -> the next-older page.
+        let last = page1.last().unwrap().clone();
+        let page2 = store.list_threads(Some((last.created_at, last.id)), 2).await;
+        assert_eq!(ids(&page2), ["t3", "t2"]);
+
+        // final (partial) page.
+        let last = page2.last().unwrap().clone();
+        let page3 = store.list_threads(Some((last.created_at, last.id)), 2).await;
+        assert_eq!(ids(&page3), ["t1"]);
+    }
+
+    // Ties on created_at break by id DESC, and the cursor must not skip or repeat the tie group.
+    #[tokio::test]
+    async fn list_threads_keyset_breaks_ties_by_id() {
+        let store = InMemoryStore::new();
+        for id in ["a", "b", "c"] {
+            store.upsert_thread(&thread(id, 100)).await.unwrap();
+        }
+        // id DESC within the equal timestamp: c, b, a.
+        let page1 = store.list_threads(None, 2).await;
+        assert_eq!(ids(&page1), ["c", "b"]);
+        let last = page1.last().unwrap().clone();
+        let page2 = store.list_threads(Some((last.created_at, last.id)), 2).await;
+        assert_eq!(ids(&page2), ["a"]);
+    }
+
+    // A non-positive limit defaults; an oversized one is capped.
+    #[test]
+    fn clamp_page_defaults_and_caps() {
+        assert_eq!(clamp_page(0), DEFAULT_PAGE);
+        assert_eq!(clamp_page(-5), DEFAULT_PAGE);
+        assert_eq!(clamp_page(10), 10);
+        assert_eq!(clamp_page(10_000), MAX_PAGE);
     }
 }

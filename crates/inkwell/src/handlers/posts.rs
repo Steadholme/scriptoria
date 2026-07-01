@@ -6,7 +6,7 @@
 //! (never a client field), and every state-changing POST is double-submit CSRF protected.
 //! A post may be edited or deleted only by its own author.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Form;
@@ -45,15 +45,42 @@ pub struct DeleteForm {
     pub csrf_token: String,
 }
 
+/// Index query string: the keyset cursor `?before=<created_at>_<id>` and an optional `?limit=`.
+/// Both are absent on the default (newest-page) view, so an old bookmark keeps working.
+#[derive(Debug, Deserialize)]
+pub struct IndexQuery {
+    #[serde(default)]
+    pub before: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
 // ---------------------------------------------------------------------------
 // Reading views
 // ---------------------------------------------------------------------------
 
-/// `GET /` — the index: posts newest-first (title + excerpt + date + author).
-pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Response {
+/// `GET /` — the index: one keyset page of posts, newest-first (title + excerpt + date + author),
+/// with a "Load older" link when a full page came back. `?before=<created_at>_<id>` pages backward
+/// and `?limit=` sizes the page (clamped); both absent yields the default newest page.
+pub async fn index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<IndexQuery>,
+) -> Response {
     let viewer = auth::author_sub(&headers);
     let email = auth::display_email(&headers);
-    let posts = state.store.list_posts().await;
+
+    let before = q.before.as_deref().and_then(parse_before);
+    let limit = crate::config::clamp_page(q.limit);
+    let posts = state.store.list_posts(before, limit).await;
+
+    // A FULL page means more history may exist: the next cursor is the LAST (oldest) row of THIS
+    // store page — derived before visibility filtering so drafts never desync the keyset position.
+    let next_cursor = if posts.len() as i64 == limit {
+        posts.last().map(|p| format!("{}_{}", p.created_at, p.id))
+    } else {
+        None
+    };
 
     let mut cards = String::new();
     let mut shown = 0usize;
@@ -64,17 +91,39 @@ pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Respons
         shown += 1;
         cards.push_str(&render_card(p, viewer.as_deref()));
     }
-    if shown == 0 {
+    if shown == 0 && next_cursor.is_none() {
         cards.push_str(
             r#"<div class="empty-state"><h2>No posts yet</h2><p>Start writing — your first post will appear here.</p><a class="btn btn-primary" href="/new">Write the first post</a></div>"#,
         );
     }
 
+    let pager = match &next_cursor {
+        Some(cursor) => format!(
+            r#"<nav class="post-list__pager"><a class="btn btn-secondary" href="/?before={cursor}">Load older</a></nav>"#,
+            cursor = esc(cursor),
+        ),
+        None => String::new(),
+    };
+
     let body = LIST_HTML
         .replace("{{CSS}}", APP_CSS)
         .replace("{{TOPBAR}}", &topbar("Inkwell", &email))
-        .replace("{{POSTS}}", &cards);
+        .replace("{{POSTS}}", &cards)
+        .replace("{{PAGER}}", &pager);
     Html(body).into_response()
+}
+
+/// Parse a `?before=<created_at>_<id>` keyset cursor into `(created_at, id)`. `created_at` is a
+/// plain integer (no `_`) and inkwell post ids are `post_<nanos>` (they DO contain `_`), so the
+/// split is on the FIRST `_`: everything after it is the id, round-tripping the cursor exactly.
+/// Returns `None` for anything malformed (treated as "no cursor" — the newest page).
+fn parse_before(raw: &str) -> Option<(i64, String)> {
+    let (ts, id) = raw.split_once('_')?;
+    let ts: i64 = ts.parse().ok()?;
+    if id.is_empty() {
+        return None;
+    }
+    Some((ts, id.to_string()))
 }
 
 /// `GET /p/{slug}` — a full post, body markdown rendered to sanitized HTML. Unpublished drafts
@@ -124,7 +173,9 @@ pub async fn view(
     let body_html = markdown::render_html(&post.body_md);
 
     // Related posts: top-3 OTHER published posts by keyword-overlap to this one (additive block).
-    let related = render_related(&post, &state.store.list_posts().await);
+    // Rank over the newest bounded page (same cap the index used before pagination).
+    let related =
+        render_related(&post, &state.store.list_posts(None, crate::config::MAX_PAGE).await);
 
     let page = POST_HTML
         .replace("{{CSS}}", APP_CSS)

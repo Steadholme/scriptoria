@@ -15,6 +15,23 @@ pub const DEFAULT_MAX_UPLOAD: usize = 25 * 1024 * 1024;
 /// Default public base URL used to render copyable share links (`{base}/s/{token}`).
 pub const DEFAULT_PUBLIC_BASE: &str = "https://drive.w33d.xyz";
 
+/// Default number of gallery file cards returned per page (the newest page + each "Load older").
+pub const DEFAULT_PAGE: i64 = 50;
+/// Hard ceiling on the gallery page size, regardless of any client-supplied `limit`.
+pub const MAX_PAGE: i64 = 200;
+
+/// Clamp a requested page size to `[1, MAX_PAGE]`, falling back to [`DEFAULT_PAGE`] when the caller
+/// asks for a non-positive value (unset / `0` / negative). Idempotent: clamping an already-clamped
+/// value is a no-op, so the handler and store agree on the exact page size (the `len == limit`
+/// "is there another page?" check stays valid).
+pub fn clamp_page(limit: i64) -> i64 {
+    if limit <= 0 {
+        DEFAULT_PAGE
+    } else {
+        limit.min(MAX_PAGE)
+    }
+}
+
 /// Default S3 region handed to the client. Cairn (MinIO-compatible) ignores it, but the signer
 /// requires a value.
 pub const DEFAULT_S3_REGION: &str = "us-east-1";

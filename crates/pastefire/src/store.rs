@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::config::RECENT_LIMIT;
+use crate::config::MAX_PAGE;
 use crate::model::Paste;
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
@@ -38,9 +38,17 @@ pub trait Store: Send + Sync {
     /// paste, so `/p` and `/raw` share one expiry definition).
     async fn get(&self, id: &str) -> Result<Option<Paste>, StoreError>;
 
-    /// An author's own non-expired pastes, newest-first, capped at [`RECENT_LIMIT`]. `now` is
+    /// An author's own non-expired pastes, newest-first (`created_at DESC, id DESC`), one keyset
+    /// page. `before` is the exclusive cursor `(created_at, id)` of the last row already seen
+    /// (`None` = newest page); `limit` is the page size (clamped to `[1, MAX_PAGE]`). `now` is
     /// epoch seconds; expired rows are excluded at the source so both stores agree.
-    async fn list_by_author(&self, author_sub: &str, now: i64) -> Result<Vec<Paste>, StoreError>;
+    async fn list_by_author(
+        &self,
+        author_sub: &str,
+        now: i64,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<Paste>, StoreError>;
 
     /// Delete a paste only if it belongs to `author_sub`. Returns `true` when a row was
     /// removed (existed AND owned), `false` otherwise.
@@ -91,11 +99,26 @@ impl Store for InMemoryStore {
         Ok(pastes.iter().find(|p| p.id == id).cloned())
     }
 
-    async fn list_by_author(&self, author_sub: &str, now: i64) -> Result<Vec<Paste>, StoreError> {
+    async fn list_by_author(
+        &self,
+        author_sub: &str,
+        now: i64,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<Paste>, StoreError> {
+        let limit = limit.clamp(1, MAX_PAGE);
         let pastes = self.pastes.lock().expect("pastes lock poisoned");
         let mut out: Vec<Paste> = pastes
             .iter()
             .filter(|p| p.author_sub == author_sub && !p.is_expired(now))
+            // Keyset "before" cursor: keep rows strictly older than the cursor under the
+            // (created_at DESC, id DESC) ordering — same predicate as the SQL path.
+            .filter(|p| match &before {
+                Some((b_ts, b_id)) => {
+                    p.created_at < *b_ts || (p.created_at == *b_ts && p.id.as_str() < b_id.as_str())
+                }
+                None => true,
+            })
             .cloned()
             .collect();
         // Newest first; id as a deterministic tiebreak when created_at collides (same second).
@@ -104,7 +127,7 @@ impl Store for InMemoryStore {
                 .cmp(&a.created_at)
                 .then_with(|| b.id.cmp(&a.id))
         });
-        out.truncate(RECENT_LIMIT);
+        out.truncate(limit as usize);
         Ok(out)
     }
 
@@ -260,17 +283,41 @@ impl PgStore {
         &self,
         author_sub: &str,
         now: i64,
+        before: Option<(i64, String)>,
+        limit: i64,
     ) -> Result<Vec<Paste>, sqlx::Error> {
-        let rows = sqlx::query(&format!(
-            "SELECT {COLS} FROM pastes \
-             WHERE author_sub = $1 AND (expires_at IS NULL OR expires_at > $2) \
-             ORDER BY created_at DESC LIMIT $3"
-        ))
-        .bind(author_sub)
-        .bind(now)
-        .bind(RECENT_LIMIT as i64)
-        .fetch_all(&self.pool)
-        .await?;
+        let limit = limit.clamp(1, MAX_PAGE);
+        // The keyset is exactly the ORDER BY: `(created_at DESC, id DESC)`. With a `before`
+        // cursor we keep only rows strictly older than it under that ordering.
+        let rows = match before {
+            None => {
+                sqlx::query(&format!(
+                    "SELECT {COLS} FROM pastes \
+                     WHERE author_sub = $1 AND (expires_at IS NULL OR expires_at > $2) \
+                     ORDER BY created_at DESC, id DESC LIMIT $3"
+                ))
+                .bind(author_sub)
+                .bind(now)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            Some((b_ts, b_id)) => {
+                sqlx::query(&format!(
+                    "SELECT {COLS} FROM pastes \
+                     WHERE author_sub = $1 AND (expires_at IS NULL OR expires_at > $2) \
+                       AND (created_at < $3 OR (created_at = $3 AND id < $4)) \
+                     ORDER BY created_at DESC, id DESC LIMIT $5"
+                ))
+                .bind(author_sub)
+                .bind(now)
+                .bind(b_ts)
+                .bind(b_id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
         rows.iter().map(Self::paste_from_row).collect()
     }
 
@@ -318,8 +365,14 @@ impl Store for PgStore {
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
-    async fn list_by_author(&self, author_sub: &str, now: i64) -> Result<Vec<Paste>, StoreError> {
-        self.list_by_author_async(author_sub, now)
+    async fn list_by_author(
+        &self,
+        author_sub: &str,
+        now: i64,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<Paste>, StoreError> {
+        self.list_by_author_async(author_sub, now, before, limit)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
@@ -381,9 +434,57 @@ mod tests {
         s.create(&paste("b", "u", 20, Some(100))).await.unwrap(); // expired at now=200
         s.create(&paste("c", "u", 30, Some(999))).await.unwrap();
         s.create(&paste("d", "other", 40, None)).await.unwrap();
-        let recent = s.list_by_author("u", 200).await.unwrap();
+        let recent = s.list_by_author("u", 200, None, 50).await.unwrap();
         let ids: Vec<&str> = recent.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, vec!["c", "a"]); // newest-first, expired + other author excluded
+    }
+
+    #[tokio::test]
+    async fn list_by_author_paginates_backward_with_cursor() {
+        let s = InMemoryStore::new();
+        // All share one created_at so the (created_at DESC, id DESC) keyset falls to the id
+        // tiebreak — the case a created_at-only cursor would get wrong.
+        for id in ["a", "b", "c", "d", "e"] {
+            s.create(&paste(id, "u", 100, None)).await.unwrap();
+        }
+
+        // Newest page of 2: e, d.
+        let p1 = s.list_by_author("u", 200, None, 2).await.unwrap();
+        let ids1: Vec<&str> = p1.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids1, vec!["e", "d"]);
+
+        // Older page, keyed off the last row of page 1: c, b.
+        let last = p1.last().unwrap();
+        let p2 = s
+            .list_by_author("u", 200, Some((last.created_at, last.id.clone())), 2)
+            .await
+            .unwrap();
+        let ids2: Vec<&str> = p2.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids2, vec!["c", "b"]);
+
+        // Final page is short (the end): just a, no overlap, no rows dropped.
+        let last2 = p2.last().unwrap();
+        let p3 = s
+            .list_by_author("u", 200, Some((last2.created_at, last2.id.clone())), 2)
+            .await
+            .unwrap();
+        let ids3: Vec<&str> = p3.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids3, vec!["a"]);
+    }
+
+    #[tokio::test]
+    async fn list_by_author_clamps_page_size() {
+        let s = InMemoryStore::new();
+        for id in ["a", "b", "c"] {
+            s.create(&paste(id, "u", 100, None)).await.unwrap();
+        }
+        // A non-positive limit is clamped up to at least 1 (never an empty/negative take).
+        assert_eq!(s.list_by_author("u", 200, None, 0).await.unwrap().len(), 1);
+        // An oversized limit is clamped down to MAX_PAGE (here just returns all 3).
+        assert_eq!(
+            s.list_by_author("u", 200, None, MAX_PAGE + 1000).await.unwrap().len(),
+            3
+        );
     }
 
     #[tokio::test]

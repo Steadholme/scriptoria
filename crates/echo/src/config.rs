@@ -6,8 +6,12 @@
 
 /// Default listen address (all interfaces, internal-only port 9120).
 pub const DEFAULT_BIND_ADDR: &str = "0.0.0.0:9120";
-/// Hard cap on how many threads the dashboard renders (keeps an unbounded list bounded).
-pub const LIST_LIMIT: usize = 200;
+/// Default page size for the dashboard's keyset-paginated thread list (a request with no explicit
+/// `?limit=` renders this many threads, newest-first).
+pub const DEFAULT_PAGE: i64 = 50;
+/// Hard ceiling on a thread-list page, regardless of what a client asks for (keeps an unbounded
+/// list bounded).
+pub const MAX_PAGE: i64 = 200;
 /// Hard cap on how many comments a single thread view renders.
 pub const COMMENT_LIMIT: usize = 500;
 /// How many comments the dashboard's "recent activity" feed shows.
@@ -43,6 +47,17 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self::dev()
+    }
+}
+
+/// Clamp a requested page size into `[1, MAX_PAGE]`, defaulting a non-positive request to
+/// [`DEFAULT_PAGE`]. Idempotent (`clamp_page(clamp_page(n)) == clamp_page(n)`), so the handler and
+/// store can both apply it and still agree on the effective page size.
+pub fn clamp_page(limit: i64) -> i64 {
+    if limit <= 0 {
+        DEFAULT_PAGE
+    } else {
+        limit.min(MAX_PAGE)
     }
 }
 

@@ -19,6 +19,7 @@ use serde::Deserialize;
 
 use crate::audit::AuditEvent;
 use crate::auth;
+use crate::config::{clamp_page_limit, DEFAULT_PAGE, MAX_PAGE};
 use crate::error::AppError;
 use crate::graph::{self, PagePanel};
 use crate::markdown;
@@ -32,6 +33,17 @@ use crate::{now_ms, AppState};
 pub struct NewQuery {
     #[serde(default)]
     pub title: String,
+}
+
+/// Query for `GET /` — keyset pagination over the page index. `before=<created_at>_<slug>` is the
+/// cursor taken from the previous page's last row (absent = the newest page); `limit` overrides
+/// the page size and is clamped into `1..=MAX_PAGE`.
+#[derive(Debug, Deserialize)]
+pub struct IndexQuery {
+    #[serde(default)]
+    pub before: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
 }
 
 /// The edit form body (`POST /edit/{slug}`). The editor/author is NEVER taken from here.
@@ -49,13 +61,39 @@ pub struct EditForm {
 // GET /  — the page index
 // ---------------------------------------------------------------------------
 
-pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Result<Html<String>, AppError> {
-    let pages = state.store.list_pages().await?;
-    let content = render_index(&pages);
+pub async fn index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<IndexQuery>,
+) -> Result<Html<String>, AppError> {
+    let before = q.before.as_deref().and_then(parse_before);
+    let limit = clamp_page_limit(q.limit.unwrap_or(DEFAULT_PAGE));
+    let pages = state.store.list_pages(before, limit).await?;
+    // A full page means older pages may exist: derive the next cursor from the last row. A short
+    // (or empty) page is the end of the walk, so no "Load older" link is rendered.
+    let next = if pages.len() as i64 == limit {
+        pages.last().map(|p| (p.created_at, p.slug.clone()))
+    } else {
+        None
+    };
+    let content = render_index(&pages, next.as_ref());
     Ok(Html(layout("Knowledge base", &headers, &content)))
 }
 
-fn render_index(pages: &[Page]) -> String {
+/// Parse a `?before=<created_at>_<slug>` cursor. Slugs are alnum + hyphen only (never `_`, per
+/// [`slugify`]), so the single `_` cleanly separates the numeric `created_at` from the slug;
+/// a malformed value is ignored and the request falls back to the newest page.
+fn parse_before(raw: &str) -> Option<(i64, String)> {
+    let (ts, id) = raw.rsplit_once('_')?;
+    let ts = ts.parse::<i64>().ok()?;
+    if id.is_empty() {
+        None
+    } else {
+        Some((ts, id.to_string()))
+    }
+}
+
+fn render_index(pages: &[Page], next: Option<&(i64, String)>) -> String {
     let count = pages.len();
     let head = format!(
         "<div class=\"page-head\">\
@@ -95,8 +133,19 @@ fn render_index(pages: &[Page]) -> String {
         format!("<ul class=\"page-list\">{items}</ul>")
     };
 
+    // "Load older" only when a full page came back (a next cursor exists). The slug is alnum +
+    // hyphen (URL-safe) but still escaped for the attribute; created_at is a plain integer.
+    let older = match next {
+        Some((ts, slug)) => format!(
+            "<nav class=\"pager\"><a class=\"btn btn-secondary\" rel=\"next\" href=\"/?before={ts}_{slug}\">Load older</a></nav>",
+            ts = ts,
+            slug = esc(slug),
+        ),
+        None => String::new(),
+    };
+
     format!(
-        "{head}<section class=\"card\">{list}</section>\
+        "{head}<section class=\"card\">{list}</section>{older}\
          <p class=\"site-foot\">HOLDFAST Lattice · server-rendered wiki · Markdown with <code>[[wiki-links]]</code> · <a href=\"/coherence\">Coherence report</a></p>"
     )
 }
@@ -135,7 +184,7 @@ pub async fn view(
             let existing: HashSet<String> = state.store.all_slugs().await?.into_iter().collect();
             let body_html = markdown::render(&page.body_md, &existing);
             // Backlink graph + keyword-related neighbours, computed locally from the page set.
-            let panel = graph::Corpus::build(state.store.list_pages().await?).panel(&slug);
+            let panel = graph::Corpus::build(state.store.list_pages(None, MAX_PAGE).await?).panel(&slug);
             let content = render_view(&page, &body_html, &panel);
             Ok(Html(layout(&page.title, &headers, &content)).into_response())
         }

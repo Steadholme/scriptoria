@@ -77,9 +77,18 @@ async fn pg_store_full_integration() {
     };
     pg.create_post(&post2).await.expect("create 2");
 
-    let listed = pg.list_posts().await;
+    let listed = pg.list_posts(None, inkwell::config::MAX_PAGE).await;
     assert!(listed.len() >= 2);
     assert_eq!(listed[0].slug, "pg-second", "newest first");
+
+    // Keyset "before" cursor pages strictly OLDER than the newest row (created_at DESC, id DESC).
+    let cursor = (listed[0].created_at, listed[0].id.clone());
+    let older = pg.list_posts(Some(cursor), inkwell::config::MAX_PAGE).await;
+    assert!(
+        older.iter().all(|p| p.slug != "pg-second"),
+        "newest row excluded by the before cursor"
+    );
+    assert!(older.iter().any(|p| p.slug == "pg-hello"), "older row still reachable");
 
     // Fetch + update (slug stays stable) + verify.
     let fetched = pg.get_post("pg-hello").await.expect("fetch");

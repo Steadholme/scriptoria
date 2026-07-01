@@ -15,7 +15,7 @@
 //!    bodies are dissimilar (potential drift/disagreement). This is a HEURISTIC FLAG for a human
 //!    to review, never a claim that the pages actually contradict.
 //!
-//! Like the index, analysis is bounded by the page set the store returns (`PAGE_LIST_LIMIT`).
+//! Like the index, analysis is bounded by the page set the store returns (`MAX_PAGE`).
 
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};

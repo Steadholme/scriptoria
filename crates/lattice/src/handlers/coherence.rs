@@ -14,6 +14,7 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::Html;
 
+use crate::config::MAX_PAGE;
 use crate::error::AppError;
 use crate::graph::{Contradiction, Corpus, StalePage};
 use crate::render::{esc, fmt_ts, layout};
@@ -23,7 +24,7 @@ pub async fn coherence(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Html<String>, AppError> {
-    let pages = state.store.list_pages().await?;
+    let pages = state.store.list_pages(None, MAX_PAGE).await?;
     let total = pages.len();
     let corpus = Corpus::build(pages);
     let stale = corpus.stale(now_ms(), state.config.stale_days);

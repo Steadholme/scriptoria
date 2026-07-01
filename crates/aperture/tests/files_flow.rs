@@ -317,6 +317,66 @@ async fn empty_upload_is_rejected() {
     assert!(res.text().contains("Choose a file"));
 }
 
+/// Collect the distinct file ids referenced by `href="/f/{id}"` gallery-card anchors.
+fn card_ids(html: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    for part in html.split("href=\"/f/").skip(1) {
+        let id: String = part.chars().take_while(|&c| c != '"' && c != '/').collect();
+        if !id.is_empty() && !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+/// Extract the `?before=<cursor>` value from the "Load older" pager link, if present.
+fn extract_before(html: &str) -> Option<String> {
+    let idx = html.find("?before=")?;
+    let rest = &html[idx + "?before=".len()..];
+    let val: String = rest.chars().take_while(|&c| c != '"').collect();
+    (!val.is_empty()).then_some(val)
+}
+
+#[tokio::test]
+async fn gallery_paginates_backward_with_before_cursor() {
+    let app = app(build_dev_state());
+    let home = send(&app, get("/", Some("alice"))).await;
+    let csrf = home.csrf_cookie().unwrap();
+
+    // Three files for alice.
+    for n in ["one.png", "two.png", "three.png"] {
+        let up = send(&app, upload_req(&csrf, &csrf, "alice", n, "image/png", &png_bytes())).await;
+        assert_eq!(up.status, StatusCode::FOUND, "{}", up.text());
+    }
+
+    // First page, capped to 2 -> two cards + a "Load older" link.
+    let p1 = send(&app, get("/?limit=2", Some("alice"))).await;
+    assert_eq!(p1.status, StatusCode::OK);
+    let p1_ids = card_ids(&p1.text());
+    assert_eq!(p1_ids.len(), 2, "a full page shows exactly the page size");
+    let before = extract_before(&p1.text()).expect("Load older link on a full page");
+
+    // Follow the cursor -> the remaining file, and NO further pager (partial page).
+    let p2 = send(&app, get(&format!("/?limit=2&before={before}"), Some("alice"))).await;
+    assert_eq!(p2.status, StatusCode::OK);
+    let p2_ids = card_ids(&p2.text());
+    assert_eq!(p2_ids.len(), 1, "the second page holds the remainder");
+    assert!(extract_before(&p2.text()).is_none(), "no pager on a non-full page");
+
+    // The two pages are disjoint and together cover all three distinct files.
+    let mut all = p1_ids;
+    all.extend(p2_ids);
+    all.sort();
+    all.dedup();
+    assert_eq!(all.len(), 3, "pages are disjoint and cover every file");
+
+    // Backward compatible: the default view (no ?before, no ?limit) still returns the newest page.
+    let def = send(&app, get("/", Some("alice"))).await;
+    assert_eq!(def.status, StatusCode::OK);
+    assert_eq!(card_ids(&def.text()).len(), 3, "default page shows all files under the cap");
+    assert!(extract_before(&def.text()).is_none(), "no pager when everything fits");
+}
+
 #[tokio::test]
 async fn filename_xss_is_escaped_on_render() {
     let state = build_dev_state();

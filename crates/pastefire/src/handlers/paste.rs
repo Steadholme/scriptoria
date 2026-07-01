@@ -7,7 +7,7 @@
 //! HTML-escaped on render, and the raw endpoint serves `text/plain` (+ `nosniff`), so a paste
 //! body can never execute as HTML.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Form;
@@ -15,7 +15,7 @@ use serde::Deserialize;
 
 use crate::audit::AuditEvent;
 use crate::auth::{self, Identity};
-use crate::config::{MAX_BODY_BYTES, MAX_TITLE_CHARS};
+use crate::config::{clamp_page, DEFAULT_PAGE, MAX_BODY_BYTES, MAX_TITLE_CHARS};
 use crate::error::AppError;
 use crate::handlers::{
     esc, expiry_options, fmt_ts, language_label, language_options, parse_expiry, userbox, APP_CSS,
@@ -35,19 +35,38 @@ const VIEW_HTML: &str = include_str!("../../templates/view.html");
 // GET / — new-paste form + "my recent pastes"
 // ---------------------------------------------------------------------------
 
-/// `GET /` — render the new-paste form (with a fresh CSRF token) and the author's recent
-/// pastes.
-pub async fn new_form(State(state): State<AppState>, headers: HeaderMap) -> Response {
+/// Query string for the recent-pastes list: an optional backward keyset cursor
+/// (`?before=<created_at>_<id>`) and an optional page size (`?limit=`).
+#[derive(Debug, Deserialize)]
+pub struct ListQuery {
+    #[serde(default)]
+    pub before: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// `GET /` — render the new-paste form (with a fresh CSRF token) and the author's recent pastes,
+/// one keyset page (newest by default; `?before=<created_at>_<id>` walks older pages).
+pub async fn new_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ListQuery>,
+) -> Response {
     let who = auth::identity(&headers);
     let now = now_secs();
     let csrf = auth::new_csrf_token();
+    let before = q.before.as_deref().and_then(parse_before);
+    let limit = clamp_page(q.limit);
     let recent = state
         .store
-        .list_by_author(&who.subject, now)
+        .list_by_author(&who.subject, now, before, limit)
         .await
         .unwrap_or_default();
+    let load_older = render_load_older(&recent, limit, q.limit);
 
-    let html = render_new(&who, &csrf, &recent, None, "", "plaintext", "never", false, "");
+    let html = render_new(
+        &who, &csrf, &recent, &load_older, None, "", "plaintext", "never", false, "",
+    );
     html_with_csrf(StatusCode::OK, html, &csrf)
 }
 
@@ -101,13 +120,15 @@ pub async fn create(
         let csrf = auth::new_csrf_token();
         let recent = state
             .store
-            .list_by_author(&who.subject, now)
+            .list_by_author(&who.subject, now, None, DEFAULT_PAGE)
             .await
             .unwrap_or_default();
+        let load_older = render_load_older(&recent, DEFAULT_PAGE, None);
         let html = render_new(
             &who,
             &csrf,
             &recent,
+            &load_older,
             Some(msg),
             title,
             &form.language,
@@ -387,11 +408,48 @@ fn redirect_found(location: &str) -> Response {
         .into_response()
 }
 
+/// Parse a `?before=<created_at>_<id>` keyset cursor. Ids are alphanumeric (never contain `_`),
+/// so the split is on the LAST `_`. A malformed cursor yields `None` — the handler then serves
+/// the newest page, so a bad/hand-edited cursor degrades gracefully instead of erroring.
+fn parse_before(raw: &str) -> Option<(i64, String)> {
+    let (ts, id) = raw.rsplit_once('_')?;
+    let ts: i64 = ts.parse().ok()?;
+    if id.is_empty() {
+        return None;
+    }
+    Some((ts, id.to_string()))
+}
+
+/// The "Load older" control, rendered ONLY when a FULL page came back (so an older page may
+/// exist). The link carries the next backward cursor `?before=<created_at>_<id>` computed from
+/// the last (oldest) row of this page; an explicit `?limit=` is preserved so paging stays at the
+/// user's chosen page size.
+fn render_load_older(recent: &[Paste], limit: i64, limit_param: Option<i64>) -> String {
+    // A short page means the end of the list — no older page to link to.
+    if (recent.len() as i64) < limit {
+        return String::new();
+    }
+    let Some(last) = recent.last() else {
+        return String::new();
+    };
+    let mut href = format!("/?before={}_{}", last.created_at, last.id);
+    if let Some(n) = limit_param {
+        href.push_str(&format!("&limit={n}"));
+    }
+    format!(
+        "<div class=\"paste-more\">\
+           <a class=\"btn btn-ghost btn-sm\" href=\"{href}\" rel=\"next\">Load older</a>\
+         </div>",
+        href = esc(&href),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_new(
     who: &Identity,
     csrf: &str,
     recent: &[Paste],
+    load_older: &str,
     error: Option<&str>,
     title: &str,
     language: &str,
@@ -419,6 +477,7 @@ fn render_new(
         .replace("{{BODY}}", &esc(body))
         .replace("{{CSRF}}", &esc(csrf))
         .replace("{{RECENT}}", &render_recent(recent))
+        .replace("{{LOAD_OLDER}}", load_older)
 }
 
 /// The author's recent-pastes list (already filtered/ordered by the store).

@@ -77,9 +77,18 @@ async fn pg_store_full_integration() {
     store.create(&paste("cccccc33", "alice", now + 20, Some(now - 1))).await.unwrap(); // expired
     store.create(&paste("dddddd44", "bob", now + 30, None)).await.unwrap();
 
-    let recent = store.list_by_author("alice", now).await.unwrap();
+    let recent = store.list_by_author("alice", now, None, 50).await.unwrap();
     let ids: Vec<&str> = recent.iter().map(|p| p.id.as_str()).collect();
     assert_eq!(ids, vec!["bbbbbb22", "aaaaaa11"], "expired + other-author excluded, newest first");
+
+    // --- keyset backward paging: a `before` cursor yields only older rows ----
+    let newest = &recent[0]; // bbbbbb22
+    let older = store
+        .list_by_author("alice", now, Some((newest.created_at, newest.id.clone())), 50)
+        .await
+        .unwrap();
+    let older_ids: Vec<&str> = older.iter().map(|p| p.id.as_str()).collect();
+    assert_eq!(older_ids, vec!["aaaaaa11"], "cursor pages strictly backward");
 
     // --- nullable expires_at round-trips both ways -------------------------
     let with_exp = store.get("bbbbbb22").await.unwrap().unwrap();

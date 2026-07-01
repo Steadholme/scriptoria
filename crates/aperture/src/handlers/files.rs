@@ -9,7 +9,7 @@
 //! otherwise as `attachment` downloads (+ `nosniff`), so an uploaded file can never execute as
 //! HTML in the drive's origin.
 
-use axum::extract::{Multipart, Path, State};
+use axum::extract::{Multipart, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Form;
@@ -17,7 +17,7 @@ use serde::Deserialize;
 
 use crate::audit::AuditEvent;
 use crate::auth::{self, Identity};
-use crate::config::Config;
+use crate::config::{clamp_page, Config};
 use crate::error::AppError;
 use crate::handlers::{
     esc, fmt_ts, human_size, resolve_content_type, safe_filename, userbox, APP_CSS, FILE_SVG,
@@ -40,18 +40,56 @@ const DETAIL_HTML: &str = include_str!("../../templates/detail.html");
 // GET / — the signed-in user's drive (gallery grid + upload dropzone)
 // ---------------------------------------------------------------------------
 
-/// `GET /` — render the upload dropzone (with a fresh CSRF token) and the owner's files as a grid.
-pub async fn gallery(State(state): State<AppState>, headers: HeaderMap) -> Response {
+/// Gallery query string: an optional keyset cursor (`?before=<created_at>_<id>`) to page back into
+/// older files, and an optional `?limit=` page size (clamped to `[1, MAX_PAGE]`).
+#[derive(Debug, Deserialize)]
+pub struct GalleryQuery {
+    #[serde(default)]
+    pub before: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// `GET /` — render the upload dropzone (with a fresh CSRF token) and one keyset page of the
+/// owner's files, newest-first. With no `?before` cursor this is the newest page (the default
+/// view, now capped at `DEFAULT_PAGE`); a `?before=<created_at>_<id>` cursor pages into older files.
+pub async fn gallery(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<GalleryQuery>,
+) -> Response {
     let who = auth::identity(&headers);
     let csrf = auth::new_csrf_token();
+    let before = parse_cursor(q.before.as_deref());
+    // Same clamp the store applies, so `files.len() == limit` below is an exact "page was full" test.
+    let limit = clamp_page(q.limit.unwrap_or(0));
     let files = state
         .store
-        .list_by_owner(&who.subject)
+        .list_by_owner(&who.subject, before, limit)
         .await
         .unwrap_or_default();
 
-    let html = render_gallery(&who, &csrf, &files);
+    // A FULL page means older rows may remain: the next cursor is the last (oldest) row shown.
+    let next = if files.len() as i64 == limit {
+        files.last().map(|f| (f.created_at, f.id.clone()))
+    } else {
+        None
+    };
+
+    let html = render_gallery(&who, &csrf, &files, next.as_ref());
     html_with_csrf(StatusCode::OK, html, &csrf)
+}
+
+/// Parse a `?before=<created_at>_<id>` keyset cursor. Ids are alphanumeric (never contain `_`) and
+/// `created_at` is a plain integer, so the LAST `_` is the boundary. Any malformed value yields
+/// `None`, so a bad cursor simply falls back to the newest page.
+fn parse_cursor(raw: Option<&str>) -> Option<(i64, String)> {
+    let (ts, id) = raw?.trim().rsplit_once('_')?;
+    let ts: i64 = ts.parse().ok()?;
+    if id.is_empty() {
+        return None;
+    }
+    Some((ts, id.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -347,11 +385,26 @@ fn ext_label(name: &str) -> String {
         .unwrap_or_else(|| "FILE".to_string())
 }
 
-fn render_gallery(who: &Identity, csrf: &str, files: &[FileRec]) -> String {
+fn render_gallery(
+    who: &Identity,
+    csrf: &str,
+    files: &[FileRec],
+    next: Option<&(i64, String)>,
+) -> String {
     let count = match files.len() {
         0 => "No files yet".to_string(),
         1 => "1 file".to_string(),
         n => format!("{n} files"),
+    };
+    // A "Load older" link only when a full page came back (there may be older files to page into).
+    // Ids are alphanumeric, so `<created_at>_<id>` is URL-safe as-is.
+    let pager = match next {
+        Some((ts, id)) => format!(
+            "<nav class=\"gallery-pager\"><a class=\"btn btn-ghost\" href=\"/?before={ts}_{id}\">Load older</a></nav>",
+            ts = ts,
+            id = esc(id),
+        ),
+        None => String::new(),
     };
     GALLERY_HTML
         .replace("{{CSS}}", APP_CSS)
@@ -360,6 +413,7 @@ fn render_gallery(who: &Identity, csrf: &str, files: &[FileRec]) -> String {
         .replace("{{CSRF}}", &esc(csrf))
         .replace("{{COUNT}}", &esc(&count))
         .replace("{{CARDS}}", &render_cards(files))
+        .replace("{{PAGER}}", &pager)
 }
 
 fn render_cards(files: &[FileRec]) -> String {

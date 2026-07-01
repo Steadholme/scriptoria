@@ -132,9 +132,48 @@ async fn drafts_are_private_to_their_author() {
     assert_eq!(status, StatusCode::OK, "author can read own draft");
 }
 
+#[tokio::test]
+async fn index_pages_backward_via_load_older() {
+    let state = build_dev_state();
+
+    // Three published posts. Created within the same second is fine — the keyset falls back to
+    // id DESC (ids are nanosecond-distinct), so ordering and the cursor stay well defined.
+    for title in ["Alpha", "Beta", "Gamma"] {
+        let body = form(&[("title", title), ("body", "x"), ("published", "on"), ("csrf_token", CSRF)]);
+        let (status, _) = call(&state, post_csrf("/new", &body, Some(("u_alice", "alice@hf")))).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+    }
+
+    // First page of 2 -> the two newest + a "Load older" cursor (a full page implies more history).
+    let (status, page1) = call(&state, get("/?limit=2")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page1.contains("Gamma"), "newest shown on first page");
+    assert!(page1.contains("Beta"), "second-newest shown on first page");
+    assert!(!page1.contains("Alpha"), "oldest NOT on the first page (beyond the page size)");
+    assert!(page1.contains("Load older"), "full page offers a Load-older cursor");
+
+    // Follow the generated cursor link: the oldest post is now REACHABLE (was unreachable before).
+    let cursor = extract_before(&page1).expect("Load older link carries a ?before= cursor");
+    let (status, page2) = call(&state, get(&format!("/?before={cursor}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page2.contains("Alpha"), "oldest reachable via Load older");
+    assert!(!page2.contains("Gamma"), "cursor pages strictly older — newest not repeated");
+    assert!(!page2.contains("Beta"), "the cursor row itself is excluded (strictly older)");
+    assert!(!page2.contains("Load older"), "partial last page has no further cursor");
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/// Pull the `?before=<cursor>` value out of a rendered "Load older" link.
+fn extract_before(html: &str) -> Option<String> {
+    let marker = "?before=";
+    let start = html.find(marker)? + marker.len();
+    let rest = &html[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
 
 async fn call(state: &inkwell::AppState, req: Request<Body>) -> (StatusCode, String) {
     let resp = app(state.clone()).oneshot(req).await.unwrap();

@@ -401,6 +401,91 @@ async fn burn_after_read_consumed_via_raw_by_recipient() {
 }
 
 #[tokio::test]
+async fn recent_list_paginates_backward_with_load_older_link() {
+    let state = build_dev_state();
+    // Seed five pastes with known, distinct created_at + ids for a deterministic keyset.
+    for (id, created_at) in [
+        ("p1aaaaaa", 100),
+        ("p2aaaaaa", 101),
+        ("p3aaaaaa", 102),
+        ("p4aaaaaa", 103),
+        ("p5aaaaaa", 104),
+    ] {
+        state
+            .store
+            .create(&Paste {
+                id: id.to_string(),
+                title: format!("title {id}"),
+                body: "body".to_string(),
+                language: "plaintext".to_string(),
+                author_sub: "alice".to_string(),
+                author_email: "alice@w33d.xyz".to_string(),
+                created_at,
+                expires_at: None,
+                burn_after_read: false,
+            })
+            .await
+            .unwrap();
+    }
+    let app = app(state);
+
+    // Newest page of 2: p5, p4. A full page => the "Load older" link is present, keyed off the
+    // last (oldest) row of this page (created_at 103, id p4). `&` is HTML-escaped in the href.
+    let page1 = send(&app, get("/?limit=2", Some("alice"))).await;
+    assert_eq!(page1.status, StatusCode::OK);
+    assert!(page1.body.contains("/p/p5aaaaaa"));
+    assert!(page1.body.contains("/p/p4aaaaaa"));
+    assert!(!page1.body.contains("/p/p3aaaaaa"), "third-newest must not be on page 1");
+    assert!(page1.body.contains("Load older"));
+    assert!(page1.body.contains("/?before=103_p4aaaaaa&amp;limit=2"));
+
+    // Follow the cursor: strictly older page of 2: p3, p2.
+    let page2 = send(&app, get("/?before=103_p4aaaaaa&limit=2", Some("alice"))).await;
+    assert_eq!(page2.status, StatusCode::OK);
+    assert!(page2.body.contains("/p/p3aaaaaa"));
+    assert!(page2.body.contains("/p/p2aaaaaa"));
+    assert!(!page2.body.contains("/p/p4aaaaaa"), "cursor excludes the row it was cut from");
+    assert!(page2.body.contains("/?before=101_p2aaaaaa&amp;limit=2"));
+
+    // Final page: only p1 remains — a short page, so NO "Load older" link.
+    let page3 = send(&app, get("/?before=101_p2aaaaaa&limit=2", Some("alice"))).await;
+    assert_eq!(page3.status, StatusCode::OK);
+    assert!(page3.body.contains("/p/p1aaaaaa"));
+    assert!(!page3.body.contains("Load older"), "end of list has no older link");
+}
+
+#[tokio::test]
+async fn recent_list_default_page_has_no_load_older_when_short() {
+    // The default newest view (no ?before) with only a couple pastes is a short page => no link.
+    let app = app(build_dev_state());
+    let page = send(&app, get("/", Some("alice"))).await;
+    let csrf = page.csrf_cookie().unwrap();
+    for title in ["one", "two"] {
+        send(
+            &app,
+            post_form(
+                "/",
+                &[
+                    ("csrf_token", &csrf),
+                    ("title", title),
+                    ("language", "plaintext"),
+                    ("body", "x"),
+                    ("expiry", "never"),
+                ],
+                &csrf,
+                Some("alice"),
+            ),
+        )
+        .await;
+    }
+    let listing = send(&app, get("/", Some("alice"))).await;
+    assert_eq!(listing.status, StatusCode::OK);
+    assert!(listing.body.contains("one"));
+    assert!(listing.body.contains("two"));
+    assert!(!listing.body.contains("Load older"));
+}
+
+#[tokio::test]
 async fn cannot_delete_another_users_paste() {
     let state: AppState = build_dev_state();
     let store: Arc<dyn Store> = state.store.clone();

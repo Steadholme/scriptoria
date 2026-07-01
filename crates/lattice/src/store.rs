@@ -17,7 +17,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::config::{HISTORY_LIMIT, PAGE_LIST_LIMIT};
+use crate::config::{clamp_page_limit, HISTORY_LIMIT};
 
 /// Storage failure surfaced to the handler layer (mapped to a 500).
 #[derive(Debug, Error)]
@@ -65,8 +65,15 @@ pub struct SaveInput {
 /// a DB round-trip (no `block_in_place`, no sync-over-async bridge).
 #[async_trait]
 pub trait Store: Send + Sync {
-    /// All pages, ordered by `title` ascending (case-insensitive), capped for the index.
-    async fn list_pages(&self) -> Result<Vec<Page>, StoreError>;
+    /// One keyset page of pages, newest-first by `(created_at DESC, slug DESC)`. `before` is the
+    /// exclusive cursor `(created_at, slug)` taken from the last row of the previous page (`None`
+    /// starts at the newest page); `limit` is clamped to `MAX_PAGE`. Older pages stay reachable by
+    /// passing the last row's cursor back in.
+    async fn list_pages(
+        &self,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<Page>, StoreError>;
 
     /// The set of all existing slugs — used to mark `[[wiki-links]]` to missing pages.
     async fn all_slugs(&self) -> Result<Vec<String>, StoreError>;
@@ -106,16 +113,22 @@ impl InMemoryStore {
 
 #[async_trait]
 impl Store for InMemoryStore {
-    async fn list_pages(&self) -> Result<Vec<Page>, StoreError> {
+    async fn list_pages(
+        &self,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<Page>, StoreError> {
+        let limit = clamp_page_limit(limit) as usize;
         let data = self.data.lock().expect("lattice store lock poisoned");
         let mut pages: Vec<Page> = data.pages.values().cloned().collect();
-        pages.sort_by(|a, b| {
-            a.title
-                .to_lowercase()
-                .cmp(&b.title.to_lowercase())
-                .then_with(|| a.slug.cmp(&b.slug))
-        });
-        pages.truncate(PAGE_LIST_LIMIT);
+        // Newest-first keyset — the exact ORDER BY the PgStore uses: created_at DESC, slug DESC.
+        pages.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.slug.cmp(&a.slug)));
+        // Drop everything at/after the cursor (strictly older than the last row seen)...
+        if let Some((b_ts, b_id)) = before {
+            pages.retain(|p| p.created_at < b_ts || (p.created_at == b_ts && p.slug < b_id));
+        }
+        // ...then take one page.
+        pages.truncate(limit);
         Ok(pages)
     }
 
@@ -230,7 +243,8 @@ impl PgStore {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_revisions_slug_ts ON revisions (slug, ts)")
             .execute(&self.pool)
             .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_pages_title ON pages (title)")
+        // Supports the newest-first keyset scan (created_at DESC, slug DESC) the index pages by.
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_pages_created_slug ON pages (created_at, slug)")
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -257,14 +271,36 @@ impl PgStore {
         })
     }
 
-    async fn list_pages_async(&self) -> Result<Vec<Page>, sqlx::Error> {
-        let rows = sqlx::query(
-            "SELECT slug, title, body_md, updated_by_email, updated_at, created_at \
-             FROM pages ORDER BY lower(title) ASC, slug ASC LIMIT $1",
-        )
-        .bind(PAGE_LIST_LIMIT as i64)
-        .fetch_all(&self.pool)
-        .await?;
+    async fn list_pages_async(
+        &self,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<Page>, sqlx::Error> {
+        let limit = clamp_page_limit(limit);
+        let rows = match before {
+            None => {
+                sqlx::query(
+                    "SELECT slug, title, body_md, updated_by_email, updated_at, created_at \
+                     FROM pages ORDER BY created_at DESC, slug DESC LIMIT $1",
+                )
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            Some((b_ts, b_id)) => {
+                sqlx::query(
+                    "SELECT slug, title, body_md, updated_by_email, updated_at, created_at \
+                     FROM pages \
+                     WHERE (created_at < $1 OR (created_at = $1 AND slug < $2)) \
+                     ORDER BY created_at DESC, slug DESC LIMIT $3",
+                )
+                .bind(b_ts)
+                .bind(b_id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
         rows.iter().map(Self::page_from_row).collect()
     }
 
@@ -356,8 +392,12 @@ impl PgStore {
 
 #[async_trait]
 impl Store for PgStore {
-    async fn list_pages(&self) -> Result<Vec<Page>, StoreError> {
-        self.list_pages_async()
+    async fn list_pages(
+        &self,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<Page>, StoreError> {
+        self.list_pages_async(before, limit)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
@@ -390,6 +430,7 @@ impl Store for PgStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{DEFAULT_PAGE, MAX_PAGE};
 
     fn input(slug: &str, title: &str, body: &str, who: &str, now: i64) -> SaveInput {
         SaveInput {
@@ -428,15 +469,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_pages_sorted_and_slugs_collected() {
+    async fn list_pages_newest_first_and_slugs_collected() {
         let store = InMemoryStore::new();
+        // beta created earliest, alpha latest → newest-first (created_at DESC) puts alpha first.
         store.save_page(input("beta", "Beta", "b", "a@x.co", 1)).await.unwrap();
         store.save_page(input("alpha", "Alpha", "a", "a@x.co", 2)).await.unwrap();
-        let pages = store.list_pages().await.unwrap();
+        let pages = store.list_pages(None, DEFAULT_PAGE).await.unwrap();
         assert_eq!(pages[0].slug, "alpha");
         assert_eq!(pages[1].slug, "beta");
         let mut slugs = store.all_slugs().await.unwrap();
         slugs.sort();
         assert_eq!(slugs, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_pages_keyset_paginates_newest_first() {
+        let store = InMemoryStore::new();
+        // Four pages with distinct created_at; the newest carries the largest timestamp.
+        store.save_page(input("a", "A", "x", "e@x.co", 10)).await.unwrap();
+        store.save_page(input("b", "B", "x", "e@x.co", 20)).await.unwrap();
+        store.save_page(input("c", "C", "x", "e@x.co", 30)).await.unwrap();
+        store.save_page(input("d", "D", "x", "e@x.co", 40)).await.unwrap();
+
+        // First page of 2: newest-first.
+        let p1 = store.list_pages(None, 2).await.unwrap();
+        assert_eq!(p1.iter().map(|p| p.slug.as_str()).collect::<Vec<_>>(), ["d", "c"]);
+
+        // Cursor from the last row of page 1 yields the next-older page — no overlap, no gap.
+        let last = p1.last().unwrap();
+        let p2 = store
+            .list_pages(Some((last.created_at, last.slug.clone())), 2)
+            .await
+            .unwrap();
+        assert_eq!(p2.iter().map(|p| p.slug.as_str()).collect::<Vec<_>>(), ["b", "a"]);
+
+        // Cursor past the oldest row returns nothing (the walk terminates).
+        let last2 = p2.last().unwrap();
+        let p3 = store
+            .list_pages(Some((last2.created_at, last2.slug.clone())), 2)
+            .await
+            .unwrap();
+        assert!(p3.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_pages_keyset_breaks_created_at_ties_by_slug() {
+        let store = InMemoryStore::new();
+        // Same created_at across all three; slug DESC is the deterministic tiebreak.
+        store.save_page(input("a", "A", "x", "e@x.co", 5)).await.unwrap();
+        store.save_page(input("b", "B", "x", "e@x.co", 5)).await.unwrap();
+        store.save_page(input("c", "C", "x", "e@x.co", 5)).await.unwrap();
+
+        let p1 = store.list_pages(None, 2).await.unwrap();
+        assert_eq!(p1.iter().map(|p| p.slug.as_str()).collect::<Vec<_>>(), ["c", "b"]);
+        let last = p1.last().unwrap();
+        let p2 = store
+            .list_pages(Some((last.created_at, last.slug.clone())), 2)
+            .await
+            .unwrap();
+        assert_eq!(p2.iter().map(|p| p.slug.as_str()).collect::<Vec<_>>(), ["a"]);
+    }
+
+    #[tokio::test]
+    async fn list_pages_limit_is_clamped_to_max() {
+        let store = InMemoryStore::new();
+        for i in 0..(MAX_PAGE + 5) {
+            store
+                .save_page(input(&format!("p{i:04}"), "T", "x", "e@x.co", i))
+                .await
+                .unwrap();
+        }
+        let page = store.list_pages(None, MAX_PAGE + 100).await.unwrap();
+        assert_eq!(page.len() as i64, MAX_PAGE, "an oversized limit is clamped to MAX_PAGE");
     }
 }

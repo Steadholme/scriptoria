@@ -16,7 +16,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::config::LIST_LIMIT;
+use crate::config::MAX_PAGE;
 
 /// A blog post (maps 1:1 to a `posts` row).
 #[derive(Clone, Debug)]
@@ -58,9 +58,12 @@ pub enum StoreError {
 /// Pluggable blog store.
 #[async_trait]
 pub trait Store: Send + Sync {
-    /// All posts, newest-first (`created_at` DESC), capped at [`LIST_LIMIT`]. Visibility
-    /// (published vs. own drafts) is decided in the handler from the viewer's identity.
-    async fn list_posts(&self) -> Vec<Post>;
+    /// One keyset page of posts, newest-first (`created_at` DESC, `id` DESC). `before` is the
+    /// exclusive cursor `(created_at, id)` of the previous page's LAST row: `None` returns the
+    /// newest page, `Some(..)` returns rows strictly OLDER than the cursor. `limit` is clamped to
+    /// `1..=`[`MAX_PAGE`]. Visibility (published vs. own drafts) is decided in the handler from the
+    /// viewer's identity; the keyset itself is exactly the `ORDER BY` the stores already use.
+    async fn list_posts(&self, before: Option<(i64, String)>, limit: i64) -> Vec<Post>;
     /// One post by its unique slug.
     async fn get_post(&self, slug: &str) -> Option<Post>;
     /// Insert a new post. Errors with [`StoreError::Conflict`] if the slug is taken.
@@ -110,16 +113,22 @@ impl InMemoryStore {
 impl Store for InMemoryStore {
     // The std `Mutex` is fine throughout: each critical section is fully synchronous (no
     // `.await` inside), so a guard is never held across a yield point.
-    async fn list_posts(&self) -> Vec<Post> {
+    async fn list_posts(&self, before: Option<(i64, String)>, limit: i64) -> Vec<Post> {
+        let limit = limit.clamp(1, MAX_PAGE) as usize;
         let posts = self.posts.lock().expect("posts lock poisoned");
         let mut v: Vec<Post> = posts.clone();
-        // Newest-first; ties broken by id so output is stable.
+        // Newest-first; ties broken by id DESC so output is stable and matches the keyset order.
         v.sort_by(|a, b| {
             b.created_at
                 .cmp(&a.created_at)
                 .then_with(|| b.id.cmp(&a.id))
         });
-        v.truncate(LIST_LIMIT);
+        // Keyset "before" cursor: keep only rows strictly OLDER than (b_ts, b_id) — the exact
+        // in-memory mirror of the SQL `created_at < $ts OR (created_at = $ts AND id < $id)`.
+        if let Some((b_ts, b_id)) = before {
+            v.retain(|p| p.created_at < b_ts || (p.created_at == b_ts && p.id < b_id));
+        }
+        v.truncate(limit);
         v
     }
 
@@ -379,15 +388,35 @@ impl PgStore {
         })
     }
 
-    async fn list_posts_async(&self) -> Result<Vec<Post>, sqlx::Error> {
-        let rows = sqlx::query(
-            "SELECT id, slug, title, body_md, author_sub, author_email, created_at, updated_at, \
-                    published \
-             FROM posts ORDER BY created_at DESC, id DESC LIMIT $1",
-        )
-        .bind(LIST_LIMIT as i64)
-        .fetch_all(&self.pool)
-        .await?;
+    async fn list_posts_async(
+        &self,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<Post>, sqlx::Error> {
+        let limit = limit.clamp(1, MAX_PAGE);
+        const COLS: &str = "SELECT id, slug, title, body_md, author_sub, author_email, \
+                            created_at, updated_at, published FROM posts";
+        // The `ORDER BY created_at DESC, id DESC` IS the keyset. With a cursor, add the standard
+        // "strictly older" tuple comparison before the ORDER BY so paging never skips a tie.
+        let rows = match before {
+            None => {
+                sqlx::query(&format!("{COLS} ORDER BY created_at DESC, id DESC LIMIT $1"))
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+            Some((b_ts, b_id)) => {
+                sqlx::query(&format!(
+                    "{COLS} WHERE (created_at < $1 OR (created_at = $1 AND id < $2)) \
+                     ORDER BY created_at DESC, id DESC LIMIT $3"
+                ))
+                .bind(b_ts)
+                .bind(b_id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
         rows.iter().map(Self::post_from_row).collect()
     }
 
@@ -458,8 +487,8 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
 
 #[async_trait]
 impl Store for PgStore {
-    async fn list_posts(&self) -> Vec<Post> {
-        self.list_posts_async().await.unwrap_or_else(|e| {
+    async fn list_posts(&self, before: Option<(i64, String)>, limit: i64) -> Vec<Post> {
+        self.list_posts_async(before, limit).await.unwrap_or_else(|e| {
             tracing::error!(error = %e, "pg list_posts failed");
             Vec::new()
         })
@@ -528,5 +557,82 @@ impl Store for PgStore {
         self.delete_post_chunks_async(post_id)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::MAX_PAGE;
+
+    fn post(id: &str, created_at: i64) -> Post {
+        Post {
+            id: id.to_string(),
+            slug: id.to_string(),
+            title: id.to_string(),
+            body_md: String::new(),
+            author_sub: "u".to_string(),
+            author_email: "u@hf".to_string(),
+            created_at,
+            updated_at: created_at,
+            published: true,
+        }
+    }
+
+    /// Newest page first, then the `before` cursor pages strictly backward until exhausted — the
+    /// whole archive is reachable page by page even past a single page's `limit`.
+    #[tokio::test]
+    async fn list_posts_keyset_pages_backward() {
+        let store = InMemoryStore::new();
+        for i in 1..=5 {
+            store.create_post(&post(&format!("post_{i}"), i)).await.unwrap();
+        }
+
+        let page1 = store.list_posts(None, 2).await;
+        assert_eq!(page1.iter().map(|p| p.created_at).collect::<Vec<_>>(), vec![5, 4]);
+
+        let last = page1.last().unwrap();
+        let page2 = store.list_posts(Some((last.created_at, last.id.clone())), 2).await;
+        assert_eq!(page2.iter().map(|p| p.created_at).collect::<Vec<_>>(), vec![3, 2]);
+
+        let last = page2.last().unwrap();
+        let page3 = store.list_posts(Some((last.created_at, last.id.clone())), 2).await;
+        assert_eq!(page3.iter().map(|p| p.created_at).collect::<Vec<_>>(), vec![1]);
+
+        // Past the end: nothing older than the last row.
+        let last = page3.last().unwrap();
+        let page4 = store.list_posts(Some((last.created_at, last.id.clone())), 2).await;
+        assert!(page4.is_empty(), "no rows older than the oldest post");
+    }
+
+    /// Ties on `created_at` are broken by `id DESC`, and the cursor's id component keeps paging
+    /// strict (never re-emits the cursor row, never skips a tie).
+    #[tokio::test]
+    async fn list_posts_cursor_breaks_ties_by_id() {
+        let store = InMemoryStore::new();
+        for id in ["post_a", "post_b", "post_c"] {
+            store.create_post(&post(id, 10)).await.unwrap();
+        }
+        let all = store.list_posts(None, 10).await;
+        assert_eq!(
+            all.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            vec!["post_c", "post_b", "post_a"],
+        );
+        let page = store.list_posts(Some((10, "post_c".to_string())), 10).await;
+        assert_eq!(
+            page.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            vec!["post_b", "post_a"],
+        );
+    }
+
+    /// A caller asking for more than [`MAX_PAGE`] rows is clamped, so a single page stays bounded.
+    #[tokio::test]
+    async fn list_posts_clamps_limit_to_max() {
+        let store = InMemoryStore::new();
+        for i in 0..(MAX_PAGE + 10) {
+            store.create_post(&post(&format!("post_{i:05}"), i)).await.unwrap();
+        }
+        let page = store.list_posts(None, MAX_PAGE + 100).await;
+        assert_eq!(page.len() as i64, MAX_PAGE, "limit clamped to MAX_PAGE");
     }
 }

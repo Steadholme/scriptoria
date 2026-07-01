@@ -14,6 +14,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use thiserror::Error;
 
+use crate::config::clamp_page;
 use crate::model::FileRec;
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
@@ -38,8 +39,18 @@ pub trait Store: Send + Sync {
     /// Fetch a file by its public share token (the unauthenticated `/s/{token}` path).
     async fn get_by_token(&self, token: &str) -> Result<Option<FileRec>, StoreError>;
 
-    /// An owner's files, newest-first.
-    async fn list_by_owner(&self, owner_sub: &str) -> Result<Vec<FileRec>, StoreError>;
+    /// An owner's files, newest-first, one keyset page at a time.
+    ///
+    /// Ordering is the fixed keyset `(created_at DESC, id DESC)`. `before` is the exclusive
+    /// `(created_at, id)` cursor of the last row already seen — pass `None` for the newest page,
+    /// or the previous page's last (oldest) row to page BACKWARD into older files. `limit` is
+    /// clamped to `[1, MAX_PAGE]` (see [`crate::config::clamp_page`]) so the read is always bounded.
+    async fn list_by_owner(
+        &self,
+        owner_sub: &str,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<FileRec>, StoreError>;
 
     /// Delete a file only if it belongs to `owner_sub`. Returns `true` when a row was removed.
     async fn delete(&self, id: &str, owner_sub: &str) -> Result<bool, StoreError>;
@@ -87,11 +98,22 @@ impl Store for InMemoryStore {
         Ok(files.iter().find(|f| f.share_token == token).cloned())
     }
 
-    async fn list_by_owner(&self, owner_sub: &str) -> Result<Vec<FileRec>, StoreError> {
+    async fn list_by_owner(
+        &self,
+        owner_sub: &str,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<FileRec>, StoreError> {
+        let limit = clamp_page(limit);
         let files = self.files.lock().expect("files lock poisoned");
         let mut out: Vec<FileRec> = files
             .iter()
             .filter(|f| f.owner_sub == owner_sub)
+            // Keyset cursor: keep only rows strictly OLDER than `before` under (created_at, id).
+            .filter(|f| match &before {
+                None => true,
+                Some((ts, id)) => f.created_at < *ts || (f.created_at == *ts && f.id < *id),
+            })
             .cloned()
             .collect();
         // Newest first; id as a deterministic tiebreak when created_at collides (same second).
@@ -100,6 +122,7 @@ impl Store for InMemoryStore {
                 .cmp(&a.created_at)
                 .then_with(|| b.id.cmp(&a.id))
         });
+        out.truncate(limit as usize);
         Ok(out)
     }
 
@@ -228,13 +251,40 @@ impl PgStore {
         row.as_ref().map(Self::file_from_row).transpose()
     }
 
-    async fn list_by_owner_async(&self, owner_sub: &str) -> Result<Vec<FileRec>, sqlx::Error> {
-        let rows = sqlx::query(&format!(
-            "SELECT {COLS} FROM files WHERE owner_sub = $1 ORDER BY created_at DESC, id DESC"
-        ))
-        .bind(owner_sub)
-        .fetch_all(&self.pool)
-        .await?;
+    async fn list_by_owner_async(
+        &self,
+        owner_sub: &str,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<FileRec>, sqlx::Error> {
+        let limit = clamp_page(limit);
+        // The table index/order IS the keyset `(created_at DESC, id DESC)`; the cursor clause
+        // (created_at, id) < (b_ts, b_id) selects the next page of strictly-older rows.
+        let rows = match &before {
+            Some((ts, id)) => {
+                sqlx::query(&format!(
+                    "SELECT {COLS} FROM files WHERE owner_sub = $1 \
+                     AND (created_at < $2 OR (created_at = $2 AND id < $3)) \
+                     ORDER BY created_at DESC, id DESC LIMIT $4"
+                ))
+                .bind(owner_sub)
+                .bind(ts)
+                .bind(id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(&format!(
+                    "SELECT {COLS} FROM files WHERE owner_sub = $1 \
+                     ORDER BY created_at DESC, id DESC LIMIT $2"
+                ))
+                .bind(owner_sub)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
         rows.iter().map(Self::file_from_row).collect()
     }
 
@@ -268,8 +318,13 @@ impl Store for PgStore {
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
-    async fn list_by_owner(&self, owner_sub: &str) -> Result<Vec<FileRec>, StoreError> {
-        self.list_by_owner_async(owner_sub)
+    async fn list_by_owner(
+        &self,
+        owner_sub: &str,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<FileRec>, StoreError> {
+        self.list_by_owner_async(owner_sub, before, limit)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
@@ -316,9 +371,65 @@ mod tests {
         s.create(&file("a", "u", "t1", 10)).await.unwrap();
         s.create(&file("c", "u", "t3", 30)).await.unwrap();
         s.create(&file("d", "other", "t4", 40)).await.unwrap();
-        let mine = s.list_by_owner("u").await.unwrap();
+        let mine = s.list_by_owner("u", None, 50).await.unwrap();
         let ids: Vec<&str> = mine.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(ids, vec!["c", "a"]);
+    }
+
+    #[tokio::test]
+    async fn list_paginates_backward_with_before_cursor() {
+        let s = InMemoryStore::new();
+        for (id, ts) in [("a", 10), ("b", 20), ("c", 30), ("d", 40), ("e", 50)] {
+            s.create(&file(id, "u", &format!("t-{id}"), ts)).await.unwrap();
+        }
+        // Page 1 (newest 2).
+        let p1 = s.list_by_owner("u", None, 2).await.unwrap();
+        assert_eq!(p1.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["e", "d"]);
+        // Cursor = last (oldest) row of page 1 -> next 2, strictly older.
+        let c1 = p1.last().unwrap();
+        let p2 = s
+            .list_by_owner("u", Some((c1.created_at, c1.id.clone())), 2)
+            .await
+            .unwrap();
+        assert_eq!(p2.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["c", "b"]);
+        // Final partial page.
+        let c2 = p2.last().unwrap();
+        let p3 = s
+            .list_by_owner("u", Some((c2.created_at, c2.id.clone())), 2)
+            .await
+            .unwrap();
+        assert_eq!(p3.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["a"]);
+    }
+
+    #[tokio::test]
+    async fn cursor_tiebreaks_on_id_when_created_at_collides() {
+        let s = InMemoryStore::new();
+        // Identical created_at: ordering falls back to id DESC => c, b, a.
+        s.create(&file("a", "u", "ta", 100)).await.unwrap();
+        s.create(&file("b", "u", "tb", 100)).await.unwrap();
+        s.create(&file("c", "u", "tc", 100)).await.unwrap();
+        let p1 = s.list_by_owner("u", None, 2).await.unwrap();
+        assert_eq!(p1.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["c", "b"]);
+        let c1 = p1.last().unwrap();
+        let p2 = s
+            .list_by_owner("u", Some((c1.created_at, c1.id.clone())), 2)
+            .await
+            .unwrap();
+        assert_eq!(p2.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["a"]);
+    }
+
+    #[tokio::test]
+    async fn limit_is_clamped_to_max_page() {
+        let s = InMemoryStore::new();
+        for i in 0..10 {
+            s.create(&file(&format!("id{i:02}"), "u", &format!("t{i:02}"), i))
+                .await
+                .unwrap();
+        }
+        // A non-positive limit falls back to the default page size (>= 10 here, so all 10 return).
+        assert_eq!(s.list_by_owner("u", None, 0).await.unwrap().len(), 10);
+        // An absurd limit is capped to MAX_PAGE but still returns everything available.
+        assert_eq!(s.list_by_owner("u", None, 100_000).await.unwrap().len(), 10);
     }
 
     #[tokio::test]

@@ -6,9 +6,13 @@
 
 /// Default listen address (all interfaces, internal-only port 8720).
 pub const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8720";
-/// Hard cap on how many pages a single index render lists. Keeps an unbounded wiki's index
-/// page bounded; pages remain reachable directly via `/w/{slug}`.
-pub const PAGE_LIST_LIMIT: usize = 1000;
+/// Default number of pages the index lists in one keyset page (the newest page, when no
+/// `?before=` cursor is given). A `?limit=` override is clamped into `1..=MAX_PAGE`.
+pub const DEFAULT_PAGE: i64 = 50;
+/// Hard ceiling on a single index page — and on the page set any corpus/graph build sees.
+/// Replaces the old unbounded `PAGE_LIST_LIMIT`: every list stays bounded, and older pages
+/// remain reachable by paging backward (`?before=<created_at>_<slug>`) or via `/w/{slug}`.
+pub const MAX_PAGE: i64 = 200;
 /// Hard cap on how many revisions a single `/history/{slug}` render lists.
 pub const HISTORY_LIMIT: usize = 500;
 /// Default staleness window (days): a page not edited within this many days is flagged on the
@@ -54,6 +58,17 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self::dev()
+    }
+}
+
+/// Clamp a requested index page size into `1..=MAX_PAGE`; a non-positive request falls back to
+/// [`DEFAULT_PAGE`]. This is the single clamp point shared by both store impls and the index
+/// handler, so the handler's "is this page full?" check always matches what the store returned.
+pub fn clamp_page_limit(limit: i64) -> i64 {
+    if limit <= 0 {
+        DEFAULT_PAGE
+    } else {
+        limit.min(MAX_PAGE)
     }
 }
 

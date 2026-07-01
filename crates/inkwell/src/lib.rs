@@ -219,7 +219,7 @@ pub async fn deindex_post(store: &dyn Store, slug: &str) {
 pub async fn build_full_index(store: &dyn Store) -> i64 {
     let now = now_secs();
     let mut chunks = Vec::new();
-    for p in store.list_posts().await {
+    for p in store.list_posts(None, crate::config::MAX_PAGE).await {
         if p.published {
             chunks.extend(index::build_post_chunks(&p.slug, &p.title, &p.body_md, now));
         }

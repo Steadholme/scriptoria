@@ -7,8 +7,21 @@
 /// Default listen address (all interfaces, internal-only port 8730).
 pub const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8730";
 
-/// How many of an author's own pastes the "my recent pastes" list shows.
-pub const RECENT_LIMIT: usize = 20;
+/// Default page size for the "my recent pastes" list when the client sends no `?limit=`.
+/// Keeps the newest-page view bounded (backward keyset pagination fetches older pages).
+pub const DEFAULT_PAGE: i64 = 50;
+
+/// Hard ceiling on a requested page size, regardless of what a client asks for.
+pub const MAX_PAGE: i64 = 200;
+
+/// Resolve a requested page size into `[1, MAX_PAGE]`, defaulting to [`DEFAULT_PAGE`] when the
+/// value is absent or non-positive. Shared by the handler and defensively re-applied in the store.
+pub fn clamp_page(requested: Option<i64>) -> i64 {
+    match requested {
+        Some(n) if n > 0 => n.min(MAX_PAGE),
+        _ => DEFAULT_PAGE,
+    }
+}
 
 /// Hard cap on a paste body, in bytes. Keeps a single submission bounded; the default axum
 /// body limit (2 MiB) is the outer guard, this is the friendly application-level one.
