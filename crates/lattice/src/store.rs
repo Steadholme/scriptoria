@@ -186,8 +186,11 @@ impl Store for InMemoryStore {
             .filter(|r| r.slug == slug)
             .cloned()
             .collect();
-        // Newest first; ties (same ms) broken by id for a stable order.
-        revs.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| b.id.cmp(&a.id)));
+        // Newest first; ties (same ms) broken by insertion order — the Vec is append-only, so
+        // reversing first and then stable-sorting on ts keeps the later write ahead. (A random-id
+        // tiebreak would make the head flap between same-ms revisions.)
+        revs.reverse();
+        revs.sort_by(|a, b| b.ts.cmp(&a.ts));
         revs.truncate(HISTORY_LIMIT);
         Ok(revs)
     }
@@ -203,12 +206,15 @@ impl Store for InMemoryStore {
 
     async fn head_revision(&self, slug: &str) -> Result<Option<Revision>, StoreError> {
         let data = self.data.lock().expect("lattice store lock poisoned");
-        // Newest-first order matches `list_revisions` / the Pg `ORDER BY ts DESC, id DESC`.
+        // Newest first, matching `list_revisions`: max ts wins, and `max_by` returns the LAST
+        // maximal element, so same-ms ties resolve to the most recently appended revision.
+        // (Tiebreaking on the random id here made the head — and thus the edit-conflict
+        // check — non-deterministic for same-millisecond saves.)
         Ok(data
             .revisions
             .iter()
             .filter(|r| r.slug == slug)
-            .max_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id)))
+            .max_by(|a, b| a.ts.cmp(&b.ts))
             .cloned())
     }
 }

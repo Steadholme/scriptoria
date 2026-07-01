@@ -9,7 +9,6 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use tower::ServiceExt;
 
-use lattice::store::Store;
 use lattice::{app, build_dev_state, AppState};
 
 #[tokio::test]
