@@ -285,6 +285,33 @@ pub async fn raw(
 }
 
 // ---------------------------------------------------------------------------
+// GET /d/{id}/thumb — derived gallery thumbnail (owner-only)
+// ---------------------------------------------------------------------------
+
+/// `GET /d/{id}/thumb` — serve the gallery-card thumbnail for a file. Owner-only, mirroring
+/// `/f/{id}/raw`'s ownership gate EXACTLY (404 when absent, 403 when owned by someone else).
+///
+/// Aperture ships no image-decoder dependency, so a sniffed raster image cannot be downscaled here;
+/// it is treated as "undecodable" and 302-redirects to the full `/f/{id}/raw` bytes, so the grid
+/// still shows the real picture (no regression). Every OTHER type gets a deterministic, mime-keyed
+/// SVG type-icon that is derived lazily on first request and cached as a derived blob
+/// (`{object_key}.thumb`), then served from that cache on later requests. The placeholder is
+/// server-generated + fully escaped, so no user bytes are ever served inline by this route.
+pub async fn thumb(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Response, AppError> {
+    let viewer = auth::identity(&headers);
+    let rec = owned_file(&state, &id, &viewer).await?;
+    // A raster image is undecodable-for-resize without a decoder dep: fall back to the full bytes.
+    if rec.is_image() {
+        return Ok(redirect_found(&format!("/f/{}/raw", rec.id)));
+    }
+    Ok(serve_thumb(&state, &rec).await)
+}
+
+// ---------------------------------------------------------------------------
 // POST /delete/{id} — delete your own file (blob + row)
 // ---------------------------------------------------------------------------
 
@@ -316,6 +343,8 @@ pub async fn delete(
     if let Err(e) = state.blobs.delete(&rec.object_key).await {
         tracing::warn!(id = rec.id, error = %e, "metadata removed but blob delete failed (orphan)");
     }
+    // Best-effort: drop any cached derived thumbnail too (an orphan derived blob is harmless).
+    let _ = state.blobs.delete(&thumb_object_key(&rec.object_key)).await;
     tracing::info!(id = rec.id, owner = actor.subject, "file deleted");
     state.audit.emit(AuditEvent::notice(
         "file.delete",
@@ -726,6 +755,102 @@ fn serve_blob(rec: &FileRec, bytes: Vec<u8>) -> Response {
         .into_response()
 }
 
+/// Derived-blob key for a file's cached thumbnail, namespaced off the original object key. The `id`
+/// alphabet is alphanumeric (never contains `.`), so the `.thumb` suffix can never collide with a
+/// real file's object key.
+fn thumb_object_key(object_key: &str) -> String {
+    format!("{object_key}.thumb")
+}
+
+/// Serve the derived thumbnail for a non-image file, deriving + caching it on first request. The
+/// thumbnail is a deterministic, mime-keyed SVG type-icon (server-generated, trusted content), so
+/// its generation cost is paid at most once per file. A cache miss OR a backend read error both
+/// simply regenerate — the thumbnail is always reproducible, so this never surfaces a 500.
+async fn serve_thumb(state: &AppState, rec: &FileRec) -> Response {
+    let key = thumb_object_key(&rec.object_key);
+    let svg = match state.blobs.get(&key).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            let generated = render_type_thumb(&rec.content_type, &rec.name).into_bytes();
+            // Best-effort cache; a write failure just means the next request regenerates (still ok).
+            if let Err(e) = state.blobs.put(&key, generated.clone()).await {
+                tracing::warn!(id = rec.id, error = %e, "thumbnail cache write failed (will regenerate)");
+            }
+            generated
+        }
+    };
+    serve_svg_thumb(svg)
+}
+
+/// Serve server-generated SVG thumbnail bytes: an image content type plus `nosniff` and a strict CSP
+/// so the trusted placeholder can never execute as script, even if the URL is opened directly
+/// (defense in depth — the estate never serves user-supplied SVG inline).
+fn serve_svg_thumb(bytes: Vec<u8>) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "image/svg+xml".to_string()),
+            (header::CONTENT_DISPOSITION, "inline".to_string()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; style-src 'unsafe-inline'".to_string(),
+            ),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+/// Build a deterministic, mime-keyed SVG type-icon thumbnail for a non-image file: a category tint
+/// behind the file's short uppercase extension label. Server-generated and fully escaped (the label
+/// is the whitelisted [`ext_label`] output), so it is safe to serve as an image. "Keyed by mime"
+/// gives each content-type category a stable accent, so the same file always yields the same icon.
+fn render_type_thumb(content_type: &str, name: &str) -> String {
+    let (tint, ink) = thumb_palette(content_type);
+    let label = esc(&ext_label(name));
+    format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 160 120\" width=\"160\" \
+           height=\"120\" role=\"img\">\
+           <rect width=\"160\" height=\"120\" fill=\"{tint}\"/>\
+           <rect x=\"44\" y=\"32\" width=\"72\" height=\"56\" rx=\"9\" fill=\"#ffffff\" \
+             fill-opacity=\"0.86\"/>\
+           <text x=\"80\" y=\"62\" text-anchor=\"middle\" dominant-baseline=\"middle\" \
+             font-family=\"system-ui,-apple-system,Segoe UI,Roboto,sans-serif\" font-size=\"22\" \
+             font-weight=\"700\" fill=\"{ink}\">{label}</text>\
+         </svg>",
+        tint = tint,
+        ink = ink,
+        label = label,
+    )
+}
+
+/// Map a content type to a `(background_tint, label_ink)` color pair for its type-icon thumbnail.
+/// A fixed, trusted allow-list (never interpolated from user input), so no escaping is required.
+fn thumb_palette(content_type: &str) -> (&'static str, &'static str) {
+    let ct = content_type;
+    if ct == "application/pdf" {
+        ("#FEE2E2", "#B91C1C") // red — documents
+    } else if ct.starts_with("image/") {
+        ("#E0E7FF", "#4338CA") // indigo — non-raster images (e.g. svg), never downscaled here
+    } else if ct.starts_with("audio/") {
+        ("#DCFCE7", "#15803D") // green — audio
+    } else if ct.starts_with("video/") {
+        ("#F3E8FF", "#7E22CE") // purple — video
+    } else if ct.starts_with("text/") {
+        ("#E2E8F0", "#334155") // slate — text
+    } else if ct.contains("zip")
+        || ct.contains("tar")
+        || ct.contains("gzip")
+        || ct.contains("compress")
+        || ct.contains("x-7z")
+        || ct.contains("x-rar")
+    {
+        ("#FEF3C7", "#B45309") // amber — archives
+    } else {
+        ("#EEF2FF", "#4F46E5") // brand indigo — everything else
+    }
+}
+
 /// Wrap rendered HTML in a response that also (re)sets the CSRF cookie.
 fn html_with_csrf(status: StatusCode, html: String, csrf: &str) -> Response {
     (
@@ -872,19 +997,14 @@ fn render_cards(files: &[FileRec]) -> String {
     files
         .iter()
         .map(|f| {
-            let thumb = if f.is_image() {
-                format!(
-                    "<span class=\"thumb\"><img src=\"/f/{id}/raw\" alt=\"{alt}\" loading=\"lazy\"></span>",
-                    id = esc(&f.id),
-                    alt = esc(&f.name),
-                )
-            } else {
-                format!(
-                    "<span class=\"thumb thumb--file\">{glyph}<span class=\"thumb__ext\">{ext}</span></span>",
-                    glyph = FILE_SVG,
-                    ext = esc(&ext_label(&f.name)),
-                )
-            };
+            // Every card loads its thumbnail through the derived-thumbnail route: an image resolves
+            // to its full bytes (302), a non-image to a cached, mime-keyed type icon. One uniform
+            // `<img>` path replaces the old image-vs-generic-icon branch.
+            let thumb = format!(
+                "<span class=\"thumb\"><img src=\"/d/{id}/thumb\" alt=\"{alt}\" loading=\"lazy\"></span>",
+                id = esc(&f.id),
+                alt = esc(&f.name),
+            );
             format!(
                 "<li class=\"file-card\">\
                    <a class=\"file-card__link\" href=\"/f/{id}\">{thumb}</a>\
@@ -1103,5 +1223,33 @@ mod tests {
         assert_eq!(ext_label("archive.tar.gz"), "GZ");
         assert_eq!(ext_label("noext"), "FILE");
         assert_eq!(ext_label("weird.name!"), "FILE");
+    }
+
+    #[test]
+    fn thumb_object_key_is_namespaced() {
+        assert_eq!(thumb_object_key("abc123"), "abc123.thumb");
+    }
+
+    #[test]
+    fn thumb_palette_is_mime_keyed_and_stable() {
+        // Same mime -> same colors every time (deterministic).
+        assert_eq!(thumb_palette("application/pdf"), thumb_palette("application/pdf"));
+        // Distinct categories get distinct tints.
+        assert_ne!(thumb_palette("application/pdf").0, thumb_palette("audio/mpeg").0);
+        assert_eq!(thumb_palette("application/zip").0, "#FEF3C7");
+        assert_eq!(thumb_palette("text/plain").0, "#E2E8F0");
+    }
+
+    #[test]
+    fn render_type_thumb_bakes_escaped_label() {
+        let svg = render_type_thumb("application/pdf", "report.pdf");
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.contains("image/svg") == false); // it's the body, not a content type
+        assert!(svg.contains(">PDF<"));
+        assert!(svg.contains("#B91C1C")); // pdf ink color
+        // A hostile "extension" is neutralized by ext_label (whitelist) before it can reach the SVG.
+        let hostile = render_type_thumb("application/octet-stream", "x.<svg onload=alert(1)>");
+        assert!(!hostile.contains("onload"));
+        assert!(hostile.contains(">FILE<"));
     }
 }

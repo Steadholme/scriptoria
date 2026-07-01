@@ -721,3 +721,101 @@ async fn filename_xss_is_escaped_on_render() {
     assert!(!detail.text().contains("<img src=x onerror=alert(1)>"));
     assert!(detail.text().contains("&lt;img src=x"));
 }
+
+/// Upload a non-image file as `subject`, returning its `/f/{id}` id plus the CSRF token.
+async fn upload_pdf(app: &axum::Router, subject: &str) -> (String, String) {
+    let home = send(app, get("/", Some(subject))).await;
+    let csrf = home.csrf_cookie().expect("csrf cookie");
+    let created = send(
+        app,
+        upload_req(&csrf, &csrf, subject, "notes.pdf", "application/pdf", b"%PDF-1.7\n...content..."),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::FOUND, "{}", created.text());
+    let id = created.location().trim_start_matches("/f/").to_string();
+    (id, csrf)
+}
+
+#[tokio::test]
+async fn thumb_redirects_image_to_full_bytes() {
+    let state = build_dev_state();
+    let blobs: Arc<dyn Blobs> = state.blobs.clone();
+    let app = app(state);
+    let (id, _csrf) = upload_png(&app, "alice").await;
+
+    // A raster image cannot be downscaled without a decoder dep -> 302 to the full /f/{id}/raw.
+    let thumb = send(&app, get(&format!("/d/{id}/thumb"), Some("alice"))).await;
+    assert_eq!(thumb.status, StatusCode::FOUND);
+    assert_eq!(thumb.location(), format!("/f/{id}/raw"));
+    // The image path caches NO derived blob (nothing was generated).
+    assert!(blobs.get(&format!("{id}.thumb")).await.is_err());
+}
+
+#[tokio::test]
+async fn thumb_serves_and_caches_svg_type_icon_for_non_image() {
+    let state = build_dev_state();
+    let blobs: Arc<dyn Blobs> = state.blobs.clone();
+    let app = app(state);
+    let (id, _csrf) = upload_pdf(&app, "alice").await;
+
+    // No derived blob exists until the thumbnail is first requested (lazy derivation).
+    assert!(blobs.get(&format!("{id}.thumb")).await.is_err());
+
+    let thumb = send(&app, get(&format!("/d/{id}/thumb"), Some("alice"))).await;
+    assert_eq!(thumb.status, StatusCode::OK);
+    assert_eq!(thumb.header(header::CONTENT_TYPE), "image/svg+xml");
+    assert_eq!(thumb.header(header::X_CONTENT_TYPE_OPTIONS), "nosniff");
+    assert!(thumb.header(header::CONTENT_SECURITY_POLICY).contains("default-src 'none'"));
+    let body = thumb.text();
+    assert!(body.starts_with("<svg"));
+    assert!(body.contains(">PDF<"), "type icon bakes the uppercase extension label");
+
+    // The derived thumbnail is now cached as a `{id}.thumb` blob, and re-requesting serves it again.
+    assert_eq!(blobs.get(&format!("{id}.thumb")).await.unwrap(), body.as_bytes());
+    let again = send(&app, get(&format!("/d/{id}/thumb"), Some("alice"))).await;
+    assert_eq!(again.status, StatusCode::OK);
+    assert_eq!(again.text(), body, "cached thumbnail is deterministic");
+}
+
+#[tokio::test]
+async fn thumb_is_owner_scoped() {
+    let app = app(build_dev_state());
+    let (id, _csrf) = upload_pdf(&app, "alice").await;
+
+    // Bob cannot fetch Alice's thumbnail (403), exactly like /f/{id}/raw.
+    let bob = send(&app, get(&format!("/d/{id}/thumb"), Some("bob"))).await;
+    assert_eq!(bob.status, StatusCode::FORBIDDEN);
+    // A missing id is a 404.
+    let missing = send(&app, get("/d/doesnotxx/thumb", Some("alice"))).await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn gallery_grid_points_at_the_thumb_route() {
+    let app = app(build_dev_state());
+    let (id, _csrf) = upload_png(&app, "alice").await;
+    let home = send(&app, get("/", Some("alice"))).await;
+    assert_eq!(home.status, StatusCode::OK);
+    // Every card's <img> loads through the derived-thumbnail route (not /f/{id}/raw directly).
+    assert!(home.text().contains(&format!("src=\"/d/{id}/thumb\"")));
+}
+
+#[tokio::test]
+async fn thumb_derived_blob_is_removed_on_delete() {
+    let state = build_dev_state();
+    let blobs: Arc<dyn Blobs> = state.blobs.clone();
+    let app = app(state);
+    let (id, csrf) = upload_pdf(&app, "alice").await;
+
+    // Prime the derived-thumbnail cache, then delete the file.
+    send(&app, get(&format!("/d/{id}/thumb"), Some("alice"))).await;
+    assert!(blobs.get(&format!("{id}.thumb")).await.is_ok(), "thumbnail cached");
+    let del = send(
+        &app,
+        post_form(&format!("/delete/{id}"), &csrf, "alice", format!("csrf_token={csrf}")),
+    )
+    .await;
+    assert_eq!(del.status, StatusCode::FOUND);
+    // Both the original blob and its derived thumbnail are gone (no orphan).
+    assert!(blobs.get(&format!("{id}.thumb")).await.is_err(), "derived thumbnail removed with file");
+}

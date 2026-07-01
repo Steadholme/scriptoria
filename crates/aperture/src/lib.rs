@@ -11,6 +11,8 @@
 //! - `POST /upload` — multipart upload -> store blob in Cairn + metadata row -> 302 `/f/{id}` [SSO]
 //! - `GET /f/{id}` — file detail / preview page (owner-only) [SSO]
 //! - `GET /f/{id}/raw` — stream the blob (inline image / attachment) (owner-only) [SSO]
+//! - `GET /d/{id}/thumb` — gallery thumbnail: 302 to the full image, else a cached, mime-keyed type
+//!   icon derived + cached as a `{object_key}.thumb` blob (owner-only) [SSO]
 //! - `POST /delete/{id}` — delete your own file (blob + row) -> 302 `/` (CSRF) [SSO]
 //! - `POST /f/{id}/share` — set the share link's expiry + optional password (CSRF) [SSO]
 //! - `POST /f/{id}/revoke` — revoke the share link (clears the token) (CSRF) [SSO]
@@ -67,6 +69,7 @@ pub fn app(state: AppState) -> Router {
         .route("/upload", post(handlers::files::upload))
         .route("/f/{id}", get(handlers::files::detail))
         .route("/f/{id}/raw", get(handlers::files::raw))
+        .route("/d/{id}/thumb", get(handlers::files::thumb))
         .route("/delete/{id}", post(handlers::files::delete))
         .route("/f/{id}/share", post(handlers::files::configure_share))
         .route("/f/{id}/revoke", post(handlers::files::revoke_share))
