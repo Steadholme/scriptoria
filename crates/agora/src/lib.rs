@@ -21,6 +21,7 @@
 //! - `POST /api/similar`     (sso+CSRF) top-3 existing threads similar to a draft {title,body}
 //! - `GET  /api/thread/{id}/summary`  extractive summary (top sentences) of a thread
 
+pub mod audit;
 pub mod auth;
 pub mod config;
 pub mod error;
@@ -38,15 +39,17 @@ use axum::Router;
 use rand::rngs::OsRng;
 use rand::RngCore;
 
-use crate::config::Config;
+use crate::audit::AuditSink;
+use crate::config::{env_nonempty, Config};
 use crate::model::Category;
 use crate::store::{InMemoryStore, PgStore, Store};
 
-/// Shared application state. Cheap to clone (everything behind `Arc`).
+/// Shared application state. Cheap to clone (everything behind `Arc` / a cloneable sink).
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
     pub store: Arc<dyn Store>,
+    pub audit: AuditSink,
 }
 
 /// Build the router wiring all endpoints onto `state`.
@@ -122,6 +125,7 @@ pub async fn build_dev_state() -> AppState {
     AppState {
         config: Arc::new(Config::dev()),
         store,
+        audit: AuditSink::disabled(),
     }
 }
 
@@ -160,10 +164,29 @@ pub async fn build_state_from_env() -> Result<AppState, String> {
         .await
         .map_err(|e| format!("seed categories: {e}"))?;
 
+    let audit = AuditSink::start(
+        env_truthy("AUDIT_ENABLED"),
+        &env_nonempty("WATCHTOWER_URL").unwrap_or_default(),
+        env_nonempty("AUDIT_INGEST_TOKEN").as_deref(),
+    );
+
     Ok(AppState {
         config: Arc::new(config),
         store,
+        audit,
     })
+}
+
+/// Interpret a boolean-ish env var (`on` / `true` / `1` / `yes`, case-insensitive).
+fn env_truthy(key: &str) -> bool {
+    matches!(
+        std::env::var(key)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "on" | "true" | "1" | "yes"
+    )
 }
 
 /// Current wall-clock time in epoch seconds (thread/post timestamps).

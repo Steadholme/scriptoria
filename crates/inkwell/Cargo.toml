@@ -18,13 +18,16 @@ path = "src/main.rs"
 axum = "0.8"
 # Async runtime axum runs on. The Store trait is async: handlers `.await` it directly and
 # PgStore drives sqlx natively, so a worker thread is NEVER blocked (no sync-over-async bridge).
-# `rt-multi-thread` keeps the serving runtime parallel for concurrent reads.
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+# `rt-multi-thread` keeps the serving runtime parallel for concurrent reads. The audit emitter also
+# `tokio::spawn`s its background worker, and its raw HTTP/1.1 POST to Watchtower needs `net`
+# (TcpStream), `io-util` (AsyncRead/WriteExt), and `time` (the per-POST timeout).
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "net", "io-util", "time"] }
 # Erase the async Store trait methods so `Arc<dyn Store>` stays object-safe (handlers depend
 # only on the trait, exactly like the keystone/keyward/beacon seam).
 async-trait = "0.1"
-# Deserialize the urlencoded compose/edit/delete form bodies.
+# Deserialize the urlencoded compose/edit/delete form bodies; serde_json serializes audit events.
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # Ergonomic error/store enums -> JSON error envelope.
 thiserror = "2"
 # Structured logging.

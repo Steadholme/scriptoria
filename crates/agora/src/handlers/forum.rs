@@ -14,6 +14,7 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use serde::Deserialize;
 
+use crate::audit::AuditEvent;
 use crate::auth;
 use crate::error::AppError;
 use crate::handlers::insight::thread_summary;
@@ -397,6 +398,18 @@ pub async fn create(
     state.store.create_thread(&thread, &first_post).await?;
     tracing::info!(thread = thread.id, author = thread.author_email, "thread created");
 
+    let actor = if thread.author_email.is_empty() {
+        &thread.author_sub
+    } else {
+        &thread.author_email
+    };
+    state.audit.emit(AuditEvent::info(
+        "thread.create",
+        actor,
+        &thread.id,
+        &thread.category_id,
+    ));
+
     Ok(redirect_to(&format!("/t/{}", thread.id)))
 }
 
@@ -443,6 +456,13 @@ pub async fn reply(
     };
     state.store.add_reply(&post).await?;
     tracing::info!(thread = id, author = post.author_email, "reply posted");
+
+    let actor = if post.author_email.is_empty() {
+        &post.author_sub
+    } else {
+        &post.author_email
+    };
+    state.audit.emit(AuditEvent::info("reply.create", actor, &post.id, &id));
 
     Ok(redirect_to(&format!("/t/{id}")))
 }

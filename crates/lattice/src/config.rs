@@ -58,7 +58,7 @@ impl Default for Config {
 }
 
 /// Read an env var, returning `None` when unset OR empty (empty never clobbers a default).
-fn env_nonempty(key: &str) -> Option<String> {
+pub fn env_nonempty(key: &str) -> Option<String> {
     match std::env::var(key) {
         Ok(v) if !v.is_empty() => Some(v),
         _ => None,

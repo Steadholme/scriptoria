@@ -17,6 +17,7 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::Form;
 use serde::Deserialize;
 
+use crate::audit::AuditEvent;
 use crate::auth;
 use crate::error::AppError;
 use crate::graph::{self, PagePanel};
@@ -317,7 +318,7 @@ pub async fn edit_submit(
         }
     };
 
-    state
+    let saved = state
         .store
         .save_page(SaveInput {
             slug: slug.clone(),
@@ -328,6 +329,21 @@ pub async fn edit_submit(
             revision_id: auth::random_hex(),
         })
         .await?;
+
+    // Tamper-evident audit trail: record the save AFTER the store commit succeeds. A brand-new
+    // page has `created_at == updated_at`; an edit keeps its earlier `created_at`. The event only
+    // carries logical fields (actor / slug / create|edit) — the page body NEVER rides an event.
+    let detail = if saved.created_at == saved.updated_at {
+        "create"
+    } else {
+        "edit"
+    };
+    state.audit.emit(AuditEvent::info(
+        "page.save",
+        &saved.updated_by_email,
+        &saved.slug,
+        detail,
+    ));
 
     Ok(Redirect::to(&format!("/w/{slug}")).into_response())
 }

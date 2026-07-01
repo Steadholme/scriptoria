@@ -14,6 +14,7 @@
 //! - `POST /delete/{id}` — delete your own file (blob + row) -> 302 `/` (CSRF) [SSO]
 //! - `GET /s/{token}` — fetch a shared file by unguessable token, NO SSO [PUBLIC `/s/` prefix]
 
+pub mod audit;
 pub mod auth;
 pub mod blobs;
 pub mod config;
@@ -31,16 +32,18 @@ use axum::Router;
 use rand::rngs::OsRng;
 use rand::RngCore;
 
+use crate::audit::AuditSink;
 use crate::blobs::{Blobs, MemoryBlobs, S3Blobs};
 use crate::config::Config;
 use crate::store::{InMemoryStore, PgStore, Store};
 
-/// Shared application state. Cheap to clone (everything behind `Arc`).
+/// Shared application state. Cheap to clone (everything behind `Arc` / a cloneable sink).
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
     pub store: Arc<dyn Store>,
     pub blobs: Arc<dyn Blobs>,
+    pub audit: AuditSink,
 }
 
 /// Build the router wiring all endpoints onto `state`. Routes are explicit (no fallback): the
@@ -89,6 +92,7 @@ pub fn build_dev_state() -> AppState {
         config: Arc::new(Config::dev()),
         store: Arc::new(InMemoryStore::new()),
         blobs: Arc::new(MemoryBlobs::new()),
+        audit: AuditSink::disabled(),
     }
 }
 
@@ -133,11 +137,32 @@ pub async fn build_state_from_env() -> Result<AppState, String> {
         other => return Err(format!("unknown APERTURE_BLOBS={other} (use memory|s3)")),
     };
 
+    // The audit sink is enabled by `AUDIT_ENABLED` + `WATCHTOWER_URL` + `AUDIT_INGEST_TOKEN`;
+    // any misconfiguration only warns and turns audit OFF (never fails startup).
+    let audit = AuditSink::start(
+        env_truthy("AUDIT_ENABLED"),
+        &std::env::var("WATCHTOWER_URL").unwrap_or_default(),
+        std::env::var("AUDIT_INGEST_TOKEN").ok().as_deref(),
+    );
+
     Ok(AppState {
         config: Arc::new(config),
         store,
         blobs,
+        audit,
     })
+}
+
+/// Interpret a boolean-ish env var (`on` / `true` / `1` / `yes`, case-insensitive).
+fn env_truthy(key: &str) -> bool {
+    matches!(
+        std::env::var(key)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "on" | "true" | "1" | "yes"
+    )
 }
 
 /// Current wall-clock time in epoch seconds (file `created_at` granularity).

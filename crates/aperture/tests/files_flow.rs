@@ -287,6 +287,7 @@ async fn oversized_upload_is_rejected() {
         config: Arc::new(cfg),
         store: Arc::new(InMemoryStore::new()),
         blobs: Arc::new(MemoryBlobs::new()),
+        audit: aperture::audit::AuditSink::disabled(),
     };
     let app = app(state);
 

@@ -38,6 +38,7 @@ async fn seeded_state(stale_days: i64, pages: &[(&str, &str, &str, i64)]) -> App
     AppState {
         config: Arc::new(config),
         store: Arc::new(store) as Arc<dyn Store>,
+        audit: lattice::audit::AuditSink::disabled(),
     }
 }
 

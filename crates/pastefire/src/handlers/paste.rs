@@ -13,6 +13,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::Form;
 use serde::Deserialize;
 
+use crate::audit::AuditEvent;
 use crate::auth::{self, Identity};
 use crate::config::{MAX_BODY_BYTES, MAX_TITLE_CHARS};
 use crate::error::AppError;
@@ -145,6 +146,25 @@ pub async fn create(
     }
 
     tracing::info!(id = paste.id, author = who.subject, "paste created");
+
+    // Tamper-evident trail: record the create AFTER the store insert succeeded. `detail` is
+    // value-free metadata (never the body) — only whether the paste self-destructs on read.
+    let actor = if who.email.is_empty() {
+        &who.subject
+    } else {
+        &who.email
+    };
+    state.audit.emit(AuditEvent::info(
+        "paste.create",
+        actor,
+        &paste.id,
+        if paste.burn_after_read {
+            "burn-after-read"
+        } else {
+            "standard"
+        },
+    ));
+
     Ok(redirect_found(&format!("/p/{}", paste.id)))
 }
 
@@ -300,6 +320,18 @@ pub async fn delete(
 
     if state.store.delete(&id, &actor.subject).await? {
         tracing::info!(id, author = actor.subject, "paste deleted");
+
+        // Tamper-evident trail: record the delete AFTER the ownership-scoped purge succeeded.
+        // Deletes are deliberate, destructive lifecycle events => `notice` severity.
+        let who = if actor.email.is_empty() {
+            &actor.subject
+        } else {
+            &actor.email
+        };
+        state
+            .audit
+            .emit(AuditEvent::notice("paste.delete", who, &id, "owner-delete"));
+
         return Ok(redirect_found("/"));
     }
     // Nothing deleted: distinguish "not yours" from "does not exist" for a precise message.

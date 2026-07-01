@@ -54,6 +54,18 @@ async fn main() {
 
     tracing_subscriber::fmt::init();
 
+    // Mandatory audit under the prod profile: a tamper-evident who-changed-what trail is a
+    // baseline requirement once real users share these surfaces. Refuse to boot in prod with
+    // audit disabled instead of silently keeping no record. Dev (profile unset) is unaffected.
+    if require_persistence() && !env_truthy("AUDIT_ENABLED") {
+        fatal(
+            "audit",
+            "HOLDFAST_PROFILE=prod (or REQUIRE_PERSISTENCE) requires AUDIT_ENABLED=true \
+             (+ WATCHTOWER_URL + AUDIT_INGEST_TOKEN) so content mutations are recorded"
+                .to_string(),
+        );
+    }
+
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_string());
 
     // Each surface connects to its OWN database and migrates idempotently — exactly what the
@@ -128,9 +140,15 @@ async fn build_blog() -> Result<Router, String> {
         .map_err(|e| format!("connect: {e}"))?;
     pg.migrate().await.map_err(|e| format!("migrate: {e}"))?;
     tracing::info!("blog (inkwell) store ready");
+    let audit = inkwell::audit::AuditSink::start(
+        env_truthy("AUDIT_ENABLED"),
+        &inkwell::config::env_nonempty("WATCHTOWER_URL").unwrap_or_default(),
+        inkwell::config::env_nonempty("AUDIT_INGEST_TOKEN").as_deref(),
+    );
     let state = inkwell::AppState {
         config: Arc::new(inkwell::config::Config::from_env()),
         store: Arc::new(pg),
+        audit,
     };
     Ok(inkwell::app(state))
 }
@@ -149,9 +167,15 @@ async fn build_forum() -> Result<Router, String> {
         .await
         .map_err(|e| format!("seed categories: {e}"))?;
     tracing::info!("forum (agora) store ready");
+    let audit = agora::audit::AuditSink::start(
+        env_truthy("AUDIT_ENABLED"),
+        &agora::config::env_nonempty("WATCHTOWER_URL").unwrap_or_default(),
+        agora::config::env_nonempty("AUDIT_INGEST_TOKEN").as_deref(),
+    );
     let state = agora::AppState {
         config: Arc::new(agora::config::Config::from_env()),
         store,
+        audit,
     };
     Ok(agora::app(state))
 }
@@ -164,9 +188,15 @@ async fn build_wiki() -> Result<Router, String> {
         .map_err(|e| format!("connect: {e}"))?;
     pg.migrate().await.map_err(|e| format!("migrate: {e}"))?;
     tracing::info!("wiki (lattice) store ready");
+    let audit = lattice::audit::AuditSink::start(
+        env_truthy("AUDIT_ENABLED"),
+        &lattice::config::env_nonempty("WATCHTOWER_URL").unwrap_or_default(),
+        lattice::config::env_nonempty("AUDIT_INGEST_TOKEN").as_deref(),
+    );
     let state = lattice::AppState {
         config: Arc::new(lattice::config::Config::from_env()),
         store: Arc::new(pg),
+        audit,
     };
     Ok(lattice::app(state))
 }
@@ -211,9 +241,15 @@ async fn build_paste() -> Result<Router, String> {
         .map_err(|e| format!("connect: {e}"))?;
     pg.migrate().await.map_err(|e| format!("migrate: {e}"))?;
     tracing::info!("paste (pastefire) store ready");
+    let audit = pastefire::audit::AuditSink::start(
+        env_truthy("AUDIT_ENABLED"),
+        &pastefire::config::env_nonempty("WATCHTOWER_URL").unwrap_or_default(),
+        pastefire::config::env_nonempty("AUDIT_INGEST_TOKEN").as_deref(),
+    );
     let state = pastefire::AppState {
         config: Arc::new(pastefire::config::Config::from_env()),
         store: Arc::new(pg),
+        audit,
     };
     Ok(pastefire::app(state))
 }
@@ -267,10 +303,16 @@ async fn build_drive() -> Result<Router, String> {
         other => return Err(format!("unknown APERTURE_BLOBS={other} (use memory|s3)")),
     };
 
+    let audit = aperture::audit::AuditSink::start(
+        env_truthy("AUDIT_ENABLED"),
+        &std::env::var("WATCHTOWER_URL").unwrap_or_default(),
+        std::env::var("AUDIT_INGEST_TOKEN").ok().as_deref(),
+    );
     let state = aperture::AppState {
         config: Arc::new(config),
         store: Arc::new(pg),
         blobs,
+        audit,
     };
     Ok(aperture::app(state))
 }

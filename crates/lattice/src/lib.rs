@@ -19,6 +19,7 @@
 //! - `GET /history/{slug}` — the revision list.
 //! - `GET /coherence` — maintenance view: stale pages + contradiction candidates (additive).
 
+pub mod audit;
 pub mod auth;
 pub mod config;
 pub mod error;
@@ -35,14 +36,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::routing::get;
 use axum::Router;
 
-use crate::config::Config;
+use crate::audit::AuditSink;
+use crate::config::{env_nonempty, Config};
 use crate::store::{InMemoryStore, PgStore, Store};
 
-/// Shared application state. Cheap to clone (everything behind `Arc`).
+/// Shared application state. Cheap to clone (everything behind `Arc` / a cloneable sink).
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
     pub store: Arc<dyn Store>,
+    pub audit: AuditSink,
 }
 
 /// Build the router wiring all endpoints onto `state`.
@@ -83,12 +86,13 @@ async fn require_gateway_sig(
     }
 }
 
-/// Construct dev state: dev [`Config`] + an empty [`InMemoryStore`]. Used by `main`'s memory
-/// mode and by the integration tests, so they need no database.
+/// Construct dev state: dev [`Config`], an empty [`InMemoryStore`], and a disabled audit sink (no
+/// network). Used by `main`'s memory mode and by the integration tests, so they need no database.
 pub fn build_dev_state() -> AppState {
     AppState {
         config: Arc::new(Config::dev()),
         store: Arc::new(InMemoryStore::new()),
+        audit: AuditSink::disabled(),
     }
 }
 
@@ -97,6 +101,9 @@ pub fn build_dev_state() -> AppState {
 /// [`Config`] comes from [`Config::from_env`]. The store is selected by `LATTICE_STORE`:
 /// - `memory` (default): empty [`InMemoryStore`] — no database required.
 /// - `postgres`: connect `DATABASE_URL`, run the idempotent migration, wire [`PgStore`].
+///
+/// The audit sink is enabled by `AUDIT_ENABLED` + `WATCHTOWER_URL` + `AUDIT_INGEST_TOKEN`; when
+/// any is unset/invalid it stays disabled (a no-op), never failing startup.
 pub async fn build_state_from_env() -> Result<AppState, String> {
     let config = Config::from_env();
 
@@ -119,10 +126,29 @@ pub async fn build_state_from_env() -> Result<AppState, String> {
         other => return Err(format!("unknown LATTICE_STORE={other} (use memory|postgres)")),
     };
 
+    let audit = AuditSink::start(
+        env_truthy("AUDIT_ENABLED"),
+        &env_nonempty("WATCHTOWER_URL").unwrap_or_default(),
+        env_nonempty("AUDIT_INGEST_TOKEN").as_deref(),
+    );
+
     Ok(AppState {
         config: Arc::new(config),
         store,
+        audit,
     })
+}
+
+/// Interpret a boolean-ish env var (`on` / `true` / `1` / `yes`, case-insensitive).
+fn env_truthy(key: &str) -> bool {
+    matches!(
+        std::env::var(key)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "on" | "true" | "1" | "yes"
+    )
 }
 
 /// Current wall-clock time in epoch milliseconds (page `updated_at` + revision `ts`).

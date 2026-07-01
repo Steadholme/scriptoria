@@ -12,6 +12,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::Form;
 use serde::Deserialize;
 
+use crate::audit::AuditEvent;
 use crate::auth;
 use crate::error::AppError;
 use crate::handlers::{esc, fmt_date, topbar, APP_CSS};
@@ -193,6 +194,15 @@ pub async fn create(
     };
     state.store.create_post(&post).await?;
     tracing::info!(slug = %slug, "post created");
+
+    let actor = if post.author_email.is_empty() { &post.author_sub } else { &post.author_email };
+    state.audit.emit(AuditEvent::info(
+        "post.create",
+        actor,
+        &slug,
+        if post.published { "published" } else { "draft" },
+    ));
+
     // Keep the ask index in step (best-effort; never fails the create).
     crate::reindex_post(state.store.as_ref(), &post).await;
 
@@ -265,6 +275,15 @@ pub async fn update(
     post.updated_at = now_secs();
     state.store.update_post(&post).await?;
     tracing::info!(slug = %slug, "post updated");
+
+    let actor = if post.author_email.is_empty() { &post.author_sub } else { &post.author_email };
+    state.audit.emit(AuditEvent::info(
+        "post.update",
+        actor,
+        &slug,
+        if post.published { "published" } else { "draft" },
+    ));
+
     // Re-chunk on edit (a now-draft post is de-indexed). Best-effort; never fails the update.
     crate::reindex_post(state.store.as_ref(), &post).await;
 
@@ -295,6 +314,10 @@ pub async fn delete(
     }
     state.store.delete_post(&slug).await?;
     tracing::info!(slug = %slug, "post deleted");
+
+    let actor = if post.author_email.is_empty() { &post.author_sub } else { &post.author_email };
+    state.audit.emit(AuditEvent::notice("post.delete", actor, &slug, "delete"));
+
     // Drop the post's chunks from the ask index (best-effort; never fails the delete).
     crate::deindex_post(state.store.as_ref(), &slug).await;
 

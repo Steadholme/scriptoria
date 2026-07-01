@@ -15,6 +15,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::Form;
 use serde::Deserialize;
 
+use crate::audit::AuditEvent;
 use crate::auth::{self, Identity};
 use crate::config::Config;
 use crate::error::AppError;
@@ -166,6 +167,12 @@ pub async fn upload(
     }
 
     tracing::info!(id = rec.id, owner = who.subject, size, "file uploaded");
+    state.audit.emit(AuditEvent::info(
+        "file.upload",
+        &who.subject,
+        &rec.id,
+        if rec.is_image() { "image" } else { "file" },
+    ));
     Ok(redirect_found(&format!("/f/{}", rec.id)))
 }
 
@@ -237,6 +244,12 @@ pub async fn delete(
         tracing::warn!(id = rec.id, error = %e, "metadata removed but blob delete failed (orphan)");
     }
     tracing::info!(id = rec.id, owner = actor.subject, "file deleted");
+    state.audit.emit(AuditEvent::notice(
+        "file.delete",
+        &actor.subject,
+        &rec.id,
+        if rec.is_image() { "image" } else { "file" },
+    ));
     Ok(redirect_found("/"))
 }
 
@@ -257,6 +270,14 @@ pub async fn share(
         .await?
         .ok_or_else(|| AppError::NotFound("This share link is invalid or has been removed.".to_string()))?;
     let bytes = state.blobs.get(&rec.object_key).await?;
+    // Public share fetch: no gateway identity on this route, so the affected file's owner is the
+    // subject the event is attributed to.
+    state.audit.emit(AuditEvent::info(
+        "file.share",
+        &rec.owner_sub,
+        &rec.id,
+        if rec.is_image() { "image" } else { "file" },
+    ));
     Ok(serve_blob(&rec, bytes))
 }
 

@@ -99,6 +99,7 @@ async fn pg_store_full_integration() {
         config: build_dev_state().config,
         store: store.clone(),
         blobs: Arc::new(MemoryBlobs::new()),
+        audit: aperture::audit::AuditSink::disabled(),
     };
     let app = app(state);
     let res = app

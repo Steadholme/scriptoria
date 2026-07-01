@@ -19,8 +19,10 @@ path = "src/main.rs"
 axum = "0.8"
 # Async runtime axum runs on. The Store trait is async: handlers `.await` it directly and
 # PgStore drives sqlx natively, so a worker thread is NEVER blocked (no sync-over-async
-# bridge). `rt-multi-thread` keeps the serving runtime parallel for concurrent reads.
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+# bridge). `rt-multi-thread` keeps the serving runtime parallel for concurrent reads. The audit
+# emitter also `tokio::spawn`s its background worker, and its hand-rolled HTTP/1.1 POST needs
+# `net`/`io-util`/`time`.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "net", "io-util", "time"] }
 # Erase the async Store trait methods so `Arc<dyn Store>` stays object-safe (handlers depend
 # only on the trait, exactly like the keystone/keyward/beacon seam).
 async-trait = "0.1"
