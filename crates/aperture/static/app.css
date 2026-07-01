@@ -289,6 +289,13 @@ hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
 .revoke-form { margin-top: 12px; }
 .form-error { margin: 0 0 12px; color: var(--down-ink); font-size: 13px; font-weight: 600; }
 
+/* ---- storage usage meter ------------------------------------------------ */
+.usage-meter { margin: -12px 0 24px; }
+.usage-meter__labels { display: flex; justify-content: space-between; gap: 12px; font-size: 12.5px; font-weight: 550; color: var(--ink-3); margin-bottom: 6px; }
+.usage-meter__track { height: 8px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); overflow: hidden; }
+.usage-meter__fill { height: 100%; border-radius: 999px; background: var(--accent); }
+.usage-meter__fill--warn { background: var(--warn-ink); }
+
 /* ---- folders (sidebar / switcher) --------------------------------------- */
 .drive-layout { display: grid; grid-template-columns: 232px 1fr; gap: 24px; align-items: start; }
 .drive-content { min-width: 0; }

@@ -2,6 +2,7 @@
 //!
 //! - [`health`] — unauthenticated liveness probe (`/healthz`).
 //! - [`files`] — the drive surface (gallery, upload, detail, raw, delete, public share).
+//! - [`admin`] — the admin panel (per-owner storage usage + quota overrides; admin groups only).
 //!
 //! The shared design tokens / CSS are embedded (via `include_str!`) and inlined into every page,
 //! matching the HOLDFAST enterprise brand: brand gradient, indigo accent, cards, buttons, the
@@ -9,6 +10,7 @@
 //! HTML-escaped on render (defense-in-depth against stored XSS); blob bytes are served as inline
 //! images only when magic-sniffed, otherwise as downloads.
 
+pub mod admin;
 pub mod files;
 pub mod health;
 

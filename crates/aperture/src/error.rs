@@ -3,7 +3,7 @@
 //! Aperture is a browser-facing app, so a failure renders the enterprise error page (same
 //! app-bar + design tokens) rather than a JSON envelope. Store/blob failures collapse to a 500;
 //! a missing file/token is a 404; a CSRF/validation rejection is a 400; a non-owner access is a
-//! 403.
+//! 403; an over-quota upload is a 413.
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -27,6 +27,10 @@ pub enum AppError {
     #[error("gone: {0}")]
     Gone(String),
 
+    /// The upload would push the owner past their storage quota (413 Payload Too Large).
+    #[error("quota_exceeded: {0}")]
+    QuotaExceeded(String),
+
     /// Unexpected internal failure (metadata or object-store I/O).
     #[error("server_error: {0}")]
     Internal(String),
@@ -40,6 +44,7 @@ impl AppError {
             AppError::Forbidden(d) => (StatusCode::FORBIDDEN, "Not allowed", d.clone()),
             AppError::NotFound(d) => (StatusCode::NOT_FOUND, "Not found", d.clone()),
             AppError::Gone(d) => (StatusCode::GONE, "Link expired", d.clone()),
+            AppError::QuotaExceeded(d) => (StatusCode::PAYLOAD_TOO_LARGE, "Storage full", d.clone()),
             AppError::Internal(d) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Something went wrong",

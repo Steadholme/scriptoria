@@ -24,6 +24,8 @@
       <p class="sub">Images, screenshots and files — stored privately and shareable by link. Ownership comes from your single sign-on session.</p>
     </div>
 
+    {{USAGE}}
+
     <form id="uploadForm" class="dropzone" method="post" action="/upload" enctype="multipart/form-data">
       <input type="hidden" name="csrf_token" value="{{CSRF}}">
       <input id="fileInput" class="dropzone__input" type="file" name="file" required>

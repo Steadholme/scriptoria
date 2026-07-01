@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Admin · Aperture · HOLDFAST</title>
+  <style>{{CSS}}</style>
+</head>
+<body class="page-console">
+  <header class="topbar">
+    <div class="topbar__inner">
+      <a class="brand" href="/" aria-label="HOLDFAST Drive">
+        <span class="brand__glyph" aria-hidden="true">{{SHIELD}}</span>
+        <span class="brand__word">HOLDFAST</span>
+      </a>
+      <div class="topbar__right">{{USERBOX}}</div>
+    </div>
+  </header>
+
+  <main class="console">
+    <div class="console__head">
+      <h1>Drive admin</h1>
+      <p class="sub">Per-owner storage usage and quota overrides. Default quota: {{DEFAULT_QUOTA}}.</p>
+    </div>
+
+    <section class="card">
+      <div class="card__head"><h2>Storage usage by owner</h2></div>
+      <table>
+        <thead>
+          <tr><th>Owner</th><th>Files</th><th>Used</th><th>Quota</th></tr>
+        </thead>
+        <tbody>
+          {{ROWS}}
+        </tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <div class="card__head"><h2>Set a quota override</h2></div>
+      <div class="card__body">
+        {{QUOTA_FORM}}
+        <p class="hint hint--muted">The override wins over the default. Leave the quota blank to clear an owner&#x27;s override; enter 0 for an explicit unlimited override.</p>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

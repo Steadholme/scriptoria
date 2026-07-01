@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::config::clamp_page;
-use crate::model::{FileRec, FolderRec};
+use crate::model::{FileRec, FolderRec, OwnerUsage};
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
 #[derive(Debug, Error)]
@@ -108,6 +108,24 @@ pub trait Store: Send + Sync {
         owner_sub: &str,
         folder_id: Option<&str>,
     ) -> Result<bool, StoreError>;
+
+    /// Total stored bytes for `owner_sub` (SUM of the owner's file sizes; `0` with no files).
+    /// Backs the drive's usage meter and the upload quota precheck.
+    async fn usage_for_owner(&self, owner_sub: &str) -> Result<i64, StoreError>;
+
+    /// Aggregated usage for every owner with at least one file, largest first (`bytes` DESC,
+    /// `owner_sub` ASC tiebreak). Backs the `/admin` usage table.
+    async fn usage_by_owner(&self) -> Result<Vec<OwnerUsage>, StoreError>;
+
+    /// The owner's per-owner quota override, when one exists. `None` means "no override" — the
+    /// caller falls back to the configured default (see [`crate::config::effective_quota`]).
+    async fn get_quota(&self, owner_sub: &str) -> Result<Option<i64>, StoreError>;
+
+    /// Set (`Some`, upsert) or clear (`None`, delete the row) an owner's quota override.
+    async fn set_quota(&self, owner_sub: &str, quota_bytes: Option<i64>) -> Result<(), StoreError>;
+
+    /// Every quota override row as `(owner_sub, quota_bytes)`, owner-ordered (for `/admin`).
+    async fn list_quotas(&self) -> Result<Vec<(String, i64)>, StoreError>;
 }
 
 // --------------------------------------------------------------------------------------
@@ -120,6 +138,8 @@ pub trait Store: Send + Sync {
 pub struct InMemoryStore {
     files: Mutex<Vec<FileRec>>,
     folders: Mutex<Vec<FolderRec>>,
+    /// Per-owner quota override rows, `(owner_sub, quota_bytes)` — mirrors the `owner_quotas` table.
+    quotas: Mutex<Vec<(String, i64)>>,
 }
 
 impl InMemoryStore {
@@ -312,6 +332,57 @@ impl Store for InMemoryStore {
             None => Ok(false),
         }
     }
+
+    async fn usage_for_owner(&self, owner_sub: &str) -> Result<i64, StoreError> {
+        let files = self.files.lock().expect("files lock poisoned");
+        Ok(files
+            .iter()
+            .filter(|f| f.owner_sub == owner_sub)
+            .map(|f| f.size)
+            .sum())
+    }
+
+    async fn usage_by_owner(&self) -> Result<Vec<OwnerUsage>, StoreError> {
+        let files = self.files.lock().expect("files lock poisoned");
+        let mut out: Vec<OwnerUsage> = Vec::new();
+        for f in files.iter() {
+            match out.iter_mut().find(|u| u.owner_sub == f.owner_sub) {
+                Some(u) => {
+                    u.files += 1;
+                    u.bytes += f.size;
+                }
+                None => out.push(OwnerUsage {
+                    owner_sub: f.owner_sub.clone(),
+                    files: 1,
+                    bytes: f.size,
+                }),
+            }
+        }
+        // Largest first; owner as a deterministic tiebreak — matches the Pg ORDER BY.
+        out.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.owner_sub.cmp(&b.owner_sub)));
+        Ok(out)
+    }
+
+    async fn get_quota(&self, owner_sub: &str) -> Result<Option<i64>, StoreError> {
+        let quotas = self.quotas.lock().expect("quotas lock poisoned");
+        Ok(quotas.iter().find(|(o, _)| o == owner_sub).map(|(_, q)| *q))
+    }
+
+    async fn set_quota(&self, owner_sub: &str, quota_bytes: Option<i64>) -> Result<(), StoreError> {
+        let mut quotas = self.quotas.lock().expect("quotas lock poisoned");
+        quotas.retain(|(o, _)| o != owner_sub);
+        if let Some(q) = quota_bytes {
+            quotas.push((owner_sub.to_string(), q));
+        }
+        Ok(())
+    }
+
+    async fn list_quotas(&self) -> Result<Vec<(String, i64)>, StoreError> {
+        let quotas = self.quotas.lock().expect("quotas lock poisoned");
+        let mut out = quotas.clone();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
 }
 
 // --------------------------------------------------------------------------------------
@@ -417,6 +488,17 @@ impl PgStore {
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_files_owner_folder \
              ON files (owner_sub, folder_id, created_at)",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Per-owner storage quota overrides. A missing row means "use the configured default"
+        // (APERTURE_DEFAULT_QUOTA_BYTES); 0 means an explicit unlimited override. Additive +
+        // idempotent; portable standard SQL only.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS owner_quotas (\
+                 owner_sub TEXT PRIMARY KEY, \
+                 quota_bytes BIGINT NOT NULL\
+             )",
         )
         .execute(&self.pool)
         .await?;
@@ -673,6 +755,84 @@ impl PgStore {
             .await?;
         Ok(result.rows_affected() > 0)
     }
+
+    async fn usage_for_owner_async(&self, owner_sub: &str) -> Result<i64, sqlx::Error> {
+        // SUM(BIGINT) widens to NUMERIC in PostgreSQL; the CAST keeps the decoded type BIGINT.
+        let row = sqlx::query(
+            "SELECT CAST(COALESCE(SUM(size), 0) AS BIGINT) AS bytes \
+             FROM files WHERE owner_sub = $1",
+        )
+        .bind(owner_sub)
+        .fetch_one(&self.pool)
+        .await?;
+        row.try_get("bytes")
+    }
+
+    async fn usage_by_owner_async(&self) -> Result<Vec<OwnerUsage>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT owner_sub, CAST(COUNT(*) AS BIGINT) AS files, \
+                    CAST(COALESCE(SUM(size), 0) AS BIGINT) AS bytes \
+             FROM files GROUP BY owner_sub ORDER BY bytes DESC, owner_sub ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(OwnerUsage {
+                    owner_sub: row.try_get("owner_sub")?,
+                    files: row.try_get("files")?,
+                    bytes: row.try_get("bytes")?,
+                })
+            })
+            .collect()
+    }
+
+    async fn get_quota_async(&self, owner_sub: &str) -> Result<Option<i64>, sqlx::Error> {
+        let row = sqlx::query("SELECT quota_bytes FROM owner_quotas WHERE owner_sub = $1")
+            .bind(owner_sub)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|r| r.try_get("quota_bytes")).transpose()
+    }
+
+    async fn set_quota_async(
+        &self,
+        owner_sub: &str,
+        quota_bytes: Option<i64>,
+    ) -> Result<(), sqlx::Error> {
+        match quota_bytes {
+            // Upsert the override row (standard ON CONFLICT .. DO UPDATE on the primary key).
+            Some(q) => {
+                sqlx::query(
+                    "INSERT INTO owner_quotas (owner_sub, quota_bytes) VALUES ($1, $2) \
+                     ON CONFLICT (owner_sub) DO UPDATE SET quota_bytes = EXCLUDED.quota_bytes",
+                )
+                .bind(owner_sub)
+                .bind(q)
+                .execute(&self.pool)
+                .await?;
+            }
+            // Clear the override: the owner falls back to the configured default.
+            None => {
+                sqlx::query("DELETE FROM owner_quotas WHERE owner_sub = $1")
+                    .bind(owner_sub)
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn list_quotas_async(&self) -> Result<Vec<(String, i64)>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT owner_sub, quota_bytes FROM owner_quotas ORDER BY owner_sub ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| Ok((row.try_get("owner_sub")?, row.try_get("quota_bytes")?)))
+            .collect()
+    }
 }
 
 #[async_trait]
@@ -772,6 +932,36 @@ impl Store for PgStore {
         folder_id: Option<&str>,
     ) -> Result<bool, StoreError> {
         self.move_file_async(id, owner_sub, folder_id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn usage_for_owner(&self, owner_sub: &str) -> Result<i64, StoreError> {
+        self.usage_for_owner_async(owner_sub)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn usage_by_owner(&self) -> Result<Vec<OwnerUsage>, StoreError> {
+        self.usage_by_owner_async()
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn get_quota(&self, owner_sub: &str) -> Result<Option<i64>, StoreError> {
+        self.get_quota_async(owner_sub)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn set_quota(&self, owner_sub: &str, quota_bytes: Option<i64>) -> Result<(), StoreError> {
+        self.set_quota_async(owner_sub, quota_bytes)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn list_quotas(&self) -> Result<Vec<(String, i64)>, StoreError> {
+        self.list_quotas_async()
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
@@ -989,6 +1179,57 @@ mod tests {
         // Move "a" back to root -> the folder view empties again.
         assert!(s.move_file("a", "u", None).await.unwrap());
         assert_eq!(s.list_by_owner("u", Some("f1"), None, 50).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn quota_override_set_get_clear_roundtrip() {
+        let s = InMemoryStore::new();
+        // No row yet -> no override.
+        assert_eq!(s.get_quota("u").await.unwrap(), None);
+        // Set, then update (upsert semantics), then clear.
+        s.set_quota("u", Some(1024)).await.unwrap();
+        assert_eq!(s.get_quota("u").await.unwrap(), Some(1024));
+        s.set_quota("u", Some(2048)).await.unwrap();
+        assert_eq!(s.get_quota("u").await.unwrap(), Some(2048));
+        s.set_quota("v", Some(0)).await.unwrap(); // explicit unlimited override
+        let all = s.list_quotas().await.unwrap();
+        assert_eq!(all, vec![("u".to_string(), 2048), ("v".to_string(), 0)]);
+        s.set_quota("u", None).await.unwrap();
+        assert_eq!(s.get_quota("u").await.unwrap(), None);
+        assert_eq!(s.list_quotas().await.unwrap(), vec![("v".to_string(), 0)]);
+    }
+
+    #[tokio::test]
+    async fn usage_sums_are_owner_scoped_and_aggregated() {
+        let s = InMemoryStore::new();
+        // No files -> zero usage, empty aggregate.
+        assert_eq!(s.usage_for_owner("u").await.unwrap(), 0);
+        assert!(s.usage_by_owner().await.unwrap().is_empty());
+
+        let mut a = file("a", "u", "ta", 1);
+        a.size = 100;
+        let mut b = file("b", "u", "tb", 2);
+        b.size = 50;
+        let mut c = file("c", "other", "tc", 3);
+        c.size = 700;
+        for f in [&a, &b, &c] {
+            s.create(f).await.unwrap();
+        }
+
+        assert_eq!(s.usage_for_owner("u").await.unwrap(), 150);
+        assert_eq!(s.usage_for_owner("other").await.unwrap(), 700);
+        // Aggregate: largest first, per-owner file counts and byte sums.
+        let agg = s.usage_by_owner().await.unwrap();
+        assert_eq!(
+            agg,
+            vec![
+                OwnerUsage { owner_sub: "other".into(), files: 1, bytes: 700 },
+                OwnerUsage { owner_sub: "u".into(), files: 2, bytes: 150 },
+            ]
+        );
+        // Deleting a file shrinks the sum (usage tracks the live rows).
+        s.delete("a", "u").await.unwrap();
+        assert_eq!(s.usage_for_owner("u").await.unwrap(), 50);
     }
 
     #[tokio::test]

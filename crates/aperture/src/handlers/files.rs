@@ -17,7 +17,7 @@ use serde::Deserialize;
 
 use crate::audit::AuditEvent;
 use crate::auth::{self, Identity};
-use crate::config::{clamp_page, Config};
+use crate::config::{clamp_page, effective_quota, Config};
 use crate::error::AppError;
 use crate::handlers::{
     esc, expiry_options, fmt_ts, human_size, parse_expiry, resolve_content_type, safe_filename,
@@ -100,7 +100,27 @@ pub async fn gallery(
         None
     };
 
-    let html = render_gallery(&who, &csrf, &files, next.as_ref(), &folders, active.as_ref());
+    // The usage meter: total stored bytes vs. the effective quota (override else default).
+    let used = state
+        .store
+        .usage_for_owner(&who.subject)
+        .await
+        .unwrap_or_default();
+    let quota = effective_quota(
+        state.store.get_quota(&who.subject).await.unwrap_or_default(),
+        state.config.default_quota_bytes,
+    );
+
+    let html = render_gallery(
+        &who,
+        &csrf,
+        &files,
+        next.as_ref(),
+        &folders,
+        active.as_ref(),
+        used,
+        quota,
+    );
     html_with_csrf(StatusCode::OK, html, &csrf)
 }
 
@@ -190,6 +210,32 @@ pub async fn upload(
     let content_type = resolve_content_type(&bytes, &client_type);
     let size = bytes.len() as i64;
     let now = now_secs();
+
+    // Enforce the owner's storage quota BEFORE reserving the row or writing the blob. The
+    // effective quota is the per-owner override else the configured default; unlimited (the
+    // pre-quota default) skips the usage read entirely, so the fast path is unchanged.
+    if let Some(quota) = effective_quota(
+        state.store.get_quota(&who.subject).await?,
+        state.config.default_quota_bytes,
+    ) {
+        let used = state.store.usage_for_owner(&who.subject).await?;
+        if used.saturating_add(size) > quota {
+            tracing::info!(owner = who.subject, used, size, quota, "upload rejected: over quota");
+            state.audit.emit(AuditEvent::warning(
+                "file.quota.reject",
+                &who.subject,
+                "upload",
+                "over-quota upload rejected",
+            ));
+            return Err(AppError::QuotaExceeded(format!(
+                "Not enough storage. This file is {size}, but only {free} of your {quota} quota \
+                 is free. Delete some files and try again.",
+                size = human_size(size),
+                free = human_size((quota - used).max(0)),
+                quota = human_size(quota),
+            )));
+        }
+    }
 
     let mut rec = FileRec {
         id: String::new(),
@@ -852,7 +898,7 @@ fn thumb_palette(content_type: &str) -> (&'static str, &'static str) {
 }
 
 /// Wrap rendered HTML in a response that also (re)sets the CSRF cookie.
-fn html_with_csrf(status: StatusCode, html: String, csrf: &str) -> Response {
+pub(crate) fn html_with_csrf(status: StatusCode, html: String, csrf: &str) -> Response {
     (
         status,
         [(header::SET_COOKIE, auth::csrf_cookie(csrf))],
@@ -862,7 +908,7 @@ fn html_with_csrf(status: StatusCode, html: String, csrf: &str) -> Response {
 }
 
 /// A `302 Found` redirect to `location` (the spec'd create/delete response code).
-fn redirect_found(location: &str) -> Response {
+pub(crate) fn redirect_found(location: &str) -> Response {
     (StatusCode::FOUND, [(header::LOCATION, location.to_string())]).into_response()
 }
 
@@ -875,6 +921,7 @@ fn ext_label(name: &str) -> String {
         .unwrap_or_else(|| "FILE".to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_gallery(
     who: &Identity,
     csrf: &str,
@@ -882,6 +929,8 @@ fn render_gallery(
     next: Option<&(i64, String)>,
     folders: &[FolderRec],
     active: Option<&FolderRec>,
+    used: i64,
+    quota: Option<i64>,
 ) -> String {
     let count = match files.len() {
         0 => "No files yet".to_string(),
@@ -911,12 +960,54 @@ fn render_gallery(
         .replace("{{CSS}}", APP_CSS)
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Drive", Some(&who.email)))
+        .replace("{{USAGE}}", &render_usage_meter(used, quota))
         .replace("{{CSRF}}", &esc(csrf))
         .replace("{{SIDEBAR}}", &render_sidebar(csrf, folders, active))
         .replace("{{HEADING}}", &esc(&heading))
         .replace("{{COUNT}}", &esc(&count))
         .replace("{{CARDS}}", &render_cards(files))
         .replace("{{PAGER}}", &pager)
+}
+
+/// Render the drive's storage usage meter: under a quota it is a labeled fill bar ("used of
+/// quota (percent)", amber past 90%); with UNLIMITED storage it shows just the used total, so
+/// the pre-quota look barely changes. All sizes are server-formatted ([`human_size`]), escaped
+/// regardless.
+fn render_usage_meter(used: i64, quota: Option<i64>) -> String {
+    match quota {
+        Some(quota) => {
+            let pct = (used as f64 / quota as f64 * 100.0).clamp(0.0, 100.0);
+            let warn = if pct >= 90.0 {
+                " usage-meter__fill--warn"
+            } else {
+                ""
+            };
+            format!(
+                "<div class=\"usage-meter\">\
+                   <div class=\"usage-meter__labels\">\
+                     <span>Storage</span>\
+                     <span>{used} of {quota} used ({pct:.0}%)</span>\
+                   </div>\
+                   <div class=\"usage-meter__track\">\
+                     <div class=\"usage-meter__fill{warn}\" style=\"width:{pct:.2}%\"></div>\
+                   </div>\
+                 </div>",
+                used = esc(&human_size(used)),
+                quota = esc(&human_size(quota)),
+                pct = pct,
+                warn = warn,
+            )
+        }
+        None => format!(
+            "<div class=\"usage-meter\">\
+               <div class=\"usage-meter__labels\">\
+                 <span>Storage</span>\
+                 <span>{used} used · no limit</span>\
+               </div>\
+             </div>",
+            used = esc(&human_size(used)),
+        ),
+    }
 }
 
 /// Render the folder sidebar/switcher: an "All files" entry, one link per folder (the active one
@@ -1238,6 +1329,24 @@ mod tests {
         assert_ne!(thumb_palette("application/pdf").0, thumb_palette("audio/mpeg").0);
         assert_eq!(thumb_palette("application/zip").0, "#FEF3C7");
         assert_eq!(thumb_palette("text/plain").0, "#E2E8F0");
+    }
+
+    #[test]
+    fn usage_meter_renders_quota_bar_or_unlimited_total() {
+        // Under a quota: used/quota labels, a percent, and a width-scaled fill bar.
+        let limited = render_usage_meter(512 * 1024, Some(1024 * 1024));
+        assert!(limited.contains("512.0 KB of 1.0 MB used (50%)"));
+        assert!(limited.contains("usage-meter__track"));
+        assert!(limited.contains("width:50.00%"));
+        assert!(!limited.contains("usage-meter__fill--warn"));
+        // Past 90% the fill switches to the warning tint; over-quota is clamped to 100%.
+        let hot = render_usage_meter(99, Some(100));
+        assert!(hot.contains("usage-meter__fill--warn"));
+        assert!(render_usage_meter(300, Some(100)).contains("width:100.00%"));
+        // Unlimited: just the used total — no track, no percent.
+        let unlimited = render_usage_meter(2048, None);
+        assert!(unlimited.contains("2.0 KB used · no limit"));
+        assert!(!unlimited.contains("usage-meter__track"));
     }
 
     #[test]

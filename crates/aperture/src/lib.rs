@@ -21,6 +21,8 @@
 //! - `POST /folders` — create an owner folder (CSRF) [SSO]
 //! - `POST /folders/{id}/rename` — rename an owner folder (CSRF) [SSO]
 //! - `POST /folders/{id}/delete` — delete an owner folder; its files are unfiled (CSRF) [SSO]
+//! - `GET /admin` — per-owner storage usage + quota overrides (admin groups only) [SSO]
+//! - `POST /admin/quota` — set/clear an owner's quota override (CSRF) [SSO, admin]
 //! - `GET /s/{token}` — fetch a shared file by unguessable token, NO SSO (410 past expiry;
 //!   password prompt when protected) [PUBLIC `/s/` prefix]
 //! - `POST /s/{token}` — submit a protected share link's password, NO SSO [PUBLIC `/s/` prefix]
@@ -81,12 +83,36 @@ pub fn app(state: AppState) -> Router {
             "/s/{token}",
             get(handlers::files::share).post(handlers::files::share_unlock),
         )
+        .merge(admin_router())
         .layer(DefaultBodyLimit::max(body_limit))
         // Reject a forged gateway identity (spoofed X-Auth-* from a rogue in-network peer):
         // when GATEWAY_HMAC_KEY is set, an injected identity MUST carry a valid X-Auth-Sig.
         // No-op when the key is unset or no identity is present (share route / dev).
         .layer(axum::middleware::from_fn(require_gateway_sig))
         .with_state(state)
+}
+
+/// The `/admin` subtree, gated as one unit by [`require_admin_mw`]: the per-owner storage usage
+/// table + quota overrides. Merged into [`app`] BEFORE the shared layers, so the group check
+/// lives in exactly one place and the gateway-signature guard still covers it.
+fn admin_router() -> Router<AppState> {
+    Router::new()
+        .route("/admin", get(handlers::admin::index))
+        .route("/admin/quota", post(handlers::admin::set_quota))
+        .layer(axum::middleware::from_fn(require_admin_mw))
+}
+
+/// Middleware gating the whole `/admin` subtree on [`auth::require_admin`]. A non-admin (or
+/// unauthenticated) request gets the branded `403`; only `admins` / `infra-admins` pass.
+async fn require_admin_mw(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match auth::require_admin(req.headers()) {
+        Ok(()) => next.run(req).await,
+        Err(e) => e.into_response(),
+    }
 }
 
 /// Middleware enforcing [`auth::gateway_identity_ok`] — 401 on a missing/invalid signature.

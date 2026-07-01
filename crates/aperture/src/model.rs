@@ -56,6 +56,19 @@ pub struct FileRec {
     pub folder_id: Option<String>,
 }
 
+/// Aggregated per-owner storage usage (file count + total stored bytes), computed from the
+/// `files` table. Backs the drive's usage meter and the `/admin` usage table; it is never
+/// persisted itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnerUsage {
+    /// Owner subject (`X-Auth-Subject`), the same ownership key as [`FileRec::owner_sub`].
+    pub owner_sub: String,
+    /// Number of stored files.
+    pub files: i64,
+    /// Total stored bytes (SUM of the owner's file sizes).
+    pub bytes: i64,
+}
+
 /// A single owner-scoped folder (album) grouping a subset of the owner's files. Field
 /// order/types mirror the `folders` table exactly. Files reference it via [`FileRec::folder_id`];
 /// deleting a folder unfiles its files rather than deleting them.

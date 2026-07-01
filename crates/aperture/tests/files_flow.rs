@@ -800,6 +800,208 @@ async fn gallery_grid_points_at_the_thumb_route() {
     assert!(home.text().contains(&format!("src=\"/d/{id}/thumb\"")));
 }
 
+// ---------------------------------------------------------------------------
+// Storage quotas + the /admin panel
+// ---------------------------------------------------------------------------
+
+/// State with a custom default quota (in-memory metadata + blobs, audit off) — mirrors the
+/// oversized-upload test's custom-config idiom.
+fn quota_state(default_quota_bytes: i64) -> AppState {
+    let mut cfg = Config::dev();
+    cfg.default_quota_bytes = default_quota_bytes;
+    AppState {
+        config: Arc::new(cfg),
+        store: Arc::new(InMemoryStore::new()),
+        blobs: Arc::new(MemoryBlobs::new()),
+        audit: aperture::audit::AuditSink::disabled(),
+    }
+}
+
+/// A GET carrying an SSO identity AND the gateway groups header (the admin path).
+fn get_with_groups(path: &str, subject: &str, groups: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(path)
+        .header("x-auth-subject", subject)
+        .header("x-auth-email", format!("{subject}@w33d.xyz"))
+        .header("x-auth-groups", groups)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// A CSRF-cookie'd form POST carrying an SSO identity AND the gateway groups header.
+fn post_form_with_groups(
+    uri: &str,
+    cookie: &str,
+    subject: &str,
+    groups: &str,
+    body: String,
+) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::COOKIE, format!("__Host-csrf={cookie}"))
+        .header("x-auth-subject", subject)
+        .header("x-auth-email", format!("{subject}@w33d.xyz"))
+        .header("x-auth-groups", groups)
+        .body(Body::from(body))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn quota_allows_exactly_at_boundary_and_rejects_over() {
+    let png = png_bytes();
+    // The default quota is EXACTLY one PNG of room.
+    let state = quota_state(png.len() as i64);
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let home = send(&app, get("/", Some("alice"))).await;
+    let csrf = home.csrf_cookie().unwrap();
+
+    // used(0) + size == quota -> allowed (exactly at the boundary).
+    let first = send(&app, upload_req(&csrf, &csrf, "alice", "a.png", "image/png", &png)).await;
+    assert_eq!(first.status, StatusCode::FOUND, "{}", first.text());
+
+    // used(quota) + size > quota -> 413, rejected BEFORE anything is stored.
+    let second = send(&app, upload_req(&csrf, &csrf, "alice", "b.png", "image/png", &png)).await;
+    assert_eq!(second.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(second.text().contains("Not enough storage"));
+    assert_eq!(store.list_by_owner("alice", None, None, 50).await.unwrap().len(), 1);
+
+    // Quotas are per-owner: bob still has his own full quota.
+    let bob_home = send(&app, get("/", Some("bob"))).await;
+    let bob_csrf = bob_home.csrf_cookie().unwrap();
+    let bob = send(&app, upload_req(&bob_csrf, &bob_csrf, "bob", "c.png", "image/png", &png)).await;
+    assert_eq!(bob.status, StatusCode::FOUND);
+}
+
+#[tokio::test]
+async fn quota_override_beats_default() {
+    let png = png_bytes();
+    // A 1-byte default rejects every upload...
+    let state = quota_state(1);
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let home = send(&app, get("/", Some("alice"))).await;
+    let csrf = home.csrf_cookie().unwrap();
+    let capped = send(&app, upload_req(&csrf, &csrf, "alice", "a.png", "image/png", &png)).await;
+    assert_eq!(capped.status, StatusCode::PAYLOAD_TOO_LARGE);
+
+    // ...an override row lifts alice above it...
+    store.set_quota("alice", Some(10 * png.len() as i64)).await.unwrap();
+    let lifted = send(&app, upload_req(&csrf, &csrf, "alice", "a.png", "image/png", &png)).await;
+    assert_eq!(lifted.status, StatusCode::FOUND, "{}", lifted.text());
+
+    // ...clearing it drops her back to the default...
+    store.set_quota("alice", None).await.unwrap();
+    let back = send(&app, upload_req(&csrf, &csrf, "alice", "b.png", "image/png", &png)).await;
+    assert_eq!(back.status, StatusCode::PAYLOAD_TOO_LARGE);
+
+    // ...and an explicit 0 override means unlimited.
+    store.set_quota("alice", Some(0)).await.unwrap();
+    let unlimited = send(&app, upload_req(&csrf, &csrf, "alice", "c.png", "image/png", &png)).await;
+    assert_eq!(unlimited.status, StatusCode::FOUND);
+}
+
+#[tokio::test]
+async fn gallery_shows_usage_meter() {
+    // Unlimited (the dev default): the used total only — no fill bar, no percent. (The class
+    // names always appear inside the inlined <style>, so assert on the DOM markers instead.)
+    let app_unlimited = app(build_dev_state());
+    let (_id, _csrf) = upload_png(&app_unlimited, "alice").await;
+    let home = send(&app_unlimited, get("/", Some("alice"))).await;
+    assert!(home.text().contains("no limit"));
+    assert!(!home.text().contains("style=\"width:"), "no fill bar without a quota");
+
+    // Under a quota: used / quota with a percent and the width-scaled fill bar.
+    let png = png_bytes();
+    let app_limited = app(quota_state(2 * png.len() as i64));
+    let (_id2, _csrf2) = upload_png(&app_limited, "alice").await;
+    let home2 = send(&app_limited, get("/", Some("alice"))).await;
+    assert!(home2.text().contains("style=\"width:50.00%\""));
+    assert!(home2.text().contains("(50%)"), "one of two PNGs of quota is 50%");
+}
+
+#[tokio::test]
+async fn admin_panel_is_group_gated() {
+    let app = app(build_dev_state());
+    // No groups at all, and non-admin groups, both get the branded 403.
+    let plain = send(&app, get("/admin", Some("alice"))).await;
+    assert_eq!(plain.status, StatusCode::FORBIDDEN);
+    let wrong = send(&app, get_with_groups("/admin", "alice", "readers,writers")).await;
+    assert_eq!(wrong.status, StatusCode::FORBIDDEN);
+    // Membership in an admin group unlocks the usage table.
+    let ok = send(&app, get_with_groups("/admin", "root", "admins")).await;
+    assert_eq!(ok.status, StatusCode::OK);
+    assert!(ok.text().contains("Storage usage by owner"));
+}
+
+#[tokio::test]
+async fn admin_set_quota_form_guards_and_applies() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    // Alice stores one file so the usage table has a row.
+    let (_id, _csrf) = upload_png(&app, "alice").await;
+
+    let panel = send(&app, get_with_groups("/admin", "root", "infra-admins")).await;
+    assert_eq!(panel.status, StatusCode::OK);
+    assert!(panel.text().contains("alice"), "usage table lists the owner");
+    let csrf = panel.csrf_cookie().unwrap();
+
+    // A non-admin cannot POST, even with a valid CSRF pair.
+    let outsider = send(
+        &app,
+        post_form("/admin/quota", &csrf, "alice", format!("csrf_token={csrf}&owner_sub=alice&quota_bytes=1")),
+    )
+    .await;
+    assert_eq!(outsider.status, StatusCode::FORBIDDEN);
+    // A wrong CSRF field is rejected.
+    let bad_csrf = send(
+        &app,
+        post_form_with_groups("/admin/quota", &csrf, "root", "admins", "csrf_token=wrong&owner_sub=alice&quota_bytes=1".to_string()),
+    )
+    .await;
+    assert_eq!(bad_csrf.status, StatusCode::BAD_REQUEST);
+    // Non-numeric bytes and a blank owner are rejected.
+    let garbage = send(
+        &app,
+        post_form_with_groups("/admin/quota", &csrf, "root", "admins", format!("csrf_token={csrf}&owner_sub=alice&quota_bytes=lots")),
+    )
+    .await;
+    assert_eq!(garbage.status, StatusCode::BAD_REQUEST);
+    let no_owner = send(
+        &app,
+        post_form_with_groups("/admin/quota", &csrf, "root", "admins", format!("csrf_token={csrf}&owner_sub=&quota_bytes=1")),
+    )
+    .await;
+    assert_eq!(no_owner.status, StatusCode::BAD_REQUEST);
+    assert_eq!(store.get_quota("alice").await.unwrap(), None, "guarded posts changed nothing");
+
+    // A valid admin POST sets the override and redirects back to the panel...
+    let set = send(
+        &app,
+        post_form_with_groups("/admin/quota", &csrf, "root", "admins", format!("csrf_token={csrf}&owner_sub=alice&quota_bytes=4096")),
+    )
+    .await;
+    assert_eq!(set.status, StatusCode::FOUND);
+    assert_eq!(set.location(), "/admin");
+    assert_eq!(store.get_quota("alice").await.unwrap(), Some(4096));
+    // ...which now shows the override...
+    let panel2 = send(&app, get_with_groups("/admin", "root", "admins")).await;
+    assert!(panel2.text().contains("4.0 KB"));
+    assert!(panel2.text().contains("(override)"));
+    // ...and a BLANK value clears it back to the default.
+    let clear = send(
+        &app,
+        post_form_with_groups("/admin/quota", &csrf, "root", "admins", format!("csrf_token={csrf}&owner_sub=alice&quota_bytes=")),
+    )
+    .await;
+    assert_eq!(clear.status, StatusCode::FOUND);
+    assert_eq!(store.get_quota("alice").await.unwrap(), None);
+}
+
 #[tokio::test]
 async fn thumb_derived_blob_is_removed_on_delete() {
     let state = build_dev_state();

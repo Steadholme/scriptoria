@@ -32,6 +32,19 @@ pub fn clamp_page(limit: i64) -> i64 {
     }
 }
 
+/// Default per-owner storage quota, bytes (`APERTURE_DEFAULT_QUOTA_BYTES`). `0` (or unset)
+/// means UNLIMITED — the pre-quota behavior, so existing deployments change nothing.
+pub const DEFAULT_QUOTA_BYTES: i64 = 0;
+
+/// Resolve an owner's effective storage quota: the per-owner override row (when one exists)
+/// wins over the `APERTURE_DEFAULT_QUOTA_BYTES` default. Any non-positive value — an unset
+/// default OR an explicit `0` override — means UNLIMITED (`None`), preserving the pre-quota
+/// behavior. Mirrors [`clamp_page`]: one tiny pure helper every layer shares.
+pub fn effective_quota(override_bytes: Option<i64>, default_bytes: i64) -> Option<i64> {
+    let quota = override_bytes.unwrap_or(default_bytes);
+    (quota > 0).then_some(quota)
+}
+
 /// Default S3 region handed to the client. Cairn (MinIO-compatible) ignores it, but the signer
 /// requires a value.
 pub const DEFAULT_S3_REGION: &str = "us-east-1";
@@ -70,6 +83,9 @@ pub struct Config {
     pub max_upload: usize,
     /// Public base URL for share links (`PUBLIC_BASE_URL`).
     pub public_base: String,
+    /// Default per-owner storage quota, bytes (`APERTURE_DEFAULT_QUOTA_BYTES`; `0` = unlimited).
+    /// A per-owner `owner_quotas` row overrides it — see [`effective_quota`].
+    pub default_quota_bytes: i64,
     /// S3 / Cairn settings.
     pub s3: S3Config,
 }
@@ -81,6 +97,7 @@ impl Config {
             bind_addr: DEFAULT_BIND_ADDR.to_string(),
             max_upload: DEFAULT_MAX_UPLOAD,
             public_base: DEFAULT_PUBLIC_BASE.to_string(),
+            default_quota_bytes: DEFAULT_QUOTA_BYTES,
             s3: S3Config {
                 endpoint: "http://cairn:9000".to_string(),
                 bucket: DEFAULT_S3_BUCKET.to_string(),
@@ -105,6 +122,11 @@ impl Config {
         if let Some(v) = env_nonempty("PUBLIC_BASE_URL") {
             config.public_base = v.trim_end_matches('/').to_string();
         }
+        if let Some(v) = env_nonempty("APERTURE_DEFAULT_QUOTA_BYTES") {
+            if let Ok(n) = v.parse::<i64>() {
+                config.default_quota_bytes = n;
+            }
+        }
         config.s3 = S3Config::from_env();
         config
     }
@@ -121,5 +143,22 @@ fn env_nonempty(key: &str) -> Option<String> {
     match std::env::var(key) {
         Ok(v) if !v.is_empty() => Some(v),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_quota_override_beats_default() {
+        // No override: the default applies; 0/negative default = unlimited.
+        assert_eq!(effective_quota(None, 0), None);
+        assert_eq!(effective_quota(None, -5), None);
+        assert_eq!(effective_quota(None, 1024), Some(1024));
+        // An override row always wins over the default — including an explicit 0 = unlimited.
+        assert_eq!(effective_quota(Some(2048), 1024), Some(2048));
+        assert_eq!(effective_quota(Some(2048), 0), Some(2048));
+        assert_eq!(effective_quota(Some(0), 1024), None);
     }
 }

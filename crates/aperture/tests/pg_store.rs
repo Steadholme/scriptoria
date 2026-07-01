@@ -186,6 +186,29 @@ async fn pg_store_full_integration() {
     assert!(store.delete("aaaaaaaaaa", "alice").await.unwrap());
     assert!(store.get("aaaaaaaaaa").await.unwrap().is_none());
 
+    // --- storage quotas: usage sums + override rows (portable SQL) ----------
+    sqlx::query("DELETE FROM owner_quotas").execute(&raw).await.unwrap();
+    // Remaining rows: cccccccccc (alice, 1234) and dddddddddd (bob, 1234).
+    assert_eq!(store.usage_for_owner("alice").await.unwrap(), 1234);
+    assert_eq!(store.usage_for_owner("nobody").await.unwrap(), 0);
+    let agg = store.usage_by_owner().await.unwrap();
+    assert_eq!(agg.len(), 2);
+    assert!(agg.iter().any(|u| u.owner_sub == "alice" && u.files == 1 && u.bytes == 1234));
+    assert!(agg.iter().any(|u| u.owner_sub == "bob" && u.files == 1 && u.bytes == 1234));
+    // Overrides: missing row -> None; set is an upsert; list is owner-ordered; None clears.
+    assert_eq!(store.get_quota("alice").await.unwrap(), None);
+    store.set_quota("alice", Some(999)).await.unwrap();
+    store.set_quota("alice", Some(2048)).await.unwrap();
+    assert_eq!(store.get_quota("alice").await.unwrap(), Some(2048));
+    store.set_quota("bob", Some(0)).await.unwrap();
+    assert_eq!(
+        store.list_quotas().await.unwrap(),
+        vec![("alice".to_string(), 2048), ("bob".to_string(), 0)]
+    );
+    store.set_quota("alice", None).await.unwrap();
+    assert_eq!(store.get_quota("alice").await.unwrap(), None);
+    sqlx::query("DELETE FROM owner_quotas").execute(&raw).await.unwrap();
+
     // --- the full HTTP app boots against Postgres (healthz) ----------------
     let state = AppState {
         config: build_dev_state().config,
