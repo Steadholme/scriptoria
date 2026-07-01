@@ -42,6 +42,16 @@ pub struct Comment {
     pub parent_id: String,
 }
 
+/// A blocklist entry (maps 1:1 to a `blocked_authors` row), keyed by the opaque `author_sub`.
+/// A blocked author's existing comments are hidden and their new comments are rejected.
+#[derive(Clone, Debug)]
+pub struct BlockedAuthor {
+    pub author_sub: String,
+    pub reason: String,
+    pub blocked_by: String,
+    pub created_at: i64,
+}
+
 /// Storage failure surfaced to the handler layer.
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -87,6 +97,22 @@ pub trait Store: Send + Sync {
     /// The most recent comments across all threads, newest-first, capped at `limit` — backs the
     /// dashboard's activity feed.
     async fn recent_comments(&self, limit: usize) -> Vec<Comment>;
+    /// Admin "delete any": delete a comment by id regardless of author. Returns `true` when a row
+    /// was actually removed.
+    async fn delete_comment_any(&self, id: &str) -> Result<bool, StoreError>;
+    /// Set the `hidden` flag on ALL comments authored by `author_sub`. Returns the number of rows
+    /// updated — backs the blocklist (blocking hides an author's existing comments).
+    async fn set_hidden_by_author(&self, author_sub: &str, hidden: bool)
+        -> Result<u64, StoreError>;
+    /// Whether `author_sub` is currently on the blocklist.
+    async fn is_blocked(&self, author_sub: &str) -> bool;
+    /// All blocklist entries, newest-first (`created_at` DESC, `author_sub` DESC).
+    async fn list_blocked(&self) -> Vec<BlockedAuthor>;
+    /// Add an author to the blocklist (idempotent on `author_sub`). Returns `true` when the row was
+    /// newly inserted, `false` when the author was already blocked.
+    async fn block_author(&self, entry: &BlockedAuthor) -> Result<bool, StoreError>;
+    /// Remove an author from the blocklist. Returns `true` when a row was actually removed.
+    async fn unblock_author(&self, author_sub: &str) -> Result<bool, StoreError>;
 }
 
 // --------------------------------------------------------------------------------------
@@ -97,6 +123,7 @@ pub trait Store: Send + Sync {
 pub struct InMemoryStore {
     threads: Mutex<Vec<Thread>>,
     comments: Mutex<Vec<Comment>>,
+    blocked: Mutex<Vec<BlockedAuthor>>,
 }
 
 impl InMemoryStore {
@@ -229,6 +256,62 @@ impl Store for InMemoryStore {
         v.truncate(limit);
         v
     }
+
+    async fn delete_comment_any(&self, id: &str) -> Result<bool, StoreError> {
+        let mut comments = self.comments.lock().expect("comments lock poisoned");
+        let before = comments.len();
+        comments.retain(|c| c.id != id);
+        Ok(comments.len() != before)
+    }
+
+    async fn set_hidden_by_author(
+        &self,
+        author_sub: &str,
+        hidden: bool,
+    ) -> Result<u64, StoreError> {
+        let mut comments = self.comments.lock().expect("comments lock poisoned");
+        let mut n = 0u64;
+        for c in comments.iter_mut().filter(|c| c.author_sub == author_sub) {
+            c.hidden = hidden;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    async fn is_blocked(&self, author_sub: &str) -> bool {
+        self.blocked
+            .lock()
+            .expect("blocked lock poisoned")
+            .iter()
+            .any(|b| b.author_sub == author_sub)
+    }
+
+    async fn list_blocked(&self) -> Vec<BlockedAuthor> {
+        let mut v: Vec<BlockedAuthor> =
+            self.blocked.lock().expect("blocked lock poisoned").clone();
+        v.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.author_sub.cmp(&a.author_sub))
+        });
+        v
+    }
+
+    async fn block_author(&self, entry: &BlockedAuthor) -> Result<bool, StoreError> {
+        let mut blocked = self.blocked.lock().expect("blocked lock poisoned");
+        if blocked.iter().any(|b| b.author_sub == entry.author_sub) {
+            return Ok(false);
+        }
+        blocked.push(entry.clone());
+        Ok(true)
+    }
+
+    async fn unblock_author(&self, author_sub: &str) -> Result<bool, StoreError> {
+        let mut blocked = self.blocked.lock().expect("blocked lock poisoned");
+        let before = blocked.len();
+        blocked.retain(|b| b.author_sub != author_sub);
+        Ok(blocked.len() != before)
+    }
 }
 
 // --------------------------------------------------------------------------------------
@@ -294,6 +377,25 @@ impl PgStore {
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_comments_thread_created \
              ON comments (thread_id, created_at)",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Author blocklist for the admin panel: a blocked author's existing comments are hidden and
+        // their new comments rejected. Keyed by the opaque author_sub.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS blocked_authors (\
+                 author_sub TEXT PRIMARY KEY, \
+                 reason TEXT NOT NULL DEFAULT '', \
+                 blocked_by TEXT NOT NULL DEFAULT '', \
+                 created_at BIGINT NOT NULL\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Backs blocking hiding an author's existing comments (bulk update by author_sub).
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_comments_author \
+             ON comments (author_sub)",
         )
         .execute(&self.pool)
         .await?;
@@ -492,6 +594,77 @@ impl PgStore {
         .await?;
         rows.iter().map(Self::comment_from_row).collect()
     }
+
+    fn blocked_from_row(row: &sqlx::postgres::PgRow) -> Result<BlockedAuthor, sqlx::Error> {
+        Ok(BlockedAuthor {
+            author_sub: row.try_get("author_sub")?,
+            reason: row.try_get("reason")?,
+            blocked_by: row.try_get("blocked_by")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+
+    async fn delete_comment_any_async(&self, id: &str) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query("DELETE FROM comments WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn set_hidden_by_author_async(
+        &self,
+        author_sub: &str,
+        hidden: bool,
+    ) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query("UPDATE comments SET hidden = $1 WHERE author_sub = $2")
+            .bind(hidden)
+            .bind(author_sub)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
+    async fn is_blocked_async(&self, author_sub: &str) -> Result<bool, sqlx::Error> {
+        let row = sqlx::query("SELECT 1 AS x FROM blocked_authors WHERE author_sub = $1")
+            .bind(author_sub)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some())
+    }
+
+    async fn list_blocked_async(&self) -> Result<Vec<BlockedAuthor>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT author_sub, reason, blocked_by, created_at \
+             FROM blocked_authors ORDER BY created_at DESC, author_sub DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::blocked_from_row).collect()
+    }
+
+    async fn block_author_async(&self, e: &BlockedAuthor) -> Result<bool, sqlx::Error> {
+        // Race-safe idempotent insert: an already-blocked author affects zero rows.
+        let res = sqlx::query(
+            "INSERT INTO blocked_authors (author_sub, reason, blocked_by, created_at) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT (author_sub) DO NOTHING",
+        )
+        .bind(&e.author_sub)
+        .bind(&e.reason)
+        .bind(&e.blocked_by)
+        .bind(e.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn unblock_author_async(&self, author_sub: &str) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query("DELETE FROM blocked_authors WHERE author_sub = $1")
+            .bind(author_sub)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
 }
 
 #[async_trait]
@@ -571,6 +744,48 @@ impl Store for PgStore {
             tracing::error!(error = %e, "pg recent_comments failed");
             Vec::new()
         })
+    }
+
+    async fn delete_comment_any(&self, id: &str) -> Result<bool, StoreError> {
+        self.delete_comment_any_async(id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn set_hidden_by_author(
+        &self,
+        author_sub: &str,
+        hidden: bool,
+    ) -> Result<u64, StoreError> {
+        self.set_hidden_by_author_async(author_sub, hidden)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn is_blocked(&self, author_sub: &str) -> bool {
+        self.is_blocked_async(author_sub).await.unwrap_or_else(|e| {
+            tracing::error!(error = %e, "pg is_blocked failed");
+            false
+        })
+    }
+
+    async fn list_blocked(&self) -> Vec<BlockedAuthor> {
+        self.list_blocked_async().await.unwrap_or_else(|e| {
+            tracing::error!(error = %e, "pg list_blocked failed");
+            Vec::new()
+        })
+    }
+
+    async fn block_author(&self, entry: &BlockedAuthor) -> Result<bool, StoreError> {
+        self.block_author_async(entry)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn unblock_author(&self, author_sub: &str) -> Result<bool, StoreError> {
+        self.unblock_author_async(author_sub)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
     }
 }
 

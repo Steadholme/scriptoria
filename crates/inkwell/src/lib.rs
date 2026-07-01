@@ -65,6 +65,14 @@ pub fn app(state: AppState) -> Router {
             get(handlers::posts::edit_form).post(handlers::posts::update),
         )
         .route("/delete/{slug}", post(handlers::posts::delete))
+        // Admin panel: an all-authors post management table + single-row site settings. Every
+        // route below is gated by `auth::require_admin` inside the handler (403 for non-admins).
+        .route("/admin", get(handlers::admin::index))
+        .route("/admin/settings", post(handlers::admin::update_settings))
+        .route("/admin/posts/bulk", post(handlers::admin::bulk))
+        .route("/admin/posts/{slug}/feature", post(handlers::admin::feature))
+        .route("/admin/posts/{slug}/unpublish", post(handlers::admin::unpublish))
+        .route("/admin/posts/{slug}/delete", post(handlers::admin::delete))
         // "Ask your blog" — retrieval over the blog's own published posts (additive).
         .route("/ask", get(handlers::ask::ask_page))
         .route("/api/ask", post(handlers::ask::ask))

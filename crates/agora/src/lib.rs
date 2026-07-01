@@ -81,12 +81,46 @@ pub fn app(state: AppState) -> Router {
         .route("/new", get(handlers::forum::new_form).post(handlers::forum::create))
         .route("/api/similar", post(handlers::insight::similar))
         .route("/api/thread/{id}/summary", get(handlers::insight::summary))
+        .merge(admin_router())
         .fallback(get(handlers::forum::home))
         // Reject a forged gateway identity (spoofed X-Auth-* from a rogue in-network peer):
         // when GATEWAY_HMAC_KEY is set, an injected identity MUST carry a valid X-Auth-Sig.
         // No-op when the key is unset or no identity is present (health/public/dev).
         .layer(axum::middleware::from_fn(require_gateway_sig))
         .with_state(state)
+}
+
+/// The `/admin` subtree, gated as one unit by [`require_admin_mw`]: category CRUD, thread
+/// moderation (lock/pin/move/delete), any-post deletion, and the author blocklist. Merged into
+/// [`app`] so the group check lives in exactly one place — no per-handler repetition.
+fn admin_router() -> Router<AppState> {
+    Router::new()
+        .route("/admin", get(handlers::admin::dashboard))
+        .route("/admin/categories", post(handlers::admin::create_category))
+        .route("/admin/categories/{id}/rename", post(handlers::admin::rename_category))
+        .route("/admin/categories/{id}/reorder", post(handlers::admin::reorder_category))
+        .route("/admin/categories/{id}/delete", post(handlers::admin::delete_category))
+        .route("/admin/threads/{id}/lock", post(handlers::admin::lock_thread))
+        .route("/admin/threads/{id}/pin", post(handlers::admin::pin_thread))
+        .route("/admin/threads/{id}/move", post(handlers::admin::move_thread))
+        .route("/admin/threads/{id}/delete", post(handlers::admin::delete_thread))
+        .route("/admin/posts/{id}/delete", post(handlers::admin::delete_post))
+        .route("/admin/bans", post(handlers::admin::add_ban))
+        .route("/admin/bans/{sub}/delete", post(handlers::admin::remove_ban))
+        .layer(axum::middleware::from_fn(require_admin_mw))
+}
+
+/// Middleware gating the whole `/admin` subtree on [`auth::require_admin`]. A non-admin (or
+/// unauthenticated) request gets the branded `403`; only `admins` / `infra-admins` pass.
+async fn require_admin_mw(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match auth::require_admin(req.headers()) {
+        Ok(()) => next.run(req).await,
+        Err(e) => e.into_response(),
+    }
 }
 
 /// Middleware enforcing [`auth::gateway_identity_ok`] — 401 on a missing/invalid signature.

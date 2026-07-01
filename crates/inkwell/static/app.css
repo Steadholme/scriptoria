@@ -214,6 +214,17 @@ body.page-console { background: var(--bg); padding: 0; }
 
 /* Draft badge — a neutral, restrained variant of the kit's .badge */
 .badge-draft { background: var(--bg-2); color: var(--ink-3); }
+/* Featured badge — the accent variant of the kit's .badge */
+.badge-featured { background: var(--accent-soft); color: var(--accent-2); }
+
+/* ---- Admin panel --------------------------------------------------------- */
+.admin-bulk { display: flex; align-items: center; gap: 10px; margin: 4px 0 16px; flex-wrap: wrap; }
+.admin-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.admin-table th, .admin-table td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.admin-table th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--ink-3); }
+.admin-table__check { width: 28px; }
+.admin-table__actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.admin-table__empty { color: var(--ink-3); text-align: center; padding: 24px; }
 
 /* Empty state (no posts / no answer) */
 .empty-state { text-align: center; padding: 56px 24px; border: 1px dashed var(--border); border-radius: var(--radius); background: var(--surface); }

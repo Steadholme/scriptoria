@@ -7,6 +7,7 @@
 //! page, matching the HOLDFAST enterprise brand (the same look as the Keystone login UI):
 //! brand gradient, indigo accent, cards, app-bar.
 
+pub mod admin;
 pub mod ask;
 pub mod feed;
 pub mod health;

@@ -23,7 +23,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::model::{Category, Post, Thread, ThreadDigest};
+use crate::model::{BannedAuthor, Category, Post, Thread, ThreadDigest};
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
 #[derive(Debug, Error)]
@@ -46,6 +46,15 @@ pub trait Store: Send + Sync {
     /// Number of threads in a category.
     async fn count_threads(&self, category_id: &str) -> Result<i64, StoreError>;
 
+    /// Insert a new category. Admin-only; the caller validates that `id` is free/well-formed.
+    async fn create_category(&self, category: &Category) -> Result<(), StoreError>;
+    /// Rename a category (its display `name`). Admin-only.
+    async fn rename_category(&self, id: &str, name: &str) -> Result<(), StoreError>;
+    /// Set a category's `sort_order` (used to reorder the list). Admin-only.
+    async fn set_category_order(&self, id: &str, sort_order: i64) -> Result<(), StoreError>;
+    /// Delete a category. Admin-only; the caller refuses when it still holds threads.
+    async fn delete_category(&self, id: &str) -> Result<(), StoreError>;
+
     /// The most recently active threads across all categories (by `last_at` DESC), capped.
     async fn recent_threads(&self, limit: i64) -> Result<Vec<Thread>, StoreError>;
     /// Threads in one category, most recently active first, capped.
@@ -63,6 +72,8 @@ pub trait Store: Send + Sync {
 
     /// Number of posts in a thread (original post + replies).
     async fn count_posts(&self, thread_id: &str) -> Result<i64, StoreError>;
+    /// A single post by id, if it exists (used by admin post-deletion + audit).
+    async fn get_post(&self, id: &str) -> Result<Option<Post>, StoreError>;
     /// All posts in a thread, oldest first (original post first, then replies).
     async fn posts_in_thread(&self, thread_id: &str) -> Result<Vec<Post>, StoreError>;
 
@@ -91,6 +102,22 @@ pub trait Store: Send + Sync {
     /// Delete a single post (used to delete a reply). Author authorisation is enforced by the
     /// caller.
     async fn delete_post(&self, post_id: &str) -> Result<(), StoreError>;
+
+    /// Set a thread's `locked` flag (a locked thread accepts no new replies). Admin-only.
+    async fn set_thread_locked(&self, thread_id: &str, locked: bool) -> Result<(), StoreError>;
+    /// Set a thread's `pinned` flag (pinned threads sort first in the lists). Admin-only.
+    async fn set_thread_pinned(&self, thread_id: &str, pinned: bool) -> Result<(), StoreError>;
+    /// Move a thread to another category. Admin-only; the caller validates the target exists.
+    async fn move_thread(&self, thread_id: &str, category_id: &str) -> Result<(), StoreError>;
+
+    /// All blocked authors, most-recently-banned first.
+    async fn list_bans(&self) -> Result<Vec<BannedAuthor>, StoreError>;
+    /// Whether `author_sub` is currently blocked (rejects their new threads/replies).
+    async fn is_banned(&self, author_sub: &str) -> Result<bool, StoreError>;
+    /// Add (or refresh) a blocklist entry. Idempotent on `author_sub`. Admin-only.
+    async fn add_ban(&self, ban: &BannedAuthor) -> Result<(), StoreError>;
+    /// Remove a blocklist entry (unblock). Admin-only.
+    async fn remove_ban(&self, author_sub: &str) -> Result<(), StoreError>;
 }
 
 // --------------------------------------------------------------------------------------
@@ -102,6 +129,7 @@ pub struct InMemoryStore {
     categories: Mutex<Vec<Category>>,
     threads: Mutex<Vec<Thread>>,
     posts: Mutex<Vec<Post>>,
+    banned: Mutex<Vec<BannedAuthor>>,
 }
 
 impl InMemoryStore {
@@ -152,9 +180,41 @@ impl Store for InMemoryStore {
             .count() as i64)
     }
 
+    async fn create_category(&self, category: &Category) -> Result<(), StoreError> {
+        let mut cats = self.categories.lock().expect("categories lock poisoned");
+        if cats.iter().all(|c| c.id != category.id) {
+            cats.push(category.clone());
+        }
+        Ok(())
+    }
+
+    async fn rename_category(&self, id: &str, name: &str) -> Result<(), StoreError> {
+        let mut cats = self.categories.lock().expect("categories lock poisoned");
+        if let Some(c) = cats.iter_mut().find(|c| c.id == id) {
+            c.name = name.to_string();
+        }
+        Ok(())
+    }
+
+    async fn set_category_order(&self, id: &str, sort_order: i64) -> Result<(), StoreError> {
+        let mut cats = self.categories.lock().expect("categories lock poisoned");
+        if let Some(c) = cats.iter_mut().find(|c| c.id == id) {
+            c.sort_order = sort_order;
+        }
+        Ok(())
+    }
+
+    async fn delete_category(&self, id: &str) -> Result<(), StoreError> {
+        self.categories
+            .lock()
+            .expect("categories lock poisoned")
+            .retain(|c| c.id != id);
+        Ok(())
+    }
+
     async fn recent_threads(&self, limit: i64) -> Result<Vec<Thread>, StoreError> {
         let mut v: Vec<Thread> = self.threads.lock().expect("threads lock poisoned").clone();
-        v.sort_by(|a, b| b.last_at.cmp(&a.last_at).then_with(|| b.created_at.cmp(&a.created_at)));
+        v.sort_by(thread_display_order);
         v.truncate(limit.max(0) as usize);
         Ok(v)
     }
@@ -172,7 +232,7 @@ impl Store for InMemoryStore {
             .filter(|t| t.category_id == category_id)
             .cloned()
             .collect();
-        v.sort_by(|a, b| b.last_at.cmp(&a.last_at).then_with(|| b.created_at.cmp(&a.created_at)));
+        v.sort_by(thread_display_order);
         v.truncate(limit.max(0) as usize);
         Ok(v)
     }
@@ -222,6 +282,16 @@ impl Store for InMemoryStore {
             .iter()
             .filter(|p| p.thread_id == thread_id)
             .count() as i64)
+    }
+
+    async fn get_post(&self, id: &str) -> Result<Option<Post>, StoreError> {
+        Ok(self
+            .posts
+            .lock()
+            .expect("posts lock poisoned")
+            .iter()
+            .find(|p| p.id == id)
+            .cloned())
     }
 
     async fn posts_in_thread(&self, thread_id: &str) -> Result<Vec<Post>, StoreError> {
@@ -301,6 +371,71 @@ impl Store for InMemoryStore {
         posts.retain(|p| p.id != post_id);
         Ok(())
     }
+
+    async fn set_thread_locked(&self, thread_id: &str, locked: bool) -> Result<(), StoreError> {
+        let mut threads = self.threads.lock().expect("threads lock poisoned");
+        if let Some(t) = threads.iter_mut().find(|t| t.id == thread_id) {
+            t.locked = locked;
+        }
+        Ok(())
+    }
+
+    async fn set_thread_pinned(&self, thread_id: &str, pinned: bool) -> Result<(), StoreError> {
+        let mut threads = self.threads.lock().expect("threads lock poisoned");
+        if let Some(t) = threads.iter_mut().find(|t| t.id == thread_id) {
+            t.pinned = pinned;
+        }
+        Ok(())
+    }
+
+    async fn move_thread(&self, thread_id: &str, category_id: &str) -> Result<(), StoreError> {
+        let mut threads = self.threads.lock().expect("threads lock poisoned");
+        if let Some(t) = threads.iter_mut().find(|t| t.id == thread_id) {
+            t.category_id = category_id.to_string();
+        }
+        Ok(())
+    }
+
+    async fn list_bans(&self) -> Result<Vec<BannedAuthor>, StoreError> {
+        let mut v: Vec<BannedAuthor> = self.banned.lock().expect("banned lock poisoned").clone();
+        v.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.author_sub.cmp(&b.author_sub)));
+        Ok(v)
+    }
+
+    async fn is_banned(&self, author_sub: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .banned
+            .lock()
+            .expect("banned lock poisoned")
+            .iter()
+            .any(|b| b.author_sub == author_sub))
+    }
+
+    async fn add_ban(&self, ban: &BannedAuthor) -> Result<(), StoreError> {
+        let mut banned = self.banned.lock().expect("banned lock poisoned");
+        match banned.iter_mut().find(|b| b.author_sub == ban.author_sub) {
+            Some(existing) => *existing = ban.clone(),
+            None => banned.push(ban.clone()),
+        }
+        Ok(())
+    }
+
+    async fn remove_ban(&self, author_sub: &str) -> Result<(), StoreError> {
+        self.banned
+            .lock()
+            .expect("banned lock poisoned")
+            .retain(|b| b.author_sub != author_sub);
+        Ok(())
+    }
+}
+
+/// Display sort for thread lists: pinned first, then most-recent activity, then newest.
+/// Shared by `recent_threads` + `threads_in_category` so both views honor `pinned`.
+fn thread_display_order(a: &Thread, b: &Thread) -> std::cmp::Ordering {
+    b.pinned
+        .cmp(&a.pinned)
+        .then_with(|| b.last_at.cmp(&a.last_at))
+        .then_with(|| b.created_at.cmp(&a.created_at))
 }
 
 // --------------------------------------------------------------------------------------
@@ -366,6 +501,14 @@ impl PgStore {
         sqlx::query("ALTER TABLE threads ADD COLUMN IF NOT EXISTS first_body_md TEXT NOT NULL DEFAULT ''")
             .execute(&self.pool)
             .await?;
+        // Admin moderation flags: locked (no new replies) + pinned (sort first). Additive,
+        // idempotent; pre-existing rows default to unlocked/unpinned. Portable BOOLEAN only.
+        sqlx::query("ALTER TABLE threads ADD COLUMN IF NOT EXISTS locked BOOLEAN NOT NULL DEFAULT FALSE")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("ALTER TABLE threads ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT FALSE")
+            .execute(&self.pool)
+            .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_threads_category ON threads (category_id)")
             .execute(&self.pool)
             .await?;
@@ -387,6 +530,18 @@ impl PgStore {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_posts_thread ON posts (thread_id)")
             .execute(&self.pool)
             .await?;
+        // Author blocklist: while a row is present, that author_sub's new threads/replies are
+        // rejected. Portable standard SQL (TEXT/BIGINT PK), idempotent.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS banned_authors (\
+                 author_sub TEXT PRIMARY KEY, \
+                 reason TEXT NOT NULL DEFAULT '', \
+                 banned_by TEXT NOT NULL DEFAULT '', \
+                 created_at BIGINT NOT NULL\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -407,6 +562,8 @@ impl PgStore {
             author_email: row.try_get("author_email")?,
             created_at: row.try_get("created_at")?,
             last_at: row.try_get("last_at")?,
+            locked: row.try_get("locked")?,
+            pinned: row.try_get("pinned")?,
         })
     }
 
@@ -422,7 +579,7 @@ impl PgStore {
     }
 
     const THREAD_COLS: &'static str =
-        "id, category_id, title, author_sub, author_email, created_at, last_at";
+        "id, category_id, title, author_sub, author_email, created_at, last_at, locked, pinned";
     const POST_COLS: &'static str =
         "id, thread_id, body_md, author_sub, author_email, created_at";
 
@@ -471,9 +628,48 @@ impl PgStore {
         row.try_get("n")
     }
 
+    async fn create_category_async(&self, c: &Category) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO categories (id, name, sort_order) VALUES ($1, $2, $3) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(&c.id)
+        .bind(&c.name)
+        .bind(c.sort_order)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn rename_category_async(&self, id: &str, name: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE categories SET name = $1 WHERE id = $2")
+            .bind(name)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn set_category_order_async(&self, id: &str, sort_order: i64) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE categories SET sort_order = $1 WHERE id = $2")
+            .bind(sort_order)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_category_async(&self, id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM categories WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn recent_threads_async(&self, limit: i64) -> Result<Vec<Thread>, sqlx::Error> {
         let sql = format!(
-            "SELECT {} FROM threads ORDER BY last_at DESC, created_at DESC LIMIT $1",
+            "SELECT {} FROM threads ORDER BY pinned DESC, last_at DESC, created_at DESC LIMIT $1",
             Self::THREAD_COLS
         );
         let rows = sqlx::query(&sql).bind(limit).fetch_all(&self.pool).await?;
@@ -486,7 +682,7 @@ impl PgStore {
         limit: i64,
     ) -> Result<Vec<Thread>, sqlx::Error> {
         let sql = format!(
-            "SELECT {} FROM threads WHERE category_id = $1 ORDER BY last_at DESC, created_at DESC LIMIT $2",
+            "SELECT {} FROM threads WHERE category_id = $1 ORDER BY pinned DESC, last_at DESC, created_at DESC LIMIT $2",
             Self::THREAD_COLS
         );
         let rows = sqlx::query(&sql)
@@ -531,6 +727,12 @@ impl PgStore {
         row.try_get("n")
     }
 
+    async fn get_post_async(&self, id: &str) -> Result<Option<Post>, sqlx::Error> {
+        let sql = format!("SELECT {} FROM posts WHERE id = $1", Self::POST_COLS);
+        let row = sqlx::query(&sql).bind(id).fetch_optional(&self.pool).await?;
+        row.as_ref().map(Self::post_from_row).transpose()
+    }
+
     async fn posts_in_thread_async(&self, thread_id: &str) -> Result<Vec<Post>, sqlx::Error> {
         let sql = format!(
             "SELECT {} FROM posts WHERE thread_id = $1 ORDER BY created_at ASC, id ASC",
@@ -551,8 +753,8 @@ impl PgStore {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO threads \
-                 (id, category_id, title, author_sub, author_email, created_at, last_at, first_body_md) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                 (id, category_id, title, author_sub, author_email, created_at, last_at, first_body_md, locked, pinned) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(&thread.id)
         .bind(&thread.category_id)
@@ -562,6 +764,8 @@ impl PgStore {
         .bind(thread.created_at)
         .bind(thread.last_at)
         .bind(&first_post.body_md)
+        .bind(thread.locked)
+        .bind(thread.pinned)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
@@ -659,6 +863,85 @@ impl PgStore {
             .await?;
         Ok(())
     }
+
+    async fn set_thread_locked_async(&self, thread_id: &str, locked: bool) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE threads SET locked = $1 WHERE id = $2")
+            .bind(locked)
+            .bind(thread_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn set_thread_pinned_async(&self, thread_id: &str, pinned: bool) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE threads SET pinned = $1 WHERE id = $2")
+            .bind(pinned)
+            .bind(thread_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn move_thread_async(&self, thread_id: &str, category_id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE threads SET category_id = $1 WHERE id = $2")
+            .bind(category_id)
+            .bind(thread_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_bans_async(&self) -> Result<Vec<BannedAuthor>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT author_sub, reason, banned_by, created_at FROM banned_authors \
+             ORDER BY created_at DESC, author_sub ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(BannedAuthor {
+                    author_sub: row.try_get("author_sub")?,
+                    reason: row.try_get("reason")?,
+                    banned_by: row.try_get("banned_by")?,
+                    created_at: row.try_get("created_at")?,
+                })
+            })
+            .collect()
+    }
+
+    async fn is_banned_async(&self, author_sub: &str) -> Result<bool, sqlx::Error> {
+        let row = sqlx::query("SELECT COUNT(*) AS n FROM banned_authors WHERE author_sub = $1")
+            .bind(author_sub)
+            .fetch_one(&self.pool)
+            .await?;
+        let n: i64 = row.try_get("n")?;
+        Ok(n > 0)
+    }
+
+    async fn add_ban_async(&self, ban: &BannedAuthor) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO banned_authors (author_sub, reason, banned_by, created_at) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (author_sub) DO UPDATE SET \
+                 reason = EXCLUDED.reason, banned_by = EXCLUDED.banned_by, created_at = EXCLUDED.created_at",
+        )
+        .bind(&ban.author_sub)
+        .bind(&ban.reason)
+        .bind(&ban.banned_by)
+        .bind(ban.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn remove_ban_async(&self, author_sub: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM banned_authors WHERE author_sub = $1")
+            .bind(author_sub)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -677,6 +960,22 @@ impl Store for PgStore {
 
     async fn count_threads(&self, category_id: &str) -> Result<i64, StoreError> {
         self.count_threads_async(category_id).await.map_err(backend)
+    }
+
+    async fn create_category(&self, category: &Category) -> Result<(), StoreError> {
+        self.create_category_async(category).await.map_err(backend)
+    }
+
+    async fn rename_category(&self, id: &str, name: &str) -> Result<(), StoreError> {
+        self.rename_category_async(id, name).await.map_err(backend)
+    }
+
+    async fn set_category_order(&self, id: &str, sort_order: i64) -> Result<(), StoreError> {
+        self.set_category_order_async(id, sort_order).await.map_err(backend)
+    }
+
+    async fn delete_category(&self, id: &str) -> Result<(), StoreError> {
+        self.delete_category_async(id).await.map_err(backend)
     }
 
     async fn recent_threads(&self, limit: i64) -> Result<Vec<Thread>, StoreError> {
@@ -703,6 +1002,10 @@ impl Store for PgStore {
 
     async fn count_posts(&self, thread_id: &str) -> Result<i64, StoreError> {
         self.count_posts_async(thread_id).await.map_err(backend)
+    }
+
+    async fn get_post(&self, id: &str) -> Result<Option<Post>, StoreError> {
+        self.get_post_async(id).await.map_err(backend)
     }
 
     async fn posts_in_thread(&self, thread_id: &str) -> Result<Vec<Post>, StoreError> {
@@ -741,6 +1044,34 @@ impl Store for PgStore {
 
     async fn delete_post(&self, post_id: &str) -> Result<(), StoreError> {
         self.delete_post_async(post_id).await.map_err(backend)
+    }
+
+    async fn set_thread_locked(&self, thread_id: &str, locked: bool) -> Result<(), StoreError> {
+        self.set_thread_locked_async(thread_id, locked).await.map_err(backend)
+    }
+
+    async fn set_thread_pinned(&self, thread_id: &str, pinned: bool) -> Result<(), StoreError> {
+        self.set_thread_pinned_async(thread_id, pinned).await.map_err(backend)
+    }
+
+    async fn move_thread(&self, thread_id: &str, category_id: &str) -> Result<(), StoreError> {
+        self.move_thread_async(thread_id, category_id).await.map_err(backend)
+    }
+
+    async fn list_bans(&self) -> Result<Vec<BannedAuthor>, StoreError> {
+        self.list_bans_async().await.map_err(backend)
+    }
+
+    async fn is_banned(&self, author_sub: &str) -> Result<bool, StoreError> {
+        self.is_banned_async(author_sub).await.map_err(backend)
+    }
+
+    async fn add_ban(&self, ban: &BannedAuthor) -> Result<(), StoreError> {
+        self.add_ban_async(ban).await.map_err(backend)
+    }
+
+    async fn remove_ban(&self, author_sub: &str) -> Result<(), StoreError> {
+        self.remove_ban_async(author_sub).await.map_err(backend)
     }
 }
 

@@ -62,6 +62,8 @@ async fn pg_store_full_integration() {
         author_email: "alice@holdfast.local".to_string(),
         created_at: now,
         last_at: now,
+        locked: false,
+        pinned: false,
     };
     let first = Post {
         id: new_id("p"),

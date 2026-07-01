@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Admin · Inkwell</title>
+  <style>{{CSS}}</style>
+</head>
+<body class="page-console">
+{{TOPBAR}}
+<main class="console">
+  <div class="console__head">
+    <h1>Admin</h1>
+    <p class="sub">Manage every author's posts and the site settings.</p>
+  </div>
+
+  <section class="card">
+    <div class="card__body">
+      <h2>Site settings</h2>
+      <form class="editor" method="post" action="/admin/settings">
+        <input type="hidden" name="csrf_token" value="{{CSRF}}">
+        <div class="field">
+          <label for="title">Blog title</label>
+          <input type="text" id="title" name="title" maxlength="200" value="{{SETTINGS_TITLE}}">
+        </div>
+        <div class="field">
+          <label for="tagline">Tagline</label>
+          <input type="text" id="tagline" name="tagline" maxlength="300" value="{{SETTINGS_TAGLINE}}">
+        </div>
+        <div class="field">
+          <label for="posts_per_page">Posts per page</label>
+          <input type="number" id="posts_per_page" name="posts_per_page" min="1" max="200" value="{{SETTINGS_PPP}}">
+        </div>
+        <div class="editor__actions">
+          <button class="btn btn-primary" type="submit">Save settings</button>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card__body">
+      <h2>All posts</h2>
+      <form id="bulk-form" class="admin-bulk" method="post" action="/admin/posts/bulk">
+        <input type="hidden" name="csrf_token" value="{{CSRF}}">
+        <label for="bulk-action">Bulk action</label>
+        <select id="bulk-action" name="action">
+          <option value="feature">Feature</option>
+          <option value="unfeature">Unfeature</option>
+          <option value="unpublish">Unpublish</option>
+          <option value="delete">Delete</option>
+        </select>
+        <button class="btn btn-secondary btn-sm" type="submit">Apply to selected</button>
+      </form>
+      <table class="admin-table">
+        <thead>
+          <tr>
+            <th class="admin-table__check"></th>
+            <th>Title</th>
+            <th>Author</th>
+            <th>Status</th>
+            <th>Featured</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+{{ROWS}}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</main>
+</body>
+</html>

@@ -30,6 +30,31 @@ pub struct Post {
     pub created_at: i64,
     pub updated_at: i64,
     pub published: bool,
+    /// Admin-set "featured" flag: surfaced with a badge on the index and toggled from /admin.
+    /// Additive; defaults to FALSE for every existing row.
+    pub featured: bool,
+}
+
+/// Single-row site settings, editable from /admin and applied to the index/head. Kept in its own
+/// one-row table (`id = 'singleton'`), so reading it is a single point-lookup with a sane default.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Settings {
+    /// Blog title (index `<title>` + masthead heading).
+    pub title: String,
+    /// Masthead tagline under the title.
+    pub tagline: String,
+    /// Default posts-per-page on the index when no `?limit=` is given (clamped to `1..=MAX_PAGE`).
+    pub posts_per_page: i64,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            title: "Inkwell".to_string(),
+            tagline: "Notes, essays, and changelog from the HOLDFAST estate.".to_string(),
+            posts_per_page: crate::config::DEFAULT_PAGE,
+        }
+    }
 }
 
 /// A retrieval chunk: a slice of one published post's body, indexed for the "ask your blog"
@@ -73,6 +98,13 @@ pub trait Store: Send + Sync {
     /// Delete a post by slug.
     async fn delete_post(&self, slug: &str) -> Result<(), StoreError>;
 
+    // -- site settings (single-row; edited from /admin, applied to the index) --------------
+
+    /// The current site settings, or [`Settings::default`] when none have been saved yet.
+    async fn get_settings(&self) -> Settings;
+    /// Persist the single settings row (insert-or-replace).
+    async fn update_settings(&self, settings: &Settings) -> Result<(), StoreError>;
+
     // -- "ask your blog" retrieval index (additive; see [`crate::index`]) -----------------
     //
     // The chunk table is a derived, rebuildable lexical index over the blog's OWN published
@@ -101,6 +133,8 @@ pub trait Store: Send + Sync {
 pub struct InMemoryStore {
     posts: Mutex<Vec<Post>>,
     chunks: Mutex<Vec<Chunk>>,
+    /// `None` until an admin saves settings; reads then fall back to [`Settings::default`].
+    settings: Mutex<Option<Settings>>,
 }
 
 impl InMemoryStore {
@@ -158,6 +192,7 @@ impl Store for InMemoryStore {
                 existing.body_md = post.body_md.clone();
                 existing.published = post.published;
                 existing.updated_at = post.updated_at;
+                existing.featured = post.featured;
                 Ok(())
             }
             None => Err(StoreError::Backend(format!("no post with slug {}", post.slug))),
@@ -167,6 +202,19 @@ impl Store for InMemoryStore {
     async fn delete_post(&self, slug: &str) -> Result<(), StoreError> {
         let mut posts = self.posts.lock().expect("posts lock poisoned");
         posts.retain(|p| p.slug != slug);
+        Ok(())
+    }
+
+    async fn get_settings(&self) -> Settings {
+        self.settings
+            .lock()
+            .expect("settings lock poisoned")
+            .clone()
+            .unwrap_or_default()
+    }
+
+    async fn update_settings(&self, settings: &Settings) -> Result<(), StoreError> {
+        *self.settings.lock().expect("settings lock poisoned") = Some(settings.clone());
         Ok(())
     }
 
@@ -264,10 +312,29 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+        // Additive "featured" flag (admin panel). IF NOT EXISTS keeps the migration idempotent and
+        // backward compatible — existing rows default to FALSE.
+        sqlx::query(
+            "ALTER TABLE posts ADD COLUMN IF NOT EXISTS featured BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(&self.pool)
+        .await?;
         // Backs the newest-first index scan.
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts (created_at)")
             .execute(&self.pool)
             .await?;
+        // Single-row site settings (blog title / tagline / posts-per-page), edited from /admin.
+        // Standard SQL only; the one row is keyed by a constant `id = 'singleton'`.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS settings (\
+                 id TEXT PRIMARY KEY, \
+                 title TEXT NOT NULL, \
+                 tagline TEXT NOT NULL, \
+                 posts_per_page BIGINT NOT NULL\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
         // Derived lexical index for the "ask your blog" feature — additive, rebuildable, owns no
         // authoritative data. Standard SQL only, so it runs unchanged on FusionDB over pgwire.
         sqlx::query(
@@ -385,7 +452,40 @@ impl PgStore {
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
             published: row.try_get("published")?,
+            featured: row.try_get("featured")?,
         })
+    }
+
+    async fn get_settings_async(&self) -> Result<Settings, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT title, tagline, posts_per_page FROM settings WHERE id = 'singleton'",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            Some(r) => Settings {
+                title: r.try_get("title")?,
+                tagline: r.try_get("tagline")?,
+                posts_per_page: r.try_get("posts_per_page")?,
+            },
+            None => Settings::default(),
+        })
+    }
+
+    async fn update_settings_async(&self, s: &Settings) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO settings (id, title, tagline, posts_per_page) \
+             VALUES ('singleton', $1, $2, $3) \
+             ON CONFLICT (id) DO UPDATE SET \
+                 title = EXCLUDED.title, tagline = EXCLUDED.tagline, \
+                 posts_per_page = EXCLUDED.posts_per_page",
+        )
+        .bind(&s.title)
+        .bind(&s.tagline)
+        .bind(s.posts_per_page)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn list_posts_async(
@@ -395,7 +495,7 @@ impl PgStore {
     ) -> Result<Vec<Post>, sqlx::Error> {
         let limit = limit.clamp(1, MAX_PAGE);
         const COLS: &str = "SELECT id, slug, title, body_md, author_sub, author_email, \
-                            created_at, updated_at, published FROM posts";
+                            created_at, updated_at, published, featured FROM posts";
         // The `ORDER BY created_at DESC, id DESC` IS the keyset. With a cursor, add the standard
         // "strictly older" tuple comparison before the ORDER BY so paging never skips a tie.
         let rows = match before {
@@ -423,7 +523,7 @@ impl PgStore {
     async fn get_post_async(&self, slug: &str) -> Result<Option<Post>, sqlx::Error> {
         let row = sqlx::query(
             "SELECT id, slug, title, body_md, author_sub, author_email, created_at, updated_at, \
-                    published \
+                    published, featured \
              FROM posts WHERE slug = $1",
         )
         .bind(slug)
@@ -439,8 +539,8 @@ impl PgStore {
         sqlx::query(
             "INSERT INTO posts \
                  (id, slug, title, body_md, author_sub, author_email, created_at, updated_at, \
-                  published) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                  published, featured) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(&p.id)
         .bind(&p.slug)
@@ -451,6 +551,7 @@ impl PgStore {
         .bind(p.created_at)
         .bind(p.updated_at)
         .bind(p.published)
+        .bind(p.featured)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -458,13 +559,15 @@ impl PgStore {
 
     async fn update_post_async(&self, p: &Post) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "UPDATE posts SET title = $1, body_md = $2, published = $3, updated_at = $4 \
-             WHERE slug = $5",
+            "UPDATE posts SET title = $1, body_md = $2, published = $3, updated_at = $4, \
+                    featured = $5 \
+             WHERE slug = $6",
         )
         .bind(&p.title)
         .bind(&p.body_md)
         .bind(p.published)
         .bind(p.updated_at)
+        .bind(p.featured)
         .bind(&p.slug)
         .execute(&self.pool)
         .await?;
@@ -523,6 +626,19 @@ impl Store for PgStore {
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
+    async fn get_settings(&self) -> Settings {
+        self.get_settings_async().await.unwrap_or_else(|e| {
+            tracing::error!(error = %e, "pg get_settings failed");
+            Settings::default()
+        })
+    }
+
+    async fn update_settings(&self, settings: &Settings) -> Result<(), StoreError> {
+        self.update_settings_async(settings)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
     async fn count_chunks(&self) -> i64 {
         self.count_chunks_async().await.unwrap_or_else(|e| {
             tracing::error!(error = %e, "pg count_chunks failed");
@@ -576,6 +692,7 @@ mod tests {
             created_at,
             updated_at: created_at,
             published: true,
+            featured: false,
         }
     }
 
@@ -623,6 +740,38 @@ mod tests {
             page.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
             vec!["post_b", "post_a"],
         );
+    }
+
+    /// Settings default until saved, then round-trip through the store (single-row semantics).
+    #[tokio::test]
+    async fn settings_default_then_roundtrip() {
+        let store = InMemoryStore::new();
+        assert_eq!(store.get_settings().await, Settings::default(), "default before any save");
+
+        let s = Settings {
+            title: "My Blog".to_string(),
+            tagline: "hello".to_string(),
+            posts_per_page: 12,
+        };
+        store.update_settings(&s).await.unwrap();
+        assert_eq!(store.get_settings().await, s, "saved settings read back");
+
+        // A second save replaces the single row (no accumulation).
+        let s2 = Settings { title: "Renamed".to_string(), ..s.clone() };
+        store.update_settings(&s2).await.unwrap();
+        assert_eq!(store.get_settings().await, s2);
+    }
+
+    /// The admin `featured` flag persists through create + update.
+    #[tokio::test]
+    async fn featured_flag_persists() {
+        let store = InMemoryStore::new();
+        store.create_post(&post("p1", 1)).await.unwrap();
+        assert!(!store.get_post("p1").await.unwrap().featured, "defaults to not featured");
+        let mut p = store.get_post("p1").await.unwrap();
+        p.featured = true;
+        store.update_post(&p).await.unwrap();
+        assert!(store.get_post("p1").await.unwrap().featured, "featured persisted");
     }
 
     /// A caller asking for more than [`MAX_PAGE`] rows is clamped, so a single page stays bounded.

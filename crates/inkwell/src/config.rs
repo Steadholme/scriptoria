@@ -17,9 +17,15 @@ pub const MAX_PAGE: i64 = 200;
 /// Clamp a requested page size into `1..=MAX_PAGE`, falling back to [`DEFAULT_PAGE`] when the
 /// request omits `?limit=` or passes a non-positive value.
 pub fn clamp_page(limit: Option<i64>) -> i64 {
+    clamp_page_with_default(limit, DEFAULT_PAGE)
+}
+
+/// Like [`clamp_page`], but the "no `?limit=`" fallback is a caller-supplied default (the admin
+/// site-setting `posts_per_page`). The `default` itself is clamped into `1..=MAX_PAGE`.
+pub fn clamp_page_with_default(limit: Option<i64>, default: i64) -> i64 {
     match limit {
         Some(n) if n > 0 => n.min(MAX_PAGE),
-        _ => DEFAULT_PAGE,
+        _ => default.clamp(1, MAX_PAGE),
     }
 }
 

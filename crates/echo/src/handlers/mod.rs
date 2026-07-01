@@ -7,6 +7,7 @@
 //! matching the HOLDFAST enterprise brand (the same look as the Keystone/inkwell UI): brand
 //! gradient, indigo accent, cards, app-bar.
 
+pub mod admin;
 pub mod comments;
 pub mod health;
 

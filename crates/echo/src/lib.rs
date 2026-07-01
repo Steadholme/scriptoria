@@ -18,6 +18,10 @@
 //! - `POST /api/comment/delete` author self-delete of one's OWN comment (CSRF)
 //! - `POST /api/moderate`   hide / unhide a comment (CSRF + moderator group)
 //! - `GET  /embed/{key}`    a minimal, iframe-able thread + composer (X-Frame-Options SAMEORIGIN)
+//! - `GET  /admin`          moderation panel: all comments + bulk controls + author blocklist (admin)
+//! - `POST /admin/moderate` bulk hide / unhide / delete-any on selected comments (CSRF + admin)
+//! - `POST /admin/block`    add an author to the blocklist, hiding their comments (CSRF + admin)
+//! - `POST /admin/unblock`  remove an author from the blocklist (CSRF + admin)
 
 pub mod audit;
 pub mod auth;
@@ -57,6 +61,11 @@ pub fn app(state: AppState) -> Router {
         .route("/api/comment/edit", post(handlers::comments::edit_comment))
         .route("/api/comment/delete", post(handlers::comments::delete_comment))
         .route("/api/moderate", post(handlers::comments::moderate))
+        // Admin panel subtree — every route is gated by `require_admin` (403 for non-admins).
+        .route("/admin", get(handlers::admin::dashboard))
+        .route("/admin/moderate", post(handlers::admin::moderate))
+        .route("/admin/block", post(handlers::admin::block))
+        .route("/admin/unblock", post(handlers::admin::unblock))
         // Reject a forged gateway identity (spoofed X-Auth-* from a rogue in-network peer):
         // when GATEWAY_HMAC_KEY is set, an injected identity MUST carry a valid X-Auth-Sig.
         // No-op when the key is unset or no identity is present (health/dev).

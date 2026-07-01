@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Admin · Echo</title>
+  <style>{{CSS}}</style>
+</head>
+<body class="page-reading">
+{{TOPBAR}}
+<main class="reader">
+  <div class="reader__head">
+    <div>
+      <h1 class="reader__title">Moderation</h1>
+      <p class="reader__sub">Every comment across the estate — hide, unhide, or delete in bulk, and manage the author blocklist.</p>
+    </div>
+  </div>
+  <section class="board-section">
+    <h2 class="section__title">All comments</h2>
+    {{MODERATION}}
+  </section>
+  <section class="board-section">
+    <h2 class="section__title">Author blocklist</h2>
+    <p class="reader__sub">A blocked author's existing comments are hidden and their new comments are rejected.</p>
+    {{BLOCKLIST}}
+    {{BLOCK_FORM}}
+  </section>
+</main>
+</body>
+</html>

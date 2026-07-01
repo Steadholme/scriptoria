@@ -70,8 +70,11 @@ pub async fn index(
     let viewer = auth::author_sub(&headers);
     let email = auth::display_email(&headers);
 
+    // Site settings drive the title/tagline in the head + masthead and the default page size.
+    let settings = state.store.get_settings().await;
+
     let before = q.before.as_deref().and_then(parse_before);
-    let limit = crate::config::clamp_page(q.limit);
+    let limit = crate::config::clamp_page_with_default(q.limit, settings.posts_per_page);
     let posts = state.store.list_posts(before, limit).await;
 
     // A FULL page means more history may exist: the next cursor is the LAST (oldest) row of THIS
@@ -107,7 +110,9 @@ pub async fn index(
 
     let body = LIST_HTML
         .replace("{{CSS}}", APP_CSS)
-        .replace("{{TOPBAR}}", &topbar("Inkwell", &email))
+        .replace("{{TOPBAR}}", &topbar(&settings.title, &email))
+        .replace("{{BLOG_TITLE}}", &esc(&settings.title))
+        .replace("{{TAGLINE}}", &esc(&settings.tagline))
         .replace("{{POSTS}}", &cards)
         .replace("{{PAGER}}", &pager);
     Html(body).into_response()
@@ -242,6 +247,7 @@ pub async fn create(
         created_at: now,
         updated_at: now,
         published: form.published.is_some(),
+        featured: false,
     };
     state.store.create_post(&post).await?;
     tracing::info!(slug = %slug, "post created");
@@ -276,7 +282,8 @@ pub async fn edit_form(
         .get_post(&slug)
         .await
         .ok_or_else(|| AppError::NotFound("no such post".to_string()))?;
-    if post.author_sub != sub {
+    // Own posts, or ANY post for an admin (the admin panel edits every author's posts).
+    if post.author_sub != sub && !auth::is_admin(&headers) {
         return Err(AppError::Forbidden("you can only edit your own posts".to_string()));
     }
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
@@ -312,7 +319,7 @@ pub async fn update(
         .get_post(&slug)
         .await
         .ok_or_else(|| AppError::NotFound("no such post".to_string()))?;
-    if post.author_sub != sub {
+    if post.author_sub != sub && !auth::is_admin(&headers) {
         return Err(AppError::Forbidden("you can only edit your own posts".to_string()));
     }
 
@@ -360,7 +367,7 @@ pub async fn delete(
         .get_post(&slug)
         .await
         .ok_or_else(|| AppError::NotFound("no such post".to_string()))?;
-    if post.author_sub != sub {
+    if post.author_sub != sub && !auth::is_admin(&headers) {
         return Err(AppError::Forbidden("you can only delete your own posts".to_string()));
     }
     state.store.delete_post(&slug).await?;
@@ -450,6 +457,12 @@ fn render_card(post: &Post, viewer_sub: Option<&str>) -> String {
     } else {
         ""
     };
+    // Admin-set featured flag: a small badge on the (published) index card.
+    let featured_badge = if post.featured {
+        r#"<span class="badge badge-featured">Featured</span>"#
+    } else {
+        ""
+    };
     let owner_link = if is_owner {
         format!(
             r#" · <a class="card__edit" href="/edit/{slug}">Edit</a>"#,
@@ -460,12 +473,13 @@ fn render_card(post: &Post, viewer_sub: Option<&str>) -> String {
     };
     format!(
         r#"<article class="card-post">
-  <h2 class="card-post__title"><a href="/p/{slug}">{title}</a>{badge}</h2>
+  <h2 class="card-post__title"><a href="/p/{slug}">{title}</a>{featured}{badge}</h2>
   <div class="card-post__meta">{date} · {author}{owner}</div>
   <p class="card-post__excerpt">{excerpt}</p>
 </article>"#,
         slug = esc(&post.slug),
         title = esc(&post.title),
+        featured = featured_badge,
         badge = draft_badge,
         date = esc(&fmt_date(post.created_at)),
         author = esc(&post.author_email),

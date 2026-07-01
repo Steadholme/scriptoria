@@ -15,7 +15,8 @@ pub struct Category {
 }
 
 /// A thread of discussion within a category (maps 1:1 to a `threads` row). `last_at` tracks
-/// the most recent post so lists can sort by recent activity.
+/// the most recent post so lists can sort by recent activity. `locked` (no new replies) and
+/// `pinned` (sort first) are admin-controlled moderation flags; both default to `false`.
 #[derive(Clone, Debug, Serialize)]
 pub struct Thread {
     pub id: String,
@@ -25,6 +26,8 @@ pub struct Thread {
     pub author_email: String,
     pub created_at: i64,
     pub last_at: i64,
+    pub locked: bool,
+    pub pinned: bool,
 }
 
 /// A lightweight thread digest for compose-time similarity scoring: the thread's identity plus
@@ -37,6 +40,17 @@ pub struct ThreadDigest {
     pub category_id: String,
     pub title: String,
     pub first_body_md: String,
+}
+
+/// A blocked author (maps 1:1 to a `banned_authors` row). Keyed by the gateway-injected
+/// `author_sub`; while present it rejects that user's new threads and replies. `reason` and
+/// `banned_by` are short operator notes for the audit trail.
+#[derive(Clone, Debug, Serialize)]
+pub struct BannedAuthor {
+    pub author_sub: String,
+    pub reason: String,
+    pub banned_by: String,
+    pub created_at: i64,
 }
 
 /// A single post in a thread (maps 1:1 to a `posts` row). The first post of a thread is the

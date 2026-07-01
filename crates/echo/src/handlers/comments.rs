@@ -285,6 +285,11 @@ pub async fn post_comment(
     let (sub, email) = auth::require_author(&headers)?;
     auth::verify_csrf(&headers, &form.csrf_token)?;
 
+    // A blocked author may not post: reject before any thread/comment mutation.
+    if state.store.is_blocked(&sub).await {
+        return Err(AppError::Forbidden("author is blocked".to_string()));
+    }
+
     let key = form.thread_key.trim();
     if key.is_empty() {
         return Err(AppError::InvalidRequest("thread_key is required".to_string()));
@@ -778,7 +783,7 @@ async fn resolve_parent(state: &AppState, thread_id: &str, requested: &str) -> S
 /// Validate a `return_to` for an open-redirect-safe local navigation: it must be a single-slash
 /// absolute path (`/...`), never protocol-relative (`//host`) or an absolute URL. Falls back to
 /// `default` otherwise.
-fn local_redirect(return_to: &str, default: &str) -> String {
+pub(crate) fn local_redirect(return_to: &str, default: &str) -> String {
     let t = return_to.trim();
     if t.starts_with('/')
         && !t.starts_with("//")
@@ -791,7 +796,7 @@ fn local_redirect(return_to: &str, default: &str) -> String {
 }
 
 /// Percent-encode a path segment so a thread key with `/`, spaces, etc. survives in a URL path.
-fn path_seg(s: &str) -> String {
+pub(crate) fn path_seg(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
@@ -803,7 +808,7 @@ fn path_seg(s: &str) -> String {
 }
 
 /// A 303 redirect (post/redirect/get).
-fn redirect(location: &str) -> Response {
+pub(crate) fn redirect(location: &str) -> Response {
     (
         StatusCode::SEE_OTHER,
         [(
@@ -815,7 +820,7 @@ fn redirect(location: &str) -> Response {
 }
 
 /// An HTML response, optionally attaching a freshly-minted CSRF `Set-Cookie`.
-fn html_with_cookie(body: String, set_cookie: Option<String>) -> Response {
+pub(crate) fn html_with_cookie(body: String, set_cookie: Option<String>) -> Response {
     let mut resp = Html(body).into_response();
     attach_cookie(&mut resp, set_cookie);
     resp

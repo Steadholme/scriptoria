@@ -306,6 +306,12 @@ hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
 .markdown th, .markdown td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
 .markdown hr { border: 0; border-top: 1px solid var(--border); margin: 20px 0; }
 
+/* Admin panel rows: each management action (rename/reorder/delete, ban, thread toolbar) sits on
+   one wrapping line. Reuses the existing card/inline-form/button vocabulary. */
+.admin-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+.admin-row:last-child { border-bottom: 0; }
+.admin-toolbar { flex-wrap: wrap; gap: 8px; }
+
 @media (max-width: 640px) {
   .page-head { align-items: flex-start; }
 }

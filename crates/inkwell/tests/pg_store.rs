@@ -50,6 +50,7 @@ async fn pg_store_full_integration() {
         created_at: now - 100,
         updated_at: now - 100,
         published: true,
+        featured: false,
     };
     pg.create_post(&post).await.expect("create");
 
@@ -74,6 +75,7 @@ async fn pg_store_full_integration() {
         created_at: now,
         updated_at: now,
         published: true,
+        featured: false,
     };
     pg.create_post(&post2).await.expect("create 2");
 

@@ -214,7 +214,17 @@ pub async fn thread(
 
     // The authenticated subject (if any) decides which edit/delete controls render.
     let viewer = auth::identity_subject(&headers);
+    let is_admin = auth::is_admin(&headers);
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
+
+    // Admin moderation toolbar (lock/pin/move/delete) — only for admins. The move dropdown
+    // needs the full category list, fetched only on the admin path.
+    let admin_actions = if is_admin {
+        let categories = state.store.list_categories().await?;
+        render_admin_thread_toolbar(&thread, &categories, &csrf)
+    } else {
+        String::new()
+    };
 
     // Breadcrumb: Home / Category / Thread.
     let cat_crumb = match &category {
@@ -249,10 +259,15 @@ pub async fn thread(
     };
 
     let summary_html = render_summary(&posts);
-    let posts_html = render_posts(&posts, now, viewer.as_deref(), &thread.id, &csrf);
+    let posts_html = render_posts(&posts, now, viewer.as_deref(), is_admin, &thread.id, &csrf);
 
-    let reply_form = format!(
-        r#"<section class="card pad">
+    // A locked thread shows a notice instead of the reply form (admins still moderate above).
+    let reply_form = if thread.locked {
+        r#"<section class="card pad"><p class="muted">This thread is locked — no new replies.</p></section>"#
+            .to_string()
+    } else {
+        format!(
+            r#"<section class="card pad">
   <h2 class="section__title">Reply</h2>
   <form class="form" method="post" action="/t/{tid}/reply">
     <input type="hidden" name="csrf" value="{csrf}">
@@ -263,26 +278,39 @@ pub async fn thread(
     </div>
   </form>
 </section>"#,
-        tid = esc(&thread.id),
-        csrf = esc(&csrf),
-    );
+            tid = esc(&thread.id),
+            csrf = esc(&csrf),
+        )
+    };
+
+    // Status badges in the thread head (pinned / locked) so the state is visible to everyone.
+    let mut badges = String::new();
+    if thread.pinned {
+        badges.push_str(r#" <span class="badge badge-op">Pinned</span>"#);
+    }
+    if thread.locked {
+        badges.push_str(r#" <span class="badge badge-op">Locked</span>"#);
+    }
 
     let content = format!(
         r#"{crumbs}
 <div class="thread-head">
-  <h1>{title}</h1>
+  <h1>{title}{badges}</h1>
   <p class="muted">Started by <strong>{author}</strong> · {when} · {replies}</p>
   {actions}
+  {admin_actions}
 </div>
 {summary}
 <section class="posts">{posts}</section>
 {reply}"#,
         crumbs = crumbs,
         title = esc(&thread.title),
+        badges = badges,
         author = esc(&thread.author_email),
         when = esc(&fmt_ts(thread.created_at)),
         replies = esc(&replies_label(posts.len() as i64)),
         actions = thread_actions,
+        admin_actions = admin_actions,
         summary = summary_html,
         posts = posts_html,
         reply = reply_form,
@@ -378,6 +406,11 @@ pub async fn create(
 ) -> Result<Response, AppError> {
     auth::verify_csrf(&headers, &form.csrf)?;
     let author = auth::require_author(&headers)?;
+    if state.store.is_banned(&author.sub).await? {
+        return Err(AppError::Forbidden(
+            "your account is blocked from posting".to_string(),
+        ));
+    }
 
     let title = form.title.trim();
     if title.is_empty() {
@@ -407,6 +440,8 @@ pub async fn create(
         author_email: author.email.clone(),
         created_at: now,
         last_at: now,
+        locked: false,
+        pinned: false,
     };
     let first_post = Post {
         id: new_id("p"),
@@ -454,9 +489,21 @@ pub async fn reply(
 ) -> Result<Response, AppError> {
     auth::verify_csrf(&headers, &form.csrf)?;
     let author = auth::require_author(&headers)?;
+    if state.store.is_banned(&author.sub).await? {
+        return Err(AppError::Forbidden(
+            "your account is blocked from posting".to_string(),
+        ));
+    }
 
-    if state.store.get_thread(&id).await?.is_none() {
-        return Err(AppError::NotFound("thread not found".to_string()));
+    let thread = state
+        .store
+        .get_thread(&id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("thread not found".to_string()))?;
+    if thread.locked {
+        return Err(AppError::Forbidden(
+            "this thread is locked — no new replies".to_string(),
+        ));
     }
     let body = form.body.trim();
     if body.is_empty() {
@@ -747,6 +794,54 @@ pub async fn delete_reply(
 // Render helpers
 // ===========================================================================
 
+/// Render the admin moderation toolbar for a thread: toggle lock, toggle pin, move to another
+/// category, and delete the whole thread. Every action is a CSRF-guarded POST into the
+/// group-gated `/admin` subtree. Category options are HTML-escaped.
+pub(crate) fn render_admin_thread_toolbar(
+    thread: &Thread,
+    categories: &[crate::model::Category],
+    csrf: &str,
+) -> String {
+    let lock_label = if thread.locked { "Unlock" } else { "Lock" };
+    let pin_label = if thread.pinned { "Unpin" } else { "Pin" };
+    let mut options = String::new();
+    for c in categories {
+        let sel = if c.id == thread.category_id { " selected" } else { "" };
+        options.push_str(&format!(
+            r#"<option value="{id}"{sel}>{name}</option>"#,
+            id = esc(&c.id),
+            sel = sel,
+            name = esc(&c.name),
+        ));
+    }
+    format!(
+        r#"<div class="owner-actions admin-toolbar">
+  <form class="inline-form" method="post" action="/admin/threads/{tid}/lock">
+    <input type="hidden" name="csrf" value="{csrf}">
+    <button class="btn btn-secondary btn-sm" type="submit">{lock_label}</button>
+  </form>
+  <form class="inline-form" method="post" action="/admin/threads/{tid}/pin">
+    <input type="hidden" name="csrf" value="{csrf}">
+    <button class="btn btn-secondary btn-sm" type="submit">{pin_label}</button>
+  </form>
+  <form class="inline-form" method="post" action="/admin/threads/{tid}/move">
+    <input type="hidden" name="csrf" value="{csrf}">
+    <select name="category" aria-label="Move to category">{options}</select>
+    <button class="btn btn-secondary btn-sm" type="submit">Move</button>
+  </form>
+  <form class="inline-form" method="post" action="/admin/threads/{tid}/delete" onsubmit="return confirm('Delete this thread and all replies as admin? This cannot be undone.');">
+    <input type="hidden" name="csrf" value="{csrf}">
+    <button class="btn btn-danger btn-sm" type="submit">Delete (admin)</button>
+  </form>
+</div>"#,
+        tid = esc(&thread.id),
+        csrf = esc(csrf),
+        lock_label = lock_label,
+        pin_label = pin_label,
+        options = options,
+    )
+}
+
 /// Render the shared edit-form card (thread or reply). `title_value` is `Some` for a thread
 /// (renders a Title input) and `None` for a reply (body only). Every interpolated value is
 /// HTML-escaped.
@@ -868,6 +963,7 @@ fn render_posts(
     posts: &[Post],
     now: i64,
     viewer: Option<&str>,
+    is_admin: bool,
     thread_id: &str,
     csrf: &str,
 ) -> String {
@@ -883,21 +979,39 @@ fn render_posts(
             ""
         };
         // Own-reply controls: not on the original post (i == 0), only for the author.
-        let controls = if i > 0 && viewer == Some(p.author_sub.as_str()) {
+        let owner_controls = if i > 0 && viewer == Some(p.author_sub.as_str()) {
             format!(
-                r#"<div class="owner-actions post__actions">
-  <a class="btn btn-ghost btn-sm" href="/t/{tid}/p/{pid}/edit">Edit</a>
+                r#"<a class="btn btn-ghost btn-sm" href="/t/{tid}/p/{pid}/edit">Edit</a>
   <form class="inline-form" method="post" action="/t/{tid}/p/{pid}/delete" onsubmit="return confirm('Delete this reply? This cannot be undone.');">
     <input type="hidden" name="csrf" value="{csrf}">
     <button class="btn btn-danger btn-sm" type="submit">Delete</button>
-  </form>
-</div>"#,
+  </form>"#,
                 tid = esc(thread_id),
                 pid = esc(&p.id),
                 csrf = esc(csrf),
             )
         } else {
             String::new()
+        };
+        // Admin can delete ANY post (original post included). The admin route is group-gated.
+        let admin_controls = if is_admin {
+            format!(
+                r#"<form class="inline-form" method="post" action="/admin/posts/{pid}/delete" onsubmit="return confirm('Delete this post as admin? This cannot be undone.');">
+    <input type="hidden" name="csrf" value="{csrf}">
+    <button class="btn btn-danger btn-sm" type="submit">Delete (admin)</button>
+  </form>"#,
+                pid = esc(&p.id),
+                csrf = esc(csrf),
+            )
+        } else {
+            String::new()
+        };
+        let controls = if owner_controls.is_empty() && admin_controls.is_empty() {
+            String::new()
+        } else {
+            format!(
+                r#"<div class="owner-actions post__actions">{owner_controls}{admin_controls}</div>"#,
+            )
         };
         out.push_str(&format!(
             r#"<article class="post{op}">
@@ -923,7 +1037,7 @@ fn render_posts(
 }
 
 /// Build an `Html` response, attaching a `Set-Cookie` header when a fresh CSRF cookie is due.
-fn html_response(html: String, set_cookie: Option<String>) -> Response {
+pub(crate) fn html_response(html: String, set_cookie: Option<String>) -> Response {
     let mut resp = Html(html).into_response();
     if let Some(cookie) = set_cookie {
         if let Ok(value) = HeaderValue::from_str(&cookie) {
@@ -934,7 +1048,7 @@ fn html_response(html: String, set_cookie: Option<String>) -> Response {
 }
 
 /// A 303 See Other redirect (post/redirect/get).
-fn redirect_to(location: &str) -> Response {
+pub(crate) fn redirect_to(location: &str) -> Response {
     (
         StatusCode::SEE_OTHER,
         [(header::LOCATION, location.to_string())],

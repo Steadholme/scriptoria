@@ -5,6 +5,7 @@
 //! embedded (via `include_str!`) and inlined into every page, matching the HOLDFAST
 //! enterprise brand: brand gradient app-bar, indigo accent, cards, pills.
 
+pub mod admin;
 pub mod forum;
 pub mod health;
 pub mod insight;
