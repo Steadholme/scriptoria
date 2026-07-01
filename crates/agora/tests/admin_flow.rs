@@ -128,7 +128,10 @@ async fn admin_lock_blocks_new_replies() {
     // The thread page shows the locked notice and hides the reply form.
     let (_s, _h, page) = send(&state, get(&loc)).await;
     assert!(page.contains("locked"), "locked state visible");
-    assert!(!page.contains(r#"action="/t/"#), "no reply form action on a locked thread");
+    assert!(
+        !page.contains(&format!(r#"action="/t/{tid}/reply""#)),
+        "no reply form action on a locked thread"
+    );
 
     // A reply is now refused.
     let reply = form(&[("csrf", TOK), ("body", "late reply")]);

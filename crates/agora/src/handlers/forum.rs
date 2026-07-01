@@ -21,7 +21,7 @@ use crate::handlers::insight::thread_summary;
 use crate::handlers::{
     email_display, esc, fmt_ts, rel_time, render_page, replies_label,
 };
-use crate::model::{Post, Thread};
+use crate::model::{Post, ReactionCount, Thread};
 use crate::{markdown, new_id, now_secs, AppState};
 
 /// Most-recent threads shown on the home page.
@@ -31,6 +31,16 @@ const CATEGORY_LIMIT: i64 = 200;
 /// Caps on user input (defense against absurd payloads; the store columns are TEXT).
 const MAX_TITLE: usize = 200;
 const MAX_BODY: usize = 20_000;
+
+/// The reaction kinds a user may toggle on a post: `(kind, glyph)`. This is the closed set — a
+/// POST with any other `kind` is rejected — and it drives the rendered button row (a button per
+/// entry, in this order) so every post shows the same, stable reaction affordances.
+pub const REACTION_KINDS: &[(&str, &str)] = &[("up", "\u{1F44D}"), ("heart", "\u{2764}")];
+
+/// Whether `kind` is one of the allowed [`REACTION_KINDS`].
+fn is_reaction_kind(kind: &str) -> bool {
+    REACTION_KINDS.iter().any(|(k, _)| *k == kind)
+}
 
 /// Inline progressive-enhancement script for the new-thread form: as the user types, it asks
 /// `POST /api/similar` for the top existing threads similar to the draft and lists them. It
@@ -259,7 +269,35 @@ pub async fn thread(
     };
 
     let summary_html = render_summary(&posts);
-    let posts_html = render_posts(&posts, now, viewer.as_deref(), is_admin, &thread.id, &csrf);
+
+    // Display order: the original post stays first, then the accepted reply (if any), then the
+    // rest in their natural oldest-first order. Reordering a clone never touches storage.
+    let ordered = order_posts_accepted_first(&posts, &thread.accepted_post_id);
+
+    // Per-post reaction aggregates (counts + whether THIS viewer reacted), keyed by post id.
+    let mut reactions: HashMap<String, Vec<ReactionCount>> = HashMap::new();
+    for p in &ordered {
+        let counts = state
+            .store
+            .reactions_for_post(&p.id, viewer.as_deref())
+            .await?;
+        reactions.insert(p.id.clone(), counts);
+    }
+
+    // The "mark accepted" control is gated to the THREAD AUTHOR and to admins.
+    let can_accept = viewer.as_deref() == Some(thread.author_sub.as_str()) || is_admin;
+
+    let posts_html = render_posts(
+        &ordered,
+        now,
+        viewer.as_deref(),
+        is_admin,
+        &thread.id,
+        &csrf,
+        &thread.accepted_post_id,
+        can_accept,
+        &reactions,
+    );
 
     // A locked thread shows a notice instead of the reply form (admins still moderate above).
     let reply_form = if thread.locked {
@@ -442,6 +480,7 @@ pub async fn create(
         last_at: now,
         locked: false,
         pinned: false,
+        accepted_post_id: String::new(),
     };
     let first_post = Post {
         id: new_id("p"),
@@ -791,6 +830,137 @@ pub async fn delete_reply(
 }
 
 // ===========================================================================
+// POST /t/{tid}/p/{pid}/react — toggle a reaction on a post
+// ===========================================================================
+
+/// Form body for a reaction toggle: the CSRF token + the reaction `kind`. Identity (the reactor)
+/// comes from the gateway headers, never the form.
+#[derive(Debug, Deserialize)]
+pub struct ReactForm {
+    #[serde(default)]
+    pub csrf: String,
+    #[serde(default)]
+    pub kind: String,
+}
+
+pub async fn react(
+    State(state): State<AppState>,
+    Path((tid, pid)): Path<(String, String)>,
+    headers: HeaderMap,
+    Form(form): Form<ReactForm>,
+) -> Result<Response, AppError> {
+    auth::verify_csrf(&headers, &form.csrf)?;
+    let author = auth::require_author(&headers)?;
+    if state.store.is_banned(&author.sub).await? {
+        return Err(AppError::Forbidden(
+            "your account is blocked from posting".to_string(),
+        ));
+    }
+
+    let kind = form.kind.trim();
+    if !is_reaction_kind(kind) {
+        return Err(AppError::InvalidRequest("unknown reaction kind".to_string()));
+    }
+
+    // The post must exist AND belong to this thread (guards cross-thread id spoofing).
+    let post = state
+        .store
+        .get_post(&pid)
+        .await?
+        .filter(|p| p.thread_id == tid)
+        .ok_or_else(|| AppError::NotFound("post not found".to_string()))?;
+
+    let on = state
+        .store
+        .toggle_reaction(&post.id, &author.sub, kind, now_secs())
+        .await?;
+    tracing::info!(thread = tid, post = pid, kind, on, "reaction toggled");
+
+    let actor = if author.email.is_empty() {
+        &author.sub
+    } else {
+        &author.email
+    };
+    state.audit.emit(AuditEvent::info(
+        "reaction.toggle",
+        actor,
+        &pid,
+        if on { kind } else { "off" },
+    ));
+
+    Ok(redirect_to(&format!("/t/{tid}")))
+}
+
+// ===========================================================================
+// POST /t/{tid}/accept — mark/unmark a reply as the accepted answer
+// ===========================================================================
+
+/// Form body for accepting an answer: the CSRF token + the reply's `post_id`. Authorisation
+/// (thread author or admin) is checked against the gateway identity, never the form.
+#[derive(Debug, Deserialize)]
+pub struct AcceptForm {
+    #[serde(default)]
+    pub csrf: String,
+    #[serde(default)]
+    pub post_id: String,
+}
+
+pub async fn accept_answer(
+    State(state): State<AppState>,
+    Path(tid): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<AcceptForm>,
+) -> Result<Response, AppError> {
+    auth::verify_csrf(&headers, &form.csrf)?;
+    let author = auth::require_author(&headers)?;
+
+    let thread = state
+        .store
+        .get_thread(&tid)
+        .await?
+        .ok_or_else(|| AppError::NotFound("thread not found".to_string()))?;
+
+    // Gate: only the thread author or an admin may mark an accepted answer.
+    if thread.author_sub != author.sub && !auth::is_admin(&headers) {
+        return Err(AppError::Forbidden(
+            "only the thread author or an admin can mark the accepted answer".to_string(),
+        ));
+    }
+
+    // The target must be a REPLY in this thread — never the original post (index 0).
+    let posts = state.store.posts_in_thread(&tid).await?;
+    let target = form.post_id.trim();
+    if posts.first().map(|p| p.id == target).unwrap_or(false) {
+        return Err(AppError::InvalidRequest(
+            "the original post cannot be the accepted answer".to_string(),
+        ));
+    }
+    if !posts.iter().any(|p| p.id == target) {
+        return Err(AppError::NotFound("reply not found".to_string()));
+    }
+
+    // Toggle: re-accepting the currently accepted reply clears it; otherwise set it. Idempotent
+    // (marking the same reply that is already accepted flips it off — a deliberate unmark).
+    let new_accepted = if thread.accepted_post_id == target { "" } else { target };
+    state.store.set_accepted_post(&tid, new_accepted).await?;
+    tracing::info!(thread = tid, accepted = new_accepted, "accepted answer set");
+
+    let actor = if author.email.is_empty() {
+        &author.sub
+    } else {
+        &author.email
+    };
+    state.audit.emit(AuditEvent::notice(
+        "thread.accept",
+        actor,
+        &tid,
+        if new_accepted.is_empty() { "cleared" } else { new_accepted },
+    ));
+
+    Ok(redirect_to(&format!("/t/{tid}")))
+}
+
+// ===========================================================================
 // Render helpers
 // ===========================================================================
 
@@ -955,10 +1125,66 @@ fn render_summary(posts: &[Post]) -> String {
     )
 }
 
+/// Reorder a thread's posts for display: keep the original post (oldest, index 0) first, then
+/// float the accepted reply (if `accepted_post_id` names one that exists and is NOT the OP) to
+/// the second slot, leaving the remaining replies in their natural order. Returns a fresh
+/// `Vec<Post>` — the stored order is never mutated.
+pub(crate) fn order_posts_accepted_first(posts: &[Post], accepted_post_id: &str) -> Vec<Post> {
+    let mut ordered: Vec<Post> = posts.to_vec();
+    if accepted_post_id.is_empty() {
+        return ordered;
+    }
+    // Only replies (index >= 1) can be accepted; never move the OP.
+    if let Some(pos) = ordered
+        .iter()
+        .position(|p| p.id == accepted_post_id)
+        .filter(|&pos| pos >= 1)
+    {
+        let accepted = ordered.remove(pos);
+        ordered.insert(1, accepted);
+    }
+    ordered
+}
+
+/// Render the reaction button row for a post: one CSRF-guarded toggle form per allowed kind (in
+/// [`REACTION_KINDS`] order), each showing the glyph and its live count. The viewer's own active
+/// reactions carry `is-mine`. Every value is HTML-escaped.
+fn render_reactions(thread_id: &str, post_id: &str, csrf: &str, counts: &[ReactionCount]) -> String {
+    let mut buttons = String::new();
+    for (kind, glyph) in REACTION_KINDS {
+        let hit = counts.iter().find(|c| c.kind == *kind);
+        let count = hit.map(|c| c.count).unwrap_or(0);
+        let mine = hit.map(|c| c.mine).unwrap_or(false);
+        let mine_class = if mine { " is-mine" } else { "" };
+        buttons.push_str(&format!(
+            r#"<form class="inline-form" method="post" action="/t/{tid}/p/{pid}/react">
+    <input type="hidden" name="csrf" value="{csrf}">
+    <input type="hidden" name="kind" value="{kind}">
+    <button class="reaction{mine}" type="submit" aria-pressed="{pressed}" title="{kind} reaction">
+      <span class="reaction__glyph" aria-hidden="true">{glyph}</span>
+      <span class="reaction__count">{count}</span>
+    </button>
+  </form>"#,
+            tid = esc(thread_id),
+            pid = esc(post_id),
+            csrf = esc(csrf),
+            kind = esc(kind),
+            mine = mine_class,
+            pressed = if mine { "true" } else { "false" },
+            glyph = esc(glyph),
+            count = count,
+        ));
+    }
+    format!(r#"<div class="reactions">{buttons}</div>"#)
+}
+
 /// Render the posts of a thread. The first post is flagged as the original post (`is-op`);
 /// each body is rendered through the markdown sanitiser. A REPLY (never the original post —
 /// that is edited/deleted via the thread controls) gets inline Edit/Delete controls when
-/// `viewer` is its author.
+/// `viewer` is its author. Every post shows the reaction row; the reply marked as the accepted
+/// answer shows an "Accepted answer" badge, and when `can_accept` (thread author or admin) each
+/// reply gets a mark/unmark-accepted control.
+#[allow(clippy::too_many_arguments)]
 fn render_posts(
     posts: &[Post],
     now: i64,
@@ -966,18 +1192,32 @@ fn render_posts(
     is_admin: bool,
     thread_id: &str,
     csrf: &str,
+    accepted_post_id: &str,
+    can_accept: bool,
+    reactions: &HashMap<String, Vec<ReactionCount>>,
 ) -> String {
     if posts.is_empty() {
         return r#"<div class="empty">This thread has no posts.</div>"#.to_string();
     }
+    let empty_counts: Vec<ReactionCount> = Vec::new();
     let mut out = String::new();
     for (i, p) in posts.iter().enumerate() {
-        let op = if i == 0 { " is-op" } else { "" };
-        let tag = if i == 0 {
-            r#"<span class="badge badge-op">Original post</span>"#
+        let is_accepted = i > 0 && !accepted_post_id.is_empty() && p.id == accepted_post_id;
+        let op = if i == 0 {
+            " is-op"
+        } else if is_accepted {
+            " is-accepted"
         } else {
             ""
         };
+        let mut tag = if i == 0 {
+            r#"<span class="badge badge-op">Original post</span>"#.to_string()
+        } else {
+            String::new()
+        };
+        if is_accepted {
+            tag.push_str(r#"<span class="badge badge-accepted">Accepted answer</span>"#);
+        }
         // Own-reply controls: not on the original post (i == 0), only for the author.
         let owner_controls = if i > 0 && viewer == Some(p.author_sub.as_str()) {
             format!(
@@ -989,6 +1229,23 @@ fn render_posts(
                 tid = esc(thread_id),
                 pid = esc(&p.id),
                 csrf = esc(csrf),
+            )
+        } else {
+            String::new()
+        };
+        // Mark/unmark accepted: replies only (i > 0), gated to the thread author + admin.
+        let accept_control = if i > 0 && can_accept {
+            let label = if is_accepted { "Unmark accepted" } else { "Mark accepted" };
+            format!(
+                r#"<form class="inline-form" method="post" action="/t/{tid}/accept">
+    <input type="hidden" name="csrf" value="{csrf}">
+    <input type="hidden" name="post_id" value="{pid}">
+    <button class="btn btn-secondary btn-sm" type="submit">{label}</button>
+  </form>"#,
+                tid = esc(thread_id),
+                pid = esc(&p.id),
+                csrf = esc(csrf),
+                label = label,
             )
         } else {
             String::new()
@@ -1006,13 +1263,15 @@ fn render_posts(
         } else {
             String::new()
         };
-        let controls = if owner_controls.is_empty() && admin_controls.is_empty() {
+        let controls = if owner_controls.is_empty() && accept_control.is_empty() && admin_controls.is_empty() {
             String::new()
         } else {
             format!(
-                r#"<div class="owner-actions post__actions">{owner_controls}{admin_controls}</div>"#,
+                r#"<div class="owner-actions post__actions">{owner_controls}{accept_control}{admin_controls}</div>"#,
             )
         };
+        let counts = reactions.get(&p.id).unwrap_or(&empty_counts);
+        let reactions_html = render_reactions(thread_id, &p.id, csrf, counts);
         out.push_str(&format!(
             r#"<article class="post{op}">
   <header class="post__meta">
@@ -1022,6 +1281,7 @@ fn render_posts(
     {tag}
   </header>
   <div class="markdown">{body}</div>
+  {reactions}
   {controls}
 </article>"#,
             op = op,
@@ -1030,6 +1290,7 @@ fn render_posts(
             ago = esc(&rel_time(p.created_at, now)),
             tag = tag,
             body = markdown::render(&p.body_md),
+            reactions = reactions_html,
             controls = controls,
         ));
     }

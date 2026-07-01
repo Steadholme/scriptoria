@@ -12,6 +12,7 @@ pub mod ask;
 pub mod feed;
 pub mod health;
 pub mod posts;
+pub mod search;
 
 use axum::http::StatusCode;
 
@@ -75,6 +76,25 @@ pub fn topbar(page_title: &str, email: &str) -> String {
         chip = chip,
         logout = LOGOUT_URL,
     )
+}
+
+/// Render a post's tags as a row of chips linking to their `/tag/{slug}` listing. Returns the
+/// empty string when the post carries no tags (so the block is hidden). Every field is escaped;
+/// parsing/slugging is shared with the `/tag/{slug}` route via [`crate::tags`].
+pub fn tag_chips(raw_tags: &str) -> String {
+    let tags = crate::tags::parse_tags(raw_tags);
+    if tags.is_empty() {
+        return String::new();
+    }
+    let mut chips = String::new();
+    for t in &tags {
+        chips.push_str(&format!(
+            r#"<a class="tag" href="/tag/{slug}">{label}</a>"#,
+            slug = esc(&crate::tags::tag_slug(t)),
+            label = esc(t),
+        ));
+    }
+    format!(r#"<div class="tag-list">{chips}</div>"#)
 }
 
 /// Format epoch seconds as a compact UTC date `Mon D, YYYY` (e.g. `Jun 29, 2026`). std `time`

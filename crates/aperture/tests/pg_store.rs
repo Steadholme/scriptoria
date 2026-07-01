@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use aperture::blobs::MemoryBlobs;
-use aperture::model::FileRec;
+use aperture::model::{FileRec, FolderRec};
 use aperture::store::{PgStore, Store};
 use aperture::{app, build_dev_state, now_secs, AppState};
 use sqlx::postgres::PgPoolOptions;
@@ -39,6 +39,7 @@ fn file(id: &str, owner: &str, token: &str, created_at: i64) -> FileRec {
         created_at,
         expires_at: None,
         share_password_hash: None,
+        folder_id: None,
     }
 }
 
@@ -104,12 +105,12 @@ async fn pg_store_full_integration() {
     // --- owner-scoped gallery list, newest-first ---------------------------
     store.create(&file("cccccccccc", "alice", "tok-cccc", now + 20)).await.unwrap();
     store.create(&file("dddddddddd", "bob", "tok-dddd", now + 30)).await.unwrap();
-    let mine = store.list_by_owner("alice", None, 50).await.unwrap();
+    let mine = store.list_by_owner("alice", None, None, 50).await.unwrap();
     let ids: Vec<&str> = mine.iter().map(|f| f.id.as_str()).collect();
     assert_eq!(ids, vec!["cccccccccc", "aaaaaaaaaa"], "other owner excluded, newest first");
 
     // --- keyset backward pagination over the portable SQL path -------------
-    let page1 = store.list_by_owner("alice", None, 1).await.unwrap();
+    let page1 = store.list_by_owner("alice", None, None, 1).await.unwrap();
     assert_eq!(
         page1.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
         vec!["cccccccccc"],
@@ -117,7 +118,7 @@ async fn pg_store_full_integration() {
     );
     let cur = page1.last().unwrap();
     let page2 = store
-        .list_by_owner("alice", Some((cur.created_at, cur.id.clone())), 1)
+        .list_by_owner("alice", None, Some((cur.created_at, cur.id.clone())), 1)
         .await
         .unwrap();
     assert_eq!(
@@ -125,6 +126,59 @@ async fn pg_store_full_integration() {
         vec!["aaaaaaaaaa"],
         "before-cursor pages into the older row"
     );
+
+    // --- folders (albums): create, filter, move, rename, delete-unfiles ----
+    sqlx::query("DELETE FROM folders").execute(&raw).await.unwrap();
+    let fld = |id: &str, owner: &str, name: &str| FolderRec {
+        id: id.to_string(),
+        owner_sub: owner.to_string(),
+        name: name.to_string(),
+        created_at: now,
+    };
+    assert!(store.create_folder(&fld("fold000001", "alice", "Zeta")).await.unwrap());
+    assert!(store.create_folder(&fld("fold000002", "alice", "alpha")).await.unwrap());
+    assert!(store.create_folder(&fld("fold000003", "bob", "bobs")).await.unwrap());
+    // id collision -> false.
+    assert!(!store.create_folder(&fld("fold000001", "alice", "dup")).await.unwrap());
+    // Owner-scoped, case-insensitive name order; bob's folder excluded.
+    let folder_names: Vec<String> = store
+        .list_folders("alice")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|f| f.name)
+        .collect();
+    assert_eq!(folder_names, vec!["alpha".to_string(), "Zeta".to_string()]);
+    // get_folder is ownership-scoped.
+    assert!(store.get_folder("fold000001", "alice").await.unwrap().is_some());
+    assert!(store.get_folder("fold000003", "alice").await.unwrap().is_none());
+
+    // Move alice's file "cccccccccc" into a folder; the folder view returns only it.
+    assert!(store.move_file("cccccccccc", "alice", Some("fold000001")).await.unwrap());
+    let in_folder = store
+        .list_by_owner("alice", Some("fold000001"), None, 50)
+        .await
+        .unwrap();
+    assert_eq!(in_folder.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["cccccccccc"]);
+    // The flat view still shows the file regardless of folder.
+    assert!(store
+        .list_by_owner("alice", None, None, 50)
+        .await
+        .unwrap()
+        .iter()
+        .any(|f| f.id == "cccccccccc"));
+    // A non-owner cannot move the file or rename/delete the folder.
+    assert!(!store.move_file("cccccccccc", "bob", Some("fold000001")).await.unwrap());
+    assert!(!store.rename_folder("fold000001", "bob", "hax").await.unwrap());
+    assert!(!store.delete_folder("fold000001", "bob").await.unwrap());
+    // Rename works for the owner.
+    assert!(store.rename_folder("fold000001", "alice", "Renamed").await.unwrap());
+    assert_eq!(store.get_folder("fold000001", "alice").await.unwrap().unwrap().name, "Renamed");
+    // Deleting the folder unfiles its file (kept, folder_id cleared).
+    assert!(store.delete_folder("fold000001", "alice").await.unwrap());
+    assert!(store.get_folder("fold000001", "alice").await.unwrap().is_none());
+    assert!(store.get("cccccccccc").await.unwrap().unwrap().folder_id.is_none());
+    sqlx::query("DELETE FROM folders").execute(&raw).await.unwrap();
 
     // --- ownership-scoped delete -------------------------------------------
     assert!(!store.delete("aaaaaaaaaa", "bob").await.unwrap(), "bob cannot delete alice's");

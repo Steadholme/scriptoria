@@ -43,7 +43,7 @@ async fn pg_store_full_integration() {
 
     // Clean slate on a shared raw pool, then seed defaults (idempotent).
     let raw = PgPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
-    for tbl in ["posts", "threads", "categories"] {
+    for tbl in ["post_reactions", "posts", "threads", "categories"] {
         sqlx::query(&format!("DELETE FROM {tbl}")).execute(&raw).await.unwrap();
     }
     pg.seed_categories_if_empty(&default_categories()).await.expect("seed");
@@ -64,6 +64,7 @@ async fn pg_store_full_integration() {
         last_at: now,
         locked: false,
         pinned: false,
+        accepted_post_id: String::new(),
     };
     let first = Post {
         id: new_id("p"),
@@ -158,12 +159,44 @@ async fn pg_store_full_integration() {
         .expect("digest for edited thread");
     assert_eq!(digest.first_body_md, "Edited **op** body.", "first_body_md kept in step");
 
+    // --- reactions: idempotent toggle + per-viewer aggregate --------------
+    // u_1 reacts "up" on the reply → inserted (true), count 1, and it is u_1's own.
+    assert!(pg.toggle_reaction(&reply.id, "u_1", "up", now).await.unwrap(), "first toggle inserts");
+    // Toggling the same (post,user,kind) again removes it (false) — idempotent, no duplicate row.
+    assert!(!pg.toggle_reaction(&reply.id, "u_1", "up", now).await.unwrap(), "second toggle removes");
+    // Two different users react "up": count 2, and "mine" reflects the viewer.
+    assert!(pg.toggle_reaction(&reply.id, "u_1", "up", now).await.unwrap());
+    assert!(pg.toggle_reaction(&reply.id, "u_2", "up", now).await.unwrap());
+    let counts = pg.reactions_for_post(&reply.id, Some("u_2")).await.unwrap();
+    let up = counts.iter().find(|c| c.kind == "up").expect("up count");
+    assert_eq!(up.count, 2, "two distinct reactors");
+    assert!(up.mine, "u_2 is among the reactors");
+    let counts_other = pg.reactions_for_post(&reply.id, Some("u_stranger")).await.unwrap();
+    assert!(!counts_other.iter().find(|c| c.kind == "up").unwrap().mine, "stranger is not a reactor");
+
+    // --- accepted answer: set, read back, and clear-on-delete -------------
+    pg.set_accepted_post(&thread.id, &reply.id).await.expect("set accepted");
+    assert_eq!(
+        pg.get_thread(&thread.id).await.unwrap().unwrap().accepted_post_id,
+        reply.id,
+        "accepted_post_id persisted"
+    );
+
     // Edit then delete the reply (a single-post UPDATE / DELETE).
     pg.update_post(&reply.id, "Edited reply.").await.expect("update reply");
     let posts = pg.posts_in_thread(&thread.id).await.unwrap();
     assert_eq!(posts[1].body_md, "Edited reply.");
     pg.delete_post(&reply.id).await.expect("delete reply");
     assert_eq!(pg.count_posts(&thread.id).await.unwrap(), 1, "reply deleted");
+    // Deleting the reply clears it as the accepted answer AND drops its reactions (no orphans).
+    assert!(
+        pg.get_thread(&thread.id).await.unwrap().unwrap().accepted_post_id.is_empty(),
+        "accepted answer cleared when the reply is deleted"
+    );
+    assert!(
+        pg.reactions_for_post(&reply.id, None).await.unwrap().is_empty(),
+        "reactions removed with the deleted post"
+    );
 
     // Delete the whole thread: thread + remaining posts go together.
     pg.delete_thread(&thread.id).await.expect("delete thread");
@@ -172,7 +205,7 @@ async fn pg_store_full_integration() {
     assert!(pg.get_thread(&thread.id).await.unwrap().is_none());
 
     // Cleanup the throwaway tables.
-    for tbl in ["posts", "threads", "categories"] {
+    for tbl in ["post_reactions", "posts", "threads", "categories"] {
         sqlx::query(&format!("DELETE FROM {tbl}")).execute(&raw).await.unwrap();
     }
     println!(

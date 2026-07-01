@@ -249,6 +249,26 @@ hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
 /* OP badge — kit owns .badge (accent-soft); this only handles placement */
 .badge-op { margin-left: auto; }
 .summary .badge-op { margin-left: 0; }
+/* accepted-answer badge: reuse the "ok" tokens; sits after the OP badge (which took margin-left) */
+.badge-accepted { background: var(--ok-soft); color: var(--ok-ink); border-color: var(--ok-border); }
+.post__meta .badge-op + .badge-accepted { margin-left: 8px; }
+.post__meta .badge-accepted:first-of-type { margin-left: auto; }
+/* the accepted reply gets a soft "ok" frame so it reads as resolved at a glance */
+.post.is-accepted { border-color: var(--ok-border); background: var(--ok-soft); }
+
+/* reaction row: a compact button per allowed kind, glyph + live count. The viewer's own active
+   reaction is filled with the accent tint. */
+.reactions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+.reaction {
+  display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+  font-size: 12.5px; font-weight: 550; padding: 4px 10px; border-radius: 6px;
+  background: var(--surface); color: var(--ink-2); border: 1px solid var(--border);
+  transition: border-color .12s, background .12s, color .12s;
+}
+.reaction:hover { border-color: var(--border-2); }
+.reaction.is-mine { background: var(--accent-soft); color: var(--accent-2); border-color: var(--accent-border); }
+.reaction__glyph { font-size: 13.5px; line-height: 1; }
+.reaction__count { font-variant-numeric: tabular-nums; }
 
 /* author edit/delete controls (thread head + per-reply). The delete form sits inline so its
    button lines up beside the edit link. */

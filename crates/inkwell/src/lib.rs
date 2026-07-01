@@ -12,6 +12,8 @@
 //! - `GET  /healthz`        liveness (container HEALTHCHECK)
 //! - `GET  /`               index: posts newest-first (title + excerpt + date + author)
 //! - `GET  /p/{slug}`       full post (body markdown rendered to sanitized HTML)
+//! - `GET  /tag/{slug}`     posts carrying a tag (keyset-paginated like the index)
+//! - `GET  /search?q=`      full-text search over published posts (title + body), highlighted
 //! - `GET  /feed.xml`       RSS 2.0 of the published posts (newest-first)
 //! - `GET  /sitemap.xml`    sitemap of the index + published posts
 //! - `GET  /new`            compose form
@@ -28,6 +30,7 @@ pub mod handlers;
 pub mod index;
 pub mod markdown;
 pub mod store;
+pub mod tags;
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -53,6 +56,11 @@ pub fn app(state: AppState) -> Router {
         .route("/healthz", get(handlers::health::healthz))
         .route("/", get(handlers::posts::index))
         .route("/p/{slug}", get(handlers::posts::view))
+        // Tag listing: published posts (plus the viewer's own drafts) carrying a given tag,
+        // keyset-paginated exactly like the index.
+        .route("/tag/{slug}", get(handlers::posts::tag_index))
+        // Full-text search over the published-post lexical index (title + body), highlighted.
+        .route("/search", get(handlers::search::search_page))
         // Public discovery feeds derived from the published posts (read-only; no schema).
         .route("/feed.xml", get(handlers::feed::feed_xml))
         .route("/sitemap.xml", get(handlers::feed::sitemap_xml))

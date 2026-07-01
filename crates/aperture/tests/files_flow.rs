@@ -551,6 +551,148 @@ async fn gallery_paginates_backward_with_before_cursor() {
     assert!(extract_before(&def.text()).is_none(), "no pager when everything fits");
 }
 
+/// Extract the folder id from a `302 /?folder={id}` create/rename redirect Location.
+fn folder_from_location(loc: &str) -> String {
+    loc.trim_start_matches("/?folder=").to_string()
+}
+
+#[tokio::test]
+async fn folder_create_move_filter_and_delete_lifecycle() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+
+    // Two files for alice.
+    let (id_a, csrf) = upload_png(&app, "alice").await;
+    let up_b = send(&app, upload_req(&csrf, &csrf, "alice", "b.png", "image/png", &png_bytes())).await;
+    let id_b = up_b.location().trim_start_matches("/f/").to_string();
+
+    // Create a folder -> 302 /?folder={fid}.
+    let made = send(
+        &app,
+        post_form("/folders", &csrf, "alice", format!("csrf_token={csrf}&name=Trips")),
+    )
+    .await;
+    assert_eq!(made.status, StatusCode::FOUND);
+    let fid = folder_from_location(&made.location());
+    assert!(store.get_folder(&fid, "alice").await.unwrap().is_some());
+
+    // The sidebar shows the folder on the gallery, and the folder view starts empty.
+    let home = send(&app, get("/", Some("alice"))).await;
+    assert!(home.text().contains("Trips"));
+    assert!(home.text().contains(&format!("/?folder={fid}")));
+    let folder_view = send(&app, get(&format!("/?folder={fid}"), Some("alice"))).await;
+    assert_eq!(folder_view.status, StatusCode::OK);
+    assert_eq!(card_ids(&folder_view.text()).len(), 0, "new folder is empty");
+
+    // Move file A into the folder (CSRF-checked) -> 302 /f/{id_a}.
+    let moved = send(
+        &app,
+        post_form(&format!("/f/{id_a}/move"), &csrf, "alice", format!("csrf_token={csrf}&folder_id={fid}")),
+    )
+    .await;
+    assert_eq!(moved.status, StatusCode::FOUND);
+    assert_eq!(store.get(&id_a).await.unwrap().unwrap().folder_id.as_deref(), Some(fid.as_str()));
+
+    // The folder view now lists only A; the flat view still lists both.
+    let fv = send(&app, get(&format!("/?folder={fid}"), Some("alice"))).await;
+    assert_eq!(card_ids(&fv.text()), vec![id_a.clone()]);
+    let flat = send(&app, get("/", Some("alice"))).await;
+    let mut flat_ids = card_ids(&flat.text());
+    flat_ids.sort();
+    let mut both = vec![id_a.clone(), id_b.clone()];
+    both.sort();
+    assert_eq!(flat_ids, both, "flat view shows every file regardless of folder");
+
+    // Rename the folder.
+    let renamed = send(
+        &app,
+        post_form(&format!("/folders/{fid}/rename"), &csrf, "alice", format!("csrf_token={csrf}&name=Vacations")),
+    )
+    .await;
+    assert_eq!(renamed.status, StatusCode::FOUND);
+    assert_eq!(store.get_folder(&fid, "alice").await.unwrap().unwrap().name, "Vacations");
+
+    // Delete the folder -> 302 / ; the file is kept but unfiled.
+    let deleted = send(
+        &app,
+        post_form(&format!("/folders/{fid}/delete"), &csrf, "alice", format!("csrf_token={csrf}")),
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::FOUND);
+    assert_eq!(deleted.location(), "/");
+    assert!(store.get_folder(&fid, "alice").await.unwrap().is_none());
+    assert!(store.get(&id_a).await.unwrap().unwrap().folder_id.is_none(), "file kept, unfiled");
+}
+
+#[tokio::test]
+async fn folder_actions_are_owner_scoped_and_csrf_checked() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+
+    // Alice owns a folder and a file.
+    let (id_a, csrf) = upload_png(&app, "alice").await;
+    let made = send(
+        &app,
+        post_form("/folders", &csrf, "alice", format!("csrf_token={csrf}&name=Private")),
+    )
+    .await;
+    let fid = folder_from_location(&made.location());
+
+    // Wrong CSRF is rejected on folder create.
+    let bad_csrf = send(
+        &app,
+        post_form("/folders", &csrf, "alice", "csrf_token=wrong&name=X".to_string()),
+    )
+    .await;
+    assert_eq!(bad_csrf.status, StatusCode::BAD_REQUEST);
+
+    // A blank name is rejected.
+    let blank = send(
+        &app,
+        post_form("/folders", &csrf, "alice", format!("csrf_token={csrf}&name=%20")),
+    )
+    .await;
+    assert_eq!(blank.status, StatusCode::BAD_REQUEST);
+
+    // Bob (own valid CSRF) cannot rename or delete Alice's folder (404 — not his).
+    let bob_home = send(&app, get("/", Some("bob"))).await;
+    let bob_csrf = bob_home.csrf_cookie().unwrap();
+    let bob_rename = send(
+        &app,
+        post_form(&format!("/folders/{fid}/rename"), &bob_csrf, "bob", format!("csrf_token={bob_csrf}&name=Hax")),
+    )
+    .await;
+    assert_eq!(bob_rename.status, StatusCode::NOT_FOUND);
+    assert_eq!(store.get_folder(&fid, "alice").await.unwrap().unwrap().name, "Private");
+
+    // Moving a file into a folder the actor does not own is a 404 (and leaves the file unfiled).
+    let bob_up = send(&app, upload_req(&bob_csrf, &bob_csrf, "bob", "b.png", "image/png", &png_bytes())).await;
+    let bob_file = bob_up.location().trim_start_matches("/f/").to_string();
+    let cross = send(
+        &app,
+        post_form(&format!("/f/{bob_file}/move"), &bob_csrf, "bob", format!("csrf_token={bob_csrf}&folder_id={fid}")),
+    )
+    .await;
+    assert_eq!(cross.status, StatusCode::NOT_FOUND);
+    assert!(store.get(&bob_file).await.unwrap().unwrap().folder_id.is_none());
+
+    // Alice can move her file back to root with a blank target.
+    send(
+        &app,
+        post_form(&format!("/f/{id_a}/move"), &csrf, "alice", format!("csrf_token={csrf}&folder_id={fid}")),
+    )
+    .await;
+    let to_root = send(
+        &app,
+        post_form(&format!("/f/{id_a}/move"), &csrf, "alice", format!("csrf_token={csrf}&folder_id=")),
+    )
+    .await;
+    assert_eq!(to_root.status, StatusCode::FOUND);
+    assert!(store.get(&id_a).await.unwrap().unwrap().folder_id.is_none());
+}
+
 #[tokio::test]
 async fn filename_xss_is_escaped_on_render() {
     let state = build_dev_state();

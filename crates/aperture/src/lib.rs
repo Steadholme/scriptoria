@@ -14,6 +14,11 @@
 //! - `POST /delete/{id}` — delete your own file (blob + row) -> 302 `/` (CSRF) [SSO]
 //! - `POST /f/{id}/share` — set the share link's expiry + optional password (CSRF) [SSO]
 //! - `POST /f/{id}/revoke` — revoke the share link (clears the token) (CSRF) [SSO]
+//! - `POST /f/{id}/move` — move the file into a folder (or back to the root) (CSRF) [SSO]
+//! - `GET /?folder={id}` — the gallery filtered to one owner folder (default: flat all-files) [SSO]
+//! - `POST /folders` — create an owner folder (CSRF) [SSO]
+//! - `POST /folders/{id}/rename` — rename an owner folder (CSRF) [SSO]
+//! - `POST /folders/{id}/delete` — delete an owner folder; its files are unfiled (CSRF) [SSO]
 //! - `GET /s/{token}` — fetch a shared file by unguessable token, NO SSO (410 past expiry;
 //!   password prompt when protected) [PUBLIC `/s/` prefix]
 //! - `POST /s/{token}` — submit a protected share link's password, NO SSO [PUBLIC `/s/` prefix]
@@ -65,6 +70,10 @@ pub fn app(state: AppState) -> Router {
         .route("/delete/{id}", post(handlers::files::delete))
         .route("/f/{id}/share", post(handlers::files::configure_share))
         .route("/f/{id}/revoke", post(handlers::files::revoke_share))
+        .route("/f/{id}/move", post(handlers::files::move_file))
+        .route("/folders", post(handlers::files::create_folder))
+        .route("/folders/{id}/rename", post(handlers::files::rename_folder))
+        .route("/folders/{id}/delete", post(handlers::files::delete_folder))
         .route(
             "/s/{token}",
             get(handlers::files::share).post(handlers::files::share_unlock),

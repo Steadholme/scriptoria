@@ -51,6 +51,7 @@ async fn pg_store_full_integration() {
         updated_at: now - 100,
         published: true,
         featured: false,
+        tags: "rust, postgres".to_string(),
     };
     pg.create_post(&post).await.expect("create");
 
@@ -76,6 +77,7 @@ async fn pg_store_full_integration() {
         updated_at: now,
         published: true,
         featured: false,
+        tags: String::new(),
     };
     pg.create_post(&post2).await.expect("create 2");
 
@@ -95,13 +97,16 @@ async fn pg_store_full_integration() {
     // Fetch + update (slug stays stable) + verify.
     let fetched = pg.get_post("pg-hello").await.expect("fetch");
     assert_eq!(fetched.title, "PG Hello");
+    assert_eq!(fetched.tags, "rust, postgres", "tags column round-trips through pg");
     let mut edited = fetched.clone();
     edited.title = "PG Hello (edited)".to_string();
+    edited.tags = "rust".to_string();
     edited.published = false;
     edited.updated_at = now;
     pg.update_post(&edited).await.expect("update");
     let after = pg.get_post("pg-hello").await.expect("refetch");
     assert_eq!(after.title, "PG Hello (edited)");
+    assert_eq!(after.tags, "rust", "tags update persisted in pg");
     assert!(!after.published);
 
     // --- full HTTP flow through the PG-backed app --------------------------

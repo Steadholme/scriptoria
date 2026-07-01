@@ -17,6 +17,8 @@ pub struct Category {
 /// A thread of discussion within a category (maps 1:1 to a `threads` row). `last_at` tracks
 /// the most recent post so lists can sort by recent activity. `locked` (no new replies) and
 /// `pinned` (sort first) are admin-controlled moderation flags; both default to `false`.
+/// `accepted_post_id` names the reply the thread author (or an admin) marked as the accepted
+/// answer; an empty string means none is marked. The accepted reply renders first under the OP.
 #[derive(Clone, Debug, Serialize)]
 pub struct Thread {
     pub id: String,
@@ -28,6 +30,7 @@ pub struct Thread {
     pub last_at: i64,
     pub locked: bool,
     pub pinned: bool,
+    pub accepted_post_id: String,
 }
 
 /// A lightweight thread digest for compose-time similarity scoring: the thread's identity plus
@@ -51,6 +54,17 @@ pub struct BannedAuthor {
     pub reason: String,
     pub banned_by: String,
     pub created_at: i64,
+}
+
+/// An aggregate reaction count for one post + one kind (e.g. `up`, `heart`). NOT a stored row —
+/// it is assembled from the `post_reactions` table (each row is one user's single reaction of a
+/// kind, unique per `(post_id, user_sub, kind)`). `mine` is whether the current viewer is one of
+/// the `count` reactors, so the UI can highlight the viewer's own toggle.
+#[derive(Clone, Debug, Serialize)]
+pub struct ReactionCount {
+    pub kind: String,
+    pub count: i64,
+    pub mine: bool,
 }
 
 /// A single post in a thread (maps 1:1 to a `posts` row). The first post of a thread is the

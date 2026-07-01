@@ -15,7 +15,7 @@ use serde::Deserialize;
 use crate::audit::AuditEvent;
 use crate::auth;
 use crate::error::AppError;
-use crate::handlers::{esc, fmt_date, topbar, APP_CSS};
+use crate::handlers::{esc, fmt_date, tag_chips, topbar, APP_CSS};
 use crate::markdown;
 use crate::store::Post;
 use crate::{now_nanos, now_secs, unique_slug, AppState};
@@ -32,6 +32,9 @@ pub struct PostForm {
     pub title: String,
     #[serde(default)]
     pub body: String,
+    /// Comma-separated tags (normalized on save via [`crate::tags::normalize`]).
+    #[serde(default)]
+    pub tags: String,
     #[serde(default)]
     pub published: Option<String>,
     #[serde(default)]
@@ -118,6 +121,83 @@ pub async fn index(
     Html(body).into_response()
 }
 
+/// `GET /tag/{slug}` — one keyset page of posts carrying the tag `slug`, newest-first. Reuses the
+/// index's `list_posts` + in-handler filtering (visibility THEN tag membership) and the same
+/// `?before=`/`?limit=` cursor, so drafts never leak and the whole tagged archive stays reachable
+/// page by page. The "Load older" cursor is derived from the store page's LAST row (before
+/// filtering) exactly like the index, so paging never desyncs.
+pub async fn tag_index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(tag_slug): Path<String>,
+    Query(q): Query<IndexQuery>,
+) -> Response {
+    let viewer = auth::author_sub(&headers);
+    let email = auth::display_email(&headers);
+    let settings = state.store.get_settings().await;
+
+    let before = q.before.as_deref().and_then(parse_before);
+    let limit = crate::config::clamp_page_with_default(q.limit, settings.posts_per_page);
+    let posts = state.store.list_posts(before, limit).await;
+
+    let next_cursor = if posts.len() as i64 == limit {
+        posts.last().map(|p| format!("{}_{}", p.created_at, p.id))
+    } else {
+        None
+    };
+
+    // Recover a display label for the tag from the first matching post (the URL only carries the
+    // slug); fall back to the slug itself when this page has no match to name it.
+    let mut cards = String::new();
+    let mut shown = 0usize;
+    let mut label: Option<String> = None;
+    for p in &posts {
+        if !visible_to(p, viewer.as_deref()) {
+            continue;
+        }
+        if !crate::tags::has_tag(&p.tags, &tag_slug) {
+            continue;
+        }
+        if label.is_none() {
+            label = crate::tags::parse_tags(&p.tags)
+                .into_iter()
+                .find(|t| crate::tags::tag_slug(t) == tag_slug);
+        }
+        shown += 1;
+        cards.push_str(&render_card(p, viewer.as_deref()));
+    }
+    let label = label.unwrap_or_else(|| tag_slug.clone());
+
+    if shown == 0 && next_cursor.is_none() {
+        cards.push_str(&format!(
+            r#"<div class="empty-state"><h2>No posts tagged “{tag}”</h2><p>Nothing here yet. <a href="/">Back to all posts</a>.</p></div>"#,
+            tag = esc(&label),
+        ));
+    }
+
+    let pager = match &next_cursor {
+        Some(cursor) => format!(
+            r#"<nav class="post-list__pager"><a class="btn btn-secondary" href="/tag/{slug}?before={cursor}">Load older</a></nav>"#,
+            slug = esc(&tag_slug),
+            cursor = esc(cursor),
+        ),
+        None => String::new(),
+    };
+
+    let heading = format!("#{label}");
+    let body = LIST_HTML
+        .replace("{{CSS}}", APP_CSS)
+        .replace("{{TOPBAR}}", &topbar(&heading, &email))
+        .replace("{{BLOG_TITLE}}", &esc(&heading))
+        .replace(
+            "{{TAGLINE}}",
+            &esc(&format!("Posts tagged “{label}”")),
+        )
+        .replace("{{POSTS}}", &cards)
+        .replace("{{PAGER}}", &pager);
+    Html(body).into_response()
+}
+
 /// Parse a `?before=<created_at>_<id>` keyset cursor into `(created_at, id)`. `created_at` is a
 /// plain integer (no `_`) and inkwell post ids are `post_<nanos>` (they DO contain `_`), so the
 /// split is on the FIRST `_`: everything after it is the id, round-tripping the cursor exactly.
@@ -188,6 +268,7 @@ pub async fn view(
         .replace("{{TITLE_TEXT}}", &esc(&post.title))
         .replace("{{TITLE}}", &esc(&post.title))
         .replace("{{META}}", &esc(&meta))
+        .replace("{{TAGS}}", &tag_chips(&post.tags))
         .replace("{{ACTIONS}}", &actions)
         .replace("{{BODY}}", &body_html)
         .replace("{{RELATED}}", &related);
@@ -211,6 +292,7 @@ pub async fn new_form(State(_state): State<AppState>, headers: HeaderMap) -> Res
         csrf: &csrf,
         title_value: "",
         body_value: "",
+        tags_value: "",
         published: true,
         submit_label: "Publish",
         cancel_href: "/",
@@ -248,6 +330,7 @@ pub async fn create(
         updated_at: now,
         published: form.published.is_some(),
         featured: false,
+        tags: crate::tags::normalize(&form.tags),
     };
     state.store.create_post(&post).await?;
     tracing::info!(slug = %slug, "post created");
@@ -296,6 +379,7 @@ pub async fn edit_form(
         csrf: &csrf,
         title_value: &post.title,
         body_value: &post.body_md,
+        tags_value: &post.tags,
         published: post.published,
         submit_label: "Save changes",
         cancel_href: &format!("/p/{}", esc(&post.slug)),
@@ -329,6 +413,7 @@ pub async fn update(
     }
     post.title = title.to_string();
     post.body_md = form.body.trim().to_string();
+    post.tags = crate::tags::normalize(&form.tags);
     post.published = form.published.is_some();
     post.updated_at = now_secs();
     state.store.update_post(&post).await?;
@@ -476,6 +561,7 @@ fn render_card(post: &Post, viewer_sub: Option<&str>) -> String {
   <h2 class="card-post__title"><a href="/p/{slug}">{title}</a>{featured}{badge}</h2>
   <div class="card-post__meta">{date} · {author}{owner}</div>
   <p class="card-post__excerpt">{excerpt}</p>
+  {tags}
 </article>"#,
         slug = esc(&post.slug),
         title = esc(&post.title),
@@ -485,6 +571,7 @@ fn render_card(post: &Post, viewer_sub: Option<&str>) -> String {
         author = esc(&post.author_email),
         owner = owner_link,
         excerpt = esc(&markdown::excerpt(&post.body_md, 200)),
+        tags = tag_chips(&post.tags),
     )
 }
 
@@ -497,6 +584,7 @@ struct EditorView<'a> {
     csrf: &'a str,
     title_value: &'a str,
     body_value: &'a str,
+    tags_value: &'a str,
     published: bool,
     submit_label: &'a str,
     cancel_href: &'a str,
@@ -529,6 +617,7 @@ fn render_editor(v: EditorView<'_>) -> String {
         .replace("{{CSRF}}", &esc(v.csrf))
         .replace("{{TITLE_VALUE}}", &esc(v.title_value))
         .replace("{{BODY_VALUE}}", &esc(v.body_value))
+        .replace("{{TAGS_VALUE}}", &esc(v.tags_value))
         .replace(
             "{{PUBLISHED_CHECKED}}",
             if v.published { "checked" } else { "" },

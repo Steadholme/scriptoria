@@ -37,16 +37,22 @@
       </div>
     </form>
 
-    <div class="section-head">
-      <h2>Files</h2>
-      <span class="count-badge">{{COUNT}}</span>
+    <div class="drive-layout">
+      {{SIDEBAR}}
+
+      <div class="drive-content">
+        <div class="section-head">
+          <h2>{{HEADING}}</h2>
+          <span class="count-badge">{{COUNT}}</span>
+        </div>
+
+        <ul class="gallery-grid">
+          {{CARDS}}
+        </ul>
+
+        {{PAGER}}
+      </div>
     </div>
-
-    <ul class="gallery-grid">
-      {{CARDS}}
-    </ul>
-
-    {{PAGER}}
   </main>
 
   <script>

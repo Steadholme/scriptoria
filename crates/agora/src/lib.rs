@@ -22,6 +22,8 @@
 //! - `POST /t/{id}/delete`   delete one's OWN thread (and all its posts)
 //! - `GET/POST /t/{tid}/p/{pid}/edit`   edit one's OWN reply
 //! - `POST /t/{tid}/p/{pid}/delete`     delete one's OWN reply
+//! - `POST /t/{tid}/p/{pid}/react`      toggle a reaction (up/heart) on a post
+//! - `POST /t/{id}/accept`   thread author/admin mark (or unmark) a reply as the accepted answer
 //! - `POST /api/similar`     (sso+CSRF) top-3 existing threads similar to a draft {title,body}
 //! - `GET  /api/thread/{id}/summary`  extractive summary (top sentences) of a thread
 
@@ -78,6 +80,8 @@ pub fn app(state: AppState) -> Router {
             get(handlers::forum::edit_reply_form).post(handlers::forum::update_reply),
         )
         .route("/t/{tid}/p/{pid}/delete", post(handlers::forum::delete_reply))
+        .route("/t/{tid}/p/{pid}/react", post(handlers::forum::react))
+        .route("/t/{id}/accept", post(handlers::forum::accept_answer))
         .route("/new", get(handlers::forum::new_form).post(handlers::forum::create))
         .route("/api/similar", post(handlers::insight::similar))
         .route("/api/thread/{id}/summary", get(handlers::insight::summary))

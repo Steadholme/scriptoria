@@ -26,6 +26,10 @@
           <label for="body">Body <span class="muted">(Markdown)</span></label>
           <textarea id="body" name="body" class="editor__body" placeholder="Write in Markdown&hellip;">{{BODY_VALUE}}</textarea>
         </div>
+        <div class="field">
+          <label for="tags">Tags <span class="muted">(comma-separated)</span></label>
+          <input type="text" id="tags" name="tags" maxlength="800" placeholder="rust, async, gateway" value="{{TAGS_VALUE}}">
+        </div>
         <div class="field field--inline">
           <label class="check"><input type="checkbox" name="published" {{PUBLISHED_CHECKED}}> Published</label>
         </div>

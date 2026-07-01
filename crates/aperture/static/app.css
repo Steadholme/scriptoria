@@ -289,8 +289,26 @@ hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
 .revoke-form { margin-top: 12px; }
 .form-error { margin: 0 0 12px; color: var(--down-ink); font-size: 13px; font-weight: 600; }
 
+/* ---- folders (sidebar / switcher) --------------------------------------- */
+.drive-layout { display: grid; grid-template-columns: 232px 1fr; gap: 24px; align-items: start; }
+.drive-content { min-width: 0; }
+.folder-rail { min-width: 0; }
+.folder-list { list-style: none; margin: 0 0 18px; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.folder-item {
+  display: block; padding: 8px 12px; border-radius: var(--radius-sm); color: var(--ink);
+  text-decoration: none; font-size: 13.5px; border: 1px solid transparent;
+}
+.folder-item:hover { background: var(--accent-soft); }
+.folder-item--active {
+  background: var(--accent-soft); color: var(--accent-2); font-weight: 600;
+  border-color: var(--accent-border);
+}
+.folder-form { margin-top: 12px; }
+.folder-form label { display: block; margin-bottom: 6px; font-size: 12px; font-weight: 600; color: var(--ink-2); }
+
 /* ---- responsive --------------------------------------------------------- */
 @media (max-width: 640px) {
   .console__head--row { flex-direction: column; }
   .gallery-grid { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+  .drive-layout { grid-template-columns: 1fr; }
 }

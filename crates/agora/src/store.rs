@@ -23,7 +23,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::model::{BannedAuthor, Category, Post, Thread, ThreadDigest};
+use crate::model::{BannedAuthor, Category, Post, ReactionCount, Thread, ThreadDigest};
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
 #[derive(Debug, Error)]
@@ -110,6 +110,31 @@ pub trait Store: Send + Sync {
     /// Move a thread to another category. Admin-only; the caller validates the target exists.
     async fn move_thread(&self, thread_id: &str, category_id: &str) -> Result<(), StoreError>;
 
+    /// Set (or clear, with an empty string) a thread's `accepted_post_id` — the reply the thread
+    /// author/admin marked as the accepted answer. Idempotent (setting the same value twice is a
+    /// no-op change). Authorisation is enforced by the caller.
+    async fn set_accepted_post(&self, thread_id: &str, post_id: &str) -> Result<(), StoreError>;
+
+    /// Toggle one user's reaction of `kind` on a post. Idempotent per `(post_id, user_sub, kind)`:
+    /// if the reaction already exists it is removed and `false` returned; otherwise it is inserted
+    /// and `true` returned. `created_at` stamps a newly-inserted row.
+    async fn toggle_reaction(
+        &self,
+        post_id: &str,
+        user_sub: &str,
+        kind: &str,
+        created_at: i64,
+    ) -> Result<bool, StoreError>;
+
+    /// Aggregate reaction counts for a post: one [`ReactionCount`] per kind that has at least one
+    /// reaction, with `mine` set when `viewer_sub` is one of the reactors. Kinds with no reactions
+    /// are omitted (the caller fills them in from its allowed-kind list).
+    async fn reactions_for_post(
+        &self,
+        post_id: &str,
+        viewer_sub: Option<&str>,
+    ) -> Result<Vec<ReactionCount>, StoreError>;
+
     /// All blocked authors, most-recently-banned first.
     async fn list_bans(&self) -> Result<Vec<BannedAuthor>, StoreError>;
     /// Whether `author_sub` is currently blocked (rejects their new threads/replies).
@@ -130,6 +155,18 @@ pub struct InMemoryStore {
     threads: Mutex<Vec<Thread>>,
     posts: Mutex<Vec<Post>>,
     banned: Mutex<Vec<BannedAuthor>>,
+    /// One row per `(post_id, user_sub, kind)` — the in-memory mirror of `post_reactions`.
+    reactions: Mutex<Vec<Reaction>>,
+}
+
+/// A single stored reaction (in-memory mirror of a `post_reactions` row).
+#[derive(Clone, Debug)]
+struct Reaction {
+    post_id: String,
+    user_sub: String,
+    kind: String,
+    #[allow(dead_code)]
+    created_at: i64,
 }
 
 impl InMemoryStore {
@@ -349,12 +386,25 @@ impl Store for InMemoryStore {
     }
 
     async fn delete_thread(&self, thread_id: &str) -> Result<(), StoreError> {
+        // Collect the doomed posts' ids first so their reactions can be dropped too.
+        let removed_ids: Vec<String> = {
+            let posts = self.posts.lock().expect("posts lock poisoned");
+            posts
+                .iter()
+                .filter(|p| p.thread_id == thread_id)
+                .map(|p| p.id.clone())
+                .collect()
+        };
         {
             let mut threads = self.threads.lock().expect("threads lock poisoned");
             threads.retain(|t| t.id != thread_id);
         }
-        let mut posts = self.posts.lock().expect("posts lock poisoned");
-        posts.retain(|p| p.thread_id != thread_id);
+        {
+            let mut posts = self.posts.lock().expect("posts lock poisoned");
+            posts.retain(|p| p.thread_id != thread_id);
+        }
+        let mut reactions = self.reactions.lock().expect("reactions lock poisoned");
+        reactions.retain(|r| !removed_ids.iter().any(|id| id == &r.post_id));
         Ok(())
     }
 
@@ -367,8 +417,19 @@ impl Store for InMemoryStore {
     }
 
     async fn delete_post(&self, post_id: &str) -> Result<(), StoreError> {
-        let mut posts = self.posts.lock().expect("posts lock poisoned");
-        posts.retain(|p| p.id != post_id);
+        {
+            let mut posts = self.posts.lock().expect("posts lock poisoned");
+            posts.retain(|p| p.id != post_id);
+        }
+        // Drop this post's reactions, and clear it as any thread's accepted answer.
+        {
+            let mut reactions = self.reactions.lock().expect("reactions lock poisoned");
+            reactions.retain(|r| r.post_id != post_id);
+        }
+        let mut threads = self.threads.lock().expect("threads lock poisoned");
+        for t in threads.iter_mut().filter(|t| t.accepted_post_id == post_id) {
+            t.accepted_post_id.clear();
+        }
         Ok(())
     }
 
@@ -394,6 +455,64 @@ impl Store for InMemoryStore {
             t.category_id = category_id.to_string();
         }
         Ok(())
+    }
+
+    async fn set_accepted_post(&self, thread_id: &str, post_id: &str) -> Result<(), StoreError> {
+        let mut threads = self.threads.lock().expect("threads lock poisoned");
+        if let Some(t) = threads.iter_mut().find(|t| t.id == thread_id) {
+            t.accepted_post_id = post_id.to_string();
+        }
+        Ok(())
+    }
+
+    async fn toggle_reaction(
+        &self,
+        post_id: &str,
+        user_sub: &str,
+        kind: &str,
+        created_at: i64,
+    ) -> Result<bool, StoreError> {
+        let mut reactions = self.reactions.lock().expect("reactions lock poisoned");
+        if let Some(pos) = reactions
+            .iter()
+            .position(|r| r.post_id == post_id && r.user_sub == user_sub && r.kind == kind)
+        {
+            reactions.remove(pos);
+            Ok(false)
+        } else {
+            reactions.push(Reaction {
+                post_id: post_id.to_string(),
+                user_sub: user_sub.to_string(),
+                kind: kind.to_string(),
+                created_at,
+            });
+            Ok(true)
+        }
+    }
+
+    async fn reactions_for_post(
+        &self,
+        post_id: &str,
+        viewer_sub: Option<&str>,
+    ) -> Result<Vec<ReactionCount>, StoreError> {
+        let reactions = self.reactions.lock().expect("reactions lock poisoned");
+        // Aggregate by kind, preserving first-seen order for a stable render.
+        let mut out: Vec<ReactionCount> = Vec::new();
+        for r in reactions.iter().filter(|r| r.post_id == post_id) {
+            let mine = viewer_sub == Some(r.user_sub.as_str());
+            match out.iter_mut().find(|c| c.kind == r.kind) {
+                Some(c) => {
+                    c.count += 1;
+                    c.mine = c.mine || mine;
+                }
+                None => out.push(ReactionCount {
+                    kind: r.kind.clone(),
+                    count: 1,
+                    mine,
+                }),
+            }
+        }
+        Ok(out)
     }
 
     async fn list_bans(&self) -> Result<Vec<BannedAuthor>, StoreError> {
@@ -509,6 +628,11 @@ impl PgStore {
         sqlx::query("ALTER TABLE threads ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT FALSE")
             .execute(&self.pool)
             .await?;
+        // Additive, idempotent: the reply the author/admin marked as the accepted answer. Empty
+        // string means none. Portable TEXT NOT NULL DEFAULT '' — pre-existing rows read as unset.
+        sqlx::query("ALTER TABLE threads ADD COLUMN IF NOT EXISTS accepted_post_id TEXT NOT NULL DEFAULT ''")
+            .execute(&self.pool)
+            .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_threads_category ON threads (category_id)")
             .execute(&self.pool)
             .await?;
@@ -528,6 +652,22 @@ impl PgStore {
         .execute(&self.pool)
         .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_posts_thread ON posts (thread_id)")
+            .execute(&self.pool)
+            .await?;
+        // Per-user post reactions. One row is one user's single reaction of a kind; the composite
+        // PRIMARY KEY makes it unique + idempotent per (post, user, kind). Portable standard SQL.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS post_reactions (\
+                 post_id TEXT NOT NULL, \
+                 user_sub TEXT NOT NULL, \
+                 kind TEXT NOT NULL, \
+                 created_at BIGINT NOT NULL, \
+                 PRIMARY KEY (post_id, user_sub, kind)\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_reactions_post ON post_reactions (post_id)")
             .execute(&self.pool)
             .await?;
         // Author blocklist: while a row is present, that author_sub's new threads/replies are
@@ -564,6 +704,7 @@ impl PgStore {
             last_at: row.try_get("last_at")?,
             locked: row.try_get("locked")?,
             pinned: row.try_get("pinned")?,
+            accepted_post_id: row.try_get("accepted_post_id")?,
         })
     }
 
@@ -579,7 +720,7 @@ impl PgStore {
     }
 
     const THREAD_COLS: &'static str =
-        "id, category_id, title, author_sub, author_email, created_at, last_at, locked, pinned";
+        "id, category_id, title, author_sub, author_email, created_at, last_at, locked, pinned, accepted_post_id";
     const POST_COLS: &'static str =
         "id, thread_id, body_md, author_sub, author_email, created_at";
 
@@ -753,8 +894,8 @@ impl PgStore {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO threads \
-                 (id, category_id, title, author_sub, author_email, created_at, last_at, first_body_md, locked, pinned) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                 (id, category_id, title, author_sub, author_email, created_at, last_at, first_body_md, locked, pinned, accepted_post_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(&thread.id)
         .bind(&thread.category_id)
@@ -766,6 +907,7 @@ impl PgStore {
         .bind(&first_post.body_md)
         .bind(thread.locked)
         .bind(thread.pinned)
+        .bind(&thread.accepted_post_id)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
@@ -835,6 +977,13 @@ impl PgStore {
 
     async fn delete_thread_async(&self, thread_id: &str) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
+        // Drop reactions on every post in the thread (subquery over the doomed posts) first.
+        sqlx::query(
+            "DELETE FROM post_reactions WHERE post_id IN (SELECT id FROM posts WHERE thread_id = $1)",
+        )
+        .bind(thread_id)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("DELETE FROM posts WHERE thread_id = $1")
             .bind(thread_id)
             .execute(&mut *tx)
@@ -857,10 +1006,21 @@ impl PgStore {
     }
 
     async fn delete_post_async(&self, post_id: &str) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM post_reactions WHERE post_id = $1")
+            .bind(post_id)
+            .execute(&mut *tx)
+            .await?;
+        // Clear it wherever it was the accepted answer, so no thread points at a gone post.
+        sqlx::query("UPDATE threads SET accepted_post_id = '' WHERE accepted_post_id = $1")
+            .bind(post_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM posts WHERE id = $1")
             .bind(post_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -889,6 +1049,75 @@ impl PgStore {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    async fn set_accepted_post_async(&self, thread_id: &str, post_id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE threads SET accepted_post_id = $1 WHERE id = $2")
+            .bind(post_id)
+            .bind(thread_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn toggle_reaction_async(
+        &self,
+        post_id: &str,
+        user_sub: &str,
+        kind: &str,
+        created_at: i64,
+    ) -> Result<bool, sqlx::Error> {
+        // Idempotent toggle without a race window: try to insert; ON CONFLICT DO NOTHING tells us
+        // (via rows_affected) whether the row was new. If it already existed, delete it instead.
+        let inserted = sqlx::query(
+            "INSERT INTO post_reactions (post_id, user_sub, kind, created_at) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT (post_id, user_sub, kind) DO NOTHING",
+        )
+        .bind(post_id)
+        .bind(user_sub)
+        .bind(kind)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if inserted > 0 {
+            return Ok(true);
+        }
+        sqlx::query("DELETE FROM post_reactions WHERE post_id = $1 AND user_sub = $2 AND kind = $3")
+            .bind(post_id)
+            .bind(user_sub)
+            .bind(kind)
+            .execute(&self.pool)
+            .await?;
+        Ok(false)
+    }
+
+    async fn reactions_for_post_async(
+        &self,
+        post_id: &str,
+        viewer_sub: Option<&str>,
+    ) -> Result<Vec<ReactionCount>, sqlx::Error> {
+        // Count per kind, and (via a conditional SUM) whether the viewer is among the reactors.
+        // The viewer marker binds '' when absent, which no real user_sub equals.
+        let rows = sqlx::query(
+            "SELECT kind, COUNT(*) AS n, \
+                    SUM(CASE WHEN user_sub = $2 THEN 1 ELSE 0 END) AS mine \
+             FROM post_reactions WHERE post_id = $1 GROUP BY kind ORDER BY kind",
+        )
+        .bind(post_id)
+        .bind(viewer_sub.unwrap_or(""))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let mine: i64 = row.try_get("mine")?;
+                Ok(ReactionCount {
+                    kind: row.try_get("kind")?,
+                    count: row.try_get("n")?,
+                    mine: mine > 0,
+                })
+            })
+            .collect()
     }
 
     async fn list_bans_async(&self) -> Result<Vec<BannedAuthor>, sqlx::Error> {
@@ -1056,6 +1285,32 @@ impl Store for PgStore {
 
     async fn move_thread(&self, thread_id: &str, category_id: &str) -> Result<(), StoreError> {
         self.move_thread_async(thread_id, category_id).await.map_err(backend)
+    }
+
+    async fn set_accepted_post(&self, thread_id: &str, post_id: &str) -> Result<(), StoreError> {
+        self.set_accepted_post_async(thread_id, post_id).await.map_err(backend)
+    }
+
+    async fn toggle_reaction(
+        &self,
+        post_id: &str,
+        user_sub: &str,
+        kind: &str,
+        created_at: i64,
+    ) -> Result<bool, StoreError> {
+        self.toggle_reaction_async(post_id, user_sub, kind, created_at)
+            .await
+            .map_err(backend)
+    }
+
+    async fn reactions_for_post(
+        &self,
+        post_id: &str,
+        viewer_sub: Option<&str>,
+    ) -> Result<Vec<ReactionCount>, StoreError> {
+        self.reactions_for_post_async(post_id, viewer_sub)
+            .await
+            .map_err(backend)
     }
 
     async fn list_bans(&self) -> Result<Vec<BannedAuthor>, StoreError> {

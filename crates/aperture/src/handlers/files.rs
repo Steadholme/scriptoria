@@ -23,11 +23,13 @@ use crate::handlers::{
     esc, expiry_options, fmt_ts, human_size, parse_expiry, resolve_content_type, safe_filename,
     userbox, APP_CSS, FILE_SVG, SHIELD_SVG,
 };
-use crate::model::FileRec;
+use crate::model::{FileRec, FolderRec};
 use crate::{now_secs, random_alnum, AppState};
 
 /// Length of the short random file id / object key (62-symbol alphabet, ~59 bits at 10 chars).
 const FILE_ID_LEN: usize = 10;
+/// Length of the short random folder id.
+const FOLDER_ID_LEN: usize = 10;
 /// Length of the unguessable public share token (~190 bits at 32 chars).
 const SHARE_TOKEN_LEN: usize = 32;
 /// Hard cap on a stored display file name (characters).
@@ -51,6 +53,10 @@ pub struct GalleryQuery {
     pub before: Option<String>,
     #[serde(default)]
     pub limit: Option<i64>,
+    /// Optional folder filter. When it names one of the owner's folders the gallery shows only that
+    /// folder's files; otherwise (unset / unknown) it falls back to the flat "all files" view.
+    #[serde(default)]
+    pub folder: Option<String>,
 }
 
 /// `GET /` — render the upload dropzone (with a fresh CSRF token) and one keyset page of the
@@ -66,9 +72,24 @@ pub async fn gallery(
     let before = parse_cursor(q.before.as_deref());
     // Same clamp the store applies, so `files.len() == limit` below is an exact "page was full" test.
     let limit = clamp_page(q.limit.unwrap_or(0));
+
+    let folders = state
+        .store
+        .list_folders(&who.subject)
+        .await
+        .unwrap_or_default();
+    // The active folder must belong to the owner; an unknown/blank id falls back to all files.
+    let active = q
+        .folder
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|fid| folders.iter().find(|f| f.id == fid).cloned());
+    let folder_filter = active.as_ref().map(|f| f.id.as_str());
+
     let files = state
         .store
-        .list_by_owner(&who.subject, before, limit)
+        .list_by_owner(&who.subject, folder_filter, before, limit)
         .await
         .unwrap_or_default();
 
@@ -79,7 +100,7 @@ pub async fn gallery(
         None
     };
 
-    let html = render_gallery(&who, &csrf, &files, next.as_ref());
+    let html = render_gallery(&who, &csrf, &files, next.as_ref(), &folders, active.as_ref());
     html_with_csrf(StatusCode::OK, html, &csrf)
 }
 
@@ -184,6 +205,8 @@ pub async fn upload(
         created_at: now,
         expires_at: None,
         share_password_hash: None,
+        // A fresh upload is unfiled (appears in the flat all-files view); the owner files it later.
+        folder_id: None,
     };
 
     // Reserve a unique row (id + share token) BEFORE writing the blob, retrying on the rare
@@ -235,7 +258,12 @@ pub async fn detail(
     let viewer = auth::identity(&headers);
     let rec = owned_file(&state, &id, &viewer).await?;
     let csrf = auth::new_csrf_token();
-    let html = render_detail(&state.config, &rec, &viewer, &csrf);
+    let folders = state
+        .store
+        .list_folders(&viewer.subject)
+        .await
+        .unwrap_or_default();
+    let html = render_detail(&state.config, &rec, &viewer, &csrf, &folders);
     Ok(html_with_csrf(StatusCode::OK, html, &csrf))
 }
 
@@ -440,6 +468,179 @@ pub async fn revoke_share(
     Ok(redirect_found(&format!("/f/{}", rec.id)))
 }
 
+// ---------------------------------------------------------------------------
+// Folders (albums): create / rename / delete (owner-only), and move a file
+// ---------------------------------------------------------------------------
+
+/// New-folder form: a display name. CSRF-checked.
+#[derive(Debug, Deserialize)]
+pub struct FolderCreateForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+/// Rename-folder form: the new display name. CSRF-checked.
+#[derive(Debug, Deserialize)]
+pub struct FolderRenameForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+/// Move-file form: the target folder id (empty = move back to the root/unfiled view). CSRF-checked.
+#[derive(Debug, Deserialize)]
+pub struct MoveForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub folder_id: String,
+}
+
+/// `POST /folders` — create an owner-scoped folder from the submitted name, then 302 to that
+/// folder's view. CSRF-checked; the name is trimmed, required, and length-capped.
+pub async fn create_folder(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<FolderCreateForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let actor = auth::identity(&headers);
+    let name = clean_folder_name(&form.name)?;
+
+    let mut rec = FolderRec {
+        id: String::new(),
+        owner_sub: actor.subject.clone(),
+        name,
+        created_at: now_secs(),
+    };
+    // Reserve a unique folder id, retrying on the rare collision.
+    let mut created = false;
+    for _ in 0..6 {
+        rec.id = random_alnum(FOLDER_ID_LEN);
+        if state.store.create_folder(&rec).await? {
+            created = true;
+            break;
+        }
+    }
+    if !created {
+        return Err(AppError::Internal(
+            "could not allocate a unique folder id".to_string(),
+        ));
+    }
+
+    tracing::info!(id = rec.id, owner = actor.subject, "folder created");
+    state
+        .audit
+        .emit(AuditEvent::notice("folder.create", &actor.subject, &rec.id, "folder"));
+    Ok(redirect_found(&format!("/?folder={}", rec.id)))
+}
+
+/// `POST /folders/{id}/rename` — rename an owner's folder, then 302 back to its view. CSRF-checked,
+/// owner-scoped (404 when the folder is absent or owned by someone else).
+pub async fn rename_folder(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<FolderRenameForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let actor = auth::identity(&headers);
+    let name = clean_folder_name(&form.name)?;
+    if !state.store.rename_folder(&id, &actor.subject, &name).await? {
+        return Err(AppError::NotFound("No such folder.".to_string()));
+    }
+    tracing::info!(id, owner = actor.subject, "folder renamed");
+    state
+        .audit
+        .emit(AuditEvent::notice("folder.rename", &actor.subject, &id, "folder"));
+    Ok(redirect_found(&format!("/?folder={id}")))
+}
+
+/// `POST /folders/{id}/delete` — delete an owner's folder (its files are UNFILED, never deleted),
+/// then 302 to the flat drive. CSRF-checked, owner-scoped.
+pub async fn delete_folder(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<DeleteForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let actor = auth::identity(&headers);
+    if !state.store.delete_folder(&id, &actor.subject).await? {
+        return Err(AppError::NotFound("No such folder.".to_string()));
+    }
+    tracing::info!(id, owner = actor.subject, "folder deleted");
+    state
+        .audit
+        .emit(AuditEvent::notice("folder.delete", &actor.subject, &id, "folder"));
+    Ok(redirect_found("/"))
+}
+
+/// `POST /f/{id}/move` — move an owned file into a folder (or back to the root when the target is
+/// blank), then 302 to `/f/{id}`. CSRF-checked, owner-scoped; a non-blank target folder must belong
+/// to the same owner (else 404), so a file can never reference a folder it does not own.
+pub async fn move_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<MoveForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let actor = auth::identity(&headers);
+    let rec = owned_file(&state, &id, &actor).await?;
+
+    // Resolve the target: blank => root (unfile); otherwise it MUST be one of the owner's folders.
+    let target = match form.folder_id.trim() {
+        "" => None,
+        fid => {
+            if state.store.get_folder(fid, &actor.subject).await?.is_none() {
+                return Err(AppError::NotFound("No such folder.".to_string()));
+            }
+            Some(fid.to_string())
+        }
+    };
+    state
+        .store
+        .move_file(&rec.id, &actor.subject, target.as_deref())
+        .await?;
+    tracing::info!(id = rec.id, owner = actor.subject, folder = ?target, "file moved");
+    state.audit.emit(AuditEvent::notice(
+        "file.move",
+        &actor.subject,
+        &rec.id,
+        if rec.is_image() { "image" } else { "file" },
+    ));
+    Ok(redirect_found(&format!("/f/{}", rec.id)))
+}
+
+/// Validate + normalize a submitted folder name: trimmed, required, and capped at [`MAX_NAME_CHARS`].
+fn clean_folder_name(raw: &str) -> Result<String, AppError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::BadRequest("Enter a folder name.".to_string()));
+    }
+    Ok(trimmed.chars().take(MAX_NAME_CHARS).collect())
+}
+
 /// Load a file by share token for the PUBLIC path, enforcing the share lifecycle: a missing/revoked
 /// token is 404, an expired link is 410 Gone.
 async fn load_shared(state: &AppState, token: &str) -> Result<FileRec, AppError> {
@@ -554,19 +755,30 @@ fn render_gallery(
     csrf: &str,
     files: &[FileRec],
     next: Option<&(i64, String)>,
+    folders: &[FolderRec],
+    active: Option<&FolderRec>,
 ) -> String {
     let count = match files.len() {
         0 => "No files yet".to_string(),
         1 => "1 file".to_string(),
         n => format!("{n} files"),
     };
+    // The content heading names the active folder, or "All files" for the flat view.
+    let heading = match active {
+        Some(f) => f.name.clone(),
+        None => "All files".to_string(),
+    };
+    // Preserve the active folder across the "Load older" pager (ids are alphanumeric => URL-safe).
+    let folder_qs = active
+        .map(|f| format!("&folder={}", f.id))
+        .unwrap_or_default();
     // A "Load older" link only when a full page came back (there may be older files to page into).
-    // Ids are alphanumeric, so `<created_at>_<id>` is URL-safe as-is.
     let pager = match next {
         Some((ts, id)) => format!(
-            "<nav class=\"gallery-pager\"><a class=\"btn btn-ghost\" href=\"/?before={ts}_{id}\">Load older</a></nav>",
+            "<nav class=\"gallery-pager\"><a class=\"btn btn-ghost\" href=\"/?before={ts}_{id}{folder_qs}\">Load older</a></nav>",
             ts = ts,
             id = esc(id),
+            folder_qs = folder_qs,
         ),
         None => String::new(),
     };
@@ -575,9 +787,81 @@ fn render_gallery(
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Drive", Some(&who.email)))
         .replace("{{CSRF}}", &esc(csrf))
+        .replace("{{SIDEBAR}}", &render_sidebar(csrf, folders, active))
+        .replace("{{HEADING}}", &esc(&heading))
         .replace("{{COUNT}}", &esc(&count))
         .replace("{{CARDS}}", &render_cards(files))
         .replace("{{PAGER}}", &pager)
+}
+
+/// Render the folder sidebar/switcher: an "All files" entry, one link per folder (the active one
+/// highlighted), a "New folder" form, and — when a folder is active — its rename + delete controls.
+/// Every form is CSRF-protected and owner-scoped.
+fn render_sidebar(csrf: &str, folders: &[FolderRec], active: Option<&FolderRec>) -> String {
+    let all_sel = if active.is_none() {
+        " folder-item--active"
+    } else {
+        ""
+    };
+    let mut items = format!(
+        "<li><a class=\"folder-item{all_sel}\" href=\"/\">All files</a></li>",
+        all_sel = all_sel,
+    );
+    for f in folders {
+        let sel = if active.map(|a| a.id.as_str()) == Some(f.id.as_str()) {
+            " folder-item--active"
+        } else {
+            ""
+        };
+        items.push_str(&format!(
+            "<li><a class=\"folder-item{sel}\" href=\"/?folder={id}\">{name}</a></li>",
+            sel = sel,
+            id = esc(&f.id),
+            name = esc(&f.name),
+        ));
+    }
+
+    // Rename + delete controls, shown only when viewing a specific folder.
+    let manage = match active {
+        Some(f) => format!(
+            "<form class=\"folder-form\" method=\"post\" action=\"/folders/{id}/rename\">\
+               <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+               <label for=\"renameFolder\">Rename folder</label>\
+               <div class=\"share-row\">\
+                 <input id=\"renameFolder\" type=\"text\" name=\"name\" value=\"{name}\" maxlength=\"255\" required>\
+                 <button class=\"btn btn-secondary btn-sm\" type=\"submit\">Save</button>\
+               </div>\
+             </form>\
+             <form class=\"folder-form\" method=\"post\" action=\"/folders/{id}/delete\" \
+               onsubmit=\"return confirm('Delete this folder? Its files are kept and moved back to All files.');\">\
+               <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+               <button class=\"btn btn-danger btn-sm\" type=\"submit\">Delete folder</button>\
+             </form>",
+            id = esc(&f.id),
+            csrf = esc(csrf),
+            name = esc(&f.name),
+        ),
+        None => String::new(),
+    };
+
+    format!(
+        "<aside class=\"folder-rail\">\
+           <div class=\"section-head\"><h2>Folders</h2></div>\
+           <ul class=\"folder-list\">{items}</ul>\
+           <form class=\"folder-form\" method=\"post\" action=\"/folders\">\
+             <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+             <label for=\"newFolder\">New folder</label>\
+             <div class=\"share-row\">\
+               <input id=\"newFolder\" type=\"text\" name=\"name\" placeholder=\"Folder name\" maxlength=\"255\" required>\
+               <button class=\"btn btn-secondary btn-sm\" type=\"submit\">Create</button>\
+             </div>\
+           </form>\
+           {manage}\
+         </aside>",
+        items = items,
+        csrf = esc(csrf),
+        manage = manage,
+    )
 }
 
 fn render_cards(files: &[FileRec]) -> String {
@@ -619,7 +903,13 @@ fn render_cards(files: &[FileRec]) -> String {
         .join("")
 }
 
-fn render_detail(config: &Config, rec: &FileRec, viewer: &Identity, csrf: &str) -> String {
+fn render_detail(
+    config: &Config,
+    rec: &FileRec,
+    viewer: &Identity,
+    csrf: &str,
+    folders: &[FolderRec],
+) -> String {
     let preview = if rec.is_image() {
         format!(
             "<img class=\"preview-img\" src=\"/f/{id}/raw\" alt=\"{alt}\">",
@@ -649,6 +939,7 @@ fn render_detail(config: &Config, rec: &FileRec, viewer: &Identity, csrf: &str) 
     );
 
     let share = render_share_section(config, rec, csrf);
+    let move_section = render_move_section(rec, csrf, folders);
 
     let sub = format!(
         "{ctype} · {size} · {date}",
@@ -675,9 +966,53 @@ fn render_detail(config: &Config, rec: &FileRec, viewer: &Identity, csrf: &str) 
         .replace("{{SUB}}", &esc(&sub))
         .replace("{{PREVIEW}}", &preview)
         .replace("{{META_LIST}}", &meta_list)
+        .replace("{{MOVE}}", &move_section)
         .replace("{{SHARE}}", &share)
         .replace("{{ID}}", &esc(&rec.id))
         .replace("{{DELETE}}", &delete)
+}
+
+/// Build the "Move to folder" control for the detail page: a `<select>` of the owner's folders
+/// (plus a "No folder" root option), pre-selecting the file's current folder. CSRF-protected,
+/// owner-scoped on submit.
+fn render_move_section(rec: &FileRec, csrf: &str, folders: &[FolderRec]) -> String {
+    let root_sel = if rec.folder_id.is_none() {
+        " selected"
+    } else {
+        ""
+    };
+    let mut options = format!(
+        "<option value=\"\"{root_sel}>No folder (All files)</option>",
+        root_sel = root_sel,
+    );
+    for f in folders {
+        let sel = if rec.folder_id.as_deref() == Some(f.id.as_str()) {
+            " selected"
+        } else {
+            ""
+        };
+        options.push_str(&format!(
+            "<option value=\"{id}\"{sel}>{name}</option>",
+            id = esc(&f.id),
+            sel = sel,
+            name = esc(&f.name),
+        ));
+    }
+    format!(
+        "<form class=\"share-form\" method=\"post\" action=\"/f/{id}/move\">\
+           <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+           <div class=\"field\">\
+             <label for=\"folderSelect\">Folder</label>\
+             <div class=\"share-row\">\
+               <select id=\"folderSelect\" name=\"folder_id\">{options}</select>\
+               <button class=\"btn btn-secondary btn-sm\" type=\"submit\">Move</button>\
+             </div>\
+           </div>\
+         </form>",
+        id = esc(&rec.id),
+        csrf = esc(csrf),
+        options = options,
+    )
 }
 
 /// Build the share-link lifecycle section for the detail page. An active link shows its URL with a

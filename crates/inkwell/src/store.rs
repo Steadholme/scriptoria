@@ -33,6 +33,10 @@ pub struct Post {
     /// Admin-set "featured" flag: surfaced with a badge on the index and toggled from /admin.
     /// Additive; defaults to FALSE for every existing row.
     pub featured: bool,
+    /// Comma-separated tags (e.g. `rust, async`). Backed by a nullable TEXT column; empty string
+    /// when the post has no tags. Parsed/slugged by [`crate::tags`] for the tag chips and the
+    /// `/tag/{slug}` listing. Additive: pre-existing rows read back as NULL -> empty string.
+    pub tags: String,
 }
 
 /// Single-row site settings, editable from /admin and applied to the index/head. Kept in its own
@@ -193,6 +197,7 @@ impl Store for InMemoryStore {
                 existing.published = post.published;
                 existing.updated_at = post.updated_at;
                 existing.featured = post.featured;
+                existing.tags = post.tags.clone();
                 Ok(())
             }
             None => Err(StoreError::Backend(format!("no post with slug {}", post.slug))),
@@ -319,6 +324,11 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+        // Additive nullable tags column (comma-separated). IF NOT EXISTS keeps the migration
+        // idempotent and backward compatible — existing rows read back as NULL -> empty string.
+        sqlx::query("ALTER TABLE posts ADD COLUMN IF NOT EXISTS tags TEXT")
+            .execute(&self.pool)
+            .await?;
         // Backs the newest-first index scan.
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts (created_at)")
             .execute(&self.pool)
@@ -453,6 +463,8 @@ impl PgStore {
             updated_at: row.try_get("updated_at")?,
             published: row.try_get("published")?,
             featured: row.try_get("featured")?,
+            // Nullable column: a pre-migration row (or a post with no tags) reads back as NULL.
+            tags: row.try_get::<Option<String>, _>("tags")?.unwrap_or_default(),
         })
     }
 
@@ -495,7 +507,7 @@ impl PgStore {
     ) -> Result<Vec<Post>, sqlx::Error> {
         let limit = limit.clamp(1, MAX_PAGE);
         const COLS: &str = "SELECT id, slug, title, body_md, author_sub, author_email, \
-                            created_at, updated_at, published, featured FROM posts";
+                            created_at, updated_at, published, featured, tags FROM posts";
         // The `ORDER BY created_at DESC, id DESC` IS the keyset. With a cursor, add the standard
         // "strictly older" tuple comparison before the ORDER BY so paging never skips a tie.
         let rows = match before {
@@ -523,7 +535,7 @@ impl PgStore {
     async fn get_post_async(&self, slug: &str) -> Result<Option<Post>, sqlx::Error> {
         let row = sqlx::query(
             "SELECT id, slug, title, body_md, author_sub, author_email, created_at, updated_at, \
-                    published, featured \
+                    published, featured, tags \
              FROM posts WHERE slug = $1",
         )
         .bind(slug)
@@ -539,8 +551,8 @@ impl PgStore {
         sqlx::query(
             "INSERT INTO posts \
                  (id, slug, title, body_md, author_sub, author_email, created_at, updated_at, \
-                  published, featured) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                  published, featured, tags) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(&p.id)
         .bind(&p.slug)
@@ -552,6 +564,7 @@ impl PgStore {
         .bind(p.updated_at)
         .bind(p.published)
         .bind(p.featured)
+        .bind(&p.tags)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -560,14 +573,15 @@ impl PgStore {
     async fn update_post_async(&self, p: &Post) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE posts SET title = $1, body_md = $2, published = $3, updated_at = $4, \
-                    featured = $5 \
-             WHERE slug = $6",
+                    featured = $5, tags = $6 \
+             WHERE slug = $7",
         )
         .bind(&p.title)
         .bind(&p.body_md)
         .bind(p.published)
         .bind(p.updated_at)
         .bind(p.featured)
+        .bind(&p.tags)
         .bind(&p.slug)
         .execute(&self.pool)
         .await?;
@@ -693,6 +707,7 @@ mod tests {
             updated_at: created_at,
             published: true,
             featured: false,
+            tags: String::new(),
         }
     }
 
@@ -772,6 +787,22 @@ mod tests {
         p.featured = true;
         store.update_post(&p).await.unwrap();
         assert!(store.get_post("p1").await.unwrap().featured, "featured persisted");
+    }
+
+    /// The comma-separated `tags` field persists through create + update (nullable column, so a
+    /// tag-less post round-trips as the empty string).
+    #[tokio::test]
+    async fn tags_persist_through_create_and_update() {
+        let store = InMemoryStore::new();
+        let mut p = post("p1", 1);
+        p.tags = "rust, async".to_string();
+        store.create_post(&p).await.unwrap();
+        assert_eq!(store.get_post("p1").await.unwrap().tags, "rust, async", "tags stored on create");
+
+        let mut edited = store.get_post("p1").await.unwrap();
+        edited.tags = "gateway".to_string();
+        store.update_post(&edited).await.unwrap();
+        assert_eq!(store.get_post("p1").await.unwrap().tags, "gateway", "tags replaced on update");
     }
 
     /// A caller asking for more than [`MAX_PAGE`] rows is clamped, so a single page stays bounded.

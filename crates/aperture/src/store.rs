@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::config::clamp_page;
-use crate::model::FileRec;
+use crate::model::{FileRec, FolderRec};
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
 #[derive(Debug, Error)]
@@ -41,13 +41,17 @@ pub trait Store: Send + Sync {
 
     /// An owner's files, newest-first, one keyset page at a time.
     ///
-    /// Ordering is the fixed keyset `(created_at DESC, id DESC)`. `before` is the exclusive
-    /// `(created_at, id)` cursor of the last row already seen — pass `None` for the newest page,
-    /// or the previous page's last (oldest) row to page BACKWARD into older files. `limit` is
-    /// clamped to `[1, MAX_PAGE]` (see [`crate::config::clamp_page`]) so the read is always bounded.
+    /// `folder` filters the view: `None` is the flat "all files" view (every file the owner has,
+    /// regardless of folder — the default), while `Some(id)` returns only the files whose
+    /// `folder_id` equals that folder. Ordering is the fixed keyset `(created_at DESC, id DESC)`.
+    /// `before` is the exclusive `(created_at, id)` cursor of the last row already seen — pass
+    /// `None` for the newest page, or the previous page's last (oldest) row to page BACKWARD into
+    /// older files. `limit` is clamped to `[1, MAX_PAGE]` (see [`crate::config::clamp_page`]) so the
+    /// read is always bounded.
     async fn list_by_owner(
         &self,
         owner_sub: &str,
+        folder: Option<&str>,
         before: Option<(i64, String)>,
         limit: i64,
     ) -> Result<Vec<FileRec>, StoreError>;
@@ -69,6 +73,41 @@ pub trait Store: Send + Sync {
         expires_at: Option<i64>,
         share_password_hash: Option<String>,
     ) -> Result<bool, StoreError>;
+
+    /// Insert a folder row. Returns `Ok(true)` when inserted, `Ok(false)` when the id already
+    /// existed (the caller retries with a fresh id).
+    async fn create_folder(&self, folder: &FolderRec) -> Result<bool, StoreError>;
+
+    /// An owner's folders, name-ordered (case-insensitive, id tiebreak) for a stable sidebar.
+    async fn list_folders(&self, owner_sub: &str) -> Result<Vec<FolderRec>, StoreError>;
+
+    /// Fetch one folder, ownership-scoped (used to validate a move target and to render the active
+    /// folder's controls). `None` when it does not exist or belongs to someone else.
+    async fn get_folder(&self, id: &str, owner_sub: &str)
+        -> Result<Option<FolderRec>, StoreError>;
+
+    /// Rename a folder only if it belongs to `owner_sub`. Returns `true` when a row was updated.
+    async fn rename_folder(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        name: &str,
+    ) -> Result<bool, StoreError>;
+
+    /// Delete a folder only if it belongs to `owner_sub`, first UNFILING its files (their
+    /// `folder_id` is cleared to `NULL`) so no file is orphaned. Returns `true` when the folder row
+    /// was removed.
+    async fn delete_folder(&self, id: &str, owner_sub: &str) -> Result<bool, StoreError>;
+
+    /// Move a file into a folder (`Some(folder_id)`) or back to the root/unfiled view (`None`),
+    /// ownership-scoped. The caller validates that a `Some` target folder belongs to the owner.
+    /// Returns `true` when the owner's file row was updated.
+    async fn move_file(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        folder_id: Option<&str>,
+    ) -> Result<bool, StoreError>;
 }
 
 // --------------------------------------------------------------------------------------
@@ -80,6 +119,7 @@ pub trait Store: Send + Sync {
 #[derive(Default)]
 pub struct InMemoryStore {
     files: Mutex<Vec<FileRec>>,
+    folders: Mutex<Vec<FolderRec>>,
 }
 
 impl InMemoryStore {
@@ -120,6 +160,7 @@ impl Store for InMemoryStore {
     async fn list_by_owner(
         &self,
         owner_sub: &str,
+        folder: Option<&str>,
         before: Option<(i64, String)>,
         limit: i64,
     ) -> Result<Vec<FileRec>, StoreError> {
@@ -128,6 +169,11 @@ impl Store for InMemoryStore {
         let mut out: Vec<FileRec> = files
             .iter()
             .filter(|f| f.owner_sub == owner_sub)
+            // Folder filter: `None` = the flat all-files view; `Some(id)` = only that folder.
+            .filter(|f| match folder {
+                None => true,
+                Some(fid) => f.folder_id.as_deref() == Some(fid),
+            })
             // Keyset cursor: keep only rows strictly OLDER than `before` under (created_at, id).
             .filter(|f| match &before {
                 None => true,
@@ -174,6 +220,98 @@ impl Store for InMemoryStore {
             None => Ok(false),
         }
     }
+
+    async fn create_folder(&self, folder: &FolderRec) -> Result<bool, StoreError> {
+        let mut folders = self.folders.lock().expect("folders lock poisoned");
+        if folders.iter().any(|f| f.id == folder.id) {
+            return Ok(false);
+        }
+        folders.push(folder.clone());
+        Ok(true)
+    }
+
+    async fn list_folders(&self, owner_sub: &str) -> Result<Vec<FolderRec>, StoreError> {
+        let folders = self.folders.lock().expect("folders lock poisoned");
+        let mut out: Vec<FolderRec> = folders
+            .iter()
+            .filter(|f| f.owner_sub == owner_sub)
+            .cloned()
+            .collect();
+        // Name-ordered (case-insensitive), id as a deterministic tiebreak — matches the Pg index.
+        out.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(out)
+    }
+
+    async fn get_folder(
+        &self,
+        id: &str,
+        owner_sub: &str,
+    ) -> Result<Option<FolderRec>, StoreError> {
+        let folders = self.folders.lock().expect("folders lock poisoned");
+        Ok(folders
+            .iter()
+            .find(|f| f.id == id && f.owner_sub == owner_sub)
+            .cloned())
+    }
+
+    async fn rename_folder(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        name: &str,
+    ) -> Result<bool, StoreError> {
+        let mut folders = self.folders.lock().expect("folders lock poisoned");
+        match folders
+            .iter_mut()
+            .find(|f| f.id == id && f.owner_sub == owner_sub)
+        {
+            Some(f) => {
+                f.name = name.to_string();
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn delete_folder(&self, id: &str, owner_sub: &str) -> Result<bool, StoreError> {
+        // Unfile the owner's files that point at this folder BEFORE removing it, so none is orphaned.
+        {
+            let mut files = self.files.lock().expect("files lock poisoned");
+            for f in files.iter_mut() {
+                if f.owner_sub == owner_sub && f.folder_id.as_deref() == Some(id) {
+                    f.folder_id = None;
+                }
+            }
+        }
+        let mut folders = self.folders.lock().expect("folders lock poisoned");
+        let before = folders.len();
+        folders.retain(|f| !(f.id == id && f.owner_sub == owner_sub));
+        Ok(folders.len() != before)
+    }
+
+    async fn move_file(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        folder_id: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let mut files = self.files.lock().expect("files lock poisoned");
+        match files
+            .iter_mut()
+            .find(|f| f.id == id && f.owner_sub == owner_sub)
+        {
+            Some(f) => {
+                f.folder_id = folder_id.map(str::to_string);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
 }
 
 // --------------------------------------------------------------------------------------
@@ -189,7 +327,10 @@ use sqlx::Row;
 
 /// Column list shared by every SELECT, so the row decoder stays in lock-step with the query.
 const COLS: &str = "id, owner_sub, name, content_type, size, bucket, object_key, share_token, \
-     created_at, expires_at, share_password_hash";
+     created_at, expires_at, share_password_hash, folder_id";
+
+/// Column list shared by every folder SELECT.
+const FOLDER_COLS: &str = "id, owner_sub, name, created_at";
 
 /// PostgreSQL-backed [`Store`]. Holds a pooled connection; the async trait methods drive sqlx
 /// natively, so no worker thread is ever blocked on a DB round-trip.
@@ -251,6 +392,34 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+        // Folders (albums). Additive + idempotent; pre-existing files default to NULL folder_id
+        // (unfiled), preserving the flat all-files view. Portable standard SQL only.
+        sqlx::query("ALTER TABLE files ADD COLUMN IF NOT EXISTS folder_id TEXT")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS folders (\
+                 id TEXT PRIMARY KEY, \
+                 owner_sub TEXT NOT NULL, \
+                 name TEXT NOT NULL, \
+                 created_at BIGINT NOT NULL\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_folders_owner_name \
+             ON folders (owner_sub, name)",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Backs the folder-filtered gallery lookup (owner + folder filter, created ordering).
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_files_owner_folder \
+             ON files (owner_sub, folder_id, created_at)",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -267,6 +436,16 @@ impl PgStore {
             created_at: row.try_get("created_at")?,
             expires_at: row.try_get("expires_at")?,
             share_password_hash: row.try_get("share_password_hash")?,
+            folder_id: row.try_get("folder_id")?,
+        })
+    }
+
+    fn folder_from_row(row: &sqlx::postgres::PgRow) -> Result<FolderRec, sqlx::Error> {
+        Ok(FolderRec {
+            id: row.try_get("id")?,
+            owner_sub: row.try_get("owner_sub")?,
+            name: row.try_get("name")?,
+            created_at: row.try_get("created_at")?,
         })
     }
 
@@ -276,8 +455,8 @@ impl PgStore {
         let result = sqlx::query(
             "INSERT INTO files \
                  (id, owner_sub, name, content_type, size, bucket, object_key, share_token, \
-                  created_at, expires_at, share_password_hash) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                  created_at, expires_at, share_password_hash, folder_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
              ON CONFLICT DO NOTHING",
         )
         .bind(&file.id)
@@ -291,6 +470,7 @@ impl PgStore {
         .bind(file.created_at)
         .bind(file.expires_at)
         .bind(&file.share_password_hash)
+        .bind(&file.folder_id)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
@@ -337,14 +517,27 @@ impl PgStore {
     async fn list_by_owner_async(
         &self,
         owner_sub: &str,
+        folder: Option<&str>,
         before: Option<(i64, String)>,
         limit: i64,
     ) -> Result<Vec<FileRec>, sqlx::Error> {
         let limit = clamp_page(limit);
         // The table index/order IS the keyset `(created_at DESC, id DESC)`; the cursor clause
-        // (created_at, id) < (b_ts, b_id) selects the next page of strictly-older rows.
-        let rows = match &before {
-            Some((ts, id)) => {
+        // (created_at, id) < (b_ts, b_id) selects the next page of strictly-older rows. The four
+        // branches keep the positional bind order in lock-step with each SQL variant (folder filter
+        // × keyset cursor).
+        let rows = match (folder, &before) {
+            (None, None) => {
+                sqlx::query(&format!(
+                    "SELECT {COLS} FROM files WHERE owner_sub = $1 \
+                     ORDER BY created_at DESC, id DESC LIMIT $2"
+                ))
+                .bind(owner_sub)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, Some((ts, id))) => {
                 sqlx::query(&format!(
                     "SELECT {COLS} FROM files WHERE owner_sub = $1 \
                      AND (created_at < $2 OR (created_at = $2 AND id < $3)) \
@@ -357,18 +550,119 @@ impl PgStore {
                 .fetch_all(&self.pool)
                 .await?
             }
-            None => {
+            (Some(fid), None) => {
                 sqlx::query(&format!(
-                    "SELECT {COLS} FROM files WHERE owner_sub = $1 \
-                     ORDER BY created_at DESC, id DESC LIMIT $2"
+                    "SELECT {COLS} FROM files WHERE owner_sub = $1 AND folder_id = $2 \
+                     ORDER BY created_at DESC, id DESC LIMIT $3"
                 ))
                 .bind(owner_sub)
+                .bind(fid)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Some(fid), Some((ts, id))) => {
+                sqlx::query(&format!(
+                    "SELECT {COLS} FROM files WHERE owner_sub = $1 AND folder_id = $2 \
+                     AND (created_at < $3 OR (created_at = $3 AND id < $4)) \
+                     ORDER BY created_at DESC, id DESC LIMIT $5"
+                ))
+                .bind(owner_sub)
+                .bind(fid)
+                .bind(ts)
+                .bind(id)
                 .bind(limit)
                 .fetch_all(&self.pool)
                 .await?
             }
         };
         rows.iter().map(Self::file_from_row).collect()
+    }
+
+    async fn create_folder_async(&self, folder: &FolderRec) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "INSERT INTO folders (id, owner_sub, name, created_at) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+        )
+        .bind(&folder.id)
+        .bind(&folder.owner_sub)
+        .bind(&folder.name)
+        .bind(folder.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn list_folders_async(&self, owner_sub: &str) -> Result<Vec<FolderRec>, sqlx::Error> {
+        let rows = sqlx::query(&format!(
+            "SELECT {FOLDER_COLS} FROM folders WHERE owner_sub = $1 \
+             ORDER BY lower(name) ASC, id ASC"
+        ))
+        .bind(owner_sub)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::folder_from_row).collect()
+    }
+
+    async fn get_folder_async(
+        &self,
+        id: &str,
+        owner_sub: &str,
+    ) -> Result<Option<FolderRec>, sqlx::Error> {
+        let row = sqlx::query(&format!(
+            "SELECT {FOLDER_COLS} FROM folders WHERE id = $1 AND owner_sub = $2"
+        ))
+        .bind(id)
+        .bind(owner_sub)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(Self::folder_from_row).transpose()
+    }
+
+    async fn rename_folder_async(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        name: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query("UPDATE folders SET name = $1 WHERE id = $2 AND owner_sub = $3")
+            .bind(name)
+            .bind(id)
+            .bind(owner_sub)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn delete_folder_async(&self, id: &str, owner_sub: &str) -> Result<bool, sqlx::Error> {
+        // Unfile the owner's files first (clear folder_id), then drop the folder row. Two portable
+        // statements — a file pointing at a missing folder is worse than a brief unfiled state.
+        sqlx::query("UPDATE files SET folder_id = NULL WHERE folder_id = $1 AND owner_sub = $2")
+            .bind(id)
+            .bind(owner_sub)
+            .execute(&self.pool)
+            .await?;
+        let result = sqlx::query("DELETE FROM folders WHERE id = $1 AND owner_sub = $2")
+            .bind(id)
+            .bind(owner_sub)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn move_file_async(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        folder_id: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query("UPDATE files SET folder_id = $1 WHERE id = $2 AND owner_sub = $3")
+            .bind(folder_id)
+            .bind(id)
+            .bind(owner_sub)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     async fn delete_async(&self, id: &str, owner_sub: &str) -> Result<bool, sqlx::Error> {
@@ -404,10 +698,11 @@ impl Store for PgStore {
     async fn list_by_owner(
         &self,
         owner_sub: &str,
+        folder: Option<&str>,
         before: Option<(i64, String)>,
         limit: i64,
     ) -> Result<Vec<FileRec>, StoreError> {
-        self.list_by_owner_async(owner_sub, before, limit)
+        self.list_by_owner_async(owner_sub, folder, before, limit)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
@@ -430,6 +725,56 @@ impl Store for PgStore {
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
+
+    async fn create_folder(&self, folder: &FolderRec) -> Result<bool, StoreError> {
+        self.create_folder_async(folder)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn list_folders(&self, owner_sub: &str) -> Result<Vec<FolderRec>, StoreError> {
+        self.list_folders_async(owner_sub)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn get_folder(
+        &self,
+        id: &str,
+        owner_sub: &str,
+    ) -> Result<Option<FolderRec>, StoreError> {
+        self.get_folder_async(id, owner_sub)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn rename_folder(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        name: &str,
+    ) -> Result<bool, StoreError> {
+        self.rename_folder_async(id, owner_sub, name)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn delete_folder(&self, id: &str, owner_sub: &str) -> Result<bool, StoreError> {
+        self.delete_folder_async(id, owner_sub)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn move_file(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        folder_id: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        self.move_file_async(id, owner_sub, folder_id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -449,6 +794,7 @@ mod tests {
             created_at,
             expires_at: None,
             share_password_hash: None,
+            folder_id: None,
         }
     }
 
@@ -469,7 +815,7 @@ mod tests {
         s.create(&file("a", "u", "t1", 10)).await.unwrap();
         s.create(&file("c", "u", "t3", 30)).await.unwrap();
         s.create(&file("d", "other", "t4", 40)).await.unwrap();
-        let mine = s.list_by_owner("u", None, 50).await.unwrap();
+        let mine = s.list_by_owner("u", None, None, 50).await.unwrap();
         let ids: Vec<&str> = mine.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(ids, vec!["c", "a"]);
     }
@@ -481,19 +827,19 @@ mod tests {
             s.create(&file(id, "u", &format!("t-{id}"), ts)).await.unwrap();
         }
         // Page 1 (newest 2).
-        let p1 = s.list_by_owner("u", None, 2).await.unwrap();
+        let p1 = s.list_by_owner("u", None, None, 2).await.unwrap();
         assert_eq!(p1.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["e", "d"]);
         // Cursor = last (oldest) row of page 1 -> next 2, strictly older.
         let c1 = p1.last().unwrap();
         let p2 = s
-            .list_by_owner("u", Some((c1.created_at, c1.id.clone())), 2)
+            .list_by_owner("u", None, Some((c1.created_at, c1.id.clone())), 2)
             .await
             .unwrap();
         assert_eq!(p2.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["c", "b"]);
         // Final partial page.
         let c2 = p2.last().unwrap();
         let p3 = s
-            .list_by_owner("u", Some((c2.created_at, c2.id.clone())), 2)
+            .list_by_owner("u", None, Some((c2.created_at, c2.id.clone())), 2)
             .await
             .unwrap();
         assert_eq!(p3.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["a"]);
@@ -506,11 +852,11 @@ mod tests {
         s.create(&file("a", "u", "ta", 100)).await.unwrap();
         s.create(&file("b", "u", "tb", 100)).await.unwrap();
         s.create(&file("c", "u", "tc", 100)).await.unwrap();
-        let p1 = s.list_by_owner("u", None, 2).await.unwrap();
+        let p1 = s.list_by_owner("u", None, None, 2).await.unwrap();
         assert_eq!(p1.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["c", "b"]);
         let c1 = p1.last().unwrap();
         let p2 = s
-            .list_by_owner("u", Some((c1.created_at, c1.id.clone())), 2)
+            .list_by_owner("u", None, Some((c1.created_at, c1.id.clone())), 2)
             .await
             .unwrap();
         assert_eq!(p2.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["a"]);
@@ -525,9 +871,9 @@ mod tests {
                 .unwrap();
         }
         // A non-positive limit falls back to the default page size (>= 10 here, so all 10 return).
-        assert_eq!(s.list_by_owner("u", None, 0).await.unwrap().len(), 10);
+        assert_eq!(s.list_by_owner("u", None, None, 0).await.unwrap().len(), 10);
         // An absurd limit is capped to MAX_PAGE but still returns everything available.
-        assert_eq!(s.list_by_owner("u", None, 100_000).await.unwrap().len(), 10);
+        assert_eq!(s.list_by_owner("u", None, None, 100_000).await.unwrap().len(), 10);
     }
 
     #[tokio::test]
@@ -574,6 +920,88 @@ mod tests {
         // A second revoked file coexists (NULL tokens are distinct — no unique collision).
         s.create(&file("b", "u", "tok-b", 2)).await.unwrap();
         assert!(s.configure_share("b", "u", None, None, None).await.unwrap());
-        assert_eq!(s.list_by_owner("u", None, 50).await.unwrap().len(), 2);
+        assert_eq!(s.list_by_owner("u", None, None, 50).await.unwrap().len(), 2);
+    }
+
+    fn folder(id: &str, owner: &str, name: &str, created_at: i64) -> FolderRec {
+        FolderRec {
+            id: id.into(),
+            owner_sub: owner.into(),
+            name: name.into(),
+            created_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn folders_are_owner_scoped_and_name_ordered() {
+        let s = InMemoryStore::new();
+        s.create_folder(&folder("f2", "u", "Zeta", 1)).await.unwrap();
+        s.create_folder(&folder("f1", "u", "alpha", 2)).await.unwrap();
+        s.create_folder(&folder("f3", "other", "Mine", 3)).await.unwrap();
+        // id collision -> false.
+        assert!(!s.create_folder(&folder("f1", "u", "dup", 9)).await.unwrap());
+
+        let mine = s.list_folders("u").await.unwrap();
+        let names: Vec<&str> = mine.iter().map(|f| f.name.as_str()).collect();
+        // Case-insensitive name order: "alpha" before "Zeta"; the other owner's folder is excluded.
+        assert_eq!(names, vec!["alpha", "Zeta"]);
+
+        // get_folder is ownership-scoped.
+        assert!(s.get_folder("f1", "u").await.unwrap().is_some());
+        assert!(s.get_folder("f1", "intruder").await.unwrap().is_none());
+        assert!(s.get_folder("f3", "u").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn rename_and_delete_folder_are_owner_scoped() {
+        let s = InMemoryStore::new();
+        s.create_folder(&folder("f1", "u", "Old", 1)).await.unwrap();
+        // A non-owner cannot rename or delete.
+        assert!(!s.rename_folder("f1", "intruder", "Hax").await.unwrap());
+        assert!(!s.delete_folder("f1", "intruder").await.unwrap());
+        // Owner renames.
+        assert!(s.rename_folder("f1", "u", "New").await.unwrap());
+        assert_eq!(s.get_folder("f1", "u").await.unwrap().unwrap().name, "New");
+        // Owner deletes.
+        assert!(s.delete_folder("f1", "u").await.unwrap());
+        assert!(s.get_folder("f1", "u").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn move_file_filters_the_folder_view() {
+        let s = InMemoryStore::new();
+        s.create_folder(&folder("f1", "u", "Album", 1)).await.unwrap();
+        s.create(&file("a", "u", "ta", 10)).await.unwrap();
+        s.create(&file("b", "u", "tb", 20)).await.unwrap();
+
+        // Both files start unfiled: the folder view is empty, the flat view has both.
+        assert_eq!(s.list_by_owner("u", Some("f1"), None, 50).await.unwrap().len(), 0);
+        assert_eq!(s.list_by_owner("u", None, None, 50).await.unwrap().len(), 2);
+
+        // A non-owner cannot move the file.
+        assert!(!s.move_file("a", "intruder", Some("f1")).await.unwrap());
+        // Owner moves "a" into the folder; only it shows in the folder view, both in the flat view.
+        assert!(s.move_file("a", "u", Some("f1")).await.unwrap());
+        let in_folder = s.list_by_owner("u", Some("f1"), None, 50).await.unwrap();
+        assert_eq!(in_folder.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["a"]);
+        assert_eq!(s.list_by_owner("u", None, None, 50).await.unwrap().len(), 2);
+
+        // Move "a" back to root -> the folder view empties again.
+        assert!(s.move_file("a", "u", None).await.unwrap());
+        assert_eq!(s.list_by_owner("u", Some("f1"), None, 50).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn delete_folder_unfiles_its_files() {
+        let s = InMemoryStore::new();
+        s.create_folder(&folder("f1", "u", "Album", 1)).await.unwrap();
+        s.create(&file("a", "u", "ta", 10)).await.unwrap();
+        s.move_file("a", "u", Some("f1")).await.unwrap();
+        assert_eq!(s.get("a").await.unwrap().unwrap().folder_id.as_deref(), Some("f1"));
+
+        // Deleting the folder keeps the file but clears its folder_id (no orphaned reference).
+        assert!(s.delete_folder("f1", "u").await.unwrap());
+        assert!(s.get("a").await.unwrap().unwrap().folder_id.is_none());
+        assert_eq!(s.list_by_owner("u", None, None, 50).await.unwrap().len(), 1);
     }
 }

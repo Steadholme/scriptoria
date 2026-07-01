@@ -50,6 +50,25 @@ pub struct FileRec {
     /// Optional salted-hash of a share-link password (`{salt}${sha256_hex}`). `None` = no password.
     /// When set, the public `/s/{token}` fetch prompts for the password before serving the blob.
     pub share_password_hash: Option<String>,
+    /// Optional owning folder id (a [`FolderRec`] belonging to the same `owner_sub`). `None` = the
+    /// file is unfiled and appears only in the flat "all files" view. A folder view (`?folder={id}`)
+    /// lists exactly the files whose `folder_id` matches.
+    pub folder_id: Option<String>,
+}
+
+/// A single owner-scoped folder (album) grouping a subset of the owner's files. Field
+/// order/types mirror the `folders` table exactly. Files reference it via [`FileRec::folder_id`];
+/// deleting a folder unfiles its files rather than deleting them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FolderRec {
+    /// Short, random, URL-safe id (the `?folder={id}` selector + primary key).
+    pub id: String,
+    /// Owner subject from `X-Auth-Subject` (ownership key for list/rename/delete).
+    pub owner_sub: String,
+    /// Display name as submitted (display only; escaped on render).
+    pub name: String,
+    /// Creation time, epoch seconds.
+    pub created_at: i64,
 }
 
 impl FileRec {
@@ -97,6 +116,7 @@ mod tests {
             created_at: 0,
             expires_at,
             share_password_hash: None,
+            folder_id: None,
         }
     }
 
