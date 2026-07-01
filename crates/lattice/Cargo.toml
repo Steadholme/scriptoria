@@ -38,6 +38,10 @@ pulldown-cmark = { version = "0.12", default-features = false, features = ["html
 getrandom = "0.2"
 # Hex-encode the random bytes for the CSRF token / revision id.
 hex = "0.4"
+# HMAC-SHA256 verification of the gateway-injected identity signature (X-Auth-Sig). Shared
+# primitive with the rest of the estate; the canonical message matches Sluice's Go signer.
+hmac = "0.12"
+sha2 = "0.10"
 # Epoch -> UTC components for human-readable "last edited" timestamps (std only — no extra C
 # deps). Same crate the rest of the estate pins.
 time = { version = "0.3", default-features = false, features = ["std"] }

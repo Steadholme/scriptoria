@@ -38,6 +38,10 @@ time = { version = "0.3", default-features = false, features = ["std"] }
 # CSPRNG (OsRng) for the short random paste id + the double-submit CSRF token. rand 0.8 matches
 # keystone's OsRng path.
 rand = "0.8"
+# HMAC-SHA256 verification of the gateway-injected identity signature (X-Auth-Sig). Shared
+# primitive with the rest of the estate; the canonical message matches Sluice's Go signer.
+hmac = "0.12"
+sha2 = "0.10"
 # Portable PostgreSQL data layer. Runtime queries only (sqlx::query/Row) — NO compile-time
 # macros, so the build needs NO database. rustls TLS (no openssl). The same standard-SQL
 # statements later run unchanged on FusionDB over pgwire.
