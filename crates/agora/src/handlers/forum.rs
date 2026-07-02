@@ -776,8 +776,8 @@ pub async fn reply(
             "reply body is too long".to_string(),
         ));
     }
-    let quoted_post_id = match form.quote_post_id.trim().is_empty() {
-        true => String::new(),
+    let quoted_post = match form.quote_post_id.trim().is_empty() {
+        true => None,
         false => {
             let quoted = state
                 .store
@@ -787,9 +787,13 @@ pub async fn reply(
                 .ok_or_else(|| {
                     AppError::InvalidRequest("quoted post must belong to this thread".to_string())
                 })?;
-            quoted.id
+            Some(quoted)
         }
     };
+    let quoted_post_id = quoted_post
+        .as_ref()
+        .map(|p| p.id.clone())
+        .unwrap_or_default();
 
     let now = now_secs();
     let post = Post {
@@ -821,6 +825,7 @@ pub async fn reply(
     state
         .audit
         .emit(AuditEvent::info("reply.create", actor, &post.id, &id));
+    notify_reply(&state, &thread, quoted_post.as_ref(), &post);
 
     Ok(redirect_to(&format!("/t/{id}")))
 }
@@ -1245,9 +1250,11 @@ pub async fn accept_answer(
             "the original post cannot be the accepted answer".to_string(),
         ));
     }
-    if !posts.iter().any(|p| p.id == target) {
-        return Err(AppError::NotFound("reply not found".to_string()));
-    }
+    let target_post = posts
+        .iter()
+        .find(|p| p.id == target)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound("reply not found".to_string()))?;
 
     // Toggle: re-accepting the currently accepted reply clears it; otherwise set it. Idempotent
     // (marking the same reply that is already accepted flips it off — a deliberate unmark).
@@ -1274,6 +1281,9 @@ pub async fn accept_answer(
             new_accepted
         },
     ));
+    if !new_accepted.is_empty() {
+        notify_accepted_answer(&state, &thread, &target_post, &author.sub, &author.email);
+    }
 
     if wants_json(&headers) {
         return Ok(axum::Json(serde_json::json!({
@@ -1570,6 +1580,75 @@ fn extract_mentions(body: &str) -> Vec<String> {
             }
         }
         i = end.max(start);
+    }
+    out
+}
+
+fn notify_reply(state: &AppState, thread: &Thread, quoted_post: Option<&Post>, post: &Post) {
+    let recipient_sub = quoted_post
+        .map(|p| p.author_sub.as_str())
+        .unwrap_or(thread.author_sub.as_str());
+    if recipient_sub == post.author_sub {
+        return;
+    }
+    let Some(klaxon) = &state.klaxon else {
+        return;
+    };
+
+    let actor = post_author_label(post);
+    let title = format!("{actor} 回复了「{}」", truncate_chars(&thread.title, 80));
+    let body = compact_snippet(&post.body_md, 180);
+    let url = forum_thread_url(&thread.id);
+    klaxon.notify("agora", recipient_sub, &title, &body, &url);
+}
+
+fn notify_accepted_answer(
+    state: &AppState,
+    thread: &Thread,
+    accepted_post: &Post,
+    actor_sub: &str,
+    actor_email: &str,
+) {
+    if accepted_post.author_sub == actor_sub {
+        return;
+    }
+    let Some(klaxon) = &state.klaxon else {
+        return;
+    };
+
+    let actor = author_label(actor_sub, actor_email);
+    let title = format!("{actor} 采纳了你的回答");
+    let body = truncate_chars(&thread.title, 180);
+    let url = forum_thread_url(&thread.id);
+    klaxon.notify("agora", &accepted_post.author_sub, &title, &body, &url);
+}
+
+fn post_author_label(post: &Post) -> &str {
+    author_label(&post.author_sub, &post.author_email)
+}
+
+fn author_label<'a>(sub: &'a str, email: &'a str) -> &'a str {
+    if email.trim().is_empty() {
+        sub
+    } else {
+        email
+    }
+}
+
+fn forum_thread_url(thread_id: &str) -> String {
+    format!("https://forum.w33d.xyz/t/{thread_id}")
+}
+
+fn compact_snippet(s: &str, max_chars: usize) -> String {
+    let compact = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_chars(&compact, max_chars)
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let mut out: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        out.push_str("...");
     }
     out
 }

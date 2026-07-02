@@ -32,6 +32,7 @@ pub mod config;
 pub mod error;
 pub mod handlers;
 pub mod markdown;
+pub mod notify;
 pub mod store;
 
 use std::sync::Arc;
@@ -42,6 +43,7 @@ use axum::Router;
 
 use crate::audit::AuditSink;
 use crate::config::{env_nonempty, Config};
+pub use crate::notify::KlaxonNotifier;
 use crate::store::{InMemoryStore, PgStore, Store};
 
 /// Shared application state. Cheap to clone (everything behind `Arc` / a cloneable sink).
@@ -50,6 +52,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub store: Arc<dyn Store>,
     pub audit: AuditSink,
+    pub klaxon: Option<Arc<KlaxonNotifier>>,
 }
 
 /// Build the router wiring all endpoints onto `state`. Routes are explicit (no fallback): the
@@ -106,6 +109,7 @@ pub fn build_dev_state() -> AppState {
         config: Arc::new(Config::dev()),
         store: Arc::new(InMemoryStore::new()),
         audit: AuditSink::disabled(),
+        klaxon: None,
     }
 }
 
@@ -149,6 +153,7 @@ pub async fn build_state_from_env() -> Result<AppState, String> {
         config: Arc::new(config),
         store,
         audit,
+        klaxon: KlaxonNotifier::from_env().map(Arc::new),
     })
 }
 

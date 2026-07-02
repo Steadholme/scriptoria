@@ -176,6 +176,7 @@ async fn build_forum() -> Result<Router, String> {
         config: Arc::new(agora::config::Config::from_env()),
         store,
         audit,
+        klaxon: agora::KlaxonNotifier::from_env().map(Arc::new),
     };
     Ok(agora::app(state))
 }
@@ -225,6 +226,7 @@ async fn build_comments() -> Result<Router, String> {
         config: Arc::new(echo::config::Config::from_env()),
         store: Arc::new(pg),
         audit,
+        klaxon: echo::KlaxonNotifier::from_env().map(Arc::new),
     };
     Ok(echo::app(state))
 }

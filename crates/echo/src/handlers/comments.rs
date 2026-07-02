@@ -493,7 +493,8 @@ pub async fn post_comment(
 
     // Resolve the parent so replies nest exactly one level: a reply to a reply re-parents onto the
     // original top-level comment. The parent must belong to this thread.
-    let parent_id = resolve_parent(&state, &thread.id, form.parent_id.trim()).await;
+    let parent = resolve_parent(&state, &thread.id, form.parent_id.trim()).await;
+    let parent_id = parent.as_ref().map(|p| p.id.clone()).unwrap_or_default();
 
     let comment = Comment {
         id: format!("cmt_{}_{}", now_nanos(), rand_suffix()),
@@ -523,6 +524,7 @@ pub async fn post_comment(
             "reply"
         },
     ));
+    notify_comment_reply(&state, &thread, &comment, parent.as_ref());
 
     // Progressive enhancement: the enhanced thread page asks for JSON and splices the freshly
     // posted comment inline. A plain form POST (no `Accept: application/json`) keeps the 303.
@@ -956,6 +958,51 @@ fn thread_meta_url(thread: &Option<Thread>) -> String {
             u = esc(url)
         )
     }
+}
+
+fn notify_comment_reply(
+    state: &AppState,
+    thread: &Thread,
+    comment: &Comment,
+    parent: Option<&ResolvedParent>,
+) {
+    let Some(parent) = parent else {
+        return;
+    };
+    if parent.author_sub == comment.author_sub {
+        return;
+    }
+    let Some(klaxon) = &state.klaxon else {
+        return;
+    };
+
+    let actor = author_label(comment);
+    let title = format!("{actor} 回复了你的评论");
+    let body = compact_snippet(&comment.body, 180);
+    let url = notify_thread_url(thread);
+    klaxon.notify("echo", &parent.author_sub, &title, &body, &url);
+}
+
+fn notify_thread_url(thread: &Thread) -> String {
+    if !thread.url.is_empty() && markdown::is_safe_url(&thread.url) {
+        thread.url.clone()
+    } else {
+        String::new()
+    }
+}
+
+fn compact_snippet(s: &str, max_chars: usize) -> String {
+    let compact = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_chars(&compact, max_chars)
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let mut out: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        out.push_str("...");
+    }
+    out
 }
 
 /// One dashboard thread row.
@@ -1512,22 +1559,42 @@ fn render_composer(
     )
 }
 
-/// Resolve the effective parent id for a new comment, enforcing one-level nesting. Returns `""`
+/// Resolve the effective parent for a new comment, enforcing one-level nesting. Returns `None`
 /// (top-level) when `requested` is empty, missing, or points outside this thread. When the parent
-/// is itself a reply, re-parent onto the original top-level comment.
-async fn resolve_parent(state: &AppState, thread_id: &str, requested: &str) -> String {
+/// is itself a reply, re-parent onto the original top-level comment and carry its author for
+/// reply notifications.
+struct ResolvedParent {
+    id: String,
+    author_sub: String,
+}
+
+async fn resolve_parent(
+    state: &AppState,
+    thread_id: &str,
+    requested: &str,
+) -> Option<ResolvedParent> {
     if requested.is_empty() {
-        return String::new();
+        return None;
     }
     match state.store.get_comment(requested).await {
+        Some(p) if p.thread_id == thread_id && p.parent_id.is_empty() => Some(ResolvedParent {
+            id: p.id,
+            author_sub: p.author_sub,
+        }),
         Some(p) if p.thread_id == thread_id => {
-            if p.parent_id.is_empty() {
-                p.id
-            } else {
-                p.parent_id
+            let parent_id = p.parent_id.clone();
+            match state.store.get_comment(&parent_id).await {
+                Some(root) if root.thread_id == thread_id => Some(ResolvedParent {
+                    id: root.id,
+                    author_sub: root.author_sub,
+                }),
+                _ => Some(ResolvedParent {
+                    id: parent_id,
+                    author_sub: p.author_sub,
+                }),
             }
         }
-        _ => String::new(),
+        _ => None,
     }
 }
 
