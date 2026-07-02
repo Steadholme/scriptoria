@@ -551,6 +551,18 @@ body.page { max-width:none; margin:0; padding:0; }
 .version-actions { display: flex; gap: 8px; justify-content: flex-end; align-items: center; }
 .version-actions form { margin: 0; }
 
+/* ---- trash + comments ---------------------------------------------------- */
+.trash-note { margin: 12px 0 0; font-size: 12.5px; line-height: 1.5; }
+.trash-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+.trash-actions form { margin: 0; }
+.comment-list { list-style: none; margin: 8px 0 14px; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.comment-item { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px; background: var(--surface-2); }
+.comment-item__head { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 8px; font-size: 12px; }
+.comment-item__body { font-size: 13.5px; line-height: 1.55; color: var(--ink); word-break: break-word; }
+.comment-item__delete { margin: 10px 0 0; }
+.comment-form { margin-top: 12px; }
+.toast + .card { margin-top: 16px; }
+
 /* ---- public folder-share index page ------------------------------------- */
 .share-file-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
 .share-file {

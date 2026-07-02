@@ -55,6 +55,24 @@ pub struct FileRec {
     /// exactly the files whose `folder_id` matches; the root view lists the files whose `folder_id`
     /// IS NULL.
     pub folder_id: Option<String>,
+    /// Soft-delete marker, epoch seconds. `0` means live; a positive value means the file is in the
+    /// owner's trash. Trashed files stay in storage (and quota usage) until purged.
+    pub trashed_at: i64,
+}
+
+/// A single per-file comment. Bodies are display-only and always escaped at render time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileComment {
+    /// Short random id for delete forms.
+    pub id: String,
+    /// The commented file.
+    pub file_id: String,
+    /// Subject from `X-Auth-Subject` of the commenter.
+    pub author_sub: String,
+    /// Submitted comment body, trimmed and capped by the handler.
+    pub body: String,
+    /// Creation time, epoch seconds.
+    pub created_at: i64,
 }
 
 /// A single blob snapshot kept when a file is re-uploaded under the same name in the same folder.
@@ -120,6 +138,9 @@ pub struct FolderRec {
     pub expires_at: Option<i64>,
     /// Optional salted-hash of a folder-share password (`{salt}${sha256_hex}`). `None` = no password.
     pub share_password_hash: Option<String>,
+    /// Unguessable public upload-inbox token (`/u/{token}`) for anonymous uploads into this folder.
+    /// `None` means the upload inbox is disabled/revoked.
+    pub upload_token: Option<String>,
 }
 
 impl FileRec {
@@ -181,6 +202,7 @@ mod tests {
             expires_at,
             share_password_hash: None,
             folder_id: None,
+            trashed_at: 0,
         }
     }
 
@@ -195,6 +217,7 @@ mod tests {
             share_token: Some("t".into()),
             expires_at: Some(1000),
             share_password_hash: None,
+            upload_token: None,
         };
         assert!(!f.share_expired(999));
         assert!(f.share_expired(1000)); // inclusive

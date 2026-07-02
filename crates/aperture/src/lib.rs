@@ -17,7 +17,12 @@
 //! - `POST /f/{id}/versions/{vid}/restore` — restore a version as the current blob (CSRF) [SSO]
 //! - `GET /d/{id}/thumb` — gallery thumbnail: 302 to the full image, else a cached, mime-keyed type
 //!   icon derived + cached as a `{object_key}.thumb` blob (owner-only) [SSO]
-//! - `POST /delete/{id}` — delete your own file (blob + row + versions) -> 302 `/` (CSRF) [SSO]
+//! - `POST /delete/{id}` — move your own file to Trash -> 302 `/` (CSRF) [SSO]
+//! - `GET /?view=trash` — the owner's trash/recycle bin; restore or delete forever [SSO]
+//! - `POST /trash/{id}/restore` — restore a trashed file (CSRF) [SSO]
+//! - `POST /trash/{id}/purge` — delete a trashed file forever (CSRF) [SSO]
+//! - `POST /f/{id}/comments` — add a file comment (CSRF) [SSO]
+//! - `POST /f/{id}/comments/{cid}/delete` — owner/admin delete a file comment (CSRF) [SSO]
 //! - `POST /f/{id}/share` — set the share link's expiry + optional password (CSRF) [SSO]
 //! - `POST /f/{id}/revoke` — revoke the share link (clears the token) (CSRF) [SSO]
 //! - `POST /f/{id}/move` — move the file into a folder (or back to the root) (CSRF) [SSO]
@@ -29,6 +34,8 @@
 //!   subtree (subfolders + files + version blobs) (CSRF) [SSO]
 //! - `POST /folders/{id}/share` — set a folder's public share-link expiry + optional password (CSRF) [SSO]
 //! - `POST /folders/{id}/revoke` — revoke a folder's public share link (CSRF) [SSO]
+//! - `POST /folders/{id}/upload` — create a public upload-only request link (CSRF) [SSO]
+//! - `POST /folders/{id}/upload/revoke` — revoke a public upload request link (CSRF) [SSO]
 //! - `GET /admin` — per-owner storage usage + quota overrides (admin groups only) [SSO]
 //! - `POST /admin/quota` — set/clear an owner's quota override (CSRF) [SSO, admin]
 //! - `GET /s/{token}` — fetch a shared file by unguessable token, NO SSO (410 past expiry;
@@ -36,6 +43,7 @@
 //! - `POST /s/{token}` — submit a protected share link's password, NO SSO [PUBLIC `/s/` prefix]
 //! - `GET /s/folder/{token}` — public index of a shared folder's files; `POST` unlocks a protected one;
 //!   `GET|POST /s/folder/{token}/f/{fid}` downloads one listed file, NO SSO [PUBLIC `/s/folder/` prefix]
+//! - `GET|POST /u/{token}` — public upload-only inbox for a folder, NO SSO [PUBLIC `/u/` prefix]
 
 pub mod audit;
 pub mod auth;
@@ -92,14 +100,38 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/d/{id}/thumb", get(handlers::files::thumb))
         .route("/delete/{id}", post(handlers::files::delete))
+        .route(
+            "/trash/{id}/restore",
+            post(handlers::files::restore_trashed),
+        )
+        .route("/trash/{id}/purge", post(handlers::files::purge_trashed))
+        .route("/f/{id}/comments", post(handlers::files::add_comment))
+        .route(
+            "/f/{id}/comments/{cid}/delete",
+            post(handlers::files::delete_comment),
+        )
         .route("/f/{id}/share", post(handlers::files::configure_share))
         .route("/f/{id}/revoke", post(handlers::files::revoke_share))
         .route("/f/{id}/move", post(handlers::files::move_file))
         .route("/folders", post(handlers::files::create_folder))
         .route("/folders/{id}/rename", post(handlers::files::rename_folder))
         .route("/folders/{id}/delete", post(handlers::files::delete_folder))
-        .route("/folders/{id}/share", post(handlers::files::configure_folder_share))
-        .route("/folders/{id}/revoke", post(handlers::files::revoke_folder_share))
+        .route(
+            "/folders/{id}/share",
+            post(handlers::files::configure_folder_share),
+        )
+        .route(
+            "/folders/{id}/revoke",
+            post(handlers::files::revoke_folder_share),
+        )
+        .route(
+            "/folders/{id}/upload",
+            post(handlers::files::configure_folder_upload),
+        )
+        .route(
+            "/folders/{id}/upload/revoke",
+            post(handlers::files::revoke_folder_upload),
+        )
         .route(
             "/s/{token}",
             get(handlers::files::share).post(handlers::files::share_unlock),
@@ -111,6 +143,10 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/s/folder/{token}/f/{fid}",
             get(handlers::files::share_folder_file).post(handlers::files::share_folder_file_unlock),
+        )
+        .route(
+            "/u/{token}",
+            get(handlers::files::upload_inbox).post(handlers::files::upload_inbox_submit),
         )
         .merge(admin_router())
         .layer(DefaultBodyLimit::max(body_limit))
@@ -196,7 +232,11 @@ pub async fn build_state_from_env() -> Result<AppState, String> {
             Arc::new(pg)
         }
         "memory" => Arc::new(InMemoryStore::new()),
-        other => return Err(format!("unknown APERTURE_STORE={other} (use memory|postgres)")),
+        other => {
+            return Err(format!(
+                "unknown APERTURE_STORE={other} (use memory|postgres)"
+            ))
+        }
     };
 
     let blobs_kind = std::env::var("APERTURE_BLOBS").unwrap_or_else(|_| "memory".to_string());

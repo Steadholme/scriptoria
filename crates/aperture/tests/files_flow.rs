@@ -64,7 +64,9 @@ async fn send(app: &axum::Router, req: Request<Body>) -> Resp {
     let res = app.clone().oneshot(req).await.unwrap();
     let status = res.status();
     let headers = res.headers().clone();
-    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
     Resp {
         status,
         headers,
@@ -101,7 +103,14 @@ fn multipart(csrf: &str, filename: &str, content_type: &str, data: &[u8]) -> Vec
     body
 }
 
-fn upload_req(csrf: &str, cookie: &str, subject: &str, filename: &str, ctype: &str, data: &[u8]) -> Request<Body> {
+fn upload_req(
+    csrf: &str,
+    cookie: &str,
+    subject: &str,
+    filename: &str,
+    ctype: &str,
+    data: &[u8],
+) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri("/upload")
@@ -118,7 +127,13 @@ fn upload_req(csrf: &str, cookie: &str, subject: &str, filename: &str, ctype: &s
 
 /// A `multipart/form-data` upload body carrying a `csrf_token`, a `folder_id` (the target level),
 /// then the `file` field — the gallery form's exact shape when uploading inside a folder.
-fn multipart_folder(csrf: &str, folder: &str, filename: &str, content_type: &str, data: &[u8]) -> Vec<u8> {
+fn multipart_folder(
+    csrf: &str,
+    folder: &str,
+    filename: &str,
+    content_type: &str,
+    data: &[u8],
+) -> Vec<u8> {
     let mut body: Vec<u8> = Vec::new();
     body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
     body.extend_from_slice(b"Content-Disposition: form-data; name=\"csrf_token\"\r\n\r\n");
@@ -159,7 +174,29 @@ fn upload_req_folder(
         .header(header::COOKIE, format!("__Host-csrf={cookie}"))
         .header("x-auth-subject", subject)
         .header("x-auth-email", format!("{subject}@w33d.xyz"))
-        .body(Body::from(multipart_folder(csrf, folder, filename, ctype, data)))
+        .body(Body::from(multipart_folder(
+            csrf, folder, filename, ctype, data,
+        )))
+        .unwrap()
+}
+
+fn public_upload_req(
+    csrf: &str,
+    cookie: &str,
+    token: &str,
+    filename: &str,
+    ctype: &str,
+    data: &[u8],
+) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(format!("/u/{token}"))
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .header(header::COOKIE, format!("__Host-csrf={cookie}"))
+        .body(Body::from(multipart(csrf, filename, ctype, data)))
         .unwrap()
 }
 
@@ -205,22 +242,24 @@ async fn share_expiry_returns_410_after_expiry() {
     let store: Arc<dyn Store> = state.store.clone();
     let app = app(state);
     let (id, csrf) = upload_png(&app, "alice").await;
-    let token = store
-        .get(&id)
-        .await
-        .unwrap()
-        .unwrap()
-        .share_token
-        .unwrap();
+    let token = store.get(&id).await.unwrap().unwrap().share_token.unwrap();
 
     // Configure an expiry 1 hour out -> the public link still serves.
     let set = send(
         &app,
-        post_form(&format!("/f/{id}/share"), &csrf, "alice", format!("csrf_token={csrf}&expiry=3600")),
+        post_form(
+            &format!("/f/{id}/share"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&expiry=3600"),
+        ),
     )
     .await;
     assert_eq!(set.status, StatusCode::FOUND);
-    assert_eq!(send(&app, get(&format!("/s/{token}"), None)).await.status, StatusCode::OK);
+    assert_eq!(
+        send(&app, get(&format!("/s/{token}"), None)).await.status,
+        StatusCode::OK
+    );
 
     // Force the stored expiry into the past; the public fetch is now 410 Gone.
     store
@@ -230,7 +269,12 @@ async fn share_expiry_returns_410_after_expiry() {
     let gone = send(&app, get(&format!("/s/{token}"), None)).await;
     assert_eq!(gone.status, StatusCode::GONE);
     // The owner still reaches the file over SSO regardless of the share expiry.
-    assert_eq!(send(&app, get(&format!("/f/{id}/raw"), Some("alice"))).await.status, StatusCode::OK);
+    assert_eq!(
+        send(&app, get(&format!("/f/{id}/raw"), Some("alice")))
+            .await
+            .status,
+        StatusCode::OK
+    );
 }
 
 #[tokio::test]
@@ -261,12 +305,20 @@ async fn share_password_prompts_then_serves() {
     assert_ne!(prompt.body, png_bytes());
 
     // Wrong password -> 401 + prompt again.
-    let wrong = send(&app, post_public(&format!("/s/{token}"), "password=nope".to_string())).await;
+    let wrong = send(
+        &app,
+        post_public(&format!("/s/{token}"), "password=nope".to_string()),
+    )
+    .await;
     assert_eq!(wrong.status, StatusCode::UNAUTHORIZED);
     assert!(wrong.text().contains("Incorrect password"));
 
     // Correct password -> the bytes.
-    let ok = send(&app, post_public(&format!("/s/{token}"), "password=hunter2".to_string())).await;
+    let ok = send(
+        &app,
+        post_public(&format!("/s/{token}"), "password=hunter2".to_string()),
+    )
+    .await;
     assert_eq!(ok.status, StatusCode::OK);
     assert_eq!(ok.body, png_bytes());
 }
@@ -280,17 +332,28 @@ async fn share_revoke_clears_the_token() {
     let token = store.get(&id).await.unwrap().unwrap().share_token.unwrap();
 
     // The link works before revoke.
-    assert_eq!(send(&app, get(&format!("/s/{token}"), None)).await.status, StatusCode::OK);
+    assert_eq!(
+        send(&app, get(&format!("/s/{token}"), None)).await.status,
+        StatusCode::OK
+    );
 
     // Revoke -> 302, token cleared in the store, outstanding link now 404.
     let rev = send(
         &app,
-        post_form(&format!("/f/{id}/revoke"), &csrf, "alice", format!("csrf_token={csrf}")),
+        post_form(
+            &format!("/f/{id}/revoke"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
     )
     .await;
     assert_eq!(rev.status, StatusCode::FOUND);
     assert!(store.get(&id).await.unwrap().unwrap().share_token.is_none());
-    assert_eq!(send(&app, get(&format!("/s/{token}"), None)).await.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        send(&app, get(&format!("/s/{token}"), None)).await.status,
+        StatusCode::NOT_FOUND
+    );
 
     // The detail page now offers to create a new link; doing so mints a fresh, working token.
     let detail = send(&app, get(&format!("/f/{id}"), Some("alice"))).await;
@@ -298,12 +361,22 @@ async fn share_revoke_clears_the_token() {
     let csrf2 = detail.csrf_cookie().unwrap();
     send(
         &app,
-        post_form(&format!("/f/{id}/share"), &csrf2, "alice", format!("csrf_token={csrf2}&expiry=never")),
+        post_form(
+            &format!("/f/{id}/share"),
+            &csrf2,
+            "alice",
+            format!("csrf_token={csrf2}&expiry=never"),
+        ),
     )
     .await;
     let new_token = store.get(&id).await.unwrap().unwrap().share_token.unwrap();
     assert_ne!(new_token, token);
-    assert_eq!(send(&app, get(&format!("/s/{new_token}"), None)).await.status, StatusCode::OK);
+    assert_eq!(
+        send(&app, get(&format!("/s/{new_token}"), None))
+            .await
+            .status,
+        StatusCode::OK
+    );
 }
 
 #[tokio::test]
@@ -314,7 +387,12 @@ async fn share_config_requires_csrf() {
     // Wrong CSRF token field vs. cookie -> rejected.
     let bad = send(
         &app,
-        post_form(&format!("/f/{id}/share"), &csrf, "alice", "csrf_token=wrong&expiry=3600".to_string()),
+        post_form(
+            &format!("/f/{id}/share"),
+            &csrf,
+            "alice",
+            "csrf_token=wrong&expiry=3600".to_string(),
+        ),
     )
     .await;
     assert_eq!(bad.status, StatusCode::BAD_REQUEST);
@@ -330,7 +408,12 @@ async fn share_config_is_owner_scoped() {
     let bob_csrf = bob_home.csrf_cookie().unwrap();
     let res = send(
         &app,
-        post_form(&format!("/f/{id}/share"), &bob_csrf, "bob", format!("csrf_token={bob_csrf}&expiry=3600")),
+        post_form(
+            &format!("/f/{id}/share"),
+            &bob_csrf,
+            "bob",
+            format!("csrf_token={bob_csrf}&expiry=3600"),
+        ),
     )
     .await;
     assert_eq!(res.status, StatusCode::FORBIDDEN);
@@ -354,7 +437,14 @@ async fn upload_detail_raw_share_delete_lifecycle() {
     let png = png_bytes();
     let created = send(
         &app,
-        upload_req(&csrf, &csrf, "alice", "screenshot.png", "application/octet-stream", &png),
+        upload_req(
+            &csrf,
+            &csrf,
+            "alice",
+            "screenshot.png",
+            "application/octet-stream",
+            &png,
+        ),
     )
     .await;
     assert_eq!(created.status, StatusCode::FOUND, "{}", created.text());
@@ -364,7 +454,10 @@ async fn upload_detail_raw_share_delete_lifecycle() {
 
     // The metadata row + blob both exist; the content type was sniffed to image/png.
     let rec = store.get(&id).await.unwrap().expect("metadata row");
-    let token = rec.share_token.clone().expect("fresh upload has a share token");
+    let token = rec
+        .share_token
+        .clone()
+        .expect("fresh upload has a share token");
     assert_eq!(rec.owner_sub, "alice");
     assert_eq!(rec.name, "screenshot.png");
     assert_eq!(rec.content_type, "image/png");
@@ -382,7 +475,9 @@ async fn upload_detail_raw_share_delete_lifecycle() {
     let raw = send(&app, get(&format!("/f/{id}/raw"), Some("alice"))).await;
     assert_eq!(raw.status, StatusCode::OK);
     assert_eq!(raw.header(header::CONTENT_TYPE), "image/png");
-    assert!(raw.header(header::CONTENT_DISPOSITION).starts_with("inline"));
+    assert!(raw
+        .header(header::CONTENT_DISPOSITION)
+        .starts_with("inline"));
     assert_eq!(raw.header(header::X_CONTENT_TYPE_OPTIONS), "nosniff");
     assert_eq!(raw.body, png);
 
@@ -396,30 +491,54 @@ async fn upload_detail_raw_share_delete_lifecycle() {
     assert_eq!(shared.status, StatusCode::OK);
     assert_eq!(shared.body, png);
 
-    // Delete it (CSRF-checked) -> 302 / ; metadata + blob both gone.
+    // Delete it (CSRF-checked) -> 302 / ; metadata + blob remain in Trash.
     let csrf2 = detail.csrf_cookie().expect("csrf on detail page");
     let del = send(
         &app,
-        Request::builder()
-            .method("POST")
-            .uri(format!("/delete/{id}"))
-            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .header(header::COOKIE, format!("__Host-csrf={csrf2}"))
-            .header("x-auth-subject", "alice")
-            .header("x-auth-email", "alice@w33d.xyz")
-            .body(Body::from(format!("csrf_token={csrf2}")))
-            .unwrap(),
+        post_form(
+            &format!("/delete/{id}"),
+            &csrf2,
+            "alice",
+            format!("csrf_token={csrf2}"),
+        ),
     )
     .await;
     assert_eq!(del.status, StatusCode::FOUND);
     assert_eq!(del.location(), "/");
-    assert!(store.get(&id).await.unwrap().is_none());
-    assert!(blobs.get(&rec.object_key).await.is_err());
+    let trashed = store
+        .get(&id)
+        .await
+        .unwrap()
+        .expect("metadata stays until purge");
+    assert!(trashed.trashed_at > 0);
+    assert_eq!(blobs.get(&rec.object_key).await.unwrap(), png);
 
+    // Normal surfaces hide trashed files, and the public share link stops serving.
     let gone = send(&app, get(&loc, Some("alice"))).await;
     assert_eq!(gone.status, StatusCode::NOT_FOUND);
+    let hidden = send(&app, get("/", Some("alice"))).await;
+    assert!(!hidden.text().contains("screenshot.png"));
+    let trash = send(&app, get("/?view=trash", Some("alice"))).await;
+    assert_eq!(trash.status, StatusCode::OK);
+    assert!(trash.text().contains("screenshot.png"));
+    assert!(trash.text().contains("Delete forever"));
     let share_gone = send(&app, get(&format!("/s/{token}"), None)).await;
     assert_eq!(share_gone.status, StatusCode::NOT_FOUND);
+
+    // Delete forever purges metadata and blob.
+    let purge = send(
+        &app,
+        post_form(
+            &format!("/trash/{id}/purge"),
+            &csrf2,
+            "alice",
+            format!("csrf_token={csrf2}"),
+        ),
+    )
+    .await;
+    assert_eq!(purge.status, StatusCode::FOUND);
+    assert!(store.get(&id).await.unwrap().is_none());
+    assert!(blobs.get(&rec.object_key).await.is_err());
 }
 
 #[tokio::test]
@@ -432,7 +551,14 @@ async fn ownership_is_enforced_with_403() {
     let csrf = home.csrf_cookie().unwrap();
     let created = send(
         &app,
-        upload_req(&csrf, &csrf, "alice", "secret.png", "image/png", &png_bytes()),
+        upload_req(
+            &csrf,
+            &csrf,
+            "alice",
+            "secret.png",
+            "image/png",
+            &png_bytes(),
+        ),
     )
     .await;
     let id = created.location().trim_start_matches("/f/").to_string();
@@ -475,7 +601,14 @@ async fn non_image_is_served_as_download() {
     // A PDF-looking payload is NOT a sniffed raster image -> attachment + octet-stream.
     let created = send(
         &app,
-        upload_req(&csrf, &csrf, "alice", "notes.pdf", "application/pdf", b"%PDF-1.7\n...content..."),
+        upload_req(
+            &csrf,
+            &csrf,
+            "alice",
+            "notes.pdf",
+            "application/pdf",
+            b"%PDF-1.7\n...content...",
+        ),
     )
     .await;
     let id = created.location().trim_start_matches("/f/").to_string();
@@ -483,8 +616,12 @@ async fn non_image_is_served_as_download() {
     let raw = send(&app, get(&format!("/f/{id}/raw"), Some("alice"))).await;
     assert_eq!(raw.status, StatusCode::OK);
     assert_eq!(raw.header(header::CONTENT_TYPE), "application/octet-stream");
-    assert!(raw.header(header::CONTENT_DISPOSITION).starts_with("attachment"));
-    assert!(raw.header(header::CONTENT_DISPOSITION).contains("notes.pdf"));
+    assert!(raw
+        .header(header::CONTENT_DISPOSITION)
+        .starts_with("attachment"));
+    assert!(raw
+        .header(header::CONTENT_DISPOSITION)
+        .contains("notes.pdf"));
 }
 
 #[tokio::test]
@@ -493,7 +630,14 @@ async fn csrf_is_required_on_upload() {
     // No matching cookie -> rejected before anything is stored.
     let bad = send(
         &app,
-        upload_req("totally-wrong", "the-cookie-value", "alice", "x.png", "image/png", &png_bytes()),
+        upload_req(
+            "totally-wrong",
+            "the-cookie-value",
+            "alice",
+            "x.png",
+            "image/png",
+            &png_bytes(),
+        ),
     )
     .await;
     assert_eq!(bad.status, StatusCode::BAD_REQUEST);
@@ -517,7 +661,14 @@ async fn oversized_upload_is_rejected() {
     let big = vec![b'a'; 64];
     let res = send(
         &app,
-        upload_req(&csrf, &csrf, "alice", "big.bin", "application/octet-stream", &big),
+        upload_req(
+            &csrf,
+            &csrf,
+            "alice",
+            "big.bin",
+            "application/octet-stream",
+            &big,
+        ),
     )
     .await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST);
@@ -531,7 +682,14 @@ async fn empty_upload_is_rejected() {
     let csrf = home.csrf_cookie().unwrap();
     let res = send(
         &app,
-        upload_req(&csrf, &csrf, "alice", "empty.bin", "application/octet-stream", b""),
+        upload_req(
+            &csrf,
+            &csrf,
+            "alice",
+            "empty.bin",
+            "application/octet-stream",
+            b"",
+        ),
     )
     .await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST);
@@ -566,7 +724,11 @@ async fn gallery_paginates_backward_with_before_cursor() {
 
     // Three files for alice.
     for n in ["one.png", "two.png", "three.png"] {
-        let up = send(&app, upload_req(&csrf, &csrf, "alice", n, "image/png", &png_bytes())).await;
+        let up = send(
+            &app,
+            upload_req(&csrf, &csrf, "alice", n, "image/png", &png_bytes()),
+        )
+        .await;
         assert_eq!(up.status, StatusCode::FOUND, "{}", up.text());
     }
 
@@ -578,11 +740,18 @@ async fn gallery_paginates_backward_with_before_cursor() {
     let before = extract_before(&p1.text()).expect("Load older link on a full page");
 
     // Follow the cursor -> the remaining file, and NO further pager (partial page).
-    let p2 = send(&app, get(&format!("/?limit=2&before={before}"), Some("alice"))).await;
+    let p2 = send(
+        &app,
+        get(&format!("/?limit=2&before={before}"), Some("alice")),
+    )
+    .await;
     assert_eq!(p2.status, StatusCode::OK);
     let p2_ids = card_ids(&p2.text());
     assert_eq!(p2_ids.len(), 1, "the second page holds the remainder");
-    assert!(extract_before(&p2.text()).is_none(), "no pager on a non-full page");
+    assert!(
+        extract_before(&p2.text()).is_none(),
+        "no pager on a non-full page"
+    );
 
     // The two pages are disjoint and together cover all three distinct files.
     let mut all = p1_ids;
@@ -594,8 +763,15 @@ async fn gallery_paginates_backward_with_before_cursor() {
     // Backward compatible: the default view (no ?before, no ?limit) still returns the newest page.
     let def = send(&app, get("/", Some("alice"))).await;
     assert_eq!(def.status, StatusCode::OK);
-    assert_eq!(card_ids(&def.text()).len(), 3, "default page shows all files under the cap");
-    assert!(extract_before(&def.text()).is_none(), "no pager when everything fits");
+    assert_eq!(
+        card_ids(&def.text()).len(),
+        3,
+        "default page shows all files under the cap"
+    );
+    assert!(
+        extract_before(&def.text()).is_none(),
+        "no pager when everything fits"
+    );
 }
 
 /// Extract the folder id from a `302 /?folder={id}` create/rename redirect Location.
@@ -611,13 +787,22 @@ async fn folder_create_move_filter_and_delete_lifecycle() {
 
     // Two files for alice.
     let (id_a, csrf) = upload_png(&app, "alice").await;
-    let up_b = send(&app, upload_req(&csrf, &csrf, "alice", "b.png", "image/png", &png_bytes())).await;
+    let up_b = send(
+        &app,
+        upload_req(&csrf, &csrf, "alice", "b.png", "image/png", &png_bytes()),
+    )
+    .await;
     let id_b = up_b.location().trim_start_matches("/f/").to_string();
 
     // Create a folder -> 302 /?folder={fid}.
     let made = send(
         &app,
-        post_form("/folders", &csrf, "alice", format!("csrf_token={csrf}&name=Trips")),
+        post_form(
+            "/folders",
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&name=Trips"),
+        ),
     )
     .await;
     assert_eq!(made.status, StatusCode::FOUND);
@@ -630,16 +815,34 @@ async fn folder_create_move_filter_and_delete_lifecycle() {
     assert!(home.text().contains(&format!("/?folder={fid}")));
     let folder_view = send(&app, get(&format!("/?folder={fid}"), Some("alice"))).await;
     assert_eq!(folder_view.status, StatusCode::OK);
-    assert_eq!(card_ids(&folder_view.text()).len(), 0, "new folder is empty");
+    assert_eq!(
+        card_ids(&folder_view.text()).len(),
+        0,
+        "new folder is empty"
+    );
 
     // Move file A into the folder (CSRF-checked) -> 302 /f/{id_a}.
     let moved = send(
         &app,
-        post_form(&format!("/f/{id_a}/move"), &csrf, "alice", format!("csrf_token={csrf}&folder_id={fid}")),
+        post_form(
+            &format!("/f/{id_a}/move"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&folder_id={fid}"),
+        ),
     )
     .await;
     assert_eq!(moved.status, StatusCode::FOUND);
-    assert_eq!(store.get(&id_a).await.unwrap().unwrap().folder_id.as_deref(), Some(fid.as_str()));
+    assert_eq!(
+        store
+            .get(&id_a)
+            .await
+            .unwrap()
+            .unwrap()
+            .folder_id
+            .as_deref(),
+        Some(fid.as_str())
+    );
 
     // The folder view now lists only A; the ROOT view now lists only B (A left the root — a tree).
     let fv = send(&app, get(&format!("/?folder={fid}"), Some("alice"))).await;
@@ -647,41 +850,74 @@ async fn folder_create_move_filter_and_delete_lifecycle() {
     // The folder view breadcrumb names the folder.
     assert!(fv.text().contains("breadcrumb"));
     let flat = send(&app, get("/", Some("alice"))).await;
-    assert_eq!(card_ids(&flat.text()), vec![id_b.clone()], "root shows only unfiled files");
+    assert_eq!(
+        card_ids(&flat.text()),
+        vec![id_b.clone()],
+        "root shows only unfiled files"
+    );
 
     // Rename the folder.
     let renamed = send(
         &app,
-        post_form(&format!("/folders/{fid}/rename"), &csrf, "alice", format!("csrf_token={csrf}&name=Vacations")),
+        post_form(
+            &format!("/folders/{fid}/rename"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&name=Vacations"),
+        ),
     )
     .await;
     assert_eq!(renamed.status, StatusCode::FOUND);
-    assert_eq!(store.get_folder(&fid, "alice").await.unwrap().unwrap().name, "Vacations");
+    assert_eq!(
+        store.get_folder(&fid, "alice").await.unwrap().unwrap().name,
+        "Vacations"
+    );
 
     // Deleting a NON-empty folder (A is inside) is refused (400) — empty-only unless cascading.
     let refused = send(
         &app,
-        post_form(&format!("/folders/{fid}/delete"), &csrf, "alice", format!("csrf_token={csrf}")),
+        post_form(
+            &format!("/folders/{fid}/delete"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
     )
     .await;
     assert_eq!(refused.status, StatusCode::BAD_REQUEST);
-    assert!(store.get_folder(&fid, "alice").await.unwrap().is_some(), "refused delete kept the folder");
+    assert!(
+        store.get_folder(&fid, "alice").await.unwrap().is_some(),
+        "refused delete kept the folder"
+    );
 
     // Move A back to the root, then the now-empty folder deletes -> 302 to its parent (root).
     send(
         &app,
-        post_form(&format!("/f/{id_a}/move"), &csrf, "alice", format!("csrf_token={csrf}&folder_id=")),
+        post_form(
+            &format!("/f/{id_a}/move"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&folder_id="),
+        ),
     )
     .await;
     let deleted = send(
         &app,
-        post_form(&format!("/folders/{fid}/delete"), &csrf, "alice", format!("csrf_token={csrf}")),
+        post_form(
+            &format!("/folders/{fid}/delete"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
     )
     .await;
     assert_eq!(deleted.status, StatusCode::FOUND);
     assert_eq!(deleted.location(), "/");
     assert!(store.get_folder(&fid, "alice").await.unwrap().is_none());
-    assert!(store.get(&id_a).await.unwrap().unwrap().folder_id.is_none(), "file kept at root");
+    assert!(
+        store.get(&id_a).await.unwrap().unwrap().folder_id.is_none(),
+        "file kept at root"
+    );
 }
 
 #[tokio::test]
@@ -694,7 +930,12 @@ async fn folder_actions_are_owner_scoped_and_csrf_checked() {
     let (id_a, csrf) = upload_png(&app, "alice").await;
     let made = send(
         &app,
-        post_form("/folders", &csrf, "alice", format!("csrf_token={csrf}&name=Private")),
+        post_form(
+            "/folders",
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&name=Private"),
+        ),
     )
     .await;
     let fid = folder_from_location(&made.location());
@@ -702,7 +943,12 @@ async fn folder_actions_are_owner_scoped_and_csrf_checked() {
     // Wrong CSRF is rejected on folder create.
     let bad_csrf = send(
         &app,
-        post_form("/folders", &csrf, "alice", "csrf_token=wrong&name=X".to_string()),
+        post_form(
+            "/folders",
+            &csrf,
+            "alice",
+            "csrf_token=wrong&name=X".to_string(),
+        ),
     )
     .await;
     assert_eq!(bad_csrf.status, StatusCode::BAD_REQUEST);
@@ -710,7 +956,12 @@ async fn folder_actions_are_owner_scoped_and_csrf_checked() {
     // A blank name is rejected.
     let blank = send(
         &app,
-        post_form("/folders", &csrf, "alice", format!("csrf_token={csrf}&name=%20")),
+        post_form(
+            "/folders",
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&name=%20"),
+        ),
     )
     .await;
     assert_eq!(blank.status, StatusCode::BAD_REQUEST);
@@ -720,32 +971,72 @@ async fn folder_actions_are_owner_scoped_and_csrf_checked() {
     let bob_csrf = bob_home.csrf_cookie().unwrap();
     let bob_rename = send(
         &app,
-        post_form(&format!("/folders/{fid}/rename"), &bob_csrf, "bob", format!("csrf_token={bob_csrf}&name=Hax")),
+        post_form(
+            &format!("/folders/{fid}/rename"),
+            &bob_csrf,
+            "bob",
+            format!("csrf_token={bob_csrf}&name=Hax"),
+        ),
     )
     .await;
     assert_eq!(bob_rename.status, StatusCode::NOT_FOUND);
-    assert_eq!(store.get_folder(&fid, "alice").await.unwrap().unwrap().name, "Private");
+    assert_eq!(
+        store.get_folder(&fid, "alice").await.unwrap().unwrap().name,
+        "Private"
+    );
 
     // Moving a file into a folder the actor does not own is a 404 (and leaves the file unfiled).
-    let bob_up = send(&app, upload_req(&bob_csrf, &bob_csrf, "bob", "b.png", "image/png", &png_bytes())).await;
+    let bob_up = send(
+        &app,
+        upload_req(
+            &bob_csrf,
+            &bob_csrf,
+            "bob",
+            "b.png",
+            "image/png",
+            &png_bytes(),
+        ),
+    )
+    .await;
     let bob_file = bob_up.location().trim_start_matches("/f/").to_string();
     let cross = send(
         &app,
-        post_form(&format!("/f/{bob_file}/move"), &bob_csrf, "bob", format!("csrf_token={bob_csrf}&folder_id={fid}")),
+        post_form(
+            &format!("/f/{bob_file}/move"),
+            &bob_csrf,
+            "bob",
+            format!("csrf_token={bob_csrf}&folder_id={fid}"),
+        ),
     )
     .await;
     assert_eq!(cross.status, StatusCode::NOT_FOUND);
-    assert!(store.get(&bob_file).await.unwrap().unwrap().folder_id.is_none());
+    assert!(store
+        .get(&bob_file)
+        .await
+        .unwrap()
+        .unwrap()
+        .folder_id
+        .is_none());
 
     // Alice can move her file back to root with a blank target.
     send(
         &app,
-        post_form(&format!("/f/{id_a}/move"), &csrf, "alice", format!("csrf_token={csrf}&folder_id={fid}")),
+        post_form(
+            &format!("/f/{id_a}/move"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&folder_id={fid}"),
+        ),
     )
     .await;
     let to_root = send(
         &app,
-        post_form(&format!("/f/{id_a}/move"), &csrf, "alice", format!("csrf_token={csrf}&folder_id=")),
+        post_form(
+            &format!("/f/{id_a}/move"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&folder_id="),
+        ),
     )
     .await;
     assert_eq!(to_root.status, StatusCode::FOUND);
@@ -781,13 +1072,143 @@ async fn filename_xss_is_escaped_on_render() {
     assert!(detail.text().contains("&lt;img src=x"));
 }
 
+#[tokio::test]
+async fn trash_restore_and_purge_lifecycle() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let blobs: Arc<dyn Blobs> = state.blobs.clone();
+    let app = app(state);
+    let (id, csrf) = upload_png(&app, "alice").await;
+    let rec = store.get(&id).await.unwrap().unwrap();
+    let token = rec.share_token.clone().unwrap();
+
+    let del = send(
+        &app,
+        post_form(
+            &format!("/delete/{id}"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(del.status, StatusCode::FOUND);
+    assert!(store.get(&id).await.unwrap().unwrap().trashed_at > 0);
+    assert_eq!(store.usage_for_owner("alice").await.unwrap(), rec.size);
+    assert!(send(&app, get("/", Some("alice")))
+        .await
+        .text()
+        .contains("No files yet"));
+    assert_eq!(
+        send(&app, get(&format!("/s/{token}"), None)).await.status,
+        StatusCode::NOT_FOUND
+    );
+
+    let restore = send(
+        &app,
+        post_form(
+            &format!("/trash/{id}/restore"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(restore.status, StatusCode::FOUND);
+    assert_eq!(store.get(&id).await.unwrap().unwrap().trashed_at, 0);
+    assert_eq!(
+        send(&app, get(&format!("/f/{id}"), Some("alice")))
+            .await
+            .status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(&app, get(&format!("/s/{token}"), None)).await.status,
+        StatusCode::OK
+    );
+
+    send(
+        &app,
+        post_form(
+            &format!("/delete/{id}"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
+    )
+    .await;
+    let purge = send(
+        &app,
+        post_form(
+            &format!("/trash/{id}/purge"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(purge.status, StatusCode::FOUND);
+    assert!(store.get(&id).await.unwrap().is_none());
+    assert!(blobs.get(&rec.object_key).await.is_err());
+    assert_eq!(store.usage_for_owner("alice").await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn file_comments_are_escaped_and_owner_or_admin_delete() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let (id, csrf) = upload_png(&app, "alice").await;
+
+    let add = send(
+        &app,
+        post_form(
+            &format!("/f/{id}/comments"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&body=%3Cscript%3Ealert(1)%3C%2Fscript%3E%0Ahello"),
+        ),
+    )
+    .await;
+    assert_eq!(add.status, StatusCode::FOUND);
+    let detail = send(&app, get(&format!("/f/{id}"), Some("alice"))).await;
+    assert!(detail
+        .text()
+        .contains("&lt;script&gt;alert(1)&lt;/script&gt;<br>hello"));
+    assert!(!detail.text().contains("<script>alert(1)</script>"));
+
+    let comment = store.list_comments(&id).await.unwrap().pop().unwrap();
+    let admin_panel = send(&app, get_with_groups("/admin", "root", "admins")).await;
+    let admin_csrf = admin_panel.csrf_cookie().unwrap();
+    let deleted = send(
+        &app,
+        post_form_with_groups(
+            &format!("/f/{id}/comments/{}/delete", comment.id),
+            &admin_csrf,
+            "root",
+            "admins",
+            format!("csrf_token={admin_csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::FOUND);
+    assert!(store.list_comments(&id).await.unwrap().is_empty());
+}
+
 /// Upload a non-image file as `subject`, returning its `/f/{id}` id plus the CSRF token.
 async fn upload_pdf(app: &axum::Router, subject: &str) -> (String, String) {
     let home = send(app, get("/", Some(subject))).await;
     let csrf = home.csrf_cookie().expect("csrf cookie");
     let created = send(
         app,
-        upload_req(&csrf, &csrf, subject, "notes.pdf", "application/pdf", b"%PDF-1.7\n...content..."),
+        upload_req(
+            &csrf,
+            &csrf,
+            subject,
+            "notes.pdf",
+            "application/pdf",
+            b"%PDF-1.7\n...content...",
+        ),
     )
     .await;
     assert_eq!(created.status, StatusCode::FOUND, "{}", created.text());
@@ -824,13 +1245,21 @@ async fn thumb_serves_and_caches_svg_type_icon_for_non_image() {
     assert_eq!(thumb.status, StatusCode::OK);
     assert_eq!(thumb.header(header::CONTENT_TYPE), "image/svg+xml");
     assert_eq!(thumb.header(header::X_CONTENT_TYPE_OPTIONS), "nosniff");
-    assert!(thumb.header(header::CONTENT_SECURITY_POLICY).contains("default-src 'none'"));
+    assert!(thumb
+        .header(header::CONTENT_SECURITY_POLICY)
+        .contains("default-src 'none'"));
     let body = thumb.text();
     assert!(body.starts_with("<svg"));
-    assert!(body.contains(">PDF<"), "type icon bakes the uppercase extension label");
+    assert!(
+        body.contains(">PDF<"),
+        "type icon bakes the uppercase extension label"
+    );
 
     // The derived thumbnail is now cached as a `{id}.thumb` blob, and re-requesting serves it again.
-    assert_eq!(blobs.get(&format!("{id}.thumb")).await.unwrap(), body.as_bytes());
+    assert_eq!(
+        blobs.get(&format!("{id}.thumb")).await.unwrap(),
+        body.as_bytes()
+    );
     let again = send(&app, get(&format!("/d/{id}/thumb"), Some("alice"))).await;
     assert_eq!(again.status, StatusCode::OK);
     assert_eq!(again.text(), body, "cached thumbnail is deterministic");
@@ -919,19 +1348,38 @@ async fn quota_allows_exactly_at_boundary_and_rejects_over() {
     let csrf = home.csrf_cookie().unwrap();
 
     // used(0) + size == quota -> allowed (exactly at the boundary).
-    let first = send(&app, upload_req(&csrf, &csrf, "alice", "a.png", "image/png", &png)).await;
+    let first = send(
+        &app,
+        upload_req(&csrf, &csrf, "alice", "a.png", "image/png", &png),
+    )
+    .await;
     assert_eq!(first.status, StatusCode::FOUND, "{}", first.text());
 
     // used(quota) + size > quota -> 413, rejected BEFORE anything is stored.
-    let second = send(&app, upload_req(&csrf, &csrf, "alice", "b.png", "image/png", &png)).await;
+    let second = send(
+        &app,
+        upload_req(&csrf, &csrf, "alice", "b.png", "image/png", &png),
+    )
+    .await;
     assert_eq!(second.status, StatusCode::PAYLOAD_TOO_LARGE);
     assert!(second.text().contains("Not enough storage"));
-    assert_eq!(store.list_by_owner("alice", None, None, 50).await.unwrap().len(), 1);
+    assert_eq!(
+        store
+            .list_by_owner("alice", None, None, 50)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 
     // Quotas are per-owner: bob still has his own full quota.
     let bob_home = send(&app, get("/", Some("bob"))).await;
     let bob_csrf = bob_home.csrf_cookie().unwrap();
-    let bob = send(&app, upload_req(&bob_csrf, &bob_csrf, "bob", "c.png", "image/png", &png)).await;
+    let bob = send(
+        &app,
+        upload_req(&bob_csrf, &bob_csrf, "bob", "c.png", "image/png", &png),
+    )
+    .await;
     assert_eq!(bob.status, StatusCode::FOUND);
 }
 
@@ -944,22 +1392,41 @@ async fn quota_override_beats_default() {
     let app = app(state);
     let home = send(&app, get("/", Some("alice"))).await;
     let csrf = home.csrf_cookie().unwrap();
-    let capped = send(&app, upload_req(&csrf, &csrf, "alice", "a.png", "image/png", &png)).await;
+    let capped = send(
+        &app,
+        upload_req(&csrf, &csrf, "alice", "a.png", "image/png", &png),
+    )
+    .await;
     assert_eq!(capped.status, StatusCode::PAYLOAD_TOO_LARGE);
 
     // ...an override row lifts alice above it...
-    store.set_quota("alice", Some(10 * png.len() as i64)).await.unwrap();
-    let lifted = send(&app, upload_req(&csrf, &csrf, "alice", "a.png", "image/png", &png)).await;
+    store
+        .set_quota("alice", Some(10 * png.len() as i64))
+        .await
+        .unwrap();
+    let lifted = send(
+        &app,
+        upload_req(&csrf, &csrf, "alice", "a.png", "image/png", &png),
+    )
+    .await;
     assert_eq!(lifted.status, StatusCode::FOUND, "{}", lifted.text());
 
     // ...clearing it drops her back to the default...
     store.set_quota("alice", None).await.unwrap();
-    let back = send(&app, upload_req(&csrf, &csrf, "alice", "b.png", "image/png", &png)).await;
+    let back = send(
+        &app,
+        upload_req(&csrf, &csrf, "alice", "b.png", "image/png", &png),
+    )
+    .await;
     assert_eq!(back.status, StatusCode::PAYLOAD_TOO_LARGE);
 
     // ...and an explicit 0 override means unlimited.
     store.set_quota("alice", Some(0)).await.unwrap();
-    let unlimited = send(&app, upload_req(&csrf, &csrf, "alice", "c.png", "image/png", &png)).await;
+    let unlimited = send(
+        &app,
+        upload_req(&csrf, &csrf, "alice", "c.png", "image/png", &png),
+    )
+    .await;
     assert_eq!(unlimited.status, StatusCode::FOUND);
 }
 
@@ -971,7 +1438,10 @@ async fn gallery_shows_usage_meter() {
     let (_id, _csrf) = upload_png(&app_unlimited, "alice").await;
     let home = send(&app_unlimited, get("/", Some("alice"))).await;
     assert!(home.text().contains("no limit"));
-    assert!(!home.text().contains("style=\"width:"), "no fill bar without a quota");
+    assert!(
+        !home.text().contains("style=\"width:"),
+        "no fill bar without a quota"
+    );
 
     // Under a quota: used / quota with a percent and the width-scaled fill bar.
     let png = png_bytes();
@@ -979,7 +1449,10 @@ async fn gallery_shows_usage_meter() {
     let (_id2, _csrf2) = upload_png(&app_limited, "alice").await;
     let home2 = send(&app_limited, get("/", Some("alice"))).await;
     assert!(home2.text().contains("style=\"width:50.00%\""));
-    assert!(home2.text().contains("(50%)"), "one of two PNGs of quota is 50%");
+    assert!(
+        home2.text().contains("(50%)"),
+        "one of two PNGs of quota is 50%"
+    );
 }
 
 #[tokio::test]
@@ -1006,42 +1479,78 @@ async fn admin_set_quota_form_guards_and_applies() {
 
     let panel = send(&app, get_with_groups("/admin", "root", "infra-admins")).await;
     assert_eq!(panel.status, StatusCode::OK);
-    assert!(panel.text().contains("alice"), "usage table lists the owner");
+    assert!(
+        panel.text().contains("alice"),
+        "usage table lists the owner"
+    );
     let csrf = panel.csrf_cookie().unwrap();
 
     // A non-admin cannot POST, even with a valid CSRF pair.
     let outsider = send(
         &app,
-        post_form("/admin/quota", &csrf, "alice", format!("csrf_token={csrf}&owner_sub=alice&quota_bytes=1")),
+        post_form(
+            "/admin/quota",
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&owner_sub=alice&quota_bytes=1"),
+        ),
     )
     .await;
     assert_eq!(outsider.status, StatusCode::FORBIDDEN);
     // A wrong CSRF field is rejected.
     let bad_csrf = send(
         &app,
-        post_form_with_groups("/admin/quota", &csrf, "root", "admins", "csrf_token=wrong&owner_sub=alice&quota_bytes=1".to_string()),
+        post_form_with_groups(
+            "/admin/quota",
+            &csrf,
+            "root",
+            "admins",
+            "csrf_token=wrong&owner_sub=alice&quota_bytes=1".to_string(),
+        ),
     )
     .await;
     assert_eq!(bad_csrf.status, StatusCode::BAD_REQUEST);
     // Non-numeric bytes and a blank owner are rejected.
     let garbage = send(
         &app,
-        post_form_with_groups("/admin/quota", &csrf, "root", "admins", format!("csrf_token={csrf}&owner_sub=alice&quota_bytes=lots")),
+        post_form_with_groups(
+            "/admin/quota",
+            &csrf,
+            "root",
+            "admins",
+            format!("csrf_token={csrf}&owner_sub=alice&quota_bytes=lots"),
+        ),
     )
     .await;
     assert_eq!(garbage.status, StatusCode::BAD_REQUEST);
     let no_owner = send(
         &app,
-        post_form_with_groups("/admin/quota", &csrf, "root", "admins", format!("csrf_token={csrf}&owner_sub=&quota_bytes=1")),
+        post_form_with_groups(
+            "/admin/quota",
+            &csrf,
+            "root",
+            "admins",
+            format!("csrf_token={csrf}&owner_sub=&quota_bytes=1"),
+        ),
     )
     .await;
     assert_eq!(no_owner.status, StatusCode::BAD_REQUEST);
-    assert_eq!(store.get_quota("alice").await.unwrap(), None, "guarded posts changed nothing");
+    assert_eq!(
+        store.get_quota("alice").await.unwrap(),
+        None,
+        "guarded posts changed nothing"
+    );
 
     // A valid admin POST sets the override and redirects back to the panel...
     let set = send(
         &app,
-        post_form_with_groups("/admin/quota", &csrf, "root", "admins", format!("csrf_token={csrf}&owner_sub=alice&quota_bytes=4096")),
+        post_form_with_groups(
+            "/admin/quota",
+            &csrf,
+            "root",
+            "admins",
+            format!("csrf_token={csrf}&owner_sub=alice&quota_bytes=4096"),
+        ),
     )
     .await;
     assert_eq!(set.status, StatusCode::FOUND);
@@ -1054,7 +1563,13 @@ async fn admin_set_quota_form_guards_and_applies() {
     // ...and a BLANK value clears it back to the default.
     let clear = send(
         &app,
-        post_form_with_groups("/admin/quota", &csrf, "root", "admins", format!("csrf_token={csrf}&owner_sub=alice&quota_bytes=")),
+        post_form_with_groups(
+            "/admin/quota",
+            &csrf,
+            "root",
+            "admins",
+            format!("csrf_token={csrf}&owner_sub=alice&quota_bytes="),
+        ),
     )
     .await;
     assert_eq!(clear.status, StatusCode::FOUND);
@@ -1068,17 +1583,43 @@ async fn thumb_derived_blob_is_removed_on_delete() {
     let app = app(state);
     let (id, csrf) = upload_pdf(&app, "alice").await;
 
-    // Prime the derived-thumbnail cache, then delete the file.
+    // Prime the derived-thumbnail cache, then trash and purge the file.
     send(&app, get(&format!("/d/{id}/thumb"), Some("alice"))).await;
-    assert!(blobs.get(&format!("{id}.thumb")).await.is_ok(), "thumbnail cached");
+    assert!(
+        blobs.get(&format!("{id}.thumb")).await.is_ok(),
+        "thumbnail cached"
+    );
     let del = send(
         &app,
-        post_form(&format!("/delete/{id}"), &csrf, "alice", format!("csrf_token={csrf}")),
+        post_form(
+            &format!("/delete/{id}"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
     )
     .await;
     assert_eq!(del.status, StatusCode::FOUND);
-    // Both the original blob and its derived thumbnail are gone (no orphan).
-    assert!(blobs.get(&format!("{id}.thumb")).await.is_err(), "derived thumbnail removed with file");
+    assert!(
+        blobs.get(&format!("{id}.thumb")).await.is_ok(),
+        "soft delete keeps cached data until purge"
+    );
+    let purge = send(
+        &app,
+        post_form(
+            &format!("/trash/{id}/purge"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(purge.status, StatusCode::FOUND);
+    // Delete forever removes the derived thumbnail too (no orphan).
+    assert!(
+        blobs.get(&format!("{id}.thumb")).await.is_err(),
+        "derived thumbnail removed on purge"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1101,34 +1642,100 @@ async fn folder_tree_subfolders_breadcrumb_and_scoped_upload() {
     let (_root_file, csrf) = upload_png(&app, "alice").await; // a file at the ROOT
 
     // Create a root folder, then a CHILD folder inside it (parent_id carried by the form).
-    let parent = send(&app, post_form("/folders", &csrf, "alice", format!("csrf_token={csrf}&name=Parent&parent_id="))).await;
+    let parent = send(
+        &app,
+        post_form(
+            "/folders",
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&name=Parent&parent_id="),
+        ),
+    )
+    .await;
     let pfid = folder_from_location(&parent.location());
-    let child = send(&app, post_form("/folders", &csrf, "alice", format!("csrf_token={csrf}&name=Child&parent_id={pfid}"))).await;
+    let child = send(
+        &app,
+        post_form(
+            "/folders",
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&name=Child&parent_id={pfid}"),
+        ),
+    )
+    .await;
     assert_eq!(child.status, StatusCode::FOUND);
     let cfid = folder_from_location(&child.location());
-    assert_eq!(store.get_folder(&cfid, "alice").await.unwrap().unwrap().parent_id.as_deref(), Some(pfid.as_str()));
+    assert_eq!(
+        store
+            .get_folder(&cfid, "alice")
+            .await
+            .unwrap()
+            .unwrap()
+            .parent_id
+            .as_deref(),
+        Some(pfid.as_str())
+    );
 
     // Root view: shows the Parent tile but NOT the (nested) Child.
     let root = send(&app, get("/", Some("alice"))).await;
-    assert!(root.text().contains(&format!("/?folder={pfid}")), "root lists the parent folder");
-    assert!(!root.text().contains(&format!("/?folder={cfid}")), "root does not list a nested child");
+    assert!(
+        root.text().contains(&format!("/?folder={pfid}")),
+        "root lists the parent folder"
+    );
+    assert!(
+        !root.text().contains(&format!("/?folder={cfid}")),
+        "root does not list a nested child"
+    );
 
     // Parent view: breadcrumb back to All files, the Child tile, and an Up-to-root tile.
     let pv = send(&app, get(&format!("/?folder={pfid}"), Some("alice"))).await;
     assert!(pv.text().contains("breadcrumb"));
-    assert!(pv.text().contains(">All files<"), "breadcrumb links back to root");
-    assert!(pv.text().contains(&format!("/?folder={cfid}")), "child folder tile is shown");
-    assert!(pv.text().contains("Up one level"), "an Up tile is shown inside a folder");
+    assert!(
+        pv.text().contains(">All files<"),
+        "breadcrumb links back to root"
+    );
+    assert!(
+        pv.text().contains(&format!("/?folder={cfid}")),
+        "child folder tile is shown"
+    );
+    assert!(
+        pv.text().contains("Up one level"),
+        "an Up tile is shown inside a folder"
+    );
 
     // Upload a file INTO the child folder; it appears there, not at the root or in the parent.
-    let up = send(&app, upload_req_folder(&csrf, &csrf, "alice", &cfid, "deep.png", "image/png", &png_bytes())).await;
+    let up = send(
+        &app,
+        upload_req_folder(
+            &csrf,
+            &csrf,
+            "alice",
+            &cfid,
+            "deep.png",
+            "image/png",
+            &png_bytes(),
+        ),
+    )
+    .await;
     assert_eq!(up.status, StatusCode::FOUND, "{}", up.text());
     let deep_id = up.location().trim_start_matches("/f/").to_string();
-    assert_eq!(store.get(&deep_id).await.unwrap().unwrap().folder_id.as_deref(), Some(cfid.as_str()));
+    assert_eq!(
+        store
+            .get(&deep_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .folder_id
+            .as_deref(),
+        Some(cfid.as_str())
+    );
     let cv = send(&app, get(&format!("/?folder={cfid}"), Some("alice"))).await;
     assert_eq!(card_ids(&cv.text()), vec![deep_id.clone()]);
     let root2 = send(&app, get("/", Some("alice"))).await;
-    assert!(!card_ids(&root2.text()).contains(&deep_id), "a filed file never shows at the root");
+    assert!(
+        !card_ids(&root2.text()).contains(&deep_id),
+        "a filed file never shows at the root"
+    );
 }
 
 #[tokio::test]
@@ -1139,23 +1746,65 @@ async fn folder_delete_cascade_removes_subtree_and_blobs() {
     let app = app(state);
     let (_f, csrf) = upload_png(&app, "alice").await;
 
-    let parent = send(&app, post_form("/folders", &csrf, "alice", format!("csrf_token={csrf}&name=Parent&parent_id="))).await;
+    let parent = send(
+        &app,
+        post_form(
+            "/folders",
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&name=Parent&parent_id="),
+        ),
+    )
+    .await;
     let pfid = folder_from_location(&parent.location());
-    let child = send(&app, post_form("/folders", &csrf, "alice", format!("csrf_token={csrf}&name=Child&parent_id={pfid}"))).await;
+    let child = send(
+        &app,
+        post_form(
+            "/folders",
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&name=Child&parent_id={pfid}"),
+        ),
+    )
+    .await;
     let cfid = folder_from_location(&child.location());
     // A file deep in the subtree.
-    let up = send(&app, upload_req_folder(&csrf, &csrf, "alice", &cfid, "deep.png", "image/png", &png_bytes())).await;
+    let up = send(
+        &app,
+        upload_req_folder(
+            &csrf,
+            &csrf,
+            "alice",
+            &cfid,
+            "deep.png",
+            "image/png",
+            &png_bytes(),
+        ),
+    )
+    .await;
     let deep_id = up.location().trim_start_matches("/f/").to_string();
     let deep_key = store.get(&deep_id).await.unwrap().unwrap().object_key;
     assert!(blobs.get(&deep_key).await.is_ok());
 
     // Cascade-delete the parent -> whole subtree + the file (blob) are gone, redirect to root.
-    let del = send(&app, post_form(&format!("/folders/{pfid}/delete"), &csrf, "alice", format!("csrf_token={csrf}&cascade=1"))).await;
+    let del = send(
+        &app,
+        post_form(
+            &format!("/folders/{pfid}/delete"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&cascade=1"),
+        ),
+    )
+    .await;
     assert_eq!(del.status, StatusCode::FOUND);
     assert_eq!(del.location(), "/");
     assert!(store.get_folder(&pfid, "alice").await.unwrap().is_none());
     assert!(store.get_folder(&cfid, "alice").await.unwrap().is_none());
-    assert!(store.get(&deep_id).await.unwrap().is_none(), "the nested file is deleted");
+    assert!(
+        store.get(&deep_id).await.unwrap().is_none(),
+        "the nested file is deleted"
+    );
     assert!(blobs.get(&deep_key).await.is_err(), "its blob is freed");
 }
 
@@ -1175,18 +1824,48 @@ async fn reupload_keeps_version_then_restore_swaps_current() {
     assert!(d0.text().contains("No earlier versions"));
 
     // Re-upload the SAME name at the root with DIFFERENT bytes -> same id, one retained version.
-    let re = send(&app, upload_req(&csrf, &csrf, "alice", "shot.png", "image/png", &png_bytes_alt())).await;
+    let re = send(
+        &app,
+        upload_req(
+            &csrf,
+            &csrf,
+            "alice",
+            "shot.png",
+            "image/png",
+            &png_bytes_alt(),
+        ),
+    )
+    .await;
     assert_eq!(re.status, StatusCode::FOUND, "{}", re.text());
-    assert_eq!(re.location(), format!("/f/{id}"), "re-upload versions the SAME file (no new id)");
+    assert_eq!(
+        re.location(),
+        format!("/f/{id}"),
+        "re-upload versions the SAME file (no new id)"
+    );
     let versions = store.list_versions(&id).await.unwrap();
     assert_eq!(versions.len(), 1, "the prior blob is retained as a version");
     // Current serves the NEW bytes; the version holds the ORIGINAL bytes.
-    assert_eq!(send(&app, get(&format!("/f/{id}/raw"), Some("alice"))).await.body, png_bytes_alt());
+    assert_eq!(
+        send(&app, get(&format!("/f/{id}/raw"), Some("alice")))
+            .await
+            .body,
+        png_bytes_alt()
+    );
     let vid = versions[0].id.clone();
-    let vdl = send(&app, get(&format!("/f/{id}/versions/{vid}/raw"), Some("alice"))).await;
+    let vdl = send(
+        &app,
+        get(&format!("/f/{id}/versions/{vid}/raw"), Some("alice")),
+    )
+    .await;
     assert_eq!(vdl.status, StatusCode::OK);
-    assert_eq!(vdl.body, png_bytes(), "the version download is the original blob");
-    assert!(vdl.header(header::CONTENT_DISPOSITION).starts_with("attachment"));
+    assert_eq!(
+        vdl.body,
+        png_bytes(),
+        "the version download is the original blob"
+    );
+    assert!(vdl
+        .header(header::CONTENT_DISPOSITION)
+        .starts_with("attachment"));
 
     // The detail page lists the version with download + restore controls.
     let d1 = send(&app, get(&format!("/f/{id}"), Some("alice"))).await;
@@ -1194,10 +1873,29 @@ async fn reupload_keeps_version_then_restore_swaps_current() {
     assert!(d1.text().contains("Restore"));
 
     // Restore the version -> current swaps back to the original bytes; history is kept (still 1).
-    let rest = send(&app, post_form(&format!("/f/{id}/versions/{vid}/restore"), &csrf, "alice", format!("csrf_token={csrf}"))).await;
+    let rest = send(
+        &app,
+        post_form(
+            &format!("/f/{id}/versions/{vid}/restore"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
+    )
+    .await;
     assert_eq!(rest.status, StatusCode::FOUND);
-    assert_eq!(send(&app, get(&format!("/f/{id}/raw"), Some("alice"))).await.body, png_bytes(), "restored to the original");
-    assert_eq!(store.list_versions(&id).await.unwrap().len(), 1, "restore keeps history (old current becomes a version)");
+    assert_eq!(
+        send(&app, get(&format!("/f/{id}/raw"), Some("alice")))
+            .await
+            .body,
+        png_bytes(),
+        "restored to the original"
+    );
+    assert_eq!(
+        store.list_versions(&id).await.unwrap().len(),
+        1,
+        "restore keeps history (old current becomes a version)"
+    );
 }
 
 #[tokio::test]
@@ -1209,10 +1907,25 @@ async fn versions_are_pruned_to_the_cap() {
 
     // Re-upload the same name 12 times -> history is capped at the newest 10.
     for _ in 0..12 {
-        let re = send(&app, upload_req(&csrf, &csrf, "alice", "shot.png", "image/png", &png_bytes_alt())).await;
+        let re = send(
+            &app,
+            upload_req(
+                &csrf,
+                &csrf,
+                "alice",
+                "shot.png",
+                "image/png",
+                &png_bytes_alt(),
+            ),
+        )
+        .await;
         assert_eq!(re.status, StatusCode::FOUND, "{}", re.text());
     }
-    assert_eq!(store.list_versions(&id).await.unwrap().len(), 10, "oldest versions are pruned to the cap");
+    assert_eq!(
+        store.list_versions(&id).await.unwrap().len(),
+        10,
+        "oldest versions are pruned to the cap"
+    );
 }
 
 #[tokio::test]
@@ -1226,12 +1939,28 @@ async fn version_bytes_count_toward_quota() {
 
     // First upload (1 PNG). Re-upload same name: old blob becomes a version (1 PNG) + new (1 PNG) =
     // exactly the quota -> allowed at the boundary. (Same-size bytes keep the boundary exact.)
-    assert_eq!(send(&app, upload_req(&csrf, &csrf, "alice", "shot.png", "image/png", &png)).await.status, StatusCode::FOUND);
-    let re1 = send(&app, upload_req(&csrf, &csrf, "alice", "shot.png", "image/png", &png)).await;
+    assert_eq!(
+        send(
+            &app,
+            upload_req(&csrf, &csrf, "alice", "shot.png", "image/png", &png)
+        )
+        .await
+        .status,
+        StatusCode::FOUND
+    );
+    let re1 = send(
+        &app,
+        upload_req(&csrf, &csrf, "alice", "shot.png", "image/png", &png),
+    )
+    .await;
     assert_eq!(re1.status, StatusCode::FOUND, "{}", re1.text());
 
     // A THIRD copy would push usage (current + version) over the quota -> 413. Proves versions count.
-    let re2 = send(&app, upload_req(&csrf, &csrf, "alice", "shot.png", "image/png", &png)).await;
+    let re2 = send(
+        &app,
+        upload_req(&csrf, &csrf, "alice", "shot.png", "image/png", &png),
+    )
+    .await;
     assert_eq!(re2.status, StatusCode::PAYLOAD_TOO_LARGE);
     assert!(re2.text().contains("Not enough storage"));
 }
@@ -1248,15 +1977,51 @@ async fn folder_share_public_index_and_gates() {
     let (root_id, csrf) = upload_png(&app, "alice").await; // a file OUTSIDE the shared folder
 
     // Folder with one file inside it.
-    let mk = send(&app, post_form("/folders", &csrf, "alice", format!("csrf_token={csrf}&name=Album&parent_id="))).await;
+    let mk = send(
+        &app,
+        post_form(
+            "/folders",
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&name=Album&parent_id="),
+        ),
+    )
+    .await;
     let fid = folder_from_location(&mk.location());
-    let up = send(&app, upload_req_folder(&csrf, &csrf, "alice", &fid, "pic.png", "image/png", &png_bytes())).await;
+    let up = send(
+        &app,
+        upload_req_folder(
+            &csrf,
+            &csrf,
+            "alice",
+            &fid,
+            "pic.png",
+            "image/png",
+            &png_bytes(),
+        ),
+    )
+    .await;
     let inid = up.location().trim_start_matches("/f/").to_string();
 
     // Create a folder share link (no password, never expires) via the owner form.
-    let sh = send(&app, post_form(&format!("/folders/{fid}/share"), &csrf, "alice", format!("csrf_token={csrf}&expiry=never"))).await;
+    let sh = send(
+        &app,
+        post_form(
+            &format!("/folders/{fid}/share"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&expiry=never"),
+        ),
+    )
+    .await;
     assert_eq!(sh.status, StatusCode::FOUND);
-    let token = store.get_folder(&fid, "alice").await.unwrap().unwrap().share_token.unwrap();
+    let token = store
+        .get_folder(&fid, "alice")
+        .await
+        .unwrap()
+        .unwrap()
+        .share_token
+        .unwrap();
 
     // Public index (NO auth) lists the folder's file + a download link.
     let idx = send(&app, get(&format!("/s/folder/{token}"), None)).await;
@@ -1272,13 +2037,35 @@ async fn folder_share_public_index_and_gates() {
     assert_eq!(cross.status, StatusCode::NOT_FOUND);
 
     // Force the expiry into the past -> the public index is 410 Gone.
-    store.configure_folder_share(&fid, "alice", Some(token.clone()), Some(1), None).await.unwrap();
-    assert_eq!(send(&app, get(&format!("/s/folder/{token}"), None)).await.status, StatusCode::GONE);
+    store
+        .configure_folder_share(&fid, "alice", Some(token.clone()), Some(1), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        send(&app, get(&format!("/s/folder/{token}"), None))
+            .await
+            .status,
+        StatusCode::GONE
+    );
 
     // Revoke -> the outstanding link is 404.
-    let rev = send(&app, post_form(&format!("/folders/{fid}/revoke"), &csrf, "alice", format!("csrf_token={csrf}"))).await;
+    let rev = send(
+        &app,
+        post_form(
+            &format!("/folders/{fid}/revoke"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
+    )
+    .await;
     assert_eq!(rev.status, StatusCode::FOUND);
-    assert_eq!(send(&app, get(&format!("/s/folder/{token}"), None)).await.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        send(&app, get(&format!("/s/folder/{token}"), None))
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
 }
 
 #[tokio::test]
@@ -1288,14 +2075,50 @@ async fn folder_share_password_gate() {
     let app = app(state);
     let (_r, csrf) = upload_png(&app, "alice").await;
 
-    let mk = send(&app, post_form("/folders", &csrf, "alice", format!("csrf_token={csrf}&name=Locked&parent_id="))).await;
+    let mk = send(
+        &app,
+        post_form(
+            "/folders",
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&name=Locked&parent_id="),
+        ),
+    )
+    .await;
     let fid = folder_from_location(&mk.location());
-    let up = send(&app, upload_req_folder(&csrf, &csrf, "alice", &fid, "secret.png", "image/png", &png_bytes())).await;
+    let up = send(
+        &app,
+        upload_req_folder(
+            &csrf,
+            &csrf,
+            "alice",
+            &fid,
+            "secret.png",
+            "image/png",
+            &png_bytes(),
+        ),
+    )
+    .await;
     let inid = up.location().trim_start_matches("/f/").to_string();
 
     // Share WITH a password.
-    send(&app, post_form(&format!("/folders/{fid}/share"), &csrf, "alice", format!("csrf_token={csrf}&expiry=never&password=hunter2"))).await;
-    let token = store.get_folder(&fid, "alice").await.unwrap().unwrap().share_token.unwrap();
+    send(
+        &app,
+        post_form(
+            &format!("/folders/{fid}/share"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&expiry=never&password=hunter2"),
+        ),
+    )
+    .await;
+    let token = store
+        .get_folder(&fid, "alice")
+        .await
+        .unwrap()
+        .unwrap()
+        .share_token
+        .unwrap();
 
     // Bare GET prompts for the password and does NOT reveal the file list.
     let prompt = send(&app, get(&format!("/s/folder/{token}"), None)).await;
@@ -1307,22 +2130,167 @@ async fn folder_share_password_gate() {
     assert_eq!(locked.status, StatusCode::UNAUTHORIZED);
 
     // Wrong password -> 401 + prompt again.
-    let wrong = send(&app, post_public(&format!("/s/folder/{token}"), "password=nope".to_string())).await;
+    let wrong = send(
+        &app,
+        post_public(&format!("/s/folder/{token}"), "password=nope".to_string()),
+    )
+    .await;
     assert_eq!(wrong.status, StatusCode::UNAUTHORIZED);
     assert!(wrong.text().contains("Incorrect password"));
 
     // Correct password -> the index with per-file POST download forms carrying the password.
-    let ok = send(&app, post_public(&format!("/s/folder/{token}"), "password=hunter2".to_string())).await;
+    let ok = send(
+        &app,
+        post_public(
+            &format!("/s/folder/{token}"),
+            "password=hunter2".to_string(),
+        ),
+    )
+    .await;
     assert_eq!(ok.status, StatusCode::OK);
     assert!(ok.text().contains("secret.png"));
-    assert!(ok.text().contains(&format!("action=\"/s/folder/{token}/f/{inid}\"")));
+    assert!(ok
+        .text()
+        .contains(&format!("action=\"/s/folder/{token}/f/{inid}\"")));
     // Download via POST with the correct password serves the bytes.
-    let dl = send(&app, post_public(&format!("/s/folder/{token}/f/{inid}"), "password=hunter2".to_string())).await;
+    let dl = send(
+        &app,
+        post_public(
+            &format!("/s/folder/{token}/f/{inid}"),
+            "password=hunter2".to_string(),
+        ),
+    )
+    .await;
     assert_eq!(dl.status, StatusCode::OK);
     assert_eq!(dl.body, png_bytes());
     // Wrong password on the download POST -> 401.
-    let dlw = send(&app, post_public(&format!("/s/folder/{token}/f/{inid}"), "password=nope".to_string())).await;
+    let dlw = send(
+        &app,
+        post_public(
+            &format!("/s/folder/{token}/f/{inid}"),
+            "password=nope".to_string(),
+        ),
+    )
+    .await;
     assert_eq!(dlw.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn public_upload_inbox_accepts_uploads_without_listing_files() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let (_root, csrf) = upload_png(&app, "alice").await;
+
+    let mk = send(
+        &app,
+        post_form(
+            "/folders",
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&name=Requests&parent_id="),
+        ),
+    )
+    .await;
+    let fid = folder_from_location(&mk.location());
+    let existing = send(
+        &app,
+        upload_req_folder(
+            &csrf,
+            &csrf,
+            "alice",
+            &fid,
+            "pic.png",
+            "image/png",
+            &png_bytes(),
+        ),
+    )
+    .await;
+    assert_eq!(existing.status, StatusCode::FOUND);
+
+    let enabled = send(
+        &app,
+        post_form(
+            &format!("/folders/{fid}/upload"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(enabled.status, StatusCode::FOUND);
+    let token = store
+        .get_folder(&fid, "alice")
+        .await
+        .unwrap()
+        .unwrap()
+        .upload_token
+        .unwrap();
+
+    let page = send(&app, get(&format!("/u/{token}"), None)).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.text().contains("Requests"));
+    assert!(
+        !page.text().contains("pic.png"),
+        "upload-only page does not list folder files"
+    );
+    let public_csrf = page.csrf_cookie().unwrap();
+
+    let up = send(
+        &app,
+        public_upload_req(
+            &public_csrf,
+            &public_csrf,
+            &token,
+            "pic.png",
+            "image/png",
+            &png_bytes_alt(),
+        ),
+    )
+    .await;
+    assert_eq!(up.status, StatusCode::OK, "{}", up.text());
+    assert!(up.text().contains("Uploaded"));
+    let files = store.list_files_in_folder(&fid, "alice").await.unwrap();
+    let names: Vec<String> = files.iter().map(|f| f.name.clone()).collect();
+    assert!(names.contains(&"pic.png".to_string()));
+    assert!(
+        names.contains(&"pic (2).png".to_string()),
+        "same-name public upload is renamed"
+    );
+
+    let used = store.usage_for_owner("alice").await.unwrap();
+    store.set_quota("alice", Some(used)).await.unwrap();
+    let page2 = send(&app, get(&format!("/u/{token}"), None)).await;
+    let csrf2 = page2.csrf_cookie().unwrap();
+    let over = send(
+        &app,
+        public_upload_req(
+            &csrf2,
+            &csrf2,
+            &token,
+            "over.png",
+            "image/png",
+            &png_bytes(),
+        ),
+    )
+    .await;
+    assert_eq!(over.status, StatusCode::PAYLOAD_TOO_LARGE);
+
+    let revoked = send(
+        &app,
+        post_form(
+            &format!("/folders/{fid}/upload/revoke"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(revoked.status, StatusCode::FOUND);
+    assert_eq!(
+        send(&app, get(&format!("/u/{token}"), None)).await.status,
+        StatusCode::NOT_FOUND
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1341,12 +2309,29 @@ async fn preview_routing_by_content_type() {
     assert!(di.text().contains("lightbox-trigger"));
 
     // Text -> escaped <pre> preview (never raw HTML).
-    let ut = send(&app, upload_req(&csrf, &csrf, "alice", "notes.txt", "text/plain", b"<script>alert(1)</script> hi")).await;
+    let ut = send(
+        &app,
+        upload_req(
+            &csrf,
+            &csrf,
+            "alice",
+            "notes.txt",
+            "text/plain",
+            b"<script>alert(1)</script> hi",
+        ),
+    )
+    .await;
     let tid = ut.location().trim_start_matches("/f/").to_string();
     let dt = send(&app, get(&format!("/f/{tid}"), Some("alice"))).await;
     assert!(dt.text().contains("preview-text"));
-    assert!(dt.text().contains("&lt;script&gt;alert(1)&lt;/script&gt;"), "text is escaped");
-    assert!(!dt.text().contains("<script>alert(1)</script>"), "no raw script survives");
+    assert!(
+        dt.text().contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+        "text is escaped"
+    );
+    assert!(
+        !dt.text().contains("<script>alert(1)</script>"),
+        "no raw script survives"
+    );
 
     // PDF -> sandboxed <iframe> of the inline preview bytes.
     let (pdfid, _c) = upload_pdf(&app, "alice").await;
@@ -1363,14 +2348,27 @@ async fn preview_routing_by_content_type() {
     assert_eq!(pr.header(header::CONTENT_SECURITY_POLICY), "sandbox");
 
     // Non-previewable binary -> the type icon + "No inline preview".
-    let ub = send(&app, upload_req(&csrf, &csrf, "alice", "blob.bin", "application/octet-stream", b"\x00\x01\x02rawbytes")).await;
+    let ub = send(
+        &app,
+        upload_req(
+            &csrf,
+            &csrf,
+            "alice",
+            "blob.bin",
+            "application/octet-stream",
+            b"\x00\x01\x02rawbytes",
+        ),
+    )
+    .await;
     let bid = ub.location().trim_start_matches("/f/").to_string();
     let db = send(&app, get(&format!("/f/{bid}"), Some("alice"))).await;
     assert!(db.text().contains("No inline preview"));
 
     // preview-raw on a NON-pdf falls back to the safe attachment path (never inline execution).
     let prb = send(&app, get(&format!("/f/{bid}/preview-raw"), Some("alice"))).await;
-    assert!(prb.header(header::CONTENT_DISPOSITION).starts_with("attachment"));
+    assert!(prb
+        .header(header::CONTENT_DISPOSITION)
+        .starts_with("attachment"));
 }
 
 #[tokio::test]
@@ -1379,7 +2377,18 @@ async fn preview_and_version_routes_are_owner_scoped() {
     let app = app(state);
     let (id, csrf) = upload_png(&app, "alice").await;
     // Give the file a version so the version route has a target.
-    send(&app, upload_req(&csrf, &csrf, "alice", "shot.png", "image/png", &png_bytes_alt())).await;
+    send(
+        &app,
+        upload_req(
+            &csrf,
+            &csrf,
+            "alice",
+            "shot.png",
+            "image/png",
+            &png_bytes_alt(),
+        ),
+    )
+    .await;
     // Read the version id out of the detail page's version link.
     let vid = {
         let d = send(&app, get(&format!("/f/{id}"), Some("alice"))).await;
@@ -1390,10 +2399,32 @@ async fn preview_and_version_routes_are_owner_scoped() {
     };
 
     // Bob cannot preview or touch Alice's file/version.
-    assert_eq!(send(&app, get(&format!("/f/{id}/preview-raw"), Some("bob"))).await.status, StatusCode::FORBIDDEN);
-    assert_eq!(send(&app, get(&format!("/f/{id}/versions/{vid}/raw"), Some("bob"))).await.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        send(&app, get(&format!("/f/{id}/preview-raw"), Some("bob")))
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send(
+            &app,
+            get(&format!("/f/{id}/versions/{vid}/raw"), Some("bob"))
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
     let bob_home = send(&app, get("/", Some("bob"))).await;
     let bob_csrf = bob_home.csrf_cookie().unwrap();
-    let restore = send(&app, post_form(&format!("/f/{id}/versions/{vid}/restore"), &bob_csrf, "bob", format!("csrf_token={bob_csrf}"))).await;
+    let restore = send(
+        &app,
+        post_form(
+            &format!("/f/{id}/versions/{vid}/restore"),
+            &bob_csrf,
+            "bob",
+            format!("csrf_token={bob_csrf}"),
+        ),
+    )
+    .await;
     assert_eq!(restore.status, StatusCode::FORBIDDEN);
 }

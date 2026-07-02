@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>Drive · Aperture · HOLDFAST</title>
+  <title>{{HEADING}} · Upload request · Aperture · HOLDFAST</title>
   <style>{{CSS}}</style>
 </head>
 <body class="page-console">
@@ -13,40 +13,33 @@
       <span class="app-tile" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="22" x2="2" y1="12" y2="12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><line x1="6" x2="6.01" y1="16" y2="16"/><line x1="10" x2="10.01" y1="16" y2="16"/></svg></span>
       <span class="appbar__name"><b>Drive</b><span>drive.w33d.xyz</span></span>
     </a>
-    <nav class="appbar__nav" aria-label="Aperture">
-      <a class="appnav is-active" href="/"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>Files</a>
-    </nav>
     <span class="appbar__spacer"></span>
-    <div class="appbar__right">{{USERBOX}}</div>
   </header>
 
   <main class="console">
     <div class="console__head">
-      <h1>Your drive</h1>
-      <p class="sub">Images, screenshots and files — stored privately and shareable by link. Ownership comes from your single sign-on session.</p>
+      <h1>{{HEADING}}</h1>
+      <p class="sub">Upload files into this request folder. Existing files are not listed.</p>
     </div>
 
-    {{USAGE}}
+    {{STATUS}}
 
-    {{UPLOAD}}
-
-    <div class="drive-layout">
-      {{SIDEBAR}}
-
-      <div class="drive-content">
-        {{BREADCRUMB}}
-        <div class="section-head">
-          <h2>{{HEADING}}</h2>
-          <span class="count-badge">{{COUNT}}</span>
-        </div>
-
-        <ul class="gallery-grid">
-          {{CARDS}}
-        </ul>
-
-        {{PAGER}}
+    <section class="card">
+      <div class="card__body">
+        <form id="uploadForm" class="dropzone" method="post" action="{{ACTION}}" enctype="multipart/form-data">
+          <input type="hidden" name="csrf_token" value="{{CSRF}}">
+          <input id="fileInput" class="dropzone__input" type="file" name="file" required>
+          <label for="fileInput" class="dropzone__label">
+            <span class="dropzone__icon" aria-hidden="true">&#8682;</span>
+            <span class="dropzone__text"><strong>Choose a file</strong> or drag &amp; drop it here</span>
+            <span id="fileName" class="dropzone__hint">Nothing selected yet</span>
+          </label>
+          <div class="dropzone__actions">
+            <button class="btn btn-primary" type="submit">Upload</button>
+          </div>
+        </form>
       </div>
-    </div>
+    </section>
   </main>
 
   <script>

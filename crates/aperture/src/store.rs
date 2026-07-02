@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::config::clamp_page;
-use crate::model::{FileRec, FolderRec, OwnerUsage, VersionRec};
+use crate::model::{FileComment, FileRec, FolderRec, OwnerUsage, VersionRec};
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
 #[derive(Debug, Error)]
@@ -65,8 +65,24 @@ pub trait Store: Send + Sync {
         limit: i64,
     ) -> Result<Vec<FileRec>, StoreError>;
 
-    /// Delete a file only if it belongs to `owner_sub`. Returns `true` when a row was removed.
+    /// Hard-delete a file row only if it belongs to `owner_sub`. Returns `true` when a row was
+    /// removed. Handler-level "Delete" uses [`Store::trash_file`]; this hard path is retained for
+    /// upload rollback and "Delete forever".
     async fn delete(&self, id: &str, owner_sub: &str) -> Result<bool, StoreError>;
+
+    /// Soft-delete a live file only if it belongs to `owner_sub`.
+    async fn trash_file(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        trashed_at: i64,
+    ) -> Result<bool, StoreError>;
+
+    /// Restore a trashed file only if it belongs to `owner_sub`.
+    async fn restore_file(&self, id: &str, owner_sub: &str) -> Result<bool, StoreError>;
+
+    /// An owner's trashed files, newest-trash-first.
+    async fn list_trashed_by_owner(&self, owner_sub: &str) -> Result<Vec<FileRec>, StoreError>;
 
     /// Configure a file's share link, ownership-scoped. Sets all three share columns atomically:
     /// `share_token` (`Some(tok)` to (re)enable, `None` to REVOKE — the file then has no public
@@ -93,13 +109,19 @@ pub trait Store: Send + Sync {
 
     /// Fetch one folder, ownership-scoped (used to validate a move target and to render the active
     /// folder's controls). `None` when it does not exist or belongs to someone else.
-    async fn get_folder(&self, id: &str, owner_sub: &str)
-        -> Result<Option<FolderRec>, StoreError>;
+    async fn get_folder(&self, id: &str, owner_sub: &str) -> Result<Option<FolderRec>, StoreError>;
 
     /// Fetch a folder by its public share token (the unauthenticated `/s/folder/{token}` index). `None`
     /// when the token is unknown / revoked. The row carries `owner_sub`, so the public handler
     /// scopes the file listing WITHOUT any request identity.
     async fn get_folder_by_token(&self, token: &str) -> Result<Option<FolderRec>, StoreError>;
+
+    /// Fetch a folder by its public upload-inbox token (`/u/{token}`). The row carries `owner_sub`,
+    /// so anonymous uploads can be charged to the owner without trusting request identity.
+    async fn get_folder_by_upload_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<FolderRec>, StoreError>;
 
     /// Rename a folder only if it belongs to `owner_sub`. Returns `true` when a row was updated.
     async fn rename_folder(
@@ -120,6 +142,15 @@ pub trait Store: Send + Sync {
         share_token: Option<String>,
         expires_at: Option<i64>,
         share_password_hash: Option<String>,
+    ) -> Result<bool, StoreError>;
+
+    /// Configure a folder's public upload-inbox token, ownership-scoped. `Some` enables/rotates,
+    /// `None` revokes.
+    async fn configure_folder_upload(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        upload_token: Option<String>,
     ) -> Result<bool, StoreError>;
 
     /// Delete a folder ONLY when it is empty (no child folders AND no files) and owned by
@@ -205,18 +236,12 @@ pub trait Store: Send + Sync {
 
     /// Prune a file's OLDEST versions beyond the newest `keep`, returning the removed rows so the
     /// caller drops their blobs. Keeps the version history bounded.
-    async fn prune_versions(
-        &self,
-        file_id: &str,
-        keep: i64,
-    ) -> Result<Vec<VersionRec>, StoreError>;
+    async fn prune_versions(&self, file_id: &str, keep: i64)
+        -> Result<Vec<VersionRec>, StoreError>;
 
     /// Remove ALL of a file's version rows (when the file itself is deleted), returning them so the
     /// caller drops their blobs.
-    async fn delete_versions_for_file(
-        &self,
-        file_id: &str,
-    ) -> Result<Vec<VersionRec>, StoreError>;
+    async fn delete_versions_for_file(&self, file_id: &str) -> Result<Vec<VersionRec>, StoreError>;
 
     /// Total stored bytes for `owner_sub`: the SUM of the owner's current file sizes PLUS the SUM of
     /// all their retained version blobs (versions count toward usage). `0` with nothing stored.
@@ -237,6 +262,21 @@ pub trait Store: Send + Sync {
 
     /// Every quota override row as `(owner_sub, quota_bytes)`, owner-ordered (for `/admin`).
     async fn list_quotas(&self) -> Result<Vec<(String, i64)>, StoreError>;
+
+    /// Insert a file comment. Returns `false` on id collision so the caller can retry.
+    async fn create_comment(&self, comment: &FileComment) -> Result<bool, StoreError>;
+
+    /// A file's comments, oldest-first.
+    async fn list_comments(&self, file_id: &str) -> Result<Vec<FileComment>, StoreError>;
+
+    /// Fetch one comment by id.
+    async fn get_comment(&self, comment_id: &str) -> Result<Option<FileComment>, StoreError>;
+
+    /// Delete one comment by id.
+    async fn delete_comment(&self, comment_id: &str) -> Result<bool, StoreError>;
+
+    /// Delete all comments for a file, used by hard purge.
+    async fn delete_comments_for_file(&self, file_id: &str) -> Result<(), StoreError>;
 }
 
 // --------------------------------------------------------------------------------------
@@ -253,6 +293,8 @@ pub struct InMemoryStore {
     versions: Mutex<Vec<VersionRec>>,
     /// Per-owner quota override rows, `(owner_sub, quota_bytes)` — mirrors the `owner_quotas` table.
     quotas: Mutex<Vec<(String, i64)>>,
+    /// Per-file comments (mirrors the `file_comments` table).
+    comments: Mutex<Vec<FileComment>>,
 }
 
 impl InMemoryStore {
@@ -268,8 +310,7 @@ impl Store for InMemoryStore {
         // Reject on any unique conflict (id OR a non-null share token), matching the Postgres
         // constraints (NULL share tokens are distinct, so revoked rows never collide).
         if files.iter().any(|f| {
-            f.id == file.id
-                || (file.share_token.is_some() && f.share_token == file.share_token)
+            f.id == file.id || (file.share_token.is_some() && f.share_token == file.share_token)
         }) {
             return Ok(false);
         }
@@ -286,7 +327,7 @@ impl Store for InMemoryStore {
         let files = self.files.lock().expect("files lock poisoned");
         Ok(files
             .iter()
-            .find(|f| f.share_token.as_deref() == Some(token))
+            .find(|f| f.trashed_at == 0 && f.share_token.as_deref() == Some(token))
             .cloned())
     }
 
@@ -302,6 +343,7 @@ impl Store for InMemoryStore {
         let mut out: Vec<FileRec> = files
             .iter()
             .filter(|f| f.owner_sub == owner_sub)
+            .filter(|f| f.trashed_at == 0)
             // Tree level: `None` = the ROOT (folder_id IS NULL); `Some(id)` = only that folder.
             .filter(|f| match folder {
                 None => f.folder_id.is_none(),
@@ -329,6 +371,54 @@ impl Store for InMemoryStore {
         let before = files.len();
         files.retain(|f| !(f.id == id && f.owner_sub == owner_sub));
         Ok(files.len() != before)
+    }
+
+    async fn trash_file(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        trashed_at: i64,
+    ) -> Result<bool, StoreError> {
+        let mut files = self.files.lock().expect("files lock poisoned");
+        match files
+            .iter_mut()
+            .find(|f| f.id == id && f.owner_sub == owner_sub && f.trashed_at == 0)
+        {
+            Some(f) => {
+                f.trashed_at = trashed_at.max(1);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn restore_file(&self, id: &str, owner_sub: &str) -> Result<bool, StoreError> {
+        let mut files = self.files.lock().expect("files lock poisoned");
+        match files
+            .iter_mut()
+            .find(|f| f.id == id && f.owner_sub == owner_sub && f.trashed_at > 0)
+        {
+            Some(f) => {
+                f.trashed_at = 0;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn list_trashed_by_owner(&self, owner_sub: &str) -> Result<Vec<FileRec>, StoreError> {
+        let files = self.files.lock().expect("files lock poisoned");
+        let mut out: Vec<FileRec> = files
+            .iter()
+            .filter(|f| f.owner_sub == owner_sub && f.trashed_at > 0)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            b.trashed_at
+                .cmp(&a.trashed_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        Ok(out)
     }
 
     async fn configure_share(
@@ -380,11 +470,7 @@ impl Store for InMemoryStore {
         Ok(out)
     }
 
-    async fn get_folder(
-        &self,
-        id: &str,
-        owner_sub: &str,
-    ) -> Result<Option<FolderRec>, StoreError> {
+    async fn get_folder(&self, id: &str, owner_sub: &str) -> Result<Option<FolderRec>, StoreError> {
         let folders = self.folders.lock().expect("folders lock poisoned");
         Ok(folders
             .iter()
@@ -397,6 +483,17 @@ impl Store for InMemoryStore {
         Ok(folders
             .iter()
             .find(|f| f.share_token.as_deref() == Some(token))
+            .cloned())
+    }
+
+    async fn get_folder_by_upload_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<FolderRec>, StoreError> {
+        let folders = self.folders.lock().expect("folders lock poisoned");
+        Ok(folders
+            .iter()
+            .find(|f| f.upload_token.as_deref() == Some(token))
             .cloned())
     }
 
@@ -442,13 +539,35 @@ impl Store for InMemoryStore {
         }
     }
 
+    async fn configure_folder_upload(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        upload_token: Option<String>,
+    ) -> Result<bool, StoreError> {
+        let mut folders = self.folders.lock().expect("folders lock poisoned");
+        match folders
+            .iter_mut()
+            .find(|f| f.id == id && f.owner_sub == owner_sub)
+        {
+            Some(f) => {
+                f.upload_token = upload_token;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     async fn delete_folder_if_empty(
         &self,
         id: &str,
         owner_sub: &str,
     ) -> Result<FolderDelete, StoreError> {
         let mut folders = self.folders.lock().expect("folders lock poisoned");
-        if !folders.iter().any(|f| f.id == id && f.owner_sub == owner_sub) {
+        if !folders
+            .iter()
+            .any(|f| f.id == id && f.owner_sub == owner_sub)
+        {
             return Ok(FolderDelete::NotFound);
         }
         // Empty = no child folder AND no file points at it (owner-scoped).
@@ -474,7 +593,10 @@ impl Store for InMemoryStore {
         owner_sub: &str,
     ) -> Result<Vec<String>, StoreError> {
         let mut folders = self.folders.lock().expect("folders lock poisoned");
-        if !folders.iter().any(|f| f.id == id && f.owner_sub == owner_sub) {
+        if !folders
+            .iter()
+            .any(|f| f.id == id && f.owner_sub == owner_sub)
+        {
             return Ok(Vec::new());
         }
         // Compute the descendant folder-id set (BFS on parent_id, owner-scoped, cycle-safe).
@@ -501,7 +623,9 @@ impl Store for InMemoryStore {
                 .iter()
                 .filter(|f| {
                     f.owner_sub == owner_sub
-                        && f.folder_id.as_deref().is_some_and(|fid| set.iter().any(|s| s == fid))
+                        && f.folder_id
+                            .as_deref()
+                            .is_some_and(|fid| set.iter().any(|s| s == fid))
                 })
                 .map(|f| f.id.clone())
                 .collect();
@@ -515,6 +639,10 @@ impl Store for InMemoryStore {
             }
             files.retain(|f| !doomed.contains(&f.id));
             versions.retain(|v| !doomed.contains(&v.file_id));
+            self.comments
+                .lock()
+                .expect("comments lock poisoned")
+                .retain(|c| !doomed.contains(&c.file_id));
         }
         folders.retain(|f| !(f.owner_sub == owner_sub && set.contains(&f.id)));
         Ok(keys)
@@ -547,10 +675,18 @@ impl Store for InMemoryStore {
         let files = self.files.lock().expect("files lock poisoned");
         let mut out: Vec<FileRec> = files
             .iter()
-            .filter(|f| f.owner_sub == owner_sub && f.folder_id.as_deref() == Some(folder_id))
+            .filter(|f| {
+                f.owner_sub == owner_sub
+                    && f.trashed_at == 0
+                    && f.folder_id.as_deref() == Some(folder_id)
+            })
             .cloned()
             .collect();
-        out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+        out.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
         Ok(out)
     }
 
@@ -565,6 +701,7 @@ impl Store for InMemoryStore {
             .iter()
             .find(|f| {
                 f.owner_sub == owner_sub
+                    && f.trashed_at == 0
                     && f.name == name
                     && f.folder_id.as_deref() == folder_id
             })
@@ -612,7 +749,11 @@ impl Store for InMemoryStore {
             .filter(|v| v.file_id == file_id)
             .cloned()
             .collect();
-        out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+        out.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
         Ok(out)
     }
 
@@ -656,7 +797,11 @@ impl Store for InMemoryStore {
             .filter(|v| v.file_id == file_id)
             .cloned()
             .collect();
-        mine.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+        mine.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
         let keep = keep.max(0) as usize;
         let pruned: Vec<VersionRec> = mine.into_iter().skip(keep).collect();
         let pruned_ids: Vec<String> = pruned.iter().map(|v| v.id.clone()).collect();
@@ -664,10 +809,7 @@ impl Store for InMemoryStore {
         Ok(pruned)
     }
 
-    async fn delete_versions_for_file(
-        &self,
-        file_id: &str,
-    ) -> Result<Vec<VersionRec>, StoreError> {
+    async fn delete_versions_for_file(&self, file_id: &str) -> Result<Vec<VersionRec>, StoreError> {
         let mut versions = self.versions.lock().expect("versions lock poisoned");
         let removed: Vec<VersionRec> = versions
             .iter()
@@ -708,12 +850,14 @@ impl Store for InMemoryStore {
         for f in files.iter() {
             match out.iter_mut().find(|u| u.owner_sub == f.owner_sub) {
                 Some(u) => {
-                    u.files += 1;
+                    if f.trashed_at == 0 {
+                        u.files += 1;
+                    }
                     u.bytes += f.size;
                 }
                 None => out.push(OwnerUsage {
                     owner_sub: f.owner_sub.clone(),
-                    files: 1,
+                    files: if f.trashed_at == 0 { 1 } else { 0 },
                     bytes: f.size,
                 }),
             }
@@ -732,7 +876,11 @@ impl Store for InMemoryStore {
             }
         }
         // Largest first; owner as a deterministic tiebreak — matches the Pg ORDER BY.
-        out.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.owner_sub.cmp(&b.owner_sub)));
+        out.sort_by(|a, b| {
+            b.bytes
+                .cmp(&a.bytes)
+                .then_with(|| a.owner_sub.cmp(&b.owner_sub))
+        });
         Ok(out)
     }
 
@@ -756,6 +904,48 @@ impl Store for InMemoryStore {
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
     }
+
+    async fn create_comment(&self, comment: &FileComment) -> Result<bool, StoreError> {
+        let mut comments = self.comments.lock().expect("comments lock poisoned");
+        if comments.iter().any(|c| c.id == comment.id) {
+            return Ok(false);
+        }
+        comments.push(comment.clone());
+        Ok(true)
+    }
+
+    async fn list_comments(&self, file_id: &str) -> Result<Vec<FileComment>, StoreError> {
+        let comments = self.comments.lock().expect("comments lock poisoned");
+        let mut out: Vec<FileComment> = comments
+            .iter()
+            .filter(|c| c.file_id == file_id)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(out)
+    }
+
+    async fn get_comment(&self, comment_id: &str) -> Result<Option<FileComment>, StoreError> {
+        let comments = self.comments.lock().expect("comments lock poisoned");
+        Ok(comments.iter().find(|c| c.id == comment_id).cloned())
+    }
+
+    async fn delete_comment(&self, comment_id: &str) -> Result<bool, StoreError> {
+        let mut comments = self.comments.lock().expect("comments lock poisoned");
+        let before = comments.len();
+        comments.retain(|c| c.id != comment_id);
+        Ok(comments.len() != before)
+    }
+
+    async fn delete_comments_for_file(&self, file_id: &str) -> Result<(), StoreError> {
+        let mut comments = self.comments.lock().expect("comments lock poisoned");
+        comments.retain(|c| c.file_id != file_id);
+        Ok(())
+    }
 }
 
 // --------------------------------------------------------------------------------------
@@ -771,11 +961,12 @@ use sqlx::Row;
 
 /// Column list shared by every SELECT, so the row decoder stays in lock-step with the query.
 const COLS: &str = "id, owner_sub, name, content_type, size, bucket, object_key, share_token, \
-     created_at, expires_at, share_password_hash, folder_id";
+     created_at, expires_at, share_password_hash, folder_id, trashed_at";
 
 /// Column list shared by every folder SELECT.
 const FOLDER_COLS: &str =
-    "id, owner_sub, parent_id, name, created_at, share_token, expires_at, share_password_hash";
+    "id, owner_sub, parent_id, name, created_at, share_token, expires_at, share_password_hash, \
+     upload_token";
 
 /// Column list shared by every version SELECT.
 const VERSION_COLS: &str = "id, file_id, object_key, size, content_type, created_at";
@@ -848,6 +1039,11 @@ impl PgStore {
         sqlx::query("ALTER TABLE files ADD COLUMN IF NOT EXISTS folder_id TEXT")
             .execute(&self.pool)
             .await?;
+        // Soft-delete marker. Live rows are `0`; trashed rows keep their blob and continue counting
+        // toward usage until purged. Additive + idempotent; existing rows become live.
+        sqlx::query("ALTER TABLE files ADD COLUMN IF NOT EXISTS trashed_at BIGINT DEFAULT 0")
+            .execute(&self.pool)
+            .await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS folders (\
                  id TEXT PRIMARY KEY, \
@@ -881,6 +1077,11 @@ impl PgStore {
         sqlx::query("ALTER TABLE folders ADD COLUMN IF NOT EXISTS share_password_hash TEXT")
             .execute(&self.pool)
             .await?;
+        // Public upload-inbox token (`/u/{token}`), separate from folder share links so request-file
+        // visitors can upload without listing/downloading existing files.
+        sqlx::query("ALTER TABLE folders ADD COLUMN IF NOT EXISTS upload_token TEXT")
+            .execute(&self.pool)
+            .await?;
         // The folder-share token gets its own unique index for the `/s/folder/{token}` lookup (NULLs are
         // distinct, so many revoked/never-shared folders coexist).
         sqlx::query(
@@ -890,6 +1091,12 @@ impl PgStore {
         .execute(&self.pool)
         .await?;
         // Backs per-level child-folder lookups (owner + parent).
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_folders_upload_token \
+             ON folders (upload_token)",
+        )
+        .execute(&self.pool)
+        .await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_folders_owner_parent \
              ON folders (owner_sub, parent_id)",
@@ -935,6 +1142,25 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+        // Per-file comments. `author_sub` is the authenticated subject; bodies are escaped only at
+        // render time so the stored text stays literal.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS file_comments (\
+                 id TEXT PRIMARY KEY, \
+                 file_id TEXT NOT NULL, \
+                 author_sub TEXT NOT NULL, \
+                 body TEXT NOT NULL, \
+                 created_at BIGINT NOT NULL\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_file_comments_file \
+             ON file_comments (file_id, created_at)",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -952,6 +1178,7 @@ impl PgStore {
             expires_at: row.try_get("expires_at")?,
             share_password_hash: row.try_get("share_password_hash")?,
             folder_id: row.try_get("folder_id")?,
+            trashed_at: row.try_get("trashed_at")?,
         })
     }
 
@@ -965,6 +1192,7 @@ impl PgStore {
             share_token: row.try_get("share_token")?,
             expires_at: row.try_get("expires_at")?,
             share_password_hash: row.try_get("share_password_hash")?,
+            upload_token: row.try_get("upload_token")?,
         })
     }
 
@@ -979,14 +1207,24 @@ impl PgStore {
         })
     }
 
+    fn comment_from_row(row: &sqlx::postgres::PgRow) -> Result<FileComment, sqlx::Error> {
+        Ok(FileComment {
+            id: row.try_get("id")?,
+            file_id: row.try_get("file_id")?,
+            author_sub: row.try_get("author_sub")?,
+            body: row.try_get("body")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+
     async fn create_async(&self, file: &FileRec) -> Result<bool, sqlx::Error> {
         // No conflict target => any unique violation (id OR share_token) yields 0 rows affected,
         // signaling the handler to retry with fresh values. Single, race-free insert path.
         let result = sqlx::query(
             "INSERT INTO files \
                  (id, owner_sub, name, content_type, size, bucket, object_key, share_token, \
-                  created_at, expires_at, share_password_hash, folder_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+                  created_at, expires_at, share_password_hash, folder_id, trashed_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
              ON CONFLICT DO NOTHING",
         )
         .bind(&file.id)
@@ -1001,6 +1239,7 @@ impl PgStore {
         .bind(file.expires_at)
         .bind(&file.share_password_hash)
         .bind(&file.folder_id)
+        .bind(file.trashed_at)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
@@ -1037,10 +1276,12 @@ impl PgStore {
     }
 
     async fn get_by_token_async(&self, token: &str) -> Result<Option<FileRec>, sqlx::Error> {
-        let row = sqlx::query(&format!("SELECT {COLS} FROM files WHERE share_token = $1"))
-            .bind(token)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = sqlx::query(&format!(
+            "SELECT {COLS} FROM files WHERE share_token = $1 AND trashed_at = 0"
+        ))
+        .bind(token)
+        .fetch_optional(&self.pool)
+        .await?;
         row.as_ref().map(Self::file_from_row).transpose()
     }
 
@@ -1060,6 +1301,7 @@ impl PgStore {
             (None, None) => {
                 sqlx::query(&format!(
                     "SELECT {COLS} FROM files WHERE owner_sub = $1 AND folder_id IS NULL \
+                     AND trashed_at = 0 \
                      ORDER BY created_at DESC, id DESC LIMIT $2"
                 ))
                 .bind(owner_sub)
@@ -1070,6 +1312,7 @@ impl PgStore {
             (None, Some((ts, id))) => {
                 sqlx::query(&format!(
                     "SELECT {COLS} FROM files WHERE owner_sub = $1 AND folder_id IS NULL \
+                     AND trashed_at = 0 \
                      AND (created_at < $2 OR (created_at = $2 AND id < $3)) \
                      ORDER BY created_at DESC, id DESC LIMIT $4"
                 ))
@@ -1083,6 +1326,7 @@ impl PgStore {
             (Some(fid), None) => {
                 sqlx::query(&format!(
                     "SELECT {COLS} FROM files WHERE owner_sub = $1 AND folder_id = $2 \
+                     AND trashed_at = 0 \
                      ORDER BY created_at DESC, id DESC LIMIT $3"
                 ))
                 .bind(owner_sub)
@@ -1094,6 +1338,7 @@ impl PgStore {
             (Some(fid), Some((ts, id))) => {
                 sqlx::query(&format!(
                     "SELECT {COLS} FROM files WHERE owner_sub = $1 AND folder_id = $2 \
+                     AND trashed_at = 0 \
                      AND (created_at < $3 OR (created_at = $3 AND id < $4)) \
                      ORDER BY created_at DESC, id DESC LIMIT $5"
                 ))
@@ -1109,12 +1354,54 @@ impl PgStore {
         rows.iter().map(Self::file_from_row).collect()
     }
 
+    async fn trash_file_async(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        trashed_at: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE files SET trashed_at = $1 WHERE id = $2 AND owner_sub = $3 AND trashed_at = 0",
+        )
+        .bind(trashed_at.max(1))
+        .bind(id)
+        .bind(owner_sub)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn restore_file_async(&self, id: &str, owner_sub: &str) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE files SET trashed_at = 0 WHERE id = $1 AND owner_sub = $2 AND trashed_at <> 0",
+        )
+        .bind(id)
+        .bind(owner_sub)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn list_trashed_by_owner_async(
+        &self,
+        owner_sub: &str,
+    ) -> Result<Vec<FileRec>, sqlx::Error> {
+        let rows = sqlx::query(&format!(
+            "SELECT {COLS} FROM files WHERE owner_sub = $1 AND trashed_at <> 0 \
+             ORDER BY trashed_at DESC, id DESC"
+        ))
+        .bind(owner_sub)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::file_from_row).collect()
+    }
+
     async fn create_folder_async(&self, folder: &FolderRec) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             "INSERT INTO folders \
                  (id, owner_sub, parent_id, name, created_at, share_token, expires_at, \
-                  share_password_hash) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING",
+                  share_password_hash, upload_token) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING",
         )
         .bind(&folder.id)
         .bind(&folder.owner_sub)
@@ -1124,6 +1411,7 @@ impl PgStore {
         .bind(&folder.share_token)
         .bind(folder.expires_at)
         .bind(&folder.share_password_hash)
+        .bind(&folder.upload_token)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
@@ -1168,6 +1456,19 @@ impl PgStore {
         row.as_ref().map(Self::folder_from_row).transpose()
     }
 
+    async fn get_folder_by_upload_token_async(
+        &self,
+        token: &str,
+    ) -> Result<Option<FolderRec>, sqlx::Error> {
+        let row = sqlx::query(&format!(
+            "SELECT {FOLDER_COLS} FROM folders WHERE upload_token = $1"
+        ))
+        .bind(token)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(Self::folder_from_row).transpose()
+    }
+
     async fn rename_folder_async(
         &self,
         id: &str,
@@ -1202,6 +1503,22 @@ impl PgStore {
         .bind(owner_sub)
         .execute(&self.pool)
         .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn configure_folder_upload_async(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        upload_token: Option<String>,
+    ) -> Result<bool, sqlx::Error> {
+        let result =
+            sqlx::query("UPDATE folders SET upload_token = $1 WHERE id = $2 AND owner_sub = $3")
+                .bind(&upload_token)
+                .bind(id)
+                .bind(owner_sub)
+                .execute(&self.pool)
+                .await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -1292,6 +1609,10 @@ impl PgStore {
                     .bind(&file_id)
                     .execute(&self.pool)
                     .await?;
+                sqlx::query("DELETE FROM file_comments WHERE file_id = $1")
+                    .bind(&file_id)
+                    .execute(&self.pool)
+                    .await?;
             }
             sqlx::query("DELETE FROM files WHERE folder_id = $1 AND owner_sub = $2")
                 .bind(fid)
@@ -1314,6 +1635,7 @@ impl PgStore {
     ) -> Result<Vec<FileRec>, sqlx::Error> {
         let rows = sqlx::query(&format!(
             "SELECT {COLS} FROM files WHERE folder_id = $1 AND owner_sub = $2 \
+             AND trashed_at = 0 \
              ORDER BY created_at DESC, id DESC"
         ))
         .bind(folder_id)
@@ -1334,7 +1656,8 @@ impl PgStore {
             None => {
                 sqlx::query(&format!(
                     "SELECT {COLS} FROM files \
-                     WHERE owner_sub = $1 AND name = $2 AND folder_id IS NULL LIMIT 1"
+                     WHERE owner_sub = $1 AND name = $2 AND folder_id IS NULL \
+                     AND trashed_at = 0 LIMIT 1"
                 ))
                 .bind(owner_sub)
                 .bind(name)
@@ -1344,7 +1667,8 @@ impl PgStore {
             Some(fid) => {
                 sqlx::query(&format!(
                     "SELECT {COLS} FROM files \
-                     WHERE owner_sub = $1 AND name = $2 AND folder_id = $3 LIMIT 1"
+                     WHERE owner_sub = $1 AND name = $2 AND folder_id = $3 \
+                     AND trashed_at = 0 LIMIT 1"
                 ))
                 .bind(owner_sub)
                 .bind(name)
@@ -1475,12 +1799,13 @@ impl PgStore {
         owner_sub: &str,
         folder_id: Option<&str>,
     ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query("UPDATE files SET folder_id = $1 WHERE id = $2 AND owner_sub = $3")
-            .bind(folder_id)
-            .bind(id)
-            .bind(owner_sub)
-            .execute(&self.pool)
-            .await?;
+        let result =
+            sqlx::query("UPDATE files SET folder_id = $1 WHERE id = $2 AND owner_sub = $3")
+                .bind(folder_id)
+                .bind(id)
+                .bind(owner_sub)
+                .execute(&self.pool)
+                .await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -1517,7 +1842,8 @@ impl PgStore {
 
     async fn usage_by_owner_async(&self) -> Result<Vec<OwnerUsage>, sqlx::Error> {
         let rows = sqlx::query(
-            "SELECT owner_sub, CAST(COUNT(*) AS BIGINT) AS files, \
+            "SELECT owner_sub, \
+                    CAST(COALESCE(SUM(CASE WHEN trashed_at = 0 THEN 1 ELSE 0 END), 0) AS BIGINT) AS files, \
                     CAST(COALESCE(SUM(size), 0) AS BIGINT) AS bytes \
              FROM files GROUP BY owner_sub ORDER BY bytes DESC, owner_sub ASC",
         )
@@ -1547,7 +1873,11 @@ impl PgStore {
                 u.bytes += bytes;
             }
         }
-        out.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.owner_sub.cmp(&b.owner_sub)));
+        out.sort_by(|a, b| {
+            b.bytes
+                .cmp(&a.bytes)
+                .then_with(|| a.owner_sub.cmp(&b.owner_sub))
+        });
         Ok(out)
     }
 
@@ -1588,14 +1918,68 @@ impl PgStore {
     }
 
     async fn list_quotas_async(&self) -> Result<Vec<(String, i64)>, sqlx::Error> {
-        let rows = sqlx::query(
-            "SELECT owner_sub, quota_bytes FROM owner_quotas ORDER BY owner_sub ASC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let rows =
+            sqlx::query("SELECT owner_sub, quota_bytes FROM owner_quotas ORDER BY owner_sub ASC")
+                .fetch_all(&self.pool)
+                .await?;
         rows.iter()
             .map(|row| Ok((row.try_get("owner_sub")?, row.try_get("quota_bytes")?)))
             .collect()
+    }
+
+    async fn create_comment_async(&self, comment: &FileComment) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "INSERT INTO file_comments (id, file_id, author_sub, body, created_at) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+        )
+        .bind(&comment.id)
+        .bind(&comment.file_id)
+        .bind(&comment.author_sub)
+        .bind(&comment.body)
+        .bind(comment.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn list_comments_async(&self, file_id: &str) -> Result<Vec<FileComment>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT id, file_id, author_sub, body, created_at FROM file_comments \
+             WHERE file_id = $1 ORDER BY created_at ASC, id ASC",
+        )
+        .bind(file_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::comment_from_row).collect()
+    }
+
+    async fn get_comment_async(
+        &self,
+        comment_id: &str,
+    ) -> Result<Option<FileComment>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT id, file_id, author_sub, body, created_at FROM file_comments WHERE id = $1",
+        )
+        .bind(comment_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(Self::comment_from_row).transpose()
+    }
+
+    async fn delete_comment_async(&self, comment_id: &str) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query("DELETE FROM file_comments WHERE id = $1")
+            .bind(comment_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn delete_comments_for_file_async(&self, file_id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM file_comments WHERE file_id = $1")
+            .bind(file_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
 
@@ -1637,6 +2021,29 @@ impl Store for PgStore {
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
+    async fn trash_file(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        trashed_at: i64,
+    ) -> Result<bool, StoreError> {
+        self.trash_file_async(id, owner_sub, trashed_at)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn restore_file(&self, id: &str, owner_sub: &str) -> Result<bool, StoreError> {
+        self.restore_file_async(id, owner_sub)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn list_trashed_by_owner(&self, owner_sub: &str) -> Result<Vec<FileRec>, StoreError> {
+        self.list_trashed_by_owner_async(owner_sub)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
     async fn configure_share(
         &self,
         id: &str,
@@ -1662,11 +2069,7 @@ impl Store for PgStore {
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
-    async fn get_folder(
-        &self,
-        id: &str,
-        owner_sub: &str,
-    ) -> Result<Option<FolderRec>, StoreError> {
+    async fn get_folder(&self, id: &str, owner_sub: &str) -> Result<Option<FolderRec>, StoreError> {
         self.get_folder_async(id, owner_sub)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
@@ -1674,6 +2077,15 @@ impl Store for PgStore {
 
     async fn get_folder_by_token(&self, token: &str) -> Result<Option<FolderRec>, StoreError> {
         self.get_folder_by_token_async(token)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn get_folder_by_upload_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<FolderRec>, StoreError> {
+        self.get_folder_by_upload_token_async(token)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
@@ -1697,7 +2109,24 @@ impl Store for PgStore {
         expires_at: Option<i64>,
         share_password_hash: Option<String>,
     ) -> Result<bool, StoreError> {
-        self.configure_folder_share_async(id, owner_sub, share_token, expires_at, share_password_hash)
+        self.configure_folder_share_async(
+            id,
+            owner_sub,
+            share_token,
+            expires_at,
+            share_password_hash,
+        )
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn configure_folder_upload(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        upload_token: Option<String>,
+    ) -> Result<bool, StoreError> {
+        self.configure_folder_upload_async(id, owner_sub, upload_token)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
@@ -1810,10 +2239,7 @@ impl Store for PgStore {
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
-    async fn delete_versions_for_file(
-        &self,
-        file_id: &str,
-    ) -> Result<Vec<VersionRec>, StoreError> {
+    async fn delete_versions_for_file(&self, file_id: &str) -> Result<Vec<VersionRec>, StoreError> {
         self.delete_versions_for_file_async(file_id)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
@@ -1848,6 +2274,36 @@ impl Store for PgStore {
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
+
+    async fn create_comment(&self, comment: &FileComment) -> Result<bool, StoreError> {
+        self.create_comment_async(comment)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn list_comments(&self, file_id: &str) -> Result<Vec<FileComment>, StoreError> {
+        self.list_comments_async(file_id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn get_comment(&self, comment_id: &str) -> Result<Option<FileComment>, StoreError> {
+        self.get_comment_async(comment_id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn delete_comment(&self, comment_id: &str) -> Result<bool, StoreError> {
+        self.delete_comment_async(comment_id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn delete_comments_for_file(&self, file_id: &str) -> Result<(), StoreError> {
+        self.delete_comments_for_file_async(file_id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -1868,6 +2324,7 @@ mod tests {
             expires_at: None,
             share_password_hash: None,
             folder_id: None,
+            trashed_at: 0,
         }
     }
 
@@ -1897,25 +2354,36 @@ mod tests {
     async fn list_paginates_backward_with_before_cursor() {
         let s = InMemoryStore::new();
         for (id, ts) in [("a", 10), ("b", 20), ("c", 30), ("d", 40), ("e", 50)] {
-            s.create(&file(id, "u", &format!("t-{id}"), ts)).await.unwrap();
+            s.create(&file(id, "u", &format!("t-{id}"), ts))
+                .await
+                .unwrap();
         }
         // Page 1 (newest 2).
         let p1 = s.list_by_owner("u", None, None, 2).await.unwrap();
-        assert_eq!(p1.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["e", "d"]);
+        assert_eq!(
+            p1.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+            vec!["e", "d"]
+        );
         // Cursor = last (oldest) row of page 1 -> next 2, strictly older.
         let c1 = p1.last().unwrap();
         let p2 = s
             .list_by_owner("u", None, Some((c1.created_at, c1.id.clone())), 2)
             .await
             .unwrap();
-        assert_eq!(p2.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["c", "b"]);
+        assert_eq!(
+            p2.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+            vec!["c", "b"]
+        );
         // Final partial page.
         let c2 = p2.last().unwrap();
         let p3 = s
             .list_by_owner("u", None, Some((c2.created_at, c2.id.clone())), 2)
             .await
             .unwrap();
-        assert_eq!(p3.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["a"]);
+        assert_eq!(
+            p3.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+            vec!["a"]
+        );
     }
 
     #[tokio::test]
@@ -1926,13 +2394,19 @@ mod tests {
         s.create(&file("b", "u", "tb", 100)).await.unwrap();
         s.create(&file("c", "u", "tc", 100)).await.unwrap();
         let p1 = s.list_by_owner("u", None, None, 2).await.unwrap();
-        assert_eq!(p1.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["c", "b"]);
+        assert_eq!(
+            p1.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+            vec!["c", "b"]
+        );
         let c1 = p1.last().unwrap();
         let p2 = s
             .list_by_owner("u", None, Some((c1.created_at, c1.id.clone())), 2)
             .await
             .unwrap();
-        assert_eq!(p2.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["a"]);
+        assert_eq!(
+            p2.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+            vec!["a"]
+        );
     }
 
     #[tokio::test]
@@ -1946,7 +2420,13 @@ mod tests {
         // A non-positive limit falls back to the default page size (>= 10 here, so all 10 return).
         assert_eq!(s.list_by_owner("u", None, None, 0).await.unwrap().len(), 10);
         // An absurd limit is capped to MAX_PAGE but still returns everything available.
-        assert_eq!(s.list_by_owner("u", None, None, 100_000).await.unwrap().len(), 10);
+        assert_eq!(
+            s.list_by_owner("u", None, None, 100_000)
+                .await
+                .unwrap()
+                .len(),
+            10
+        );
     }
 
     #[tokio::test]
@@ -1974,7 +2454,13 @@ mod tests {
 
         // Owner sets an expiry + password on the existing token.
         assert!(s
-            .configure_share("a", "u", Some("tok-a".into()), Some(999), Some("salt$hash".into()))
+            .configure_share(
+                "a",
+                "u",
+                Some("tok-a".into()),
+                Some(999),
+                Some("salt$hash".into())
+            )
             .await
             .unwrap());
         let rec = s.get("a").await.unwrap().unwrap();
@@ -1996,6 +2482,75 @@ mod tests {
         assert_eq!(s.list_by_owner("u", None, None, 50).await.unwrap().len(), 2);
     }
 
+    #[tokio::test]
+    async fn trash_hides_live_surfaces_but_counts_usage_until_hard_delete() {
+        let s = InMemoryStore::new();
+        let mut a = file("a", "u", "tok-a", 1);
+        a.size = 25;
+        s.create(&a).await.unwrap();
+        assert_eq!(s.usage_for_owner("u").await.unwrap(), 25);
+
+        assert!(s.trash_file("a", "u", 99).await.unwrap());
+        assert!(s
+            .list_by_owner("u", None, None, 50)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(s.get_by_token("tok-a").await.unwrap().is_none());
+        assert_eq!(s.list_trashed_by_owner("u").await.unwrap()[0].id, "a");
+        assert_eq!(s.usage_for_owner("u").await.unwrap(), 25);
+        let agg = s.usage_by_owner().await.unwrap();
+        assert_eq!(
+            agg[0].files, 0,
+            "trashed files are hidden from visible file counts"
+        );
+        assert_eq!(agg[0].bytes, 25, "trashed bytes still count toward usage");
+
+        assert!(s.restore_file("a", "u").await.unwrap());
+        assert_eq!(s.get("a").await.unwrap().unwrap().trashed_at, 0);
+        assert_eq!(s.list_by_owner("u", None, None, 50).await.unwrap().len(), 1);
+
+        assert!(s.trash_file("a", "u", 100).await.unwrap());
+        assert!(s.delete("a", "u").await.unwrap());
+        assert_eq!(s.usage_for_owner("u").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn comments_roundtrip_oldest_first_and_delete_for_file() {
+        let s = InMemoryStore::new();
+        s.create(&file("a", "u", "tok-a", 1)).await.unwrap();
+        let c1 = FileComment {
+            id: "c1".into(),
+            file_id: "a".into(),
+            author_sub: "u".into(),
+            body: "first".into(),
+            created_at: 1,
+        };
+        let c2 = FileComment {
+            id: "c2".into(),
+            file_id: "a".into(),
+            author_sub: "v".into(),
+            body: "second".into(),
+            created_at: 2,
+        };
+        assert!(s.create_comment(&c2).await.unwrap());
+        assert!(s.create_comment(&c1).await.unwrap());
+        assert!(
+            !s.create_comment(&c1).await.unwrap(),
+            "comment id collision returns false"
+        );
+        let comments = s.list_comments("a").await.unwrap();
+        assert_eq!(
+            comments.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["c1", "c2"]
+        );
+        assert_eq!(s.get_comment("c2").await.unwrap().unwrap().body, "second");
+        assert!(s.delete_comment("c1").await.unwrap());
+        assert_eq!(s.list_comments("a").await.unwrap().len(), 1);
+        s.delete_comments_for_file("a").await.unwrap();
+        assert!(s.list_comments("a").await.unwrap().is_empty());
+    }
+
     fn folder(id: &str, owner: &str, name: &str, created_at: i64) -> FolderRec {
         FolderRec {
             id: id.into(),
@@ -2006,6 +2561,7 @@ mod tests {
             share_token: None,
             expires_at: None,
             share_password_hash: None,
+            upload_token: None,
         }
     }
 
@@ -2020,6 +2576,7 @@ mod tests {
             share_token: None,
             expires_at: None,
             share_password_hash: None,
+            upload_token: None,
         }
     }
 
@@ -2037,9 +2594,15 @@ mod tests {
     #[tokio::test]
     async fn folders_are_owner_scoped_and_name_ordered() {
         let s = InMemoryStore::new();
-        s.create_folder(&folder("f2", "u", "Zeta", 1)).await.unwrap();
-        s.create_folder(&folder("f1", "u", "alpha", 2)).await.unwrap();
-        s.create_folder(&folder("f3", "other", "Mine", 3)).await.unwrap();
+        s.create_folder(&folder("f2", "u", "Zeta", 1))
+            .await
+            .unwrap();
+        s.create_folder(&folder("f1", "u", "alpha", 2))
+            .await
+            .unwrap();
+        s.create_folder(&folder("f3", "other", "Mine", 3))
+            .await
+            .unwrap();
         // id collision -> false.
         assert!(!s.create_folder(&folder("f1", "u", "dup", 9)).await.unwrap());
 
@@ -2078,12 +2641,20 @@ mod tests {
     #[tokio::test]
     async fn move_file_filters_root_vs_folder_view() {
         let s = InMemoryStore::new();
-        s.create_folder(&folder("f1", "u", "Album", 1)).await.unwrap();
+        s.create_folder(&folder("f1", "u", "Album", 1))
+            .await
+            .unwrap();
         s.create(&file("a", "u", "ta", 10)).await.unwrap();
         s.create(&file("b", "u", "tb", 20)).await.unwrap();
 
         // Both files start at ROOT: the folder view is empty, the root view has both.
-        assert_eq!(s.list_by_owner("u", Some("f1"), None, 50).await.unwrap().len(), 0);
+        assert_eq!(
+            s.list_by_owner("u", Some("f1"), None, 50)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
         assert_eq!(s.list_by_owner("u", None, None, 50).await.unwrap().len(), 2);
 
         // A non-owner cannot move the file.
@@ -2092,22 +2663,36 @@ mod tests {
         // only "b" (a filed file leaves the root — the tree model).
         assert!(s.move_file("a", "u", Some("f1")).await.unwrap());
         let in_folder = s.list_by_owner("u", Some("f1"), None, 50).await.unwrap();
-        assert_eq!(in_folder.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["a"]);
+        assert_eq!(
+            in_folder.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+            vec!["a"]
+        );
         let root = s.list_by_owner("u", None, None, 50).await.unwrap();
-        assert_eq!(root.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["b"]);
+        assert_eq!(
+            root.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+            vec!["b"]
+        );
         // list_files_in_folder returns the whole folder unpaginated.
         assert_eq!(s.list_files_in_folder("f1", "u").await.unwrap().len(), 1);
 
         // Move "a" back to root -> the folder view empties, root has both again.
         assert!(s.move_file("a", "u", None).await.unwrap());
-        assert_eq!(s.list_by_owner("u", Some("f1"), None, 50).await.unwrap().len(), 0);
+        assert_eq!(
+            s.list_by_owner("u", Some("f1"), None, 50)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
         assert_eq!(s.list_by_owner("u", None, None, 50).await.unwrap().len(), 2);
     }
 
     #[tokio::test]
     async fn find_file_in_folder_scopes_by_name_and_level() {
         let s = InMemoryStore::new();
-        s.create_folder(&folder("f1", "u", "Album", 1)).await.unwrap();
+        s.create_folder(&folder("f1", "u", "Album", 1))
+            .await
+            .unwrap();
         let mut root = file("r", "u", "tr", 1);
         root.name = "same.png".into();
         s.create(&root).await.unwrap();
@@ -2118,16 +2703,32 @@ mod tests {
 
         // Same name resolves per-level: root vs folder are distinct files.
         assert_eq!(
-            s.find_file_in_folder("u", "same.png", None).await.unwrap().unwrap().id,
+            s.find_file_in_folder("u", "same.png", None)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
             "r"
         );
         assert_eq!(
-            s.find_file_in_folder("u", "same.png", Some("f1")).await.unwrap().unwrap().id,
+            s.find_file_in_folder("u", "same.png", Some("f1"))
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
             "g"
         );
-        assert!(s.find_file_in_folder("u", "nope.png", None).await.unwrap().is_none());
+        assert!(s
+            .find_file_in_folder("u", "nope.png", None)
+            .await
+            .unwrap()
+            .is_none());
         // Owner-scoped.
-        assert!(s.find_file_in_folder("other", "same.png", None).await.unwrap().is_none());
+        assert!(s
+            .find_file_in_folder("other", "same.png", None)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -2172,8 +2773,16 @@ mod tests {
         assert_eq!(
             agg,
             vec![
-                OwnerUsage { owner_sub: "other".into(), files: 1, bytes: 700 },
-                OwnerUsage { owner_sub: "u".into(), files: 2, bytes: 150 },
+                OwnerUsage {
+                    owner_sub: "other".into(),
+                    files: 1,
+                    bytes: 700
+                },
+                OwnerUsage {
+                    owner_sub: "u".into(),
+                    files: 2,
+                    bytes: 150
+                },
             ]
         );
         // Deleting a file shrinks the sum (usage tracks the live rows).
@@ -2184,27 +2793,45 @@ mod tests {
     #[tokio::test]
     async fn delete_folder_empty_only_then_cascade() {
         let s = InMemoryStore::new();
-        s.create_folder(&folder("f1", "u", "Album", 1)).await.unwrap();
-        s.create_folder(&subfolder("f2", "u", "f1", "Sub")).await.unwrap();
+        s.create_folder(&folder("f1", "u", "Album", 1))
+            .await
+            .unwrap();
+        s.create_folder(&subfolder("f2", "u", "f1", "Sub"))
+            .await
+            .unwrap();
         s.create(&file("a", "u", "ta", 10)).await.unwrap();
         s.move_file("a", "u", Some("f2")).await.unwrap();
 
         // f1 has a subfolder -> not empty; f2 has a file -> not empty.
-        assert_eq!(s.delete_folder_if_empty("f1", "u").await.unwrap(), FolderDelete::NotEmpty);
-        assert_eq!(s.delete_folder_if_empty("f2", "u").await.unwrap(), FolderDelete::NotEmpty);
+        assert_eq!(
+            s.delete_folder_if_empty("f1", "u").await.unwrap(),
+            FolderDelete::NotEmpty
+        );
+        assert_eq!(
+            s.delete_folder_if_empty("f2", "u").await.unwrap(),
+            FolderDelete::NotEmpty
+        );
 
         // Cascade from f1 removes the whole subtree (f1, f2) AND the file, returning the freed keys.
         let keys = s.delete_folder_cascade("f1", "u").await.unwrap();
-        assert!(keys.contains(&"a".to_string()), "the file's object key is freed for blob cleanup");
+        assert!(
+            keys.contains(&"a".to_string()),
+            "the file's object key is freed for blob cleanup"
+        );
         assert!(s.get_folder("f1", "u").await.unwrap().is_none());
         assert!(s.get_folder("f2", "u").await.unwrap().is_none());
-        assert!(s.get("a").await.unwrap().is_none(), "cascade deletes the file too");
+        assert!(
+            s.get("a").await.unwrap().is_none(),
+            "cascade deletes the file too"
+        );
     }
 
     #[tokio::test]
     async fn cascade_frees_version_blobs_and_is_owner_scoped() {
         let s = InMemoryStore::new();
-        s.create_folder(&folder("f1", "u", "Album", 1)).await.unwrap();
+        s.create_folder(&folder("f1", "u", "Album", 1))
+            .await
+            .unwrap();
         let mut a = file("a", "u", "ta", 10);
         a.object_key = "a".into();
         a.folder_id = Some("f1".into());
@@ -2212,7 +2839,11 @@ mod tests {
         s.add_version(&version("v1", "a", 5, 1)).await.unwrap();
 
         // A non-owner cascade removes nothing.
-        assert!(s.delete_folder_cascade("f1", "other").await.unwrap().is_empty());
+        assert!(s
+            .delete_folder_cascade("f1", "other")
+            .await
+            .unwrap()
+            .is_empty());
         assert!(s.get_folder("f1", "u").await.unwrap().is_some());
 
         // Owner cascade frees the current blob AND the version blob.
@@ -2225,7 +2856,9 @@ mod tests {
     #[tokio::test]
     async fn folder_share_configure_and_lookup_by_token() {
         let s = InMemoryStore::new();
-        s.create_folder(&folder("f1", "u", "Shared", 1)).await.unwrap();
+        s.create_folder(&folder("f1", "u", "Shared", 1))
+            .await
+            .unwrap();
         // Non-owner cannot configure.
         assert!(!s
             .configure_folder_share("f1", "intruder", Some("ftok".into()), None, None)
@@ -2233,7 +2866,13 @@ mod tests {
             .unwrap());
         // Owner enables a share with an expiry + password.
         assert!(s
-            .configure_folder_share("f1", "u", Some("ftok".into()), Some(999), Some("salt$h".into()))
+            .configure_folder_share(
+                "f1",
+                "u",
+                Some("ftok".into()),
+                Some(999),
+                Some("salt$h".into())
+            )
             .await
             .unwrap());
         let byf = s.get_folder_by_token("ftok").await.unwrap().unwrap();
@@ -2241,8 +2880,35 @@ mod tests {
         assert_eq!(byf.expires_at, Some(999));
         assert!(byf.share_has_password());
         // Revoke clears the token; the public lookup misses.
-        assert!(s.configure_folder_share("f1", "u", None, None, None).await.unwrap());
+        assert!(s
+            .configure_folder_share("f1", "u", None, None, None)
+            .await
+            .unwrap());
         assert!(s.get_folder_by_token("ftok").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn folder_upload_token_configure_lookup_and_revoke() {
+        let s = InMemoryStore::new();
+        s.create_folder(&folder("f1", "u", "Inbox", 1))
+            .await
+            .unwrap();
+        assert!(!s
+            .configure_folder_upload("f1", "intruder", Some("utok".into()))
+            .await
+            .unwrap());
+        assert!(s
+            .configure_folder_upload("f1", "u", Some("utok".into()))
+            .await
+            .unwrap());
+        let got = s.get_folder_by_upload_token("utok").await.unwrap().unwrap();
+        assert_eq!(got.id, "f1");
+        assert!(s.configure_folder_upload("f1", "u", None).await.unwrap());
+        assert!(s
+            .get_folder_by_upload_token("utok")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -2254,14 +2920,23 @@ mod tests {
         s.add_version(&version("v2", "a", 20, 2)).await.unwrap();
         s.add_version(&version("v3", "a", 30, 3)).await.unwrap();
         // Newest-first ordering.
-        let ids: Vec<String> = s.list_versions("a").await.unwrap().into_iter().map(|v| v.id).collect();
+        let ids: Vec<String> = s
+            .list_versions("a")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|v| v.id)
+            .collect();
         assert_eq!(ids, vec!["v3", "v2", "v1"]);
         // get is file-scoped.
         assert!(s.get_version("v2", "a").await.unwrap().is_some());
         assert!(s.get_version("v2", "other").await.unwrap().is_none());
         // Prune to keep the newest 2 -> the oldest (v1) is returned for blob cleanup.
         let pruned = s.prune_versions("a", 2).await.unwrap();
-        assert_eq!(pruned.iter().map(|v| v.id.as_str()).collect::<Vec<_>>(), vec!["v1"]);
+        assert_eq!(
+            pruned.iter().map(|v| v.id.as_str()).collect::<Vec<_>>(),
+            vec!["v1"]
+        );
         assert_eq!(s.list_versions("a").await.unwrap().len(), 2);
         // delete_version returns the removed row (caller decides whether to drop the blob).
         let removed = s.delete_version("v2", "a").await.unwrap().unwrap();
@@ -2292,13 +2967,19 @@ mod tests {
     async fn update_file_blob_repoints_current() {
         let s = InMemoryStore::new();
         s.create(&file("a", "u", "ta", 1)).await.unwrap();
-        assert!(s.update_file_blob("a", "u", "newkey", 77, "application/pdf", 999).await.unwrap());
+        assert!(s
+            .update_file_blob("a", "u", "newkey", 77, "application/pdf", 999)
+            .await
+            .unwrap());
         let got = s.get("a").await.unwrap().unwrap();
         assert_eq!(got.object_key, "newkey");
         assert_eq!(got.size, 77);
         assert_eq!(got.content_type, "application/pdf");
         assert_eq!(got.created_at, 999);
         // Owner-scoped.
-        assert!(!s.update_file_blob("a", "intruder", "x", 1, "text/plain", 1).await.unwrap());
+        assert!(!s
+            .update_file_blob("a", "intruder", "x", 1, "text/plain", 1)
+            .await
+            .unwrap());
     }
 }

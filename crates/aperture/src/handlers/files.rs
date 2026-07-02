@@ -23,7 +23,7 @@ use crate::handlers::{
     esc, expiry_options, fmt_ts, human_size, parse_expiry, resolve_content_type, safe_filename,
     userbox, APP_CSS, FILE_SVG, SHIELD_SVG,
 };
-use crate::model::{FileRec, FolderRec, VersionRec};
+use crate::model::{FileComment, FileRec, FolderRec, VersionRec};
 use crate::store::{FolderDelete, MAX_VERSIONS_PER_FILE};
 use crate::{now_secs, random_alnum, AppState};
 
@@ -35,8 +35,14 @@ const FOLDER_ID_LEN: usize = 10;
 const VERSION_ID_LEN: usize = 10;
 /// Length of the unguessable public share token (~190 bits at 32 chars).
 const SHARE_TOKEN_LEN: usize = 32;
+/// Length of a public upload-inbox token.
+const UPLOAD_TOKEN_LEN: usize = 32;
+/// Length of a file comment id.
+const COMMENT_ID_LEN: usize = 10;
 /// Hard cap on a stored display file name (characters).
 const MAX_NAME_CHARS: usize = 255;
+/// Hard cap on a submitted comment body (characters).
+const MAX_COMMENT_CHARS: usize = 2000;
 /// Hard cap on a submitted share-link password (characters).
 const MAX_PASSWORD_CHARS: usize = 128;
 /// Hard cap on the byte prefix rendered inline for a text/markdown preview (256 KiB). Larger files
@@ -50,6 +56,7 @@ const GALLERY_HTML: &str = include_str!("../../templates/gallery.html");
 const DETAIL_HTML: &str = include_str!("../../templates/detail.html");
 const SHARE_PW_HTML: &str = include_str!("../../templates/share_password.html");
 const SHARE_FOLDER_HTML: &str = include_str!("../../templates/share_folder.html");
+const UPLOAD_INBOX_HTML: &str = include_str!("../../templates/upload_inbox.html");
 
 /// Folder glyph for the drive's subfolder tiles (trusted, server-owned markup).
 const FOLDER_SVG: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h5l2 2.5h9a1 1 0 0 1 1 1V18a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Z"/></svg>"##;
@@ -73,6 +80,9 @@ pub struct GalleryQuery {
     /// folder's files; otherwise (unset / unknown) it falls back to the flat "all files" view.
     #[serde(default)]
     pub folder: Option<String>,
+    /// Optional view selector. `view=trash` renders the owner's recycle bin instead of live files.
+    #[serde(default)]
+    pub view: Option<String>,
 }
 
 /// `GET /` — render the upload dropzone (with a fresh CSRF token) and one keyset page of the
@@ -123,9 +133,23 @@ pub async fn gallery(
         .await
         .unwrap_or_default();
     let quota = effective_quota(
-        state.store.get_quota(&who.subject).await.unwrap_or_default(),
+        state
+            .store
+            .get_quota(&who.subject)
+            .await
+            .unwrap_or_default(),
         state.config.default_quota_bytes,
     );
+
+    if q.view.as_deref() == Some("trash") {
+        let trashed = state
+            .store
+            .list_trashed_by_owner(&who.subject)
+            .await
+            .unwrap_or_default();
+        let html = render_trash_gallery(&state.config, &who, &csrf, &trashed, used, quota);
+        return html_with_csrf(StatusCode::OK, html, &csrf);
+    }
 
     let html = render_gallery(
         &state.config,
@@ -257,7 +281,13 @@ pub async fn upload(
     ) {
         let used = state.store.usage_for_owner(&who.subject).await?;
         if used.saturating_add(size) > quota {
-            tracing::info!(owner = who.subject, used, size, quota, "upload rejected: over quota");
+            tracing::info!(
+                owner = who.subject,
+                used,
+                size,
+                quota,
+                "upload rejected: over quota"
+            );
             state.audit.emit(AuditEvent::warning(
                 "file.quota.reject",
                 &who.subject,
@@ -300,6 +330,7 @@ pub async fn upload(
         share_password_hash: None,
         // A fresh upload lands at the level it was uploaded into (root when unset).
         folder_id: target,
+        trashed_at: 0,
     };
 
     // Reserve a unique row (id + share token) BEFORE writing the blob, retrying on the rare
@@ -397,7 +428,14 @@ async fn reupload_as_version(
     // Repoint the file to the new blob (bumps created_at + content type to the new bytes').
     state
         .store
-        .update_file_blob(&existing.id, &who.subject, &new_key, size, &content_type, now)
+        .update_file_blob(
+            &existing.id,
+            &who.subject,
+            &new_key,
+            size,
+            &content_type,
+            now,
+        )
         .await?;
 
     // Prune the oldest versions past the cap and delete their blobs.
@@ -410,9 +448,17 @@ async fn reupload_as_version(
         let _ = state.blobs.delete(&v.object_key).await;
     }
     // The old derived thumbnail (keyed off the prior object key) is now an orphan — drop it.
-    let _ = state.blobs.delete(&thumb_object_key(&existing.object_key)).await;
+    let _ = state
+        .blobs
+        .delete(&thumb_object_key(&existing.object_key))
+        .await;
 
-    tracing::info!(id = existing.id, owner = who.subject, size, "file re-uploaded as new version");
+    tracing::info!(
+        id = existing.id,
+        owner = who.subject,
+        size,
+        "file re-uploaded as new version"
+    );
     state.audit.emit(AuditEvent::notice(
         "file.version.add",
         &who.subject,
@@ -443,7 +489,17 @@ pub async fn detail(
         .unwrap_or_default();
     let preview = build_preview(&state, &rec).await;
     let versions = state.store.list_versions(&rec.id).await.unwrap_or_default();
-    let html = render_detail(&state.config, &rec, &viewer, &csrf, &folders, &preview, &versions);
+    let comments = state.store.list_comments(&rec.id).await.unwrap_or_default();
+    let html = render_detail(
+        &state.config,
+        &rec,
+        &viewer,
+        &csrf,
+        &folders,
+        &preview,
+        &versions,
+        &comments,
+    );
     Ok(html_with_csrf(StatusCode::OK, html, &csrf))
 }
 
@@ -582,7 +638,12 @@ pub async fn restore_version(
     }
     let _ = state.blobs.delete(&thumb_object_key(&rec.object_key)).await;
 
-    tracing::info!(id = rec.id, owner = actor.subject, version = vid, "file version restored");
+    tracing::info!(
+        id = rec.id,
+        owner = actor.subject,
+        version = vid,
+        "file version restored"
+    );
     state.audit.emit(AuditEvent::notice(
         "file.version.restore",
         &actor.subject,
@@ -620,7 +681,7 @@ pub async fn thumb(
 }
 
 // ---------------------------------------------------------------------------
-// POST /delete/{id} — delete your own file (blob + row)
+// POST /delete/{id} — move your own file to Trash
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -629,8 +690,7 @@ pub struct DeleteForm {
     pub csrf_token: String,
 }
 
-/// `POST /delete/{id}` — CSRF-checked, ownership-scoped delete (metadata then best-effort blob),
-/// then 302 to `/`.
+/// `POST /delete/{id}` — CSRF-checked, ownership-scoped soft delete, then 302 to `/`.
 pub async fn delete(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -645,22 +705,190 @@ pub async fn delete(
     let actor = auth::identity(&headers);
     let rec = owned_file(&state, &id, &actor).await?;
 
-    // Remove the metadata row first; a row pointing at a missing blob is worse than an orphan
-    // blob, so the blob delete is best-effort afterwards.
-    state.store.delete(&rec.id, &actor.subject).await?;
-    if let Err(e) = state.blobs.delete(&rec.object_key).await {
-        tracing::warn!(id = rec.id, error = %e, "metadata removed but blob delete failed (orphan)");
-    }
-    // Best-effort: drop any cached derived thumbnail too (an orphan derived blob is harmless).
-    let _ = state.blobs.delete(&thumb_object_key(&rec.object_key)).await;
-    tracing::info!(id = rec.id, owner = actor.subject, "file deleted");
+    state
+        .store
+        .trash_file(&rec.id, &actor.subject, now_secs())
+        .await?;
+    tracing::info!(id = rec.id, owner = actor.subject, "file moved to trash");
     state.audit.emit(AuditEvent::notice(
-        "file.delete",
+        "file.trash",
         &actor.subject,
         &rec.id,
         if rec.is_image() { "image" } else { "file" },
     ));
     Ok(redirect_found("/"))
+}
+
+/// `POST /trash/{id}/restore` — restore a trashed file to the normal drive view.
+pub async fn restore_trashed(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<DeleteForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let actor = auth::identity(&headers);
+    let rec = owned_trashed_file(&state, &id, &actor).await?;
+    state.store.restore_file(&rec.id, &actor.subject).await?;
+    tracing::info!(
+        id = rec.id,
+        owner = actor.subject,
+        "file restored from trash"
+    );
+    state.audit.emit(AuditEvent::notice(
+        "file.trash.restore",
+        &actor.subject,
+        &rec.id,
+        if rec.is_image() { "image" } else { "file" },
+    ));
+    Ok(redirect_found("/?view=trash"))
+}
+
+/// `POST /trash/{id}/purge` — permanently delete a trashed file and all retained data.
+pub async fn purge_trashed(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<DeleteForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let actor = auth::identity(&headers);
+    let rec = owned_trashed_file(&state, &id, &actor).await?;
+    let versions = state.store.delete_versions_for_file(&rec.id).await?;
+    state.store.delete_comments_for_file(&rec.id).await?;
+    state.store.delete(&rec.id, &actor.subject).await?;
+    if let Err(e) = state.blobs.delete(&rec.object_key).await {
+        tracing::warn!(id = rec.id, error = %e, "metadata purged but blob delete failed (orphan)");
+    }
+    let _ = state.blobs.delete(&thumb_object_key(&rec.object_key)).await;
+    for v in versions {
+        let _ = state.blobs.delete(&v.object_key).await;
+        let _ = state.blobs.delete(&thumb_object_key(&v.object_key)).await;
+    }
+    tracing::info!(id = rec.id, owner = actor.subject, "trashed file purged");
+    state.audit.emit(AuditEvent::warning(
+        "file.delete.forever",
+        &actor.subject,
+        &rec.id,
+        if rec.is_image() { "image" } else { "file" },
+    ));
+    Ok(redirect_found("/?view=trash"))
+}
+
+// ---------------------------------------------------------------------------
+// File comments (owner detail page)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct CommentForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub body: String,
+}
+
+/// `POST /f/{id}/comments` — append a comment to a live owned file.
+pub async fn add_comment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<CommentForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let actor = auth::identity(&headers);
+    let rec = owned_file(&state, &id, &actor).await?;
+    let body = clean_comment_body(&form.body)?;
+    let mut comment = FileComment {
+        id: String::new(),
+        file_id: rec.id.clone(),
+        author_sub: actor.subject.clone(),
+        body,
+        created_at: now_secs(),
+    };
+    let mut created = false;
+    for _ in 0..6 {
+        comment.id = random_alnum(COMMENT_ID_LEN);
+        if state.store.create_comment(&comment).await? {
+            created = true;
+            break;
+        }
+    }
+    if !created {
+        return Err(AppError::Internal(
+            "could not allocate a unique comment id".to_string(),
+        ));
+    }
+    tracing::info!(
+        id = rec.id,
+        comment = comment.id,
+        author = actor.subject,
+        "file comment added"
+    );
+    state.audit.emit(AuditEvent::info(
+        "file.comment.add",
+        &actor.subject,
+        &rec.id,
+        "comment",
+    ));
+    Ok(redirect_found(&format!("/f/{}", rec.id)))
+}
+
+/// `POST /f/{id}/comments/{cid}/delete` — delete one comment. The file owner or an admin may
+/// delete any comment; the comment must belong to the addressed file.
+pub async fn delete_comment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, cid)): Path<(String, String)>,
+    Form(form): Form<DeleteForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let actor = auth::identity(&headers);
+    let rec = state
+        .store
+        .get(&id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("No file exists at that link.".to_string()))?;
+    let comment = state
+        .store
+        .get_comment(&cid)
+        .await?
+        .filter(|c| c.file_id == rec.id)
+        .ok_or_else(|| AppError::NotFound("No such comment.".to_string()))?;
+    if rec.owner_sub != actor.subject && !auth::is_admin(&headers) {
+        return Err(AppError::Forbidden(
+            "Only the file owner or an admin can delete comments.".to_string(),
+        ));
+    }
+    state.store.delete_comment(&comment.id).await?;
+    tracing::info!(
+        id = rec.id,
+        comment = comment.id,
+        actor = actor.subject,
+        "file comment deleted"
+    );
+    state.audit.emit(AuditEvent::notice(
+        "file.comment.delete",
+        &actor.subject,
+        &rec.id,
+        "comment",
+    ));
+    Ok(redirect_found(&format!("/f/{}", rec.id)))
 }
 
 // ---------------------------------------------------------------------------
@@ -678,7 +906,11 @@ pub async fn share(
     let rec = load_shared(&state, &token).await?;
     // Password-protected: never serve the bytes on a bare GET — prompt for the password first.
     if rec.share_has_password() {
-        return Ok(render_share_prompt(&format!("/s/{token}"), StatusCode::OK, None));
+        return Ok(render_share_prompt(
+            &format!("/s/{token}"),
+            StatusCode::OK,
+            None,
+        ));
     }
     serve_shared(&state, &rec).await
 }
@@ -727,7 +959,11 @@ pub async fn share_folder(
 ) -> Result<Response, AppError> {
     let folder = load_shared_folder(&state, &token).await?;
     if folder.share_has_password() {
-        return Ok(render_share_prompt(&format!("/s/folder/{token}"), StatusCode::OK, None));
+        return Ok(render_share_prompt(
+            &format!("/s/folder/{token}"),
+            StatusCode::OK,
+            None,
+        ));
     }
     let files = state
         .store
@@ -765,7 +1001,9 @@ pub async fn share_folder_unlock(
         .unwrap_or_default();
     emit_folder_share_audit(&state, &folder);
     // Non-password folders never reach this branch with a value; carry the password only when set.
-    let pw = folder.share_has_password().then_some(form.password.as_str());
+    let pw = folder
+        .share_has_password()
+        .then_some(form.password.as_str());
     Ok(render_folder_index(&folder, &files, &token, pw))
 }
 
@@ -811,18 +1049,270 @@ pub async fn share_folder_file_unlock(
     Ok(serve_blob(&file, bytes))
 }
 
+// ---------------------------------------------------------------------------
+// GET/POST /u/{token} — public upload inbox (NO SSO)
+// ---------------------------------------------------------------------------
+
+/// `GET /u/{token}` — render an anonymous upload form for a folder upload inbox. It never lists
+/// existing files. A CSRF cookie is still minted because the POST changes server state.
+pub async fn upload_inbox(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> Result<Response, AppError> {
+    let folder = load_upload_folder(&state, &token).await?;
+    let csrf = auth::new_csrf_token();
+    let html = render_upload_inbox(&folder, &token, &csrf, None);
+    Ok(html_with_csrf(StatusCode::OK, html, &csrf))
+}
+
+/// `POST /u/{token}` — anonymous upload into the token's folder. The visitor cannot choose owner
+/// or folder; both come from the token row.
+pub async fn upload_inbox_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+    mut multipart: Multipart,
+) -> Result<Response, AppError> {
+    let folder = load_upload_folder(&state, &token).await?;
+    let mut csrf_field = String::new();
+    let mut file: Option<(String, String, Vec<u8>)> = None;
+
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => {
+                return Err(AppError::BadRequest(format!(
+                    "Upload failed (it may exceed the size limit): {e}"
+                )))
+            }
+        };
+        match field.name().unwrap_or("") {
+            "csrf_token" => {
+                csrf_field = field
+                    .text()
+                    .await
+                    .map_err(|e| AppError::BadRequest(e.to_string()))?;
+            }
+            "file" => {
+                let name = field
+                    .file_name()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.chars().take(MAX_NAME_CHARS).collect::<String>())
+                    .unwrap_or_else(|| "file".to_string());
+                let client_type = field.content_type().unwrap_or("").to_string();
+                let data = field.bytes().await.map_err(|e| {
+                    AppError::BadRequest(format!(
+                        "Upload failed (it may exceed the size limit): {e}"
+                    ))
+                })?;
+                file = Some((name, client_type, data.to_vec()));
+            }
+            _ => {
+                let _ = field.bytes().await;
+            }
+        }
+    }
+
+    if !auth::verify_csrf(&headers, &csrf_field) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let (name, client_type, bytes) = match file {
+        Some(f) if !f.2.is_empty() => f,
+        _ => return Err(AppError::BadRequest("Choose a file to upload.".to_string())),
+    };
+    if bytes.len() > state.config.max_upload {
+        return Err(AppError::BadRequest(format!(
+            "File is too large (maximum {}).",
+            human_size(state.config.max_upload as i64)
+        )));
+    }
+
+    let content_type = resolve_content_type(&bytes, &client_type);
+    let size = bytes.len() as i64;
+    if let Some(quota) = effective_quota(
+        state.store.get_quota(&folder.owner_sub).await?,
+        state.config.default_quota_bytes,
+    ) {
+        let used = state.store.usage_for_owner(&folder.owner_sub).await?;
+        if used.saturating_add(size) > quota {
+            tracing::info!(
+                owner = folder.owner_sub,
+                folder = folder.id,
+                used,
+                size,
+                quota,
+                "public upload rejected: over quota"
+            );
+            state.audit.emit(AuditEvent::warning(
+                "folder.upload_inbox.quota.reject",
+                &folder.owner_sub,
+                &folder.id,
+                "over-quota public upload rejected",
+            ));
+            return Err(AppError::QuotaExceeded(format!(
+                "Not enough storage. This file is {size}, but only {free} of the owner's {quota} quota is free.",
+                size = human_size(size),
+                free = human_size((quota - used).max(0)),
+                quota = human_size(quota),
+            )));
+        }
+    }
+
+    let unique_name = unique_upload_name(&state, &folder.owner_sub, &folder.id, &name).await?;
+    let mut rec = FileRec {
+        id: String::new(),
+        owner_sub: folder.owner_sub.clone(),
+        name: unique_name,
+        content_type,
+        size,
+        bucket: state.blobs.bucket().to_string(),
+        object_key: String::new(),
+        share_token: None,
+        created_at: now_secs(),
+        expires_at: None,
+        share_password_hash: None,
+        folder_id: Some(folder.id.clone()),
+        trashed_at: 0,
+    };
+    let mut reserved = false;
+    for _ in 0..6 {
+        rec.id = random_alnum(FILE_ID_LEN);
+        rec.object_key = rec.id.clone();
+        rec.share_token = Some(random_alnum(SHARE_TOKEN_LEN));
+        if state.store.create(&rec).await? {
+            reserved = true;
+            break;
+        }
+    }
+    if !reserved {
+        return Err(AppError::Internal(
+            "could not allocate a unique file id".to_string(),
+        ));
+    }
+    if let Err(e) = state.blobs.put(&rec.object_key, bytes).await {
+        let _ = state.store.delete(&rec.id, &folder.owner_sub).await;
+        return Err(e.into());
+    }
+
+    tracing::info!(
+        id = rec.id,
+        owner = folder.owner_sub,
+        folder = folder.id,
+        size,
+        "public upload accepted"
+    );
+    state.audit.emit(AuditEvent::info(
+        "folder.upload_inbox.file",
+        &folder.owner_sub,
+        &folder.id,
+        "file",
+    ));
+    let csrf = auth::new_csrf_token();
+    let status = Some(format!("Uploaded {}.", rec.name));
+    let html = render_upload_inbox(&folder, &token, &csrf, status.as_deref());
+    Ok(html_with_csrf(StatusCode::OK, html, &csrf))
+}
+
 /// Load a folder by its public share token, enforcing the lifecycle (missing/revoked -> 404,
 /// expired -> 410 Gone). No request identity is consulted.
 async fn load_shared_folder(state: &AppState, token: &str) -> Result<FolderRec, AppError> {
-    let folder = state.store.get_folder_by_token(token).await?.ok_or_else(|| {
-        AppError::NotFound("This share link is invalid or has been removed.".to_string())
-    })?;
+    let folder = state
+        .store
+        .get_folder_by_token(token)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound("This share link is invalid or has been removed.".to_string())
+        })?;
     if folder.share_expired(now_secs()) {
         return Err(AppError::Gone(
             "This share link has expired and is no longer available.".to_string(),
         ));
     }
     Ok(folder)
+}
+
+/// Load a folder by upload-inbox token. Missing/revoked tokens are indistinguishable.
+async fn load_upload_folder(state: &AppState, token: &str) -> Result<FolderRec, AppError> {
+    state
+        .store
+        .get_folder_by_upload_token(token)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound("This upload link is invalid or has been removed.".to_string())
+        })
+}
+
+fn render_upload_inbox(
+    folder: &FolderRec,
+    token: &str,
+    csrf: &str,
+    status: Option<&str>,
+) -> String {
+    let status_html = match status {
+        Some(msg) => format!("<div class=\"toast toast--ok\">{}</div>", esc(msg)),
+        None => String::new(),
+    };
+    UPLOAD_INBOX_HTML
+        .replace("{{CSS}}", APP_CSS)
+        .replace("{{SHIELD}}", SHIELD_SVG)
+        .replace("{{HEADING}}", &esc(&folder.name))
+        .replace("{{STATUS}}", &status_html)
+        .replace("{{ACTION}}", &format!("/u/{}", esc(token)))
+        .replace("{{CSRF}}", &esc(csrf))
+}
+
+async fn unique_upload_name(
+    state: &AppState,
+    owner_sub: &str,
+    folder_id: &str,
+    desired: &str,
+) -> Result<String, AppError> {
+    let base = desired.chars().take(MAX_NAME_CHARS).collect::<String>();
+    if state
+        .store
+        .find_file_in_folder(owner_sub, &base, Some(folder_id))
+        .await?
+        .is_none()
+    {
+        return Ok(base);
+    }
+    let (stem, ext) = split_name_ext(&base);
+    for n in 2..100 {
+        let candidate = if ext.is_empty() {
+            format!("{stem} ({n})")
+        } else {
+            format!("{stem} ({n}).{ext}")
+        };
+        let capped: String = candidate.chars().take(MAX_NAME_CHARS).collect();
+        if state
+            .store
+            .find_file_in_folder(owner_sub, &capped, Some(folder_id))
+            .await?
+            .is_none()
+        {
+            return Ok(capped);
+        }
+    }
+    let suffix = random_alnum(6);
+    let candidate = if ext.is_empty() {
+        format!("{stem} {suffix}")
+    } else {
+        format!("{stem} {suffix}.{ext}")
+    };
+    Ok(candidate.chars().take(MAX_NAME_CHARS).collect())
+}
+
+fn split_name_ext(name: &str) -> (String, String) {
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => {
+            (stem.to_string(), ext.to_string())
+        }
+        _ => (name.to_string(), String::new()),
+    }
 }
 
 /// Resolve one file requested under a folder share: it MUST belong to the shared folder (same
@@ -836,7 +1326,11 @@ async fn shared_folder_file(
         .store
         .get(file_id)
         .await?
-        .filter(|f| f.owner_sub == folder.owner_sub && f.folder_id.as_deref() == Some(&folder.id))
+        .filter(|f| {
+            f.owner_sub == folder.owner_sub
+                && f.trashed_at == 0
+                && f.folder_id.as_deref() == Some(&folder.id)
+        })
         .ok_or_else(|| AppError::NotFound("No such file in this shared folder.".to_string()))?;
     Ok(file)
 }
@@ -1085,6 +1579,7 @@ pub async fn create_folder(
         share_token: None,
         expires_at: None,
         share_password_hash: None,
+        upload_token: None,
     };
     // Reserve a unique folder id, retrying on the rare collision.
     let mut created = false;
@@ -1102,9 +1597,12 @@ pub async fn create_folder(
     }
 
     tracing::info!(id = rec.id, owner = actor.subject, "folder created");
-    state
-        .audit
-        .emit(AuditEvent::notice("folder.create", &actor.subject, &rec.id, "folder"));
+    state.audit.emit(AuditEvent::notice(
+        "folder.create",
+        &actor.subject,
+        &rec.id,
+        "folder",
+    ));
     Ok(redirect_found(&format!("/?folder={}", rec.id)))
 }
 
@@ -1123,13 +1621,20 @@ pub async fn rename_folder(
     }
     let actor = auth::identity(&headers);
     let name = clean_folder_name(&form.name)?;
-    if !state.store.rename_folder(&id, &actor.subject, &name).await? {
+    if !state
+        .store
+        .rename_folder(&id, &actor.subject, &name)
+        .await?
+    {
         return Err(AppError::NotFound("No such folder.".to_string()));
     }
     tracing::info!(id, owner = actor.subject, "folder renamed");
-    state
-        .audit
-        .emit(AuditEvent::notice("folder.rename", &actor.subject, &id, "folder"));
+    state.audit.emit(AuditEvent::notice(
+        "folder.rename",
+        &actor.subject,
+        &id,
+        "folder",
+    ));
     Ok(redirect_found(&format!("/?folder={id}")))
 }
 
@@ -1164,12 +1669,20 @@ pub async fn delete_folder(
     let cascade = matches!(form.cascade.trim(), "1" | "true" | "on" | "yes");
     if cascade {
         // Remove the subtree; drop every freed blob (and its derived thumbnail) best-effort.
-        let keys = state.store.delete_folder_cascade(&id, &actor.subject).await?;
+        let keys = state
+            .store
+            .delete_folder_cascade(&id, &actor.subject)
+            .await?;
         for key in &keys {
             let _ = state.blobs.delete(key).await;
             let _ = state.blobs.delete(&thumb_object_key(key)).await;
         }
-        tracing::info!(id, owner = actor.subject, blobs = keys.len(), "folder cascade-deleted");
+        tracing::info!(
+            id,
+            owner = actor.subject,
+            blobs = keys.len(),
+            "folder cascade-deleted"
+        );
         state.audit.emit(AuditEvent::warning(
             "folder.delete.cascade",
             &actor.subject,
@@ -1179,12 +1692,19 @@ pub async fn delete_folder(
         return Ok(redirect_found(&up));
     }
 
-    match state.store.delete_folder_if_empty(&id, &actor.subject).await? {
+    match state
+        .store
+        .delete_folder_if_empty(&id, &actor.subject)
+        .await?
+    {
         FolderDelete::Deleted => {
             tracing::info!(id, owner = actor.subject, "empty folder deleted");
-            state
-                .audit
-                .emit(AuditEvent::notice("folder.delete", &actor.subject, &id, "folder"));
+            state.audit.emit(AuditEvent::notice(
+                "folder.delete",
+                &actor.subject,
+                &id,
+                "folder",
+            ));
             Ok(redirect_found(&up))
         }
         FolderDelete::NotEmpty => Err(AppError::BadRequest(
@@ -1239,9 +1759,12 @@ pub async fn configure_folder_share(
         .configure_folder_share(&id, &actor.subject, Some(token), expires_at, password_hash)
         .await?;
     tracing::info!(id, owner = actor.subject, "folder share link configured");
-    state
-        .audit
-        .emit(AuditEvent::notice("folder.share.update", &actor.subject, &id, "folder"));
+    state.audit.emit(AuditEvent::notice(
+        "folder.share.update",
+        &actor.subject,
+        &id,
+        "folder",
+    ));
     Ok(redirect_found(&format!("/?folder={id}")))
 }
 
@@ -1267,9 +1790,79 @@ pub async fn revoke_folder_share(
         return Err(AppError::NotFound("No such folder.".to_string()));
     }
     tracing::info!(id, owner = actor.subject, "folder share link revoked");
+    state.audit.emit(AuditEvent::notice(
+        "folder.share.revoke",
+        &actor.subject,
+        &id,
+        "folder",
+    ));
+    Ok(redirect_found(&format!("/?folder={id}")))
+}
+
+/// `POST /folders/{id}/upload` — enable/rotate a folder's public upload-inbox token. Anonymous
+/// visitors can upload into the folder at `/u/{token}` but cannot list or download its files.
+pub async fn configure_folder_upload(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<DeleteForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let actor = auth::identity(&headers);
+    let folder = state
+        .store
+        .get_folder(&id, &actor.subject)
+        .await?
+        .ok_or_else(|| AppError::NotFound("No such folder.".to_string()))?;
+    let token = folder
+        .upload_token
+        .clone()
+        .unwrap_or_else(|| random_alnum(UPLOAD_TOKEN_LEN));
     state
-        .audit
-        .emit(AuditEvent::notice("folder.share.revoke", &actor.subject, &id, "folder"));
+        .store
+        .configure_folder_upload(&id, &actor.subject, Some(token))
+        .await?;
+    tracing::info!(id, owner = actor.subject, "folder upload inbox configured");
+    state.audit.emit(AuditEvent::notice(
+        "folder.upload_inbox.update",
+        &actor.subject,
+        &id,
+        "folder",
+    ));
+    Ok(redirect_found(&format!("/?folder={id}")))
+}
+
+/// `POST /folders/{id}/upload/revoke` — revoke a folder's public upload-inbox token.
+pub async fn revoke_folder_upload(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<DeleteForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let actor = auth::identity(&headers);
+    if !state
+        .store
+        .configure_folder_upload(&id, &actor.subject, None)
+        .await?
+    {
+        return Err(AppError::NotFound("No such folder.".to_string()));
+    }
+    tracing::info!(id, owner = actor.subject, "folder upload inbox revoked");
+    state.audit.emit(AuditEvent::notice(
+        "folder.upload_inbox.revoke",
+        &actor.subject,
+        &id,
+        "folder",
+    ));
     Ok(redirect_found(&format!("/?folder={id}")))
 }
 
@@ -1321,6 +1914,14 @@ fn clean_folder_name(raw: &str) -> Result<String, AppError> {
         return Err(AppError::BadRequest("Enter a folder name.".to_string()));
     }
     Ok(trimmed.chars().take(MAX_NAME_CHARS).collect())
+}
+
+fn clean_comment_body(raw: &str) -> Result<String, AppError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::BadRequest("Enter a comment.".to_string()));
+    }
+    Ok(trimmed.chars().take(MAX_COMMENT_CHARS).collect())
 }
 
 /// Load a file by share token for the PUBLIC path, enforcing the share lifecycle: a missing/revoked
@@ -1384,6 +1985,35 @@ async fn owned_file(state: &AppState, id: &str, who: &Identity) -> Result<FileRe
             "You can only access your own files.".to_string(),
         ));
     }
+    if rec.trashed_at != 0 {
+        return Err(AppError::NotFound(
+            "No file exists at that link.".to_string(),
+        ));
+    }
+    Ok(rec)
+}
+
+/// Fetch an owner-scoped file that MUST currently be in Trash.
+async fn owned_trashed_file(
+    state: &AppState,
+    id: &str,
+    who: &Identity,
+) -> Result<FileRec, AppError> {
+    let rec = state
+        .store
+        .get(id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("No file exists at that link.".to_string()))?;
+    if rec.owner_sub != who.subject {
+        return Err(AppError::Forbidden(
+            "You can only access your own files.".to_string(),
+        ));
+    }
+    if rec.trashed_at == 0 {
+        return Err(AppError::NotFound(
+            "No trashed file exists at that link.".to_string(),
+        ));
+    }
     Ok(rec)
 }
 
@@ -1391,7 +2021,10 @@ async fn owned_file(state: &AppState, id: &str, who: &Identity) -> Result<FileRe
 fn serve_blob(rec: &FileRec, bytes: Vec<u8>) -> Response {
     let filename = safe_filename(&rec.name);
     let (ctype, disposition) = if rec.is_image() {
-        (rec.content_type.clone(), format!("inline; filename=\"{filename}\""))
+        (
+            rec.content_type.clone(),
+            format!("inline; filename=\"{filename}\""),
+        )
     } else {
         (
             "application/octet-stream".to_string(),
@@ -1517,7 +2150,11 @@ pub(crate) fn html_with_csrf(status: StatusCode, html: String, csrf: &str) -> Re
 
 /// A `302 Found` redirect to `location` (the spec'd create/delete response code).
 pub(crate) fn redirect_found(location: &str) -> Response {
-    (StatusCode::FOUND, [(header::LOCATION, location.to_string())]).into_response()
+    (
+        StatusCode::FOUND,
+        [(header::LOCATION, location.to_string())],
+    )
+        .into_response()
 }
 
 /// Uppercase file extension label for the non-image card/preview glyph (e.g. `PDF`, `ZIP`).
@@ -1683,20 +2320,120 @@ fn render_gallery(
         format!("{tiles}{file_cards}")
     };
     let upload_folder = active.map(|a| a.id.clone()).unwrap_or_default();
+    let upload = render_upload_form(csrf, &upload_folder);
 
     GALLERY_HTML
         .replace("{{CSS}}", APP_CSS)
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Drive", Some(&who.email)))
         .replace("{{USAGE}}", &render_usage_meter(used, quota))
-        .replace("{{CSRF}}", &esc(csrf))
-        .replace("{{UPLOAD_FOLDER}}", &esc(&upload_folder))
+        .replace("{{UPLOAD}}", &upload)
         .replace("{{SIDEBAR}}", &render_sidebar(config, csrf, active))
         .replace("{{BREADCRUMB}}", &breadcrumb)
         .replace("{{HEADING}}", &esc(&heading))
         .replace("{{COUNT}}", &esc(&count))
         .replace("{{CARDS}}", &cards)
         .replace("{{PAGER}}", &pager)
+}
+
+fn render_upload_form(csrf: &str, folder_id: &str) -> String {
+    format!(
+        "<form id=\"uploadForm\" class=\"dropzone\" method=\"post\" action=\"/upload\" enctype=\"multipart/form-data\">\
+          <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+          <input type=\"hidden\" name=\"folder_id\" value=\"{folder}\">\
+          <input id=\"fileInput\" class=\"dropzone__input\" type=\"file\" name=\"file\" required>\
+          <label for=\"fileInput\" class=\"dropzone__label\">\
+            <span class=\"dropzone__icon\" aria-hidden=\"true\">&#8682;</span>\
+            <span class=\"dropzone__text\"><strong>Choose a file</strong> or drag &amp; drop it here</span>\
+            <span id=\"fileName\" class=\"dropzone__hint\">Nothing selected yet</span>\
+          </label>\
+          <div class=\"dropzone__actions\">\
+            <button class=\"btn btn-primary\" type=\"submit\">Upload</button>\
+          </div>\
+        </form>",
+        csrf = esc(csrf),
+        folder = esc(folder_id),
+    )
+}
+
+fn render_trash_gallery(
+    _config: &Config,
+    who: &Identity,
+    csrf: &str,
+    files: &[FileRec],
+    used: i64,
+    quota: Option<i64>,
+) -> String {
+    let count = match files.len() {
+        0 => "Trash is empty".to_string(),
+        1 => "1 trashed file".to_string(),
+        n => format!("{n} trashed files"),
+    };
+    let cards = if files.is_empty() {
+        "<li class=\"file-card file-card--empty\">Trash is empty.</li>".to_string()
+    } else {
+        render_trash_cards(files, csrf)
+    };
+    let breadcrumb =
+        "<nav class=\"breadcrumb\" aria-label=\"Folder path\"><a class=\"breadcrumb__crumb\" href=\"/\">All files</a><span class=\"breadcrumb__sep\" aria-hidden=\"true\">/</span><span class=\"breadcrumb__here\">Trash</span></nav>";
+    GALLERY_HTML
+        .replace("{{CSS}}", APP_CSS)
+        .replace("{{SHIELD}}", SHIELD_SVG)
+        .replace("{{USERBOX}}", &userbox("Drive", Some(&who.email)))
+        .replace("{{USAGE}}", &render_usage_meter(used, quota))
+        .replace("{{UPLOAD}}", "")
+        .replace("{{SIDEBAR}}", &render_trash_sidebar())
+        .replace("{{BREADCRUMB}}", breadcrumb)
+        .replace("{{HEADING}}", "Trash")
+        .replace("{{COUNT}}", &esc(&count))
+        .replace("{{CARDS}}", &cards)
+        .replace("{{PAGER}}", "")
+}
+
+fn render_trash_sidebar() -> String {
+    "<aside class=\"folder-rail\">\
+       <div class=\"section-head\"><h2>Drive</h2></div>\
+       <a class=\"folder-item\" href=\"/\">All files</a>\
+       <a class=\"folder-item folder-item--active\" href=\"/?view=trash\">Trash</a>\
+       <p class=\"muted trash-note\">Trashed files stay in storage and count toward quota until deleted forever.</p>\
+     </aside>"
+        .to_string()
+}
+
+fn render_trash_cards(files: &[FileRec], csrf: &str) -> String {
+    files
+        .iter()
+        .map(|f| {
+            format!(
+                "<li class=\"file-card file-card--trash\">\
+                   <div class=\"thumb thumb--file\">{glyph}<span class=\"thumb__ext\">{ext}</span></div>\
+                   <div class=\"file-card__body\">\
+                     <span class=\"file-card__name\" title=\"{name}\">{name}</span>\
+                     <div class=\"file-card__meta\"><span>{size}</span><span>Deleted {deleted}</span></div>\
+                     <div class=\"trash-actions\">\
+                       <form method=\"post\" action=\"/trash/{id}/restore\">\
+                         <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+                         <button class=\"btn btn-secondary btn-sm\" type=\"submit\">Restore</button>\
+                       </form>\
+                       <form method=\"post\" action=\"/trash/{id}/purge\" \
+                         onsubmit=\"return confirm('Delete this file forever? This cannot be undone.');\">\
+                         <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+                         <button class=\"btn btn-danger btn-sm\" type=\"submit\">Delete forever</button>\
+                       </form>\
+                     </div>\
+                   </div>\
+                 </li>",
+                glyph = FILE_SVG,
+                ext = esc(&ext_label(&f.name)),
+                id = esc(&f.id),
+                csrf = esc(csrf),
+                name = esc(&f.name),
+                size = esc(&human_size(f.size)),
+                deleted = esc(&fmt_ts(f.trashed_at)),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 /// Render the drive's storage usage meter: under a quota it is a labeled fill bar ("used of
@@ -1773,6 +2510,7 @@ fn render_sidebar(config: &Config, csrf: &str, active: Option<&FolderRec>) -> St
                </div>\
              </form>\
              {share}\
+             {upload_inbox}\
              <form class=\"folder-form\" method=\"post\" action=\"/folders/{id}/delete\" \
                onsubmit=\"return confirm('Delete this folder? It must be empty.');\">\
                <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
@@ -1788,6 +2526,7 @@ fn render_sidebar(config: &Config, csrf: &str, active: Option<&FolderRec>) -> St
             csrf = esc(csrf),
             name = esc(&f.name),
             share = render_folder_share_section(config, f, csrf),
+            upload_inbox = render_folder_upload_section(config, f, csrf),
         ),
         None => String::new(),
     };
@@ -1795,6 +2534,8 @@ fn render_sidebar(config: &Config, csrf: &str, active: Option<&FolderRec>) -> St
     format!(
         "<aside class=\"folder-rail\">\
            <div class=\"section-head\"><h2>Folder actions</h2></div>\
+           <a class=\"folder-item\" href=\"/\">All files</a>\
+           <a class=\"folder-item\" href=\"/?view=trash\">Trash</a>\
            {new_form}\
            {manage}\
          </aside>",
@@ -1867,6 +2608,43 @@ fn render_folder_share_section(config: &Config, folder: &FolderRec, csrf: &str) 
             id = esc(&folder.id),
             csrf = esc(csrf),
             controls = controls,
+        ),
+    }
+}
+
+/// Build the public upload-inbox control for a folder. This is intentionally separate from the
+/// folder share link: upload visitors get `/u/{token}`, which never lists or downloads files.
+fn render_folder_upload_section(config: &Config, folder: &FolderRec, csrf: &str) -> String {
+    match &folder.upload_token {
+        Some(token) => {
+            let upload_url = format!("{}/u/{}", config.public_base, token);
+            format!(
+                "<div class=\"field\">\
+                   <label for=\"folderUploadUrl\">Upload request link</label>\
+                   <div class=\"share-row\">\
+                     <input id=\"folderUploadUrl\" type=\"text\" readonly value=\"{url}\">\
+                   </div>\
+                   <p class=\"muted\">Visitors can upload into this folder, but cannot view existing files.</p>\
+                 </div>\
+                 <form class=\"folder-form\" method=\"post\" action=\"/folders/{id}/upload/revoke\" \
+                   onsubmit=\"return confirm('Revoke this upload request link?');\">\
+                   <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+                   <button class=\"btn btn-danger btn-sm\" type=\"submit\">Revoke upload request</button>\
+                 </form>",
+                url = esc(&upload_url),
+                id = esc(&folder.id),
+                csrf = esc(csrf),
+            )
+        }
+        None => format!(
+            "<form class=\"folder-form\" method=\"post\" action=\"/folders/{id}/upload\">\
+               <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+               <label>Request files</label>\
+               <p class=\"muted\">Create a public upload-only link for this folder.</p>\
+               <button class=\"btn btn-secondary btn-sm\" type=\"submit\">Create upload request</button>\
+             </form>",
+            id = esc(&folder.id),
+            csrf = esc(csrf),
         ),
     }
 }
@@ -2001,6 +2779,7 @@ fn render_detail(
     folders: &[FolderRec],
     preview: &str,
     versions: &[VersionRec],
+    comments: &[FileComment],
 ) -> String {
     let meta_list = format!(
         "<dl class=\"meta-list\">\
@@ -2018,6 +2797,7 @@ fn render_detail(
     let share = render_share_section(config, rec, csrf);
     let move_section = render_move_section(rec, csrf, folders);
     let versions_section = render_versions(rec, versions, csrf);
+    let comments_section = render_comments(rec, comments, csrf);
 
     let sub = format!(
         "{ctype} · {size} · {date}",
@@ -2028,7 +2808,7 @@ fn render_detail(
 
     let delete = format!(
         "<form class=\"delete-form\" method=\"post\" action=\"/delete/{id}\" \
-           onsubmit=\"return confirm('Delete this file? This cannot be undone.');\">\
+           onsubmit=\"return confirm('Move this file to Trash?');\">\
            <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
            <button class=\"btn btn-danger\" type=\"submit\">Delete</button>\
          </form>",
@@ -2047,8 +2827,64 @@ fn render_detail(
         .replace("{{MOVE}}", &move_section)
         .replace("{{SHARE}}", &share)
         .replace("{{VERSIONS}}", &versions_section)
+        .replace("{{COMMENTS}}", &comments_section)
         .replace("{{ID}}", &esc(&rec.id))
         .replace("{{DELETE}}", &delete)
+}
+
+fn render_comments(rec: &FileRec, comments: &[FileComment], csrf: &str) -> String {
+    let rows = if comments.is_empty() {
+        "<p class=\"muted\">No comments yet.</p>".to_string()
+    } else {
+        comments
+            .iter()
+            .map(|c| {
+                format!(
+                    "<li class=\"comment-item\">\
+                       <div class=\"comment-item__head\">\
+                         <span class=\"mono\">{author}</span>\
+                         <span class=\"muted\">{date}</span>\
+                       </div>\
+                       <div class=\"comment-item__body\">{body}</div>\
+                       <form class=\"comment-item__delete\" method=\"post\" action=\"/f/{fid}/comments/{cid}/delete\" \
+                         onsubmit=\"return confirm('Delete this comment?');\">\
+                         <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+                         <button class=\"btn btn-danger btn-sm\" type=\"submit\">Delete</button>\
+                       </form>\
+                     </li>",
+                    author = esc(&c.author_sub),
+                    date = esc(&fmt_ts(c.created_at)),
+                    body = render_comment_body(&c.body),
+                    fid = esc(&rec.id),
+                    cid = esc(&c.id),
+                    csrf = esc(csrf),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    format!(
+        "<div class=\"field comments\">\
+           <label>Comments <span class=\"count-badge\">{count}</span></label>\
+           <ul class=\"comment-list\">{rows}</ul>\
+           <form class=\"comment-form\" method=\"post\" action=\"/f/{id}/comments\">\
+             <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+             <textarea name=\"body\" rows=\"4\" maxlength=\"{max}\" placeholder=\"Add a comment\" required></textarea>\
+             <div class=\"actions\">\
+               <button class=\"btn btn-secondary\" type=\"submit\">Comment</button>\
+             </div>\
+           </form>\
+         </div>",
+        count = comments.len(),
+        rows = rows,
+        id = esc(&rec.id),
+        csrf = esc(csrf),
+        max = MAX_COMMENT_CHARS,
+    )
+}
+
+fn render_comment_body(body: &str) -> String {
+    esc(body).replace('\n', "<br>")
 }
 
 /// Render the version history block for the detail page: each retained snapshot with its date,
@@ -2280,9 +3116,15 @@ mod tests {
     #[test]
     fn thumb_palette_is_mime_keyed_and_stable() {
         // Same mime -> same colors every time (deterministic).
-        assert_eq!(thumb_palette("application/pdf"), thumb_palette("application/pdf"));
+        assert_eq!(
+            thumb_palette("application/pdf"),
+            thumb_palette("application/pdf")
+        );
         // Distinct categories get distinct tints.
-        assert_ne!(thumb_palette("application/pdf").0, thumb_palette("audio/mpeg").0);
+        assert_ne!(
+            thumb_palette("application/pdf").0,
+            thumb_palette("audio/mpeg").0
+        );
         assert_eq!(thumb_palette("application/zip").0, "#FEF3C7");
         assert_eq!(thumb_palette("text/plain").0, "#E2E8F0");
     }
@@ -2312,7 +3154,7 @@ mod tests {
         assert!(svg.contains("image/svg") == false); // it's the body, not a content type
         assert!(svg.contains(">PDF<"));
         assert!(svg.contains("#B91C1C")); // pdf ink color
-        // A hostile "extension" is neutralized by ext_label (whitelist) before it can reach the SVG.
+                                          // A hostile "extension" is neutralized by ext_label (whitelist) before it can reach the SVG.
         let hostile = render_type_thumb("application/octet-stream", "x.<svg onload=alert(1)>");
         assert!(!hostile.contains("onload"));
         assert!(hostile.contains(">FILE<"));
