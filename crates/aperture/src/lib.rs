@@ -100,6 +100,9 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/d/{id}/thumb", get(handlers::files::thumb))
         .route("/delete/{id}", post(handlers::files::delete))
+        // Inline file rename (owner-scoped + CSRF). Additive: form POST 302s, JSON for the
+        // enhanced gallery. The form route stands alongside the JSON response via Accept.
+        .route("/f/{id}/rename", post(handlers::files::rename))
         .route(
             "/trash/{id}/restore",
             post(handlers::files::restore_trashed),

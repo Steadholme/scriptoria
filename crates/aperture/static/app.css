@@ -584,3 +584,50 @@ body.page { max-width:none; margin:0; padding:0; }
   .console__head--row { flex-direction: column; }
   .gallery-grid { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
 }
+
+/* ============================================================================
+   Odyssey v2 — progressive-enhancement layer (ADDITIVE; redefines no selector
+   above). Toast host + optimistic busy/pending states used by the JS layer.
+   All motion rides the shared --dur/--ease tokens and is neutralised by the
+   global prefers-reduced-motion rule already declared above.
+   ============================================================================ */
+.toast-host { position:fixed; z-index:80; left:50%; bottom:22px; transform:translateX(-50%);
+  display:flex; flex-direction:column; gap:9px; align-items:center; width:auto; max-width:92vw; pointer-events:none; }
+.toast-host .toast { pointer-events:auto; opacity:0; transform:translateY(8px);
+  transition:opacity var(--dur) var(--ease), transform var(--dur) var(--ease); max-width:100%; }
+.toast-host .toast.is-in { opacity:1; transform:translateY(0); }
+.toast--err { background:var(--down); }
+.toast--err svg { color:#fecaca; }
+.is-busy { opacity:.55; pointer-events:none; }
+.is-pending { opacity:.6; }
+
+/* aperture — grid/list toggle, per-card actions menu, drag-drop upload progress. */
+.view-toggle { margin-left:auto; display:inline-flex; gap:2px; background:var(--surface-2); border:1px solid var(--border); border-radius:var(--r-sm); padding:2px; }
+.view-toggle__btn { display:grid; place-items:center; width:30px; height:28px; border:0; background:transparent; color:var(--ink-3); border-radius:var(--r-xs); cursor:pointer; transition:background var(--dur) var(--ease), color var(--dur) var(--ease); }
+.view-toggle__btn:hover { color:var(--ink); }
+.view-toggle__btn.is-active { background:var(--surface); color:var(--accent-ink); box-shadow:var(--sh-xs); }
+
+/* list layout */
+.gallery-grid.is-list { display:flex; flex-direction:column; gap:0; }
+.gallery-grid.is-list .file-card { flex-direction:row; align-items:center; gap:14px; padding:8px 10px; }
+.gallery-grid.is-list .file-card + .file-card { border-top:1px solid var(--hairline); }
+.gallery-grid.is-list .file-card__link { width:44px; height:44px; flex:0 0 auto; }
+.gallery-grid.is-list .thumb { height:44px; width:44px; border-radius:var(--r-xs); }
+.gallery-grid.is-list .file-card__body { flex:1 1 auto; display:flex; align-items:center; gap:14px; min-width:0; border-top:0; padding:0; }
+.gallery-grid.is-list .file-card__meta { margin-left:auto; }
+
+/* per-card actions menu */
+.file-card__body { position:relative; }
+.card-menu { position:absolute; top:6px; right:6px; margin:0; }
+.card-menu__btn { list-style:none; width:26px; height:26px; display:grid; place-items:center; border-radius:var(--r-xs); color:var(--ink-3); background:var(--surface); border:1px solid var(--border); cursor:pointer; opacity:0; transition:opacity var(--dur) var(--ease), color var(--dur) var(--ease); }
+.card-menu__btn::-webkit-details-marker { display:none; }
+.file-card:hover .card-menu__btn, .card-menu[open] .card-menu__btn, .card-menu:focus-within .card-menu__btn, .card-menu__btn:focus-visible { opacity:1; }
+.card-menu__btn:hover { color:var(--ink); }
+.card-menu__pop { position:absolute; top:30px; right:0; z-index:20; width:236px; background:var(--surface); border:1px solid var(--border); border-radius:var(--r-sm); box-shadow:var(--sh-pop); padding:10px; display:flex; flex-direction:column; gap:10px; }
+.card-menu__form { display:flex; gap:6px; margin:0; }
+.rename-form__input { flex:1 1 auto; min-width:0; }
+
+/* dropzone upload progress */
+.dropzone__progress { margin-top:12px; height:6px; background:var(--surface-3); border-radius:var(--r-pill); overflow:hidden; }
+.dropzone__bar { height:100%; width:0; background:var(--accent); border-radius:var(--r-pill); transition:width 120ms linear; }
+@media (max-width:720px){ .card-menu__btn { opacity:1; } .card-menu__pop { width:200px; } }

@@ -73,6 +73,9 @@ pub fn app(state: AppState) -> Router {
             get(handlers::posts::edit_form).post(handlers::posts::update),
         )
         .route("/delete/{slug}", post(handlers::posts::delete))
+        // Live Markdown preview for the editor (author-gated + CSRF, read-only JSON). Additive
+        // progressive enhancement: the compose/edit form still POSTs and works without JS.
+        .route("/api/preview", post(handlers::posts::preview))
         // Admin panel: an all-authors post management table + single-row site settings. Every
         // route below is gated by `auth::require_admin` inside the handler (403 for non-admins).
         .route("/admin", get(handlers::admin::index))

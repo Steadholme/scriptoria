@@ -14,5 +14,39 @@
   <main class="wrap">
     {{CONTENT}}
   </main>
+
+  <script>
+    // Scroll-spy: highlight the table-of-contents entry (and, when present, the
+    // matching sticky page-tree node) for the heading currently in view. Pure
+    // read-only enhancement — the anchors work identically without it.
+    (function () {
+      var links = document.querySelectorAll('.toc__item a[href^="#"]');
+      if (!links.length || !('IntersectionObserver' in window)) { return; }
+      var liFor = {};
+      var order = [];
+      Array.prototype.forEach.call(links, function (a) {
+        var id = decodeURIComponent(a.getAttribute('href').slice(1));
+        var el = id && document.getElementById(id);
+        if (el) { liFor[id] = a.parentNode; order.push(el); }
+      });
+      var current = null;
+      function activate(li) {
+        if (current === li) { return; }
+        if (current) { current.classList.remove('is-active'); }
+        current = li;
+        if (li) { li.classList.add('is-active'); }
+      }
+      var visible = {};
+      var obs = new IntersectionObserver(function (entries) {
+        entries.forEach(function (e) {
+          if (e.isIntersecting) { visible[e.target.id] = 1; } else { delete visible[e.target.id]; }
+        });
+        for (var i = 0; i < order.length; i++) {
+          if (visible[order[i].id]) { activate(liFor[order[i].id]); return; }
+        }
+      }, { rootMargin: '-90px 0px -70% 0px', threshold: 0 });
+      order.forEach(function (t) { obs.observe(t); });
+    })();
+  </script>
 </body>
 </html>

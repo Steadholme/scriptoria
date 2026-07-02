@@ -522,3 +522,31 @@ body.page-console { background: var(--bg); padding: 0; }
 .error-card__code { font-size: 40px; font-weight: 600; color: var(--accent-2); letter-spacing: -.02em; }
 .error-card__title { font-size: 18px; font-weight: 600; color: var(--ink); margin: 6px 0 10px; }
 .error-card__msg { font-size: 14px; color: var(--ink-3); margin: 0 auto 22px; max-width: 40ch; line-height: 1.6; }
+
+/* ============================================================================
+   Odyssey v2 — progressive-enhancement layer (ADDITIVE; redefines no selector
+   above). Toast host + optimistic busy/pending states used by the JS layer.
+   All motion rides the shared --dur/--ease tokens and is neutralised by the
+   global prefers-reduced-motion rule already declared above.
+   ============================================================================ */
+.toast-host { position:fixed; z-index:80; left:50%; bottom:22px; transform:translateX(-50%);
+  display:flex; flex-direction:column; gap:9px; align-items:center; width:auto; max-width:92vw; pointer-events:none; }
+.toast-host .toast { pointer-events:auto; opacity:0; transform:translateY(8px);
+  transition:opacity var(--dur) var(--ease), transform var(--dur) var(--ease); max-width:100%; }
+.toast-host .toast.is-in { opacity:1; transform:translateY(0); }
+.toast--err { background:var(--down); }
+.toast--err svg { color:#fecaca; }
+.is-busy { opacity:.55; pointer-events:none; }
+.is-pending { opacity:.6; }
+
+/* inkwell — editor live-preview tabs, title counter, and the draft-restore bar. */
+.field__labelrow { display:flex; align-items:baseline; justify-content:space-between; gap:12px; }
+.field__counter { font-size:11.5px; color:var(--ink-3); font-variant-numeric:tabular-nums; }
+.field__counter.is-over { color:var(--down-ink); }
+.editor__bodybar { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px; }
+.editor__tabs { margin-bottom:0; border-bottom:0; gap:2px; }
+.editor__tabs .tab { height:30px; padding:0 12px; border-radius:var(--r-xs); border-bottom:2px solid transparent; }
+.editor__preview { border:1px solid var(--border); border-radius:var(--r-sm); padding:16px 18px; min-height:140px; background:var(--surface); }
+.editor__preview:empty::before { content:"Nothing to preview yet — start writing in the Write tab."; color:var(--ink-3); font-size:13.5px; }
+.draftbar { display:flex; align-items:center; gap:10px; padding:10px 14px; margin:0 0 16px; border:1px solid var(--accent-border); background:var(--accent-soft); border-radius:var(--r-sm); font-size:13px; color:var(--ink-2); }
+.draftbar__spacer { margin-left:auto; }

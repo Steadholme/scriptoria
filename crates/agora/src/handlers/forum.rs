@@ -1179,6 +1179,25 @@ pub async fn react(
         if on { kind } else { "off" },
     ));
 
+    if wants_json(&headers) {
+        let count = state
+            .store
+            .reactions_for_post(&post.id, Some(&author.sub))
+            .await?
+            .into_iter()
+            .find(|c| c.kind == kind)
+            .map(|c| c.count)
+            .unwrap_or(0);
+        return Ok(axum::Json(serde_json::json!({
+            "ok": true,
+            "post_id": pid,
+            "kind": kind,
+            "on": on,
+            "count": count,
+        }))
+        .into_response());
+    }
+
     Ok(redirect_to(&format!("/t/{tid}")))
 }
 
@@ -1256,6 +1275,15 @@ pub async fn accept_answer(
         },
     ));
 
+    if wants_json(&headers) {
+        return Ok(axum::Json(serde_json::json!({
+            "ok": true,
+            "thread_id": tid,
+            "accepted_post_id": new_accepted,
+        }))
+        .into_response());
+    }
+
     Ok(redirect_to(&format!("/t/{tid}")))
 }
 
@@ -1307,6 +1335,15 @@ pub async fn toggle_subscription(
         },
     ));
 
+    if wants_json(&headers) {
+        return Ok(axum::Json(serde_json::json!({
+            "ok": true,
+            "thread_id": tid,
+            "subscribed": subscribed,
+        }))
+        .into_response());
+    }
+
     Ok(redirect_to(&format!("/t/{tid}")))
 }
 
@@ -1324,30 +1361,54 @@ fn subscribed_subject<'a>(q: &ThreadListQuery, viewer_sub: Option<&'a str>) -> O
 
 fn render_thread_list_controls(action: &str, q: &ThreadListQuery, show_subscribed: bool) -> String {
     let sort = q.sort_key();
-    let selected = |key: &str| if sort == key { " selected" } else { "" };
-    let filter = if show_subscribed {
+    let sub = q.subscribed_only();
+    let filter_q = if sub { "&filter=subscribed" } else { "" };
+    // Sort as tabs: real links (no-JS navigates + keeps the `?sort=` contract); the enhancement
+    // script intercepts a click, fetches the same URL and swaps the `.thread-list` in place.
+    let tab = |key: &str, label: &str| {
+        let active = sort == key;
         format!(
-            r#"<label class="thread-filter"><input type="checkbox" name="filter" value="subscribed"{checked}> Subscribed</label>"#,
-            checked = if q.subscribed_only() { " checked" } else { "" },
+            r#"<a class="tab{cls}" role="tab" aria-selected="{sel}" data-sort-tab="{key}" href="{action}?sort={key}{filter}">{label}</a>"#,
+            cls = if active { " is-active" } else { "" },
+            sel = if active { "true" } else { "false" },
+            action = esc(action),
+            key = key,
+            filter = filter_q,
+            label = label,
+        )
+    };
+    // Subscribed filter as a toggle link that preserves the current sort.
+    let filter = if show_subscribed {
+        let (href, label, cls) = if sub {
+            (
+                format!("{}?sort={}", esc(action), sort),
+                "Show all",
+                "btn btn-secondary btn-sm",
+            )
+        } else {
+            (
+                format!("{}?sort={}&filter=subscribed", esc(action), sort),
+                "Subscribed",
+                "btn btn-ghost btn-sm",
+            )
+        };
+        format!(
+            r#"<a class="{cls} thread-filter" href="{href}">{label}</a>"#,
+            cls = cls,
+            href = href,
+            label = label,
         )
     } else {
         String::new()
     };
     format!(
-        r#"<form class="thread-controls" method="get" action="{action}">
-  <label for="thread-sort">Sort</label>
-  <select id="thread-sort" name="sort">
-    <option value="latest"{latest}>Latest</option>
-    <option value="top"{top}>Top</option>
-    <option value="hot"{hot}>Hot</option>
-  </select>
+        r#"<div class="thread-controls" data-thread-controls>
+  <nav class="tabs sort-tabs" role="tablist" aria-label="Sort threads">{latest}{top}{hot}</nav>
   {filter}
-  <button class="btn btn-secondary btn-sm" type="submit">Apply</button>
-</form>"#,
-        action = esc(action),
-        latest = selected("latest"),
-        top = selected("top"),
-        hot = selected("hot"),
+</div>"#,
+        latest = tab("latest", "Latest"),
+        top = tab("top", "Top"),
+        hot = tab("hot", "Hot"),
         filter = filter,
     )
 }
@@ -1986,4 +2047,15 @@ pub(crate) fn redirect_to(location: &str) -> Response {
         [(header::LOCATION, location.to_string())],
     )
         .into_response()
+}
+
+/// True when the caller (a `fetch()` from the enhanced thread page) asked for a JSON reply via
+/// the `Accept` header. A plain form POST (no-JS) never sets this, so it keeps the 303 redirect —
+/// the seam that lets the optimistic JSON replies live ALONGSIDE the unchanged form routes.
+pub(crate) fn wants_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|a| a.contains("application/json"))
+        .unwrap_or(false)
 }

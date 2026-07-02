@@ -716,7 +716,70 @@ pub async fn delete(
         &rec.id,
         if rec.is_image() { "image" } else { "file" },
     ));
+    if wants_json(&headers) {
+        return Ok(axum::Json(serde_json::json!({ "ok": true, "id": rec.id })).into_response());
+    }
     Ok(redirect_found("/"))
+}
+
+/// True when the caller (a `fetch()` from the enhanced gallery) asked for JSON via `Accept`. A
+/// plain form POST (no-JS) never sets this, so it keeps its 302 — this is the seam that lets the
+/// optimistic JSON replies live ALONGSIDE the unchanged form routes.
+fn wants_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|a| a.contains("application/json"))
+        .unwrap_or(false)
+}
+
+/// Form body for an inline file rename: the CSRF token + the new display name.
+#[derive(Debug, Deserialize)]
+pub struct RenameForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+/// `POST /f/{id}/rename` — rename your own live file, then 302 back to its view. CSRF-checked,
+/// ownership-scoped, name trimmed + required + length-capped. The enhanced gallery asks for JSON
+/// (`Accept: application/json`) and updates the card in place; a plain form POST 302s as usual.
+pub async fn rename(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<RenameForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let actor = auth::identity(&headers);
+    let rec = owned_file(&state, &id, &actor).await?;
+
+    let name: String = form.name.trim().chars().take(MAX_NAME_CHARS).collect();
+    if name.is_empty() {
+        return Err(AppError::BadRequest("A file name is required.".to_string()));
+    }
+
+    state.store.rename_file(&rec.id, &actor.subject, &name).await?;
+    tracing::info!(id = rec.id, owner = actor.subject, "file renamed");
+    state.audit.emit(AuditEvent::notice(
+        "file.rename",
+        &actor.subject,
+        &rec.id,
+        &name,
+    ));
+
+    if wants_json(&headers) {
+        return Ok(
+            axum::Json(serde_json::json!({ "ok": true, "id": rec.id, "name": name }))
+                .into_response(),
+        );
+    }
+    Ok(redirect_found(&format!("/f/{}", rec.id)))
 }
 
 /// `POST /trash/{id}/restore` — restore a trashed file to the normal drive view.
@@ -745,6 +808,9 @@ pub async fn restore_trashed(
         &rec.id,
         if rec.is_image() { "image" } else { "file" },
     ));
+    if wants_json(&headers) {
+        return Ok(axum::Json(serde_json::json!({ "ok": true, "id": rec.id })).into_response());
+    }
     Ok(redirect_found("/?view=trash"))
 }
 
@@ -2307,7 +2373,7 @@ fn render_gallery(
         None => "/".to_string(),
     });
     let tiles = render_folder_tiles(&children, up_href.as_deref());
-    let file_cards = render_cards(files);
+    let file_cards = render_cards(files, csrf);
     // The empty placeholder shows only when the whole level is empty (no subfolders, no files).
     let cards = if tiles.is_empty() && file_cards.is_empty() {
         let msg = if active.is_none() {
@@ -2349,6 +2415,9 @@ fn render_upload_form(csrf: &str, folder_id: &str) -> String {
           </label>\
           <div class=\"dropzone__actions\">\
             <button class=\"btn btn-primary\" type=\"submit\">Upload</button>\
+          </div>\
+          <div class=\"dropzone__progress\" id=\"uploadProgress\" role=\"progressbar\" aria-label=\"Upload progress\" aria-valuemin=\"0\" aria-valuemax=\"100\" hidden>\
+            <div class=\"dropzone__bar\" id=\"uploadBar\"></div>\
           </div>\
         </form>",
         csrf = esc(csrf),
@@ -2649,7 +2718,7 @@ fn render_folder_upload_section(config: &Config, folder: &FolderRec, csrf: &str)
     }
 }
 
-fn render_cards(files: &[FileRec]) -> String {
+fn render_cards(files: &[FileRec], csrf: &str) -> String {
     files
         .iter()
         .map(|f| {
@@ -2661,18 +2730,44 @@ fn render_cards(files: &[FileRec]) -> String {
                 id = esc(&f.id),
                 alt = esc(&f.name),
             );
+            // Per-card actions live in a native <details> menu — no-JS: expand, rename/trash via
+            // the real forms (302 back). With JS: the rename becomes an inline PATCH-like update
+            // and "Move to trash" removes the card optimistically. All owner-scoped + CSRF-checked.
+            let menu = format!(
+                "<details class=\"card-menu\">\
+                   <summary class=\"card-menu__btn\" title=\"Actions\" aria-label=\"File actions\">\
+                     <svg viewBox=\"0 0 24 24\" width=\"16\" height=\"16\" fill=\"currentColor\" aria-hidden=\"true\"><circle cx=\"5\" cy=\"12\" r=\"1.6\"/><circle cx=\"12\" cy=\"12\" r=\"1.6\"/><circle cx=\"19\" cy=\"12\" r=\"1.6\"/></svg>\
+                   </summary>\
+                   <div class=\"card-menu__pop\" role=\"menu\">\
+                     <form class=\"card-menu__form rename-form\" method=\"post\" action=\"/f/{id}/rename\">\
+                       <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+                       <input class=\"rename-form__input\" type=\"text\" name=\"name\" value=\"{name}\" maxlength=\"255\" required aria-label=\"New file name\">\
+                       <button class=\"btn btn-primary btn-sm\" type=\"submit\">Rename</button>\
+                     </form>\
+                     <form class=\"card-menu__form trash-form\" method=\"post\" action=\"/delete/{id}\">\
+                       <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+                       <button class=\"btn btn-danger btn-sm\" type=\"submit\">Move to trash</button>\
+                     </form>\
+                   </div>\
+                 </details>",
+                id = esc(&f.id),
+                csrf = esc(csrf),
+                name = esc(&f.name),
+            );
             format!(
-                "<li class=\"file-card\">\
+                "<li class=\"file-card\" data-file-id=\"{id}\">\
                    <a class=\"file-card__link\" href=\"/f/{id}\">{thumb}</a>\
                    <div class=\"file-card__body\">\
-                     <a class=\"file-card__name\" href=\"/f/{id}\" title=\"{name}\">{name}</a>\
+                     <a class=\"file-card__name\" href=\"/f/{id}\" title=\"{name}\" data-file-name>{name}</a>\
                      <div class=\"file-card__meta\"><span>{size}</span><span>{date}</span></div>\
+                     {menu}\
                    </div>\
                  </li>",
                 id = esc(&f.id),
                 name = esc(&f.name),
                 size = esc(&human_size(f.size)),
                 date = esc(&fmt_ts(f.created_at)),
+                menu = menu,
             )
         })
         .collect::<Vec<_>>()

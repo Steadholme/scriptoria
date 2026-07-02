@@ -16,5 +16,163 @@
   </main>
 
   <footer class="site-foot">HOLDFAST Agora · discussion forum · identity by Keystone SSO</footer>
+
+  <div class="toast-host" id="hf-toasts" aria-live="polite" aria-atomic="false"></div>
+
+  <script>
+    // Progressive enhancement. Every control below is a real form/link that works without JS
+    // (POST→303 / GET navigation). With JS: reactions, accept-answer and subscribe become
+    // optimistic in-place updates, and the sort tabs swap the thread list without a full reload.
+    (function () {
+      var host = document.getElementById('hf-toasts');
+      function toast(msg, kind) {
+        if (!host) { return; }
+        var t = document.createElement('div');
+        t.className = 'toast' + (kind === 'err' ? ' toast--err' : ' toast--ok');
+        t.setAttribute('role', 'status');
+        t.textContent = msg;
+        host.appendChild(t);
+        requestAnimationFrame(function () { t.classList.add('is-in'); });
+        setTimeout(function () {
+          t.classList.remove('is-in');
+          setTimeout(function () { if (t.parentNode) { t.parentNode.removeChild(t); } }, 220);
+        }, kind === 'err' ? 4200 : 2000);
+      }
+      function body(form) { return new URLSearchParams(new FormData(form)); }
+
+      // ---- Reaction toggle (optimistic) ----
+      function handleReact(form) {
+        var btn = form.querySelector('.reaction');
+        if (!btn) { return; }
+        var countEl = btn.querySelector('.reaction__count');
+        var prevCount = countEl ? (parseInt(countEl.textContent, 10) || 0) : 0;
+        var prevOn = btn.classList.contains('is-mine');
+        var newOn = !prevOn;
+        btn.classList.toggle('is-mine', newOn);
+        btn.setAttribute('aria-pressed', newOn ? 'true' : 'false');
+        if (countEl) { countEl.textContent = String(Math.max(0, prevCount + (newOn ? 1 : -1))); }
+        fetch(form.action, { method: 'POST', headers: { 'Accept': 'application/json' }, credentials: 'same-origin', body: body(form) })
+          .then(function (r) { if (!r.ok) { throw 0; } return r.json(); })
+          .then(function (d) {
+            btn.classList.toggle('is-mine', d.on);
+            btn.setAttribute('aria-pressed', d.on ? 'true' : 'false');
+            if (countEl) { countEl.textContent = String(d.count); }
+          })
+          .catch(function () {
+            btn.classList.toggle('is-mine', prevOn);
+            btn.setAttribute('aria-pressed', prevOn ? 'true' : 'false');
+            if (countEl) { countEl.textContent = String(prevCount); }
+            toast('Could not save your reaction', 'err');
+          });
+      }
+
+      // ---- Accept answer (optimistic, reconciles every post) ----
+      function applyAccepted(acceptedId) {
+        Array.prototype.forEach.call(document.querySelectorAll('article.post'), function (post) {
+          var isOp = post.classList.contains('is-op');
+          var accept = post.querySelector('form[action$="/accept"] button');
+          var on = !!acceptedId && post.id === ('post-' + acceptedId);
+          post.classList.toggle('is-accepted', on && !isOp);
+          var meta = post.querySelector('.post__meta');
+          var badge = meta ? meta.querySelector('.badge-accepted') : null;
+          if (on && !isOp) {
+            if (!badge && meta) {
+              badge = document.createElement('span');
+              badge.className = 'badge badge-accepted';
+              badge.textContent = 'Accepted answer';
+              meta.appendChild(badge);
+            }
+          } else if (badge) {
+            badge.parentNode.removeChild(badge);
+          }
+          if (accept) { accept.textContent = (on && !isOp) ? 'Unmark accepted' : 'Mark accepted'; }
+        });
+      }
+      function handleAccept(form) {
+        var pidInput = form.querySelector('input[name="post_id"]');
+        var pid = pidInput ? pidInput.value : '';
+        var prev = null;
+        var cur = document.querySelector('article.post.is-accepted');
+        prev = cur ? cur.id.replace(/^post-/, '') : '';
+        var predicted = (prev === pid) ? '' : pid;
+        applyAccepted(predicted);
+        fetch(form.action, { method: 'POST', headers: { 'Accept': 'application/json' }, credentials: 'same-origin', body: body(form) })
+          .then(function (r) { if (!r.ok) { throw 0; } return r.json(); })
+          .then(function (d) { applyAccepted(d.accepted_post_id); })
+          .catch(function () { applyAccepted(prev); toast('Could not update the accepted answer', 'err'); });
+      }
+
+      // ---- Subscribe toggle (optimistic) ----
+      function handleSubscribe(form) {
+        var btn = form.querySelector('button');
+        if (!btn) { return; }
+        var prevLabel = btn.textContent;
+        var prevSubscribed = prevLabel.indexOf('Unsub') === 0;
+        var newSubscribed = !prevSubscribed;
+        btn.textContent = newSubscribed ? 'Unsubscribe' : 'Subscribe';
+        btn.classList.toggle('btn-secondary', newSubscribed);
+        btn.classList.toggle('btn-ghost', !newSubscribed);
+        fetch(form.action, { method: 'POST', headers: { 'Accept': 'application/json' }, credentials: 'same-origin', body: body(form) })
+          .then(function (r) { if (!r.ok) { throw 0; } return r.json(); })
+          .then(function (d) {
+            btn.textContent = d.subscribed ? 'Unsubscribe' : 'Subscribe';
+            btn.classList.toggle('btn-secondary', d.subscribed);
+            btn.classList.toggle('btn-ghost', !d.subscribed);
+          })
+          .catch(function () {
+            btn.textContent = prevLabel;
+            btn.classList.toggle('btn-secondary', prevSubscribed);
+            btn.classList.toggle('btn-ghost', !prevSubscribed);
+            toast('Could not update your subscription', 'err');
+          });
+      }
+
+      document.addEventListener('submit', function (e) {
+        var form = e.target;
+        if (!form || form.tagName !== 'FORM') { return; }
+        var action = form.getAttribute('action') || '';
+        if (form.querySelector('.reaction') && /\/react$/.test(action)) { e.preventDefault(); handleReact(form); return; }
+        if (/\/accept$/.test(action)) { e.preventDefault(); handleAccept(form); return; }
+        if (form.classList.contains('subscription-form')) { e.preventDefault(); handleSubscribe(form); return; }
+      });
+
+      // ---- Instant sort tabs (fetch + swap the thread list) ----
+      (function () {
+        var tabs = document.querySelectorAll('.sort-tabs a[data-sort-tab]');
+        if (!tabs.length) { return; }
+        function swap(href, pushed) {
+          var list = document.querySelector('.thread-list');
+          if (list) { list.classList.add('is-busy'); }
+          fetch(href, { headers: { 'Accept': 'text/html' }, credentials: 'same-origin' })
+            .then(function (r) { if (!r.ok) { throw 0; } return r.text(); })
+            .then(function (htmlText) {
+              var doc = new DOMParser().parseFromString(htmlText, 'text/html');
+              var freshList = doc.querySelector('.thread-list');
+              var freshControls = doc.querySelector('[data-thread-controls]');
+              if (freshList && list) { list.replaceWith(freshList); }
+              var controls = document.querySelector('[data-thread-controls]');
+              if (freshControls && controls) { controls.replaceWith(freshControls); bindTabs(); }
+              if (pushed) { history.pushState({}, '', href); }
+            })
+            .catch(function () {
+              if (list) { list.classList.remove('is-busy'); }
+              toast('Could not load that view', 'err');
+              window.location.href = href; // hard fallback
+            });
+        }
+        function bindTabs() {
+          Array.prototype.forEach.call(document.querySelectorAll('.sort-tabs a[data-sort-tab]'), function (a) {
+            a.addEventListener('click', function (e) {
+              if (e.metaKey || e.ctrlKey || e.shiftKey || e.button) { return; }
+              e.preventDefault();
+              swap(a.getAttribute('href'), true);
+            });
+          });
+        }
+        window.addEventListener('popstate', function () { swap(location.pathname + location.search, false); });
+        bindTabs();
+      })();
+    })();
+  </script>
 </body>
 </html>

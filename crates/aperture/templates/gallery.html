@@ -37,7 +37,11 @@
         {{BREADCRUMB}}
         <div class="section-head">
           <h2>{{HEADING}}</h2>
-          <span class="count-badge">{{COUNT}}</span>
+          <span class="count-badge" id="countBadge">{{COUNT}}</span>
+          <div class="view-toggle" id="viewToggle" role="group" aria-label="Layout" hidden>
+            <button type="button" class="view-toggle__btn is-active" data-view="grid" aria-label="Grid view" aria-pressed="true"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></button>
+            <button type="button" class="view-toggle__btn" data-view="list" aria-label="List view" aria-pressed="false"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg></button>
+          </div>
         </div>
 
         <ul class="gallery-grid">
@@ -49,33 +53,187 @@
     </div>
   </main>
 
+  <div class="toast-host" id="hf-toasts" aria-live="polite" aria-atomic="false"></div>
+
   <script>
+    // Progressive enhancement for the drive. Every control is a real form/link that works without
+    // JS. With JS: drag-drop uploads stream with a progress bar, the grid/list layout toggles and
+    // persists, and rename / move-to-trash / restore become optimistic in-place updates.
     (function () {
-      var input = document.getElementById('fileInput');
-      var name = document.getElementById('fileName');
-      var zone = document.getElementById('uploadForm');
-      if (!input || !zone) { return; }
-      function show() {
-        if (input.files && input.files.length) {
-          name.textContent = input.files[0].name;
-          zone.classList.add('has-file');
-        } else {
-          name.textContent = 'Nothing selected yet';
-          zone.classList.remove('has-file');
-        }
+      var host = document.getElementById('hf-toasts');
+      function toast(msg, kind) {
+        if (!host) { return; }
+        var t = document.createElement('div');
+        t.className = 'toast' + (kind === 'err' ? ' toast--err' : ' toast--ok');
+        t.setAttribute('role', 'status');
+        t.textContent = msg;
+        host.appendChild(t);
+        requestAnimationFrame(function () { t.classList.add('is-in'); });
+        setTimeout(function () {
+          t.classList.remove('is-in');
+          setTimeout(function () { if (t.parentNode) { t.parentNode.removeChild(t); } }, 220);
+        }, kind === 'err' ? 4200 : 2000);
       }
-      input.addEventListener('change', show);
-      ['dragenter', 'dragover'].forEach(function (ev) {
-        zone.addEventListener(ev, function (e) { e.preventDefault(); zone.classList.add('dragging'); });
-      });
-      ['dragleave', 'drop'].forEach(function (ev) {
-        zone.addEventListener(ev, function (e) { e.preventDefault(); zone.classList.remove('dragging'); });
-      });
-      zone.addEventListener('drop', function (e) {
-        if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
-          input.files = e.dataTransfer.files;
-          show();
+
+      // ---- Drag & drop + XHR upload with a progress bar --------------------
+      (function () {
+        var input = document.getElementById('fileInput');
+        var name = document.getElementById('fileName');
+        var zone = document.getElementById('uploadForm');
+        var progress = document.getElementById('uploadProgress');
+        var bar = document.getElementById('uploadBar');
+        if (!input || !zone) { return; }
+        function show() {
+          if (input.files && input.files.length) {
+            name.textContent = input.files[0].name;
+            zone.classList.add('has-file');
+          } else {
+            name.textContent = 'Nothing selected yet';
+            zone.classList.remove('has-file');
+          }
         }
+        var uploading = false;
+        function upload() {
+          if (!(input.files && input.files.length) || !window.FormData || !window.XMLHttpRequest) {
+            zone.submit();
+            return;
+          }
+          if (uploading) { return; }
+          uploading = true;
+          var fd = new FormData(zone);
+          var xhr = new XMLHttpRequest();
+          xhr.open('POST', zone.getAttribute('action'), true);
+          xhr.setRequestHeader('Accept', 'text/html');
+          zone.classList.add('is-busy');
+          if (progress) { progress.hidden = false; }
+          if (xhr.upload) {
+            xhr.upload.addEventListener('progress', function (e) {
+              if (e.lengthComputable && bar) {
+                var pct = Math.round((e.loaded / e.total) * 100);
+                bar.style.width = pct + '%';
+                if (progress) { progress.setAttribute('aria-valuenow', String(pct)); }
+              }
+            });
+          }
+          xhr.addEventListener('load', function () {
+            if (xhr.status >= 200 && xhr.status < 400) {
+              toast('Upload complete', 'ok');
+              window.location = xhr.responseURL || '/';
+            } else {
+              uploading = false;
+              zone.classList.remove('is-busy');
+              if (progress) { progress.hidden = true; }
+              toast('Upload failed — please retry', 'err');
+            }
+          });
+          xhr.addEventListener('error', function () {
+            uploading = false;
+            zone.classList.remove('is-busy');
+            if (progress) { progress.hidden = true; }
+            toast('Upload failed — please retry', 'err');
+          });
+          xhr.send(fd);
+        }
+        input.addEventListener('change', function () { show(); upload(); });
+        ['dragenter', 'dragover'].forEach(function (ev) {
+          zone.addEventListener(ev, function (e) { e.preventDefault(); zone.classList.add('dragging'); });
+        });
+        ['dragleave', 'drop'].forEach(function (ev) {
+          zone.addEventListener(ev, function (e) { e.preventDefault(); zone.classList.remove('dragging'); });
+        });
+        zone.addEventListener('drop', function (e) {
+          if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
+            input.files = e.dataTransfer.files;
+            show();
+            upload();
+          }
+        });
+        // Keep the explicit Upload button working through the same XHR path.
+        zone.addEventListener('submit', function (e) {
+          if (window.FormData && window.XMLHttpRequest && input.files && input.files.length) {
+            e.preventDefault();
+            upload();
+          }
+        });
+      })();
+
+      // ---- Grid / list layout toggle (persisted) ---------------------------
+      (function () {
+        var toggle = document.getElementById('viewToggle');
+        var grid = document.querySelector('.gallery-grid');
+        if (!toggle || !grid) { return; }
+        toggle.hidden = false;
+        function apply(view) {
+          grid.classList.toggle('is-list', view === 'list');
+          Array.prototype.forEach.call(toggle.querySelectorAll('.view-toggle__btn'), function (b) {
+            var on = b.getAttribute('data-view') === view;
+            b.classList.toggle('is-active', on);
+            b.setAttribute('aria-pressed', on ? 'true' : 'false');
+          });
+        }
+        var saved = 'grid';
+        try { saved = localStorage.getItem('aperture:view') || 'grid'; } catch (e) {}
+        apply(saved);
+        Array.prototype.forEach.call(toggle.querySelectorAll('.view-toggle__btn'), function (b) {
+          b.addEventListener('click', function () {
+            var view = b.getAttribute('data-view');
+            apply(view);
+            try { localStorage.setItem('aperture:view', view); } catch (e) {}
+          });
+        });
+      })();
+
+      // ---- Optimistic rename / trash / restore -----------------------------
+      function recount() {
+        var badge = document.getElementById('countBadge');
+        if (!badge) { return; }
+        var n = document.querySelectorAll('.gallery-grid .file-card[data-file-id]').length;
+        badge.textContent = n === 0 ? 'No files yet' : (n === 1 ? '1 file' : (n + ' files'));
+      }
+      function body(form) { return new URLSearchParams(new FormData(form)); }
+
+      function handleRename(form) {
+        var card = form.closest('.file-card');
+        var input = form.querySelector('input[name="name"]');
+        var newName = input ? input.value.trim() : '';
+        if (!newName) { toast('A file name is required', 'err'); return; }
+        var nameEl = card ? card.querySelector('[data-file-name]') : null;
+        var prev = nameEl ? nameEl.textContent : '';
+        if (nameEl) { nameEl.textContent = newName; nameEl.setAttribute('title', newName); }
+        var details = form.closest('details.card-menu');
+        if (details) { details.open = false; }
+        fetch(form.action, { method: 'POST', headers: { 'Accept': 'application/json' }, credentials: 'same-origin', body: body(form) })
+          .then(function (r) { if (!r.ok) { throw 0; } return r.json(); })
+          .then(function (d) { if (nameEl && d.name) { nameEl.textContent = d.name; nameEl.setAttribute('title', d.name); } toast('File renamed', 'ok'); })
+          .catch(function () { if (nameEl) { nameEl.textContent = prev; nameEl.setAttribute('title', prev); } toast('Rename failed', 'err'); });
+      }
+
+      function optimisticRemove(form, okMsg) {
+        var card = form.closest('.file-card');
+        if (!card) { return; }
+        var live = card.hasAttribute('data-file-id'); // live gallery card vs trash card
+        var parent = card.parentNode;
+        var nextSib = card.nextSibling;
+        card.parentNode.removeChild(card);
+        if (live) { recount(); }
+        fetch(form.action, { method: 'POST', headers: { 'Accept': 'application/json' }, credentials: 'same-origin', body: body(form) })
+          .then(function (r) { if (!r.ok) { throw 0; } return r.json(); })
+          .then(function () { toast(okMsg, 'ok'); })
+          .catch(function () {
+            if (nextSib) { parent.insertBefore(card, nextSib); } else { parent.appendChild(card); }
+            if (live) { recount(); }
+            toast('Action failed — please retry', 'err');
+          });
+      }
+
+      document.addEventListener('submit', function (e) {
+        var form = e.target;
+        if (!form || form.tagName !== 'FORM') { return; }
+        var action = form.getAttribute('action') || '';
+        if (form.classList.contains('rename-form')) { e.preventDefault(); handleRename(form); return; }
+        if (form.classList.contains('trash-form')) { e.preventDefault(); optimisticRemove(form, 'Moved to trash'); return; }
+        if (/^\/trash\/[^/]+\/restore$/.test(action)) { e.preventDefault(); optimisticRemove(form, 'Restored'); return; }
+        // purge / share / folder forms submit normally.
       });
     })();
   </script>

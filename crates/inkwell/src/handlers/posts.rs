@@ -10,7 +10,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Form;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::audit::AuditEvent;
 use crate::auth;
@@ -409,6 +409,40 @@ pub async fn create(
     crate::reindex_post(state.store.as_ref(), &post).await;
 
     Ok(redirect(&format!("/p/{slug}")))
+}
+
+// ---------------------------------------------------------------------------
+// Live preview (progressive enhancement)
+// ---------------------------------------------------------------------------
+
+/// The Markdown-body payload for the live-preview endpoint.
+#[derive(Debug, Deserialize)]
+pub struct PreviewForm {
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub csrf_token: String,
+}
+
+/// The rendered-preview envelope.
+#[derive(Serialize)]
+struct PreviewResponse {
+    html: String,
+}
+
+/// `POST /api/preview` — render the editor's Markdown to the SAME sanitized HTML the published
+/// post uses, for the live-preview pane. Author-gated + double-submit-CSRF-checked exactly like
+/// the compose/edit POST it shadows; it is read-only (no store write), so it emits no audit
+/// event. Returns `{ "html": "<sanitized>" }`. The HTML is safe because [`markdown::render_html`]
+/// neutralizes raw HTML and scheme-restricts links — identical to the reading view.
+pub async fn preview(
+    headers: HeaderMap,
+    Form(form): Form<PreviewForm>,
+) -> Result<Response, AppError> {
+    auth::require_author(&headers)?;
+    auth::verify_csrf(&headers, &form.csrf_token)?;
+    let html = markdown::render_html(form.body.trim());
+    Ok(axum::Json(PreviewResponse { html }).into_response())
 }
 
 // ---------------------------------------------------------------------------

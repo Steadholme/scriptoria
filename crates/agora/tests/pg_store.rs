@@ -73,6 +73,7 @@ async fn pg_store_full_integration() {
         author_sub: "u_1".to_string(),
         author_email: "alice@holdfast.local".to_string(),
         created_at: now,
+        quoted_post_id: String::new(),
     };
     pg.create_thread(&thread, &first).await.expect("create thread");
 
@@ -86,6 +87,7 @@ async fn pg_store_full_integration() {
         author_sub: "u_2".to_string(),
         author_email: "bob@holdfast.local".to_string(),
         created_at: now + 5,
+        quoted_post_id: String::new(),
     };
     pg.add_reply(&reply).await.expect("add reply");
 

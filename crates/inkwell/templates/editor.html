@@ -16,15 +16,33 @@
   </div>
   <section class="card">
     <div class="card__body">
+      <div class="draftbar" id="draftbar" hidden>
+        <span id="draftbar-msg">You have an unsaved draft.</span>
+        <span class="draftbar__spacer"></span>
+        <button type="button" class="btn btn-ghost btn-sm" id="draftRestore">Restore</button>
+        <button type="button" class="btn btn-subtle btn-sm" id="draftDiscard">Discard</button>
+      </div>
       <form class="editor" method="post" action="{{ACTION}}">
         <input type="hidden" name="csrf_token" value="{{CSRF}}">
         <div class="field">
-          <label for="title">Title</label>
+          <div class="field__labelrow">
+            <label for="title">Title</label>
+            <span class="field__counter" id="titleCount" aria-hidden="true"></span>
+          </div>
           <input type="text" id="title" name="title" required maxlength="200" placeholder="Post title" value="{{TITLE_VALUE}}">
         </div>
         <div class="field">
-          <label for="body">Body <span class="muted">(Markdown)</span></label>
-          <textarea id="body" name="body" class="editor__body" placeholder="Write in Markdown&hellip;">{{BODY_VALUE}}</textarea>
+          <div class="editor__bodybar">
+            <label for="body">Body <span class="muted">(Markdown)</span></label>
+            <div class="tabs editor__tabs" role="tablist" aria-label="Editor mode">
+              <button type="button" class="tab is-active" id="tab-write" role="tab" aria-selected="true" aria-controls="pane-write" data-mode="write">Write</button>
+              <button type="button" class="tab" id="tab-preview" role="tab" aria-selected="false" aria-controls="pane-preview" data-mode="preview">Preview</button>
+            </div>
+          </div>
+          <div id="pane-write" role="tabpanel" aria-labelledby="tab-write">
+            <textarea id="body" name="body" class="editor__body" placeholder="Write in Markdown&hellip;">{{BODY_VALUE}}</textarea>
+          </div>
+          <div id="pane-preview" class="article__body editor__preview" role="tabpanel" aria-labelledby="tab-preview" aria-live="polite" hidden></div>
         </div>
         <div class="field">
           <label for="tags">Tags <span class="muted">(comma-separated)</span></label>
@@ -47,7 +65,7 @@
           <label class="check"><input type="checkbox" name="pinned" {{PINNED_CHECKED}}> Pinned</label>
         </div>
         <div class="editor__actions">
-          <button class="btn btn-primary" type="submit">{{SUBMIT_LABEL}}</button>
+          <button class="btn btn-primary" type="submit" id="submitBtn" data-label="{{SUBMIT_LABEL}}" data-busy="Publishing&hellip;">{{SUBMIT_LABEL}}</button>
           <a class="btn btn-ghost" href="{{CANCEL_HREF}}">Cancel</a>
         </div>
       </form>
@@ -55,5 +73,177 @@
     </div>
   </section>
 </main>
+
+<div class="toast-host" id="hf-toasts" aria-live="polite" aria-atomic="false"></div>
+
+<script>
+  var hfToast = (function () {
+    var host = document.getElementById('hf-toasts');
+    return function (msg, kind) {
+      if (!host) { return; }
+      var t = document.createElement('div');
+      t.className = 'toast' + (kind === 'err' ? ' toast--err' : ' toast--ok');
+      t.setAttribute('role', 'status');
+      t.textContent = msg;
+      host.appendChild(t);
+      requestAnimationFrame(function () { t.classList.add('is-in'); });
+      setTimeout(function () {
+        t.classList.remove('is-in');
+        setTimeout(function () { if (t.parentNode) { t.parentNode.removeChild(t); } }, 220);
+      }, kind === 'err' ? 4200 : 2000);
+    };
+  })();
+
+  (function () {
+    var form = document.querySelector('form.editor');
+    if (!form) { return; }
+    var titleEl = document.getElementById('title');
+    var bodyEl = document.getElementById('body');
+    var tagsEl = document.getElementById('tags');
+    var coverEl = document.getElementById('cover_url');
+    var csrfEl = form.querySelector('input[name="csrf_token"]');
+    var action = form.getAttribute('action') || '';
+
+    // ---- Title character counter -----------------------------------------
+    var counter = document.getElementById('titleCount');
+    if (counter && titleEl) {
+      var max = parseInt(titleEl.getAttribute('maxlength') || '200', 10);
+      var sync = function () {
+        var n = titleEl.value.length;
+        counter.textContent = n + ' / ' + max;
+        counter.classList.toggle('is-over', n >= max);
+      };
+      titleEl.addEventListener('input', sync);
+      sync();
+    }
+
+    // ---- Write / Preview tabs --------------------------------------------
+    var tabWrite = document.getElementById('tab-write');
+    var tabPreview = document.getElementById('tab-preview');
+    var paneWrite = document.getElementById('pane-write');
+    var panePreview = document.getElementById('pane-preview');
+    var lastRendered = null;
+    function setMode(mode) {
+      var preview = mode === 'preview';
+      tabWrite.classList.toggle('is-active', !preview);
+      tabPreview.classList.toggle('is-active', preview);
+      tabWrite.setAttribute('aria-selected', String(!preview));
+      tabPreview.setAttribute('aria-selected', String(preview));
+      paneWrite.hidden = preview;
+      panePreview.hidden = !preview;
+      if (preview) { renderPreview(); }
+    }
+    function renderPreview() {
+      var src = bodyEl.value;
+      if (src === lastRendered) { return; }
+      panePreview.textContent = 'Rendering…';
+      var params = new URLSearchParams();
+      params.set('body', src);
+      params.set('csrf_token', csrfEl ? csrfEl.value : '');
+      fetch('/api/preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+        credentials: 'same-origin',
+        body: params.toString()
+      }).then(function (r) {
+        if (!r.ok) { throw new Error('preview failed'); }
+        return r.json();
+      }).then(function (data) {
+        // Server-sanitized Markdown HTML (same renderer as the published post).
+        panePreview.innerHTML = data.html || '';
+        lastRendered = src;
+      }).catch(function () {
+        panePreview.textContent = '';
+        hfToast('Preview failed — check your connection', 'err');
+      });
+    }
+    if (tabWrite && tabPreview && paneWrite && panePreview) {
+      tabWrite.addEventListener('click', function () { setMode('write'); });
+      tabPreview.addEventListener('click', function () { setMode('preview'); });
+    }
+
+    // ---- Autosave draft to localStorage ----------------------------------
+    var draftKey = 'inkwell:draft:' + action;
+    var bakKey = 'inkwell:draftbak:' + action;
+    var BAK_TTL = 90000; // 90s bounce-back window for error recovery
+    function snapshot() {
+      return { title: titleEl ? titleEl.value : '', body: bodyEl ? bodyEl.value : '',
+               tags: tagsEl ? tagsEl.value : '', cover: coverEl ? coverEl.value : '', ts: Date.now() };
+    }
+    function apply(d) {
+      if (titleEl && typeof d.title === 'string') { titleEl.value = d.title; titleEl.dispatchEvent(new Event('input')); }
+      if (bodyEl && typeof d.body === 'string') { bodyEl.value = d.body; }
+      if (tagsEl && typeof d.tags === 'string') { tagsEl.value = d.tags; }
+      if (coverEl && typeof d.cover === 'string') { coverEl.value = d.cover; }
+    }
+    function differsFromForm(d) {
+      return (titleEl && d.title !== titleEl.value) || (bodyEl && d.body !== bodyEl.value);
+    }
+    var save = (function () {
+      var t = null;
+      return function () {
+        if (t) { clearTimeout(t); }
+        t = setTimeout(function () {
+          try { localStorage.setItem(draftKey, JSON.stringify(snapshot())); } catch (e) {}
+        }, 600);
+      };
+    })();
+    [titleEl, bodyEl, tagsEl, coverEl].forEach(function (el) { if (el) { el.addEventListener('input', save); } });
+
+    // Restore bar for a stale draft (crash / accidental close).
+    var bar = document.getElementById('draftbar');
+    var barMsg = document.getElementById('draftbar-msg');
+    var pendingDraft = null;
+    try {
+      var rawBak = localStorage.getItem(bakKey);
+      if (rawBak) {
+        var bak = JSON.parse(rawBak);
+        localStorage.removeItem(bakKey);
+        if (bak && (Date.now() - bak.ts) < BAK_TTL && differsFromForm(bak)) {
+          apply(bak);
+          hfToast('Restored your unsaved draft', 'ok');
+        }
+      }
+      var raw = localStorage.getItem(draftKey);
+      if (raw) {
+        var d = JSON.parse(raw);
+        if (!d || (Date.now() - d.ts) > 7 * 24 * 3600 * 1000) {
+          localStorage.removeItem(draftKey);
+        } else if (differsFromForm(d) && (d.body || d.title)) {
+          pendingDraft = d;
+          if (barMsg) {
+            var mins = Math.max(1, Math.round((Date.now() - d.ts) / 60000));
+            barMsg.textContent = 'A draft from about ' + mins + ' minute' + (mins === 1 ? '' : 's') + ' ago is available.';
+          }
+          if (bar) { bar.hidden = false; }
+        }
+      }
+    } catch (e) {}
+    var restoreBtn = document.getElementById('draftRestore');
+    var discardBtn = document.getElementById('draftDiscard');
+    if (restoreBtn) { restoreBtn.addEventListener('click', function () {
+      if (pendingDraft) { apply(pendingDraft); }
+      if (bar) { bar.hidden = true; }
+      hfToast('Draft restored', 'ok');
+    }); }
+    if (discardBtn) { discardBtn.addEventListener('click', function () {
+      try { localStorage.removeItem(draftKey); } catch (e) {}
+      if (bar) { bar.hidden = true; }
+    }); }
+
+    // ---- Publish in-flight + hand-off draft to the bounce-back backup -----
+    form.addEventListener('submit', function () {
+      try {
+        localStorage.setItem(bakKey, JSON.stringify(snapshot()));
+        localStorage.removeItem(draftKey);
+      } catch (e) {}
+      var btn = document.getElementById('submitBtn');
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = btn.getAttribute('data-busy');
+      }
+    });
+  })();
+</script>
 </body>
 </html>

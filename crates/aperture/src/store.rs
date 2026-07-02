@@ -81,6 +81,10 @@ pub trait Store: Send + Sync {
     /// Restore a trashed file only if it belongs to `owner_sub`.
     async fn restore_file(&self, id: &str, owner_sub: &str) -> Result<bool, StoreError>;
 
+    /// Rename an owner's live (non-trashed) file. Returns `true` when a row was updated.
+    async fn rename_file(&self, id: &str, owner_sub: &str, name: &str)
+        -> Result<bool, StoreError>;
+
     /// An owner's trashed files, newest-trash-first.
     async fn list_trashed_by_owner(&self, owner_sub: &str) -> Result<Vec<FileRec>, StoreError>;
 
@@ -400,6 +404,25 @@ impl Store for InMemoryStore {
         {
             Some(f) => {
                 f.trashed_at = 0;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn rename_file(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        name: &str,
+    ) -> Result<bool, StoreError> {
+        let mut files = self.files.lock().expect("files lock poisoned");
+        match files
+            .iter_mut()
+            .find(|f| f.id == id && f.owner_sub == owner_sub && f.trashed_at == 0)
+        {
+            Some(f) => {
+                f.name = name.to_string();
                 Ok(true)
             }
             None => Ok(false),
@@ -1382,6 +1405,23 @@ impl PgStore {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn rename_file_async(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        name: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE files SET name = $1 WHERE id = $2 AND owner_sub = $3 AND trashed_at = 0",
+        )
+        .bind(name)
+        .bind(id)
+        .bind(owner_sub)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn list_trashed_by_owner_async(
         &self,
         owner_sub: &str,
@@ -2034,6 +2074,17 @@ impl Store for PgStore {
 
     async fn restore_file(&self, id: &str, owner_sub: &str) -> Result<bool, StoreError> {
         self.restore_file_async(id, owner_sub)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn rename_file(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        name: &str,
+    ) -> Result<bool, StoreError> {
+        self.rename_file_async(id, owner_sub, name)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
     }

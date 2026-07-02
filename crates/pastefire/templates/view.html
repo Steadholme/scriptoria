@@ -48,18 +48,76 @@
     {{SIMILAR}}
   </main>
 
+  <div class="toast-host" id="hf-toasts" aria-live="polite" aria-atomic="false"></div>
+
   <script>
+    // Minimal toast helper (textContent only — never innerHTML for messages).
+    var hfToast = (function () {
+      var host = document.getElementById('hf-toasts');
+      return function (msg, kind) {
+        if (!host) { return; }
+        var t = document.createElement('div');
+        t.className = 'toast' + (kind === 'err' ? ' toast--err' : ' toast--ok');
+        t.setAttribute('role', 'status');
+        t.textContent = msg;
+        host.appendChild(t);
+        requestAnimationFrame(function () { t.classList.add('is-in'); });
+        setTimeout(function () {
+          t.classList.remove('is-in');
+          setTimeout(function () { if (t.parentNode) { t.parentNode.removeChild(t); } }, 220);
+        }, kind === 'err' ? 4200 : 2000);
+      };
+    })();
+
+    // Copy the code cells (never the gutter line numbers) of a given container.
+    function copyLines(container, done) {
+      var cells = container.querySelectorAll('.ln-code');
+      var text = Array.prototype.map.call(cells, function (c) { return c.textContent; }).join('\n');
+      if (!navigator.clipboard) { done(false); return; }
+      navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(false); });
+    }
+
+    // Whole-paste copy button in the card header.
     (function () {
       var btn = document.getElementById('copyBtn');
       var code = document.getElementById('code');
-      if (!btn || !code || !navigator.clipboard) { if (btn) { btn.disabled = true; } return; }
+      if (!btn || !code) { return; }
+      if (!navigator.clipboard) { btn.disabled = true; return; }
       btn.addEventListener('click', function () {
-        // Copy only the code cells (never the gutter line numbers), one line per row.
-        var cells = code.querySelectorAll('.ln-code');
-        var text = Array.prototype.map.call(cells, function (c) { return c.textContent; }).join('\n');
-        navigator.clipboard.writeText(text).then(function () {
-          btn.textContent = 'Copied';
-          setTimeout(function () { btn.textContent = btn.getAttribute('data-label'); }, 1200);
+        copyLines(code, function (ok) {
+          if (ok) {
+            btn.textContent = 'Copied';
+            setTimeout(function () { btn.textContent = btn.getAttribute('data-label'); }, 1200);
+            hfToast('Copied to clipboard', 'ok');
+          } else {
+            hfToast('Copy failed — select and copy manually', 'err');
+          }
+        });
+      });
+    })();
+
+    // Per-file copy buttons in each multi-file block header.
+    (function () {
+      var buttons = document.querySelectorAll('.file-copy[data-copy="file"]');
+      if (!buttons.length) { return; }
+      if (!navigator.clipboard) {
+        Array.prototype.forEach.call(buttons, function (b) { b.disabled = true; });
+        return;
+      }
+      Array.prototype.forEach.call(buttons, function (btn) {
+        btn.addEventListener('click', function () {
+          var block = btn.closest('.file-block');
+          var body = block && block.querySelector('.code-lines');
+          if (!body) { hfToast('Copy failed', 'err'); return; }
+          copyLines(body, function (ok) {
+            if (ok) {
+              btn.textContent = 'Copied';
+              setTimeout(function () { btn.textContent = btn.getAttribute('data-label'); }, 1200);
+              hfToast('File copied to clipboard', 'ok');
+            } else {
+              hfToast('Copy failed — select and copy manually', 'err');
+            }
+          });
         });
       });
     })();

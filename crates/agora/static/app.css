@@ -550,3 +550,26 @@ body.page { max-width:none; margin:0; padding:0; }
 @media (max-width: 640px) {
   .page-head { align-items: flex-start; }
 }
+
+/* ============================================================================
+   Odyssey v2 — progressive-enhancement layer (ADDITIVE; redefines no selector
+   above). Toast host + optimistic busy/pending states used by the JS layer.
+   All motion rides the shared --dur/--ease tokens and is neutralised by the
+   global prefers-reduced-motion rule already declared above.
+   ============================================================================ */
+.toast-host { position:fixed; z-index:80; left:50%; bottom:22px; transform:translateX(-50%);
+  display:flex; flex-direction:column; gap:9px; align-items:center; width:auto; max-width:92vw; pointer-events:none; }
+.toast-host .toast { pointer-events:auto; opacity:0; transform:translateY(8px);
+  transition:opacity var(--dur) var(--ease), transform var(--dur) var(--ease); max-width:100%; }
+.toast-host .toast.is-in { opacity:1; transform:translateY(0); }
+.toast--err { background:var(--down); }
+.toast--err svg { color:#fecaca; }
+.is-busy { opacity:.55; pointer-events:none; }
+.is-pending { opacity:.6; }
+
+/* agora — instant sort tabs row + subscribed filter alignment. Tabs reuse the
+   shared .tabs/.tab kit; this only lays out the control row. */
+.thread-controls { display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin-bottom:16px; }
+.sort-tabs { margin-bottom:0; }
+.thread-filter { margin-left:auto; }
+@media (max-width:720px){ .thread-filter { margin-left:0; } }

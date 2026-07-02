@@ -1186,11 +1186,17 @@ fn render_body_html(
             format!(
                 "<div class=\"file-block\">\
                    <div class=\"file-block__head\">{icon}<span>{name}</span>\
-                     <span class=\"file-block__count\">{n} of {count}</span></div>\
+                     <span class=\"file-block__tools\">\
+                       <span class=\"lang-badge\">{lang}</span>\
+                       <span class=\"file-block__count\">{n} of {count}</span>\
+                       <button class=\"btn btn-subtle btn-sm file-copy\" type=\"button\" \
+                         data-copy=\"file\" data-label=\"Copy\" aria-label=\"Copy this file\">Copy</button>\
+                     </span></div>\
                    <div class=\"code-pre code-lines\">{lines}</div>\
                  </div>",
                 icon = FILE_ICON_SVG,
                 name = esc(&display_filename(&f.filename, i)),
+                lang = esc(&language_label(&paste.language)),
                 n = i + 1,
                 count = count,
                 lines = highlight::render_lines(&paste.language, &f.content, None),

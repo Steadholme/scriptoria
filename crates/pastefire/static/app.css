@@ -470,3 +470,25 @@ body.page { max-width:none; margin:0; padding:0; }
 .status-code { font-family: var(--mono); font-size: 13px; font-weight: 600; letter-spacing: .08em; color: var(--accent-2); }
 .message-heading { margin: 14px 0 8px; font-size: 22px; font-weight: 600; }
 .message-body { margin: 0 0 24px; color: var(--ink-2); font-size: 14px; }
+
+/* ============================================================================
+   Odyssey v2 — progressive-enhancement layer (ADDITIVE; redefines no selector
+   above). Toast host + optimistic busy/pending states used by the JS layer.
+   All motion rides the shared --dur/--ease tokens and is neutralised by the
+   global prefers-reduced-motion rule already declared above.
+   ============================================================================ */
+.toast-host { position:fixed; z-index:80; left:50%; bottom:22px; transform:translateX(-50%);
+  display:flex; flex-direction:column; gap:9px; align-items:center; width:auto; max-width:92vw; pointer-events:none; }
+.toast-host .toast { pointer-events:auto; opacity:0; transform:translateY(8px);
+  transition:opacity var(--dur) var(--ease), transform var(--dur) var(--ease); max-width:100%; }
+.toast-host .toast.is-in { opacity:1; transform:translateY(0); }
+.toast--err { background:var(--down); }
+.toast--err svg { color:#fecaca; }
+.is-busy { opacity:.55; pointer-events:none; }
+.is-pending { opacity:.6; }
+
+/* pastefire — per-file copy affordance in each multi-file block header. The
+   name grows; the tools cluster (language pill + "n of N" + Copy) sits right. */
+.file-block__tools { margin-left:auto; display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; }
+.file-block__tools .file-block__count { margin-left:0; }
+.file-copy { white-space:nowrap; }

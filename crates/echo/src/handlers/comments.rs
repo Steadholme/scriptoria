@@ -524,10 +524,45 @@ pub async fn post_comment(
         },
     ));
 
+    // Progressive enhancement: the enhanced thread page asks for JSON and splices the freshly
+    // posted comment inline. A plain form POST (no `Accept: application/json`) keeps the 303.
+    if wants_json(&headers) {
+        let html = render_comment(
+            &comment,
+            &Reactions::empty(),
+            &Votes::empty(),
+            &form.csrf_token,
+            &thread.key,
+            &form.return_to,
+            true,                              // moderate — mirror thread_view
+            !comment.parent_id.is_empty(),     // is_reply
+            &comment.author_sub,               // viewer_sub — the poster owns it
+            false,                             // embed
+        );
+        return Ok(axum::Json(serde_json::json!({
+            "ok": true,
+            "id": comment.id,
+            "parent_id": comment.parent_id,
+            "html": html,
+        }))
+        .into_response());
+    }
+
     Ok(redirect(&local_redirect(
         &form.return_to,
         &format!("/t/{}", path_seg(&thread.key)),
     )))
+}
+
+/// True when the caller (a `fetch()` from the enhanced thread page) asked for a JSON reply via
+/// the `Accept` header. A plain form POST (no-JS) never sets this, so it keeps the 303 redirect —
+/// this is the seam that lets the JSON responses live ALONGSIDE the unchanged form routes.
+fn wants_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|a| a.contains("application/json"))
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -719,6 +754,24 @@ pub async fn react(
         if added { kind } else { "removed" },
     ));
 
+    if wants_json(&headers) {
+        let count = state
+            .store
+            .reactions_for(&[comment_id.to_string()])
+            .await
+            .iter()
+            .filter(|r| r.kind == kind)
+            .count() as i64;
+        return Ok(axum::Json(serde_json::json!({
+            "ok": true,
+            "comment_id": comment_id,
+            "kind": kind,
+            "added": added,
+            "count": count,
+        }))
+        .into_response());
+    }
+
     Ok(redirect(&local_redirect(&form.return_to, "/")))
 }
 
@@ -783,6 +836,23 @@ pub async fn vote(
         comment_id,
         detail,
     ));
+
+    if wants_json(&headers) {
+        let score: i64 = state
+            .store
+            .votes_for(&[comment_id.to_string()])
+            .await
+            .iter()
+            .map(|v| v.value)
+            .sum();
+        return Ok(axum::Json(serde_json::json!({
+            "ok": true,
+            "comment_id": comment_id,
+            "score": score,
+            "my_vote": current,
+        }))
+        .into_response());
+    }
 
     Ok(redirect(&local_redirect(&form.return_to, "/")))
 }

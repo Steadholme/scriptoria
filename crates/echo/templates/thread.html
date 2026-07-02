@@ -27,5 +27,142 @@
     </section>
   </article>
 </main>
+
+<div class="toast-host" id="hf-toasts" aria-live="polite" aria-atomic="false"></div>
+
+<script>
+  // Progressive enhancement for the full thread page: vote + react become optimistic in-place
+  // updates, and a posted comment/reply is spliced in without a reload. Every form still works
+  // without JS (it POSTs and 303s). The embed widget deliberately does NOT load this script.
+  (function () {
+    var host = document.getElementById('hf-toasts');
+    function toast(msg, kind) {
+      if (!host) { return; }
+      var t = document.createElement('div');
+      t.className = 'toast' + (kind === 'err' ? ' toast--err' : ' toast--ok');
+      t.setAttribute('role', 'status');
+      t.textContent = msg;
+      host.appendChild(t);
+      requestAnimationFrame(function () { t.classList.add('is-in'); });
+      setTimeout(function () {
+        t.classList.remove('is-in');
+        setTimeout(function () { if (t.parentNode) { t.parentNode.removeChild(t); } }, 220);
+      }, kind === 'err' ? 4200 : 2000);
+    }
+
+    var root = document.querySelector('main.reader') || document;
+    function body(form) { return new URLSearchParams(new FormData(form)); }
+
+    function applyVote(votesEl, score, myVote) {
+      var b = votesEl.querySelector('.vote-score b');
+      if (b) { b.textContent = String(score); }
+      Array.prototype.forEach.call(votesEl.querySelectorAll('.vote-btn'), function (btn) {
+        var f = btn.closest('.vote-form');
+        var val = f ? parseInt(f.querySelector('input[name="value"]').value, 10) : 0;
+        var on = val === myVote;
+        btn.classList.toggle('vote-btn--on', on);
+        btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+      });
+    }
+    function currentVote(votesEl) {
+      var on = votesEl.querySelector('.vote-btn--on');
+      if (!on) { return 0; }
+      var f = on.closest('.vote-form');
+      return f ? parseInt(f.querySelector('input[name="value"]').value, 10) : 0;
+    }
+    function handleVote(form) {
+      var votesEl = form.closest('.votes');
+      if (!votesEl) { return; }
+      var scoreB = votesEl.querySelector('.vote-score b');
+      var prevScore = scoreB ? (parseInt(scoreB.textContent, 10) || 0) : 0;
+      var prevMine = currentVote(votesEl);
+      var val = parseInt(form.querySelector('input[name="value"]').value, 10);
+      var newMine = (prevMine === val) ? 0 : val;
+      applyVote(votesEl, prevScore + (newMine - prevMine), newMine);
+      fetch(form.action, { method: 'POST', headers: { 'Accept': 'application/json' }, credentials: 'same-origin', body: body(form) })
+        .then(function (r) { if (!r.ok) { throw 0; } return r.json(); })
+        .then(function (d) { applyVote(votesEl, d.score, d.my_vote); })
+        .catch(function () { applyVote(votesEl, prevScore, prevMine); toast('Could not save your vote', 'err'); });
+    }
+
+    function handleReact(form) {
+      var btn = form.querySelector('.react-btn');
+      if (!btn) { return; }
+      var countEl = btn.querySelector('.react-btn__count');
+      var prevCount = countEl ? (parseInt(countEl.textContent, 10) || 0) : 0;
+      var prevOn = btn.classList.contains('react-btn--on');
+      var newOn = !prevOn;
+      var newCount = Math.max(0, prevCount + (newOn ? 1 : -1));
+      btn.classList.toggle('react-btn--on', newOn);
+      btn.setAttribute('aria-pressed', newOn ? 'true' : 'false');
+      if (countEl) { countEl.textContent = String(newCount); }
+      fetch(form.action, { method: 'POST', headers: { 'Accept': 'application/json' }, credentials: 'same-origin', body: body(form) })
+        .then(function (r) { if (!r.ok) { throw 0; } return r.json(); })
+        .then(function (d) {
+          btn.classList.toggle('react-btn--on', d.added);
+          btn.setAttribute('aria-pressed', d.added ? 'true' : 'false');
+          if (countEl) { countEl.textContent = String(d.count); }
+        })
+        .catch(function () {
+          btn.classList.toggle('react-btn--on', prevOn);
+          btn.setAttribute('aria-pressed', prevOn ? 'true' : 'false');
+          if (countEl) { countEl.textContent = String(prevCount); }
+          toast('Could not save your reaction', 'err');
+        });
+    }
+
+    function handlePost(form) {
+      var btn = form.querySelector('button[type="submit"]');
+      var ta = form.querySelector('textarea[name="body"]');
+      var label = btn ? btn.textContent : '';
+      if (btn) { btn.disabled = true; btn.textContent = 'Posting…'; }
+      fetch(form.action, { method: 'POST', headers: { 'Accept': 'application/json' }, credentials: 'same-origin', body: body(form) })
+        .then(function (r) { if (!r.ok) { throw 0; } return r.json(); })
+        .then(function (d) {
+          // Server-rendered + sanitized comment fragment (same renderer as a page reload).
+          var tmp = document.createElement('div');
+          tmp.innerHTML = d.html;
+          var node = tmp.firstElementChild;
+          if (!node) { throw 0; }
+          if (d.parent_id) {
+            var parentArticle = null;
+            Array.prototype.forEach.call(root.querySelectorAll('.composer-form input[name="parent_id"]'), function (inp) {
+              if (inp.value === d.parent_id && !parentArticle) { parentArticle = inp.closest('article.comment'); }
+            });
+            if (parentArticle) {
+              var replies = parentArticle.querySelector('.replies');
+              if (!replies) { replies = document.createElement('div'); replies.className = 'replies'; parentArticle.appendChild(replies); }
+              replies.appendChild(node);
+            } else {
+              var l0 = document.querySelector('.comment-list');
+              if (l0) { l0.appendChild(node); }
+            }
+            var det = form.closest('details.reply-toggle');
+            if (det) { det.open = false; }
+          } else {
+            var list = document.querySelector('.comment-list');
+            var empty = list && list.querySelector('.comment-list__empty');
+            if (empty) { empty.parentNode.removeChild(empty); }
+            if (list) { list.appendChild(node); }
+          }
+          if (ta) { ta.value = ''; }
+          toast('Comment posted', 'ok');
+        })
+        .catch(function () { toast('Could not post your comment — please retry', 'err'); })
+        .then(function () { if (btn) { btn.disabled = false; btn.textContent = label; } });
+    }
+
+    root.addEventListener('submit', function (e) {
+      var form = e.target;
+      if (!form || form.tagName !== 'FORM') { return; }
+      if (form.classList.contains('vote-form')) { e.preventDefault(); handleVote(form); return; }
+      if (form.classList.contains('react-form')) { e.preventDefault(); handleReact(form); return; }
+      if (form.classList.contains('composer-form') && form.getAttribute('action') === '/api/comment') {
+        e.preventDefault(); handlePost(form); return;
+      }
+      // edit / report / delete / moderate submit normally (full-page).
+    });
+  })();
+</script>
 </body>
 </html>
