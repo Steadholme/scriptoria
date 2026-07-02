@@ -54,6 +54,25 @@ pub struct PasteRevision {
     pub created_at: i64,
 }
 
+/// One named file within a multi-file paste (a la a GitHub Gist with several files). Field
+/// order/types mirror the `paste_files` table exactly. A paste with NO `paste_files` rows is a
+/// legacy/single-content paste: its lone "file" is synthesized from `pastes.body` on read, so
+/// pre-existing pastes keep their exact single-file rendering with zero migration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PasteFile {
+    /// Random, unique file id (primary key). Never surfaced in a URL — files are addressed by
+    /// their parent paste + position.
+    pub id: String,
+    /// The paste this file belongs to (`pastes.id`).
+    pub paste_id: String,
+    /// The file's display name (may be empty -> rendered as "File {n}").
+    pub filename: String,
+    /// The file's verbatim content (rendered into an HTML-escaped, line-numbered block).
+    pub content: String,
+    /// 0-based ordering within the paste; the view renders files in ascending `position`.
+    pub position: i64,
+}
+
 impl Paste {
     /// True once `now` (epoch seconds) has reached the expiry instant. A `None` expiry never
     /// expires. Keeping this on the model means the view path, the raw path, and the recent

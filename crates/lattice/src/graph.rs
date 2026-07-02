@@ -483,6 +483,7 @@ mod tests {
             updated_by_email: "a@x.co".to_string(),
             updated_at,
             created_at: updated_at,
+            parent_id: None,
         }
     }
 

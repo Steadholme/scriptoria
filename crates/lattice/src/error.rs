@@ -9,6 +9,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum AppError {
+    /// Bad client input that was rejected before any write.
+    #[error("bad_request: {0}")]
+    BadRequest(String),
+
     /// CSRF check failed on a state-changing POST.
     #[error("forbidden: {0}")]
     Forbidden(String),
@@ -21,6 +25,7 @@ pub enum AppError {
 impl AppError {
     fn parts(&self) -> (StatusCode, String) {
         match self {
+            AppError::BadRequest(d) => (StatusCode::BAD_REQUEST, d.clone()),
             AppError::Forbidden(d) => (StatusCode::FORBIDDEN, d.clone()),
             AppError::Internal(d) => (StatusCode::INTERNAL_SERVER_ERROR, d.clone()),
         }
@@ -31,6 +36,7 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, detail) = self.parts();
         let title = match status {
+            StatusCode::BAD_REQUEST => "Bad request",
             StatusCode::FORBIDDEN => "Forbidden",
             _ => "Something went wrong",
         };
@@ -42,6 +48,11 @@ impl IntoResponse for AppError {
 /// Store failures collapse to a 500 server_error.
 impl From<crate::store::StoreError> for AppError {
     fn from(e: crate::store::StoreError) -> Self {
-        AppError::Internal(e.to_string())
+        match e {
+            crate::store::StoreError::InvalidMove(detail) => AppError::BadRequest(detail),
+            crate::store::StoreError::Backend(detail) => {
+                AppError::Internal(format!("store error: {detail}"))
+            }
+        }
     }
 }

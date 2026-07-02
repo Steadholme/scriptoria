@@ -41,13 +41,21 @@ async fn admin_mutations_feature_unpublish_delete() {
 
     // Seed a published post by u_alice.
     create_post(&state, "Alpha", "u_alice", "alice@hf").await;
-    assert!(index_body(&state).await.contains("Alpha"), "post visible on index");
+    assert!(
+        index_body(&state).await.contains("Alpha"),
+        "post visible on index"
+    );
 
     // --- feature (as admin) ------------------------------------------------
     // CSRF missing -> 401.
     let (status, _) = call(
         &state,
-        post_admin("/admin/posts/alpha/feature", "csrf_token=WRONG", "admins", false),
+        post_admin(
+            "/admin/posts/alpha/feature",
+            "csrf_token=WRONG",
+            "admins",
+            false,
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "bad CSRF rejected");
@@ -58,7 +66,11 @@ async fn admin_mutations_feature_unpublish_delete() {
         post_admin("/admin/posts/alpha/feature", &csrf_body(), "readers", true),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "non-admin blocked from mutation");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "non-admin blocked from mutation"
+    );
 
     // Admin features it -> redirect, then the index shows the Featured badge.
     let (status, _) = call(
@@ -67,7 +79,10 @@ async fn admin_mutations_feature_unpublish_delete() {
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert!(index_body(&state).await.contains("badge badge-featured"), "featured badge shown");
+    assert!(
+        index_body(&state).await.contains("badge badge-featured"),
+        "featured badge shown"
+    );
 
     // Toggle again -> unfeatured.
     let (status, _) = call(
@@ -76,7 +91,10 @@ async fn admin_mutations_feature_unpublish_delete() {
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert!(!index_body(&state).await.contains("badge badge-featured"), "badge gone after unfeature");
+    assert!(
+        !index_body(&state).await.contains("badge badge-featured"),
+        "badge gone after unfeature"
+    );
 
     // --- unpublish ---------------------------------------------------------
     let (status, _) = call(
@@ -86,7 +104,10 @@ async fn admin_mutations_feature_unpublish_delete() {
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     // Anonymous index no longer shows it (it is a draft now).
-    assert!(!index_body(&state).await.contains("Alpha"), "unpublished hidden from index");
+    assert!(
+        !index_body(&state).await.contains("Alpha"),
+        "unpublished hidden from index"
+    );
 
     // --- delete ------------------------------------------------------------
     let (status, _) = call(
@@ -95,8 +116,45 @@ async fn admin_mutations_feature_unpublish_delete() {
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    let (status, _) = call(&state, get_auth("/p/alpha", "u_admin", "admin@hf", Some("admins"))).await;
+    let (status, _) = call(
+        &state,
+        get_auth("/p/alpha", "u_admin", "admin@hf", Some("admins")),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "deleted post is gone");
+}
+
+#[tokio::test]
+async fn admin_can_pin_posts_to_top() {
+    let state = build_dev_state();
+    create_post(&state, "Alpha", "u_alice", "alice@hf").await;
+    create_post(&state, "Beta", "u_bob", "bob@hf").await;
+
+    let idx = index_body(&state).await;
+    let beta_pos = idx.find("Beta").expect("newer post rendered");
+    let alpha_pos = idx.find("Alpha").expect("older post rendered");
+    assert!(beta_pos < alpha_pos, "newer post starts first");
+
+    let (status, _) = call(
+        &state,
+        post_admin("/admin/posts/alpha/pin", &csrf_body(), "admins", true),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "admin pins older post");
+
+    let idx = index_body(&state).await;
+    let alpha_pos = idx.find("Alpha").expect("pinned post rendered");
+    let beta_pos = idx.find("Beta").expect("ordinary post rendered");
+    assert!(
+        alpha_pos < beta_pos,
+        "pinned post floats above newer ordinary post"
+    );
+
+    let (_, panel) = call(&state, get("/admin", Some("admins"))).await;
+    assert!(
+        panel.contains("<th>Pinned</th>"),
+        "admin table exposes pinned column"
+    );
 }
 
 #[tokio::test]
@@ -108,7 +166,11 @@ async fn admin_bulk_action_over_selected_slugs() {
 
     // Bulk delete "one" and "three"; "two" survives.
     let body = format!("csrf_token={CSRF}&action=delete&slugs=one&slugs=three");
-    let (status, _) = call(&state, post_admin("/admin/posts/bulk", &body, "admins", true)).await;
+    let (status, _) = call(
+        &state,
+        post_admin("/admin/posts/bulk", &body, "admins", true),
+    )
+    .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
 
     let idx = index_body(&state).await;
@@ -118,13 +180,24 @@ async fn admin_bulk_action_over_selected_slugs() {
 
     // Bulk feature "two".
     let body = format!("csrf_token={CSRF}&action=feature&slugs=two");
-    let (status, _) = call(&state, post_admin("/admin/posts/bulk", &body, "admins", true)).await;
+    let (status, _) = call(
+        &state,
+        post_admin("/admin/posts/bulk", &body, "admins", true),
+    )
+    .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert!(index_body(&state).await.contains("badge badge-featured"), "two now featured");
+    assert!(
+        index_body(&state).await.contains("badge badge-featured"),
+        "two now featured"
+    );
 
     // Non-admin bulk -> 403.
     let body = format!("csrf_token={CSRF}&action=delete&slugs=two");
-    let (status, _) = call(&state, post_admin("/admin/posts/bulk", &body, "readers", true)).await;
+    let (status, _) = call(
+        &state,
+        post_admin("/admin/posts/bulk", &body, "readers", true),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
@@ -135,8 +208,11 @@ async fn admin_can_edit_and_delete_any_authors_post() {
 
     // A non-owner NON-admin still cannot edit (the ownership gate holds).
     let body = form(&[("title", "Hijack"), ("body", "x"), ("csrf_token", CSRF)]);
-    let (status, _) =
-        call(&state, post_edit("/edit/alice-post", &body, "u_mallory", "m@hf", None)).await;
+    let (status, _) = call(
+        &state,
+        post_edit("/edit/alice-post", &body, "u_mallory", "m@hf", None),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "non-owner non-admin blocked");
 
     // An admin (different subject) CAN edit it — the author gate is overridden for admins.
@@ -148,17 +224,32 @@ async fn admin_can_edit_and_delete_any_authors_post() {
     ]);
     let (status, _) = call(
         &state,
-        post_edit("/edit/alice-post", &body, "u_admin", "admin@hf", Some("admins")),
+        post_edit(
+            "/edit/alice-post",
+            &body,
+            "u_admin",
+            "admin@hf",
+            Some("admins"),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER, "admin overrides ownership");
-    assert!(index_body(&state).await.contains("Edited By Admin"), "admin edit applied");
+    assert!(
+        index_body(&state).await.contains("Edited By Admin"),
+        "admin edit applied"
+    );
 
     // And an admin can delete it via the ordinary delete route too.
     let body = form(&[("csrf_token", CSRF)]);
     let (status, _) = call(
         &state,
-        post_edit("/delete/alice-post", &body, "u_admin", "admin@hf", Some("admins")),
+        post_edit(
+            "/delete/alice-post",
+            &body,
+            "u_admin",
+            "admin@hf",
+            Some("admins"),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER, "admin deletes any post");
@@ -169,7 +260,10 @@ async fn admin_settings_apply_to_the_index() {
     let state = build_dev_state();
 
     // Default title on the index head.
-    assert!(index_body(&state).await.contains("Inkwell · HOLDFAST"), "default title");
+    assert!(
+        index_body(&state).await.contains("Inkwell · HOLDFAST"),
+        "default title"
+    );
 
     // Save new settings.
     let body = form(&[
@@ -182,14 +276,31 @@ async fn admin_settings_apply_to_the_index() {
     assert_eq!(status, StatusCode::SEE_OTHER);
 
     let idx = index_body(&state).await;
-    assert!(idx.contains("Wanderlust · HOLDFAST"), "custom title in head");
-    assert!(idx.contains("Field notes from the road"), "custom tagline in masthead");
+    assert!(
+        idx.contains("Wanderlust · HOLDFAST"),
+        "custom title in head"
+    );
+    assert!(
+        idx.contains("Field notes from the road"),
+        "custom tagline in masthead"
+    );
 
     // A non-admin cannot change settings.
-    let body = form(&[("title", "Hacked"), ("posts_per_page", "5"), ("csrf_token", CSRF)]);
-    let (status, _) = call(&state, post_admin("/admin/settings", &body, "readers", true)).await;
+    let body = form(&[
+        ("title", "Hacked"),
+        ("posts_per_page", "5"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, _) = call(
+        &state,
+        post_admin("/admin/settings", &body, "readers", true),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert!(!index_body(&state).await.contains("Hacked"), "non-admin change rejected");
+    assert!(
+        !index_body(&state).await.contains("Hacked"),
+        "non-admin change rejected"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -199,7 +310,9 @@ async fn admin_settings_apply_to_the_index() {
 async fn call(state: &AppState, req: Request<Body>) -> (StatusCode, String) {
     let resp = app(state.clone()).oneshot(req).await.unwrap();
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     (status, String::from_utf8_lossy(&bytes).to_string())
 }
 
@@ -209,7 +322,12 @@ async fn index_body(state: &AppState) -> String {
 
 /// Create a published post through the ordinary SSO+CSRF authoring path.
 async fn create_post(state: &AppState, title: &str, sub: &str, email: &str) {
-    let body = form(&[("title", title), ("body", "body text"), ("published", "on"), ("csrf_token", CSRF)]);
+    let body = form(&[
+        ("title", title),
+        ("body", "body text"),
+        ("published", "on"),
+        ("csrf_token", CSRF),
+    ]);
     let (status, _) = call(state, post_edit("/new", &body, sub, email, None)).await;
     assert_eq!(status, StatusCode::SEE_OTHER, "seed post created");
 }
@@ -221,7 +339,10 @@ fn csrf_body() -> String {
 fn get(uri: &str, groups: Option<&str>) -> Request<Body> {
     let mut b = Request::builder().uri(uri);
     if let Some(g) = groups {
-        b = b.header("x-auth-subject", "u_admin").header("x-auth-email", "admin@hf").header("x-auth-groups", g);
+        b = b
+            .header("x-auth-subject", "u_admin")
+            .header("x-auth-email", "admin@hf")
+            .header("x-auth-groups", g);
     }
     b.body(Body::empty()).unwrap()
 }
@@ -270,14 +391,20 @@ fn post_edit(uri: &str, body: &str, sub: &str, email: &str, groups: Option<&str>
 }
 
 fn form(pairs: &[(&str, &str)]) -> String {
-    pairs.iter().map(|(k, v)| format!("{}={}", k, enc(v))).collect::<Vec<_>>().join("&")
+    pairs
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, enc(v)))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 fn enc(s: &str) -> String {
     let mut o = String::new();
     for b in s.bytes() {
         match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => o.push(b as char),
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                o.push(b as char)
+            }
             b' ' => o.push('+'),
             _ => o.push_str(&format!("%{b:02X}")),
         }

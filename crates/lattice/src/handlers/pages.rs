@@ -9,7 +9,7 @@
 //! The editor identity ALWAYS comes from the gateway-injected `X-Auth-Email` — never from a
 //! client field — and every state-changing POST is double-submit CSRF checked.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -34,6 +34,8 @@ use crate::{now_ms, AppState};
 pub struct NewQuery {
     #[serde(default)]
     pub title: String,
+    #[serde(default)]
+    pub template: String,
 }
 
 /// Query for `GET /` — keyset pagination over the page index. `before=<created_at>_<slug>` is the
@@ -62,6 +64,13 @@ pub struct EditForm {
     pub base_rev: String,
 }
 
+/// Query for `GET /edit/{slug}`. A trusted template id can prefill brand-new pages.
+#[derive(Debug, Deserialize)]
+pub struct EditQuery {
+    #[serde(default)]
+    pub template: String,
+}
+
 /// Query for `GET /history/{slug}`. With both `from` and `to` set to revision ids, the handler
 /// renders the line-level diff between those two revisions instead of the revision list.
 #[derive(Debug, Deserialize)]
@@ -81,6 +90,40 @@ pub struct RevertForm {
     #[serde(default)]
     pub rev_id: String,
 }
+
+/// The move form body (`POST /move/{slug}`). `parent_id` is a page slug selected from the UI;
+/// blank means top-level. The actor is taken from the gateway, NEVER from here.
+#[derive(Debug, Deserialize)]
+pub struct MoveForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub parent_id: String,
+}
+
+struct PageTemplate {
+    id: &'static str,
+    label: &'static str,
+    body: &'static str,
+}
+
+const PAGE_TEMPLATES: &[PageTemplate] = &[
+    PageTemplate {
+        id: "meeting-notes",
+        label: "Meeting notes",
+        body: "# Meeting notes\n\n## Attendees\n\n- \n\n## Agenda\n\n- \n\n## Notes\n\n\n## Action items\n\n- [ ] ",
+    },
+    PageTemplate {
+        id: "how-to",
+        label: "How-to",
+        body: "# How-to\n\n## Goal\n\n\n## Prerequisites\n\n- \n\n## Steps\n\n1. \n\n## Verification\n\n",
+    },
+    PageTemplate {
+        id: "decision-record",
+        label: "Decision record",
+        body: "# Decision record\n\n## Context\n\n\n## Decision\n\n\n## Consequences\n\n",
+    },
+];
 
 // ---------------------------------------------------------------------------
 // GET /  — the page index
@@ -125,14 +168,16 @@ fn render_index(pages: &[Page], next: Option<&(i64, String)>) -> String {
            <div>\
              <h1>Knowledge base</h1>\
              <p class=\"muted\">{count} page{plural}</p>\
-           </div>\
-           <form class=\"newpage\" method=\"get\" action=\"/new\">\
-             <input type=\"text\" name=\"title\" placeholder=\"New page title…\" autocomplete=\"off\" aria-label=\"New page title\">\
-             <button class=\"btn btn-primary\" type=\"submit\">Create page</button>\
-           </form>\
-         </div>",
+	           </div>\
+	           <form class=\"newpage\" method=\"get\" action=\"/new\">\
+	             <input type=\"text\" name=\"title\" placeholder=\"New page title…\" autocomplete=\"off\" aria-label=\"New page title\">\
+	             <select name=\"template\" aria-label=\"Page template\">{templates}</select>\
+	             <button class=\"btn btn-primary\" type=\"submit\">Create page</button>\
+	           </form>\
+	         </div>",
         count = count,
         plural = if count == 1 { "" } else { "s" },
+        templates = render_template_options(""),
     );
 
     let list = if pages.is_empty() {
@@ -184,7 +229,36 @@ pub async fn new_page(Query(q): Query<NewQuery>) -> Response {
     if slug.is_empty() {
         return Redirect::to("/").into_response();
     }
-    Redirect::to(&format!("/edit/{slug}")).into_response()
+    let target = match template_for(&q.template) {
+        Some(t) => format!("/edit/{slug}?template={}", t.id),
+        None => format!("/edit/{slug}"),
+    };
+    Redirect::to(&target).into_response()
+}
+
+fn template_for(raw: &str) -> Option<&'static PageTemplate> {
+    let trimmed = raw.trim();
+    PAGE_TEMPLATES
+        .iter()
+        .find(|t| t.id == trimmed || t.label.eq_ignore_ascii_case(trimmed))
+}
+
+fn template_body(raw: &str) -> &'static str {
+    template_for(raw).map(|t| t.body).unwrap_or("")
+}
+
+fn render_template_options(selected: &str) -> String {
+    let mut out = String::from("<option value=\"\">Blank page</option>");
+    for t in PAGE_TEMPLATES {
+        let sel = if t.id == selected { " selected" } else { "" };
+        out.push_str(&format!(
+            "<option value=\"{id}\"{sel}>{label}</option>",
+            id = esc(t.id),
+            sel = sel,
+            label = esc(t.label),
+        ));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -208,10 +282,33 @@ pub async fn view(
         Some(page) => {
             let existing: HashSet<String> = state.store.all_slugs().await?.into_iter().collect();
             let rendered = markdown::render(&page.body_md, &existing);
-            // Backlink graph + keyword-related neighbours, computed locally from the page set.
-            let panel = graph::Corpus::build(state.store.list_pages(None, MAX_PAGE).await?).panel(&slug);
-            let content = render_view(&page, &rendered.html, &rendered.toc, &panel);
-            Ok(Html(layout(&page.title, &headers, &content)).into_response())
+            let pages = state.store.list_pages(None, MAX_PAGE).await?;
+            // Keyword-related neighbours stay computed locally from the existing semantic graph.
+            // The explicit backlinks shown in the same panel come from the persisted page_links table.
+            let mut panel = graph::Corpus::build(pages.clone()).panel(&slug);
+            panel.backlinks = state
+                .store
+                .list_backlinks(&slug)
+                .await?
+                .into_iter()
+                .map(|p| graph::LinkRef {
+                    slug: p.slug,
+                    title: p.title,
+                })
+                .collect();
+            let path = state.store.page_path(&slug).await?;
+            let csrf = auth::new_csrf_token();
+            let content = render_view(
+                &page,
+                &rendered.html,
+                &rendered.toc,
+                &panel,
+                &pages,
+                &path,
+                &csrf,
+            );
+            let html = layout(&page.title, &headers, &content);
+            Ok(html_with_csrf_cookie(html, &csrf))
         }
         None => {
             let title = humanize(&slug);
@@ -221,9 +318,18 @@ pub async fn view(
     }
 }
 
-fn render_view(page: &Page, body_html: &str, toc: &[markdown::TocEntry], panel: &PagePanel) -> String {
-    format!(
+fn render_view(
+    page: &Page,
+    body_html: &str,
+    toc: &[markdown::TocEntry],
+    panel: &PagePanel,
+    pages: &[Page],
+    path: &[Page],
+    csrf: &str,
+) -> String {
+    let article = format!(
         "<article class=\"card page\">\
+           {breadcrumb}\
            <div class=\"page__bar\">\
              <div>\
                <h1>{title}</h1>\
@@ -236,15 +342,187 @@ fn render_view(page: &Page, body_html: &str, toc: &[markdown::TocEntry], panel: 
            </div>\
            {toc}\
            <div class=\"prose\">{body}</div>\
-         </article>{relations}",
+         </article>",
+        breadcrumb = render_breadcrumb(path),
         title = esc(&page.title),
         email = esc(&page.updated_by_email),
         time = esc(&fmt_ts(page.updated_at)),
         slug = esc(&page.slug),
         toc = render_toc(toc),
         body = body_html,
-        relations = render_relations(panel),
+    );
+    let move_form = render_move_form(page, pages, csrf);
+    let relations = render_relations(panel);
+
+    if pages.iter().any(|p| p.parent_id.is_some()) {
+        format!(
+            "<div class=\"wiki-shell\">\
+               {tree}\
+               <div class=\"wiki-main\">{article}{move_form}{relations}</div>\
+             </div>",
+            tree = render_page_tree(pages, &page.slug),
+            article = article,
+            move_form = move_form,
+            relations = relations,
+        )
+    } else {
+        format!("{article}{move_form}{relations}")
+    }
+}
+
+fn render_breadcrumb(path: &[Page]) -> String {
+    if path.len() <= 1 {
+        return String::new();
+    }
+    let last = path.len() - 1;
+    let items: String = path
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            if i == last {
+                format!("<span aria-current=\"page\">{}</span>", esc(&p.title))
+            } else {
+                format!(
+                    "<a href=\"/w/{slug}\">{title}</a>",
+                    slug = esc(&p.slug),
+                    title = esc(&p.title)
+                )
+            }
+        })
+        .collect();
+    format!("<nav class=\"breadcrumb\" aria-label=\"Breadcrumb\">{items}</nav>")
+}
+
+fn render_page_tree(pages: &[Page], current_slug: &str) -> String {
+    let known: BTreeSet<&str> = pages.iter().map(|p| p.slug.as_str()).collect();
+    let mut children: BTreeMap<String, Vec<&Page>> = BTreeMap::new();
+    for page in pages {
+        let parent = page
+            .parent_id
+            .as_deref()
+            .filter(|p| known.contains(p))
+            .unwrap_or("");
+        children.entry(parent.to_string()).or_default().push(page);
+    }
+    for siblings in children.values_mut() {
+        siblings.sort_by(|a, b| {
+            a.title
+                .to_lowercase()
+                .cmp(&b.title.to_lowercase())
+                .then_with(|| a.slug.cmp(&b.slug))
+        });
+    }
+    let mut visited = BTreeSet::new();
+    let items = render_tree_children("", &children, current_slug, &mut visited);
+    format!(
+        "<aside class=\"card page-tree\" aria-label=\"Page tree\">\
+           <h2>Page tree</h2>\
+           <ul class=\"page-tree__list\">{items}</ul>\
+         </aside>",
     )
+}
+
+fn render_tree_children(
+    parent: &str,
+    children: &BTreeMap<String, Vec<&Page>>,
+    current_slug: &str,
+    visited: &mut BTreeSet<String>,
+) -> String {
+    let Some(siblings) = children.get(parent) else {
+        return String::new();
+    };
+    siblings
+        .iter()
+        .map(|page| {
+            if !visited.insert(page.slug.clone()) {
+                return String::new();
+            }
+            let cls = if page.slug == current_slug {
+                " class=\"is-current\""
+            } else {
+                ""
+            };
+            let nested = render_tree_children(&page.slug, children, current_slug, visited);
+            let nested = if nested.is_empty() {
+                String::new()
+            } else {
+                format!("<ul>{nested}</ul>")
+            };
+            format!(
+                "<li{cls}><a href=\"/w/{slug}\">{title}</a>{nested}</li>",
+                cls = cls,
+                slug = esc(&page.slug),
+                title = esc(&page.title),
+                nested = nested,
+            )
+        })
+        .collect()
+}
+
+fn render_move_form(page: &Page, pages: &[Page], csrf: &str) -> String {
+    if pages.len() <= 1 {
+        return String::new();
+    }
+    let descendants = descendant_slugs(&page.slug, pages);
+    let mut candidates: Vec<&Page> = pages
+        .iter()
+        .filter(|p| p.slug != page.slug && !descendants.contains(p.slug.as_str()))
+        .collect();
+    candidates.sort_by(|a, b| {
+        a.title
+            .to_lowercase()
+            .cmp(&b.title.to_lowercase())
+            .then_with(|| a.slug.cmp(&b.slug))
+    });
+    let top_selected = if page.parent_id.is_none() {
+        " selected"
+    } else {
+        ""
+    };
+    let mut options = format!("<option value=\"\"{top_selected}>Top level</option>");
+    for candidate in candidates {
+        let selected = if page.parent_id.as_deref() == Some(candidate.slug.as_str()) {
+            " selected"
+        } else {
+            ""
+        };
+        options.push_str(&format!(
+            "<option value=\"{slug}\"{selected}>{title}</option>",
+            slug = esc(&candidate.slug),
+            selected = selected,
+            title = esc(&candidate.title),
+        ));
+    }
+    format!(
+        "<section class=\"card move-card\">\
+           <form class=\"move-form\" method=\"post\" action=\"/move/{slug}\">\
+             <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+             <label for=\"parent_id\">Parent page</label>\
+             <select id=\"parent_id\" name=\"parent_id\">{options}</select>\
+             <button class=\"btn btn-secondary btn-sm\" type=\"submit\">Move</button>\
+           </form>\
+         </section>",
+        slug = esc(&page.slug),
+        csrf = esc(csrf),
+        options = options,
+    )
+}
+
+fn descendant_slugs<'a>(slug: &str, pages: &'a [Page]) -> BTreeSet<&'a str> {
+    let mut out = BTreeSet::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for page in pages {
+            let Some(parent) = page.parent_id.as_deref() else {
+                continue;
+            };
+            if (parent == slug || out.contains(parent)) && out.insert(page.slug.as_str()) {
+                changed = true;
+            }
+        }
+    }
+    out
 }
 
 /// The on-page "Contents" box. Rendered only for pages with at least two headings — a single
@@ -338,6 +616,7 @@ pub async fn edit_form(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(raw_slug): Path<String>,
+    Query(q): Query<EditQuery>,
 ) -> Result<Response, AppError> {
     let slug = slugify(&raw_slug);
     if slug.is_empty() {
@@ -347,7 +626,11 @@ pub async fn edit_form(
     let existing = state.store.get_page(&slug).await?;
     let (title, body, exists) = match &existing {
         Some(p) => (p.title.clone(), p.body_md.clone(), true),
-        None => (humanize(&slug), String::new(), false),
+        None => (
+            humanize(&slug),
+            template_body(&q.template).to_string(),
+            false,
+        ),
     };
 
     // The head revision the editor is loaded against. On save we compare it to the current head:
@@ -367,7 +650,14 @@ pub async fn edit_form(
     Ok(html_with_csrf_cookie(html, &csrf))
 }
 
-fn render_editor(slug: &str, title: &str, body: &str, csrf: &str, exists: bool, base_rev: &str) -> String {
+fn render_editor(
+    slug: &str,
+    title: &str,
+    body: &str,
+    csrf: &str,
+    exists: bool,
+    base_rev: &str,
+) -> String {
     format!(
         "<form class=\"card editor\" method=\"post\" action=\"/edit/{slug}\">\
            <div class=\"editor__head\">\
@@ -537,7 +827,10 @@ pub async fn history(
     }
 
     let page = state.store.get_page(&slug).await?;
-    let title = page.as_ref().map(|p| p.title.clone()).unwrap_or_else(|| humanize(&slug));
+    let title = page
+        .as_ref()
+        .map(|p| p.title.clone())
+        .unwrap_or_else(|| humanize(&slug));
 
     // Diff view: both endpoints selected AND both resolve (scoped to this slug). An unknown/foreign
     // id falls through to the plain revision list rather than erroring.
@@ -567,13 +860,20 @@ fn render_history(
     csrf: &str,
 ) -> String {
     let back = if page_exists {
-        format!("<a class=\"btn btn-secondary btn-sm\" href=\"/w/{}\">Back to page</a>", esc(slug))
+        format!(
+            "<a class=\"btn btn-secondary btn-sm\" href=\"/w/{}\">Back to page</a>",
+            esc(slug)
+        )
     } else {
-        format!("<a class=\"btn btn-primary btn-sm\" href=\"/edit/{}\">Create this page</a>", esc(slug))
+        format!(
+            "<a class=\"btn btn-primary btn-sm\" href=\"/edit/{}\">Create this page</a>",
+            esc(slug)
+        )
     };
 
     let rows = if revs.is_empty() {
-        "<tr><td class=\"empty\" colspan=\"4\">No revisions recorded for this page.</td></tr>".to_string()
+        "<tr><td class=\"empty\" colspan=\"4\">No revisions recorded for this page.</td></tr>"
+            .to_string()
     } else {
         revs.iter()
             .enumerate()
@@ -762,7 +1062,51 @@ pub async fn revert_submit(
         .await?;
 
     // A revert is a deliberate rollback → notice severity. Value-free detail only.
-    state.audit.emit(AuditEvent::notice("page.revert", &editor_email, &slug, "revert"));
+    state.audit.emit(AuditEvent::notice(
+        "page.revert",
+        &editor_email,
+        &slug,
+        "revert",
+    ));
+
+    Ok(Redirect::to(&format!("/w/{slug}")).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// POST /move/{slug}  — re-parent a page in the nested tree
+// ---------------------------------------------------------------------------
+
+pub async fn move_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(raw_slug): Path<String>,
+    Form(form): Form<MoveForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::Forbidden(
+            "CSRF token missing or invalid — reload the page and try again.".to_string(),
+        ));
+    }
+
+    let slug = slugify(&raw_slug);
+    if slug.is_empty() {
+        return Ok(Redirect::to("/").into_response());
+    }
+
+    let parent_id = {
+        let parent = slugify(&form.parent_id);
+        if parent.is_empty() {
+            None
+        } else {
+            Some(parent)
+        }
+    };
+    let actor = auth::signed_in_email(&headers).unwrap_or_else(|| "anonymous".to_string());
+    let moved = state.store.move_page(&slug, parent_id).await?;
+
+    state
+        .audit
+        .emit(AuditEvent::notice("page.move", &actor, &moved.slug, "move"));
 
     Ok(Redirect::to(&format!("/w/{slug}")).into_response())
 }

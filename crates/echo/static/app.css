@@ -502,6 +502,37 @@ body.page { max-width:none; margin:0; padding:0; }
 .react-btn__glyph { font-size: 14px; line-height: 1; }
 .react-btn__count { font-variant-numeric: tabular-nums; min-width: 8px; text-align: left; }
 
+/* ---- Votes / reports ---------------------------------------------------- */
+.votes { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
+.vote-form { display: inline; margin: 0; }
+.vote-score {
+  display: inline-flex; align-items: center; min-height: 28px;
+  color: var(--ink-3); font-size: 12.5px; font-weight: 500;
+}
+.vote-score b { color: var(--ink); font-variant-numeric: tabular-nums; margin-left: 4px; }
+.vote-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 48px; height: 28px; padding: 0 10px; cursor: pointer;
+  background: var(--surface); color: var(--ink-2);
+  border: 1px solid var(--border-2); border-radius: 999px;
+  font-family: var(--font); font-size: 12.5px; font-weight: 600; line-height: 1;
+  transition: background .12s, border-color .12s, color .12s;
+}
+.vote-btn:hover { background: var(--bg-2); color: var(--ink); border-color: var(--border-2); }
+.vote-btn--on { background: var(--accent-soft); color: var(--accent-ink); border-color: var(--accent); }
+.report-toggle { margin-top: 12px; }
+.report-toggle > summary {
+  cursor: pointer; display: inline-block; font-size: 13px; font-weight: 500;
+  color: var(--ink-2); list-style: none; user-select: none;
+}
+.report-toggle > summary::-webkit-details-marker { display: none; }
+.report-toggle > summary:hover { color: var(--accent-2); }
+.report-toggle[open] > summary { margin-bottom: 12px; }
+.report__reason { min-height: 72px; }
+.report-summary { display: flex; flex-direction: column; gap: 6px; }
+.report-summary ul { margin: 0; padding-left: 16px; color: var(--ink-2); font-size: 12.5px; line-height: 1.45; }
+.report-summary li + li { margin-top: 4px; }
+
 /* ---- Sort control ------------------------------------------------------- */
 .sort-control { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 16px; }
 .sort-tab {

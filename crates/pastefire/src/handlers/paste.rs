@@ -21,12 +21,33 @@ use crate::handlers::{
     esc, expiry_options, fmt_ts, language_label, language_options, parse_expiry, userbox, APP_CSS,
     LANGUAGES, SHIELD_SVG,
 };
-use crate::model::{Paste, PasteRevision};
+use crate::model::{Paste, PasteFile, PasteRevision};
 use crate::{highlight, now_secs, random_alnum, similar, AppState};
 
 /// Length of the short random paste id (62-symbol alphabet => ~48 bits at 8 chars; the
 /// `ON CONFLICT` insert retries on the astronomically rare collision).
 const PASTE_ID_LEN: usize = 8;
+
+/// Length of the random `paste_files.id` primary key (never surfaced in a URL).
+const FILE_ID_LEN: usize = 12;
+
+/// Upper bound on the number of files a single paste may hold (bounds per-request work).
+const MAX_FILES: usize = 20;
+
+/// Upper bound on a stored filename length (characters).
+const MAX_FILENAME_CHARS: usize = 128;
+
+/// A small file glyph for the multi-file per-file header.
+const FILE_ICON_SVG: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>"##;
+
+/// One file's worth of submitted form input (a filename + its content), before it is assigned an
+/// id/position and persisted. A paste with a single [`FileInput`] is stored the legacy way (in
+/// `pastes.body` only, no `paste_files` rows), so single-file pastes stay byte-identical.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileInput {
+    filename: String,
+    content: String,
+}
 
 const NEW_HTML: &str = include_str!("../../templates/new.html");
 const VIEW_HTML: &str = include_str!("../../templates/view.html");
@@ -68,7 +89,7 @@ pub async fn new_form(
     let load_older = render_load_older(&recent, limit, q.limit);
 
     let html = render_new(
-        &who, &csrf, &recent, &load_older, None, "", "plaintext", "never", false, "",
+        &who, &csrf, &recent, &load_older, None, "", "plaintext", "never", false, &[],
     );
     html_with_csrf(StatusCode::OK, html, &csrf)
 }
@@ -77,28 +98,6 @@ pub async fn new_form(
 // POST / — create a paste
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
-pub struct CreateForm {
-    #[serde(default)]
-    pub csrf_token: String,
-    #[serde(default)]
-    pub title: String,
-    #[serde(default)]
-    pub language: String,
-    #[serde(default)]
-    pub body: String,
-    #[serde(default)]
-    pub expiry: String,
-    /// Burn-after-read toggle. An unchecked checkbox is omitted from the body, so the default
-    /// (empty) reads as `false` — existing POSTs that never send this field keep their behavior.
-    #[serde(default)]
-    pub burn: String,
-    /// Optional password. Blank => no protection; non-blank => the paste is salted-SHA-256
-    /// password-protected and a non-owner must supply it to view.
-    #[serde(default)]
-    pub password: String,
-}
-
 /// Interpret a checkbox form value: present and non-empty (e.g. `on`) => checked.
 fn checkbox_on(value: &str) -> bool {
     !value.trim().is_empty()
@@ -106,12 +105,18 @@ fn checkbox_on(value: &str) -> bool {
 
 /// `POST /` — validate + store a paste, then 302 to `/p/{id}`. On a validation error the form
 /// is re-rendered (preserving the user's input) with an inline message.
+///
+/// The body is parsed by hand (not `Form<T>`) because a multi-file paste submits repeated
+/// `file_name` / `file_content` fields, which `serde_urlencoded` cannot map into a sequence. A
+/// paste with a single file is stored the legacy way; the older single-`body` field is still
+/// accepted (so pre-existing clients/tests keep working).
 pub async fn create(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Form(form): Form<CreateForm>,
+    body: String,
 ) -> Result<Response, AppError> {
-    if !auth::verify_csrf(&headers, &form.csrf_token) {
+    let pairs = parse_pairs(&body);
+    if !auth::verify_csrf(&headers, field(&pairs, "csrf_token")) {
         return Err(AppError::BadRequest(
             "Your session token expired. Reload the page and submit again.".to_string(),
         ));
@@ -119,11 +124,16 @@ pub async fn create(
 
     let who = auth::identity(&headers);
     let now = now_secs();
-    let title = form.title.trim();
+    let title = field(&pairs, "title").trim();
+    let language = field(&pairs, "language");
+    let expiry = field(&pairs, "expiry");
+    let burn = field(&pairs, "burn");
+    let password = field(&pairs, "password");
+    let files = collect_files_or_legacy(&pairs);
 
-    // Validation: a non-empty, bounded body. On failure re-render the form with the input
-    // intact and a fresh CSRF token.
-    if let Some(msg) = body_problem(&form.body) {
+    // Validation: at least one non-empty file, within the overall byte budget. On failure
+    // re-render the form with the input intact and a fresh CSRF token.
+    if let Some(msg) = files_problem(&files) {
         let csrf = auth::new_csrf_token();
         let recent = state
             .store
@@ -138,10 +148,10 @@ pub async fn create(
             &load_older,
             Some(msg),
             title,
-            &form.language,
-            &form.expiry,
-            checkbox_on(&form.burn),
-            &form.body,
+            language,
+            expiry,
+            checkbox_on(burn),
+            &files,
         );
         return Ok(html_with_csrf(StatusCode::BAD_REQUEST, html, &csrf));
     }
@@ -149,15 +159,15 @@ pub async fn create(
     let mut paste = Paste {
         id: String::new(),
         title: title.chars().take(MAX_TITLE_CHARS).collect(),
-        body: form.body,
-        language: normalize_language(&form.language),
+        body: combined_body(&files),
+        language: normalize_language(language),
         author_sub: who.subject.clone(),
         author_email: who.email.clone(),
         created_at: now,
-        expires_at: parse_expiry(&form.expiry, now),
-        burn_after_read: checkbox_on(&form.burn),
+        expires_at: parse_expiry(expiry, now),
+        burn_after_read: checkbox_on(burn),
         source_id: None,
-        password_hash: password_hash(&form.password),
+        password_hash: password_hash(password),
     };
 
     // Allocate a unique id: generate, try to insert, retry on the rare collision.
@@ -175,7 +185,14 @@ pub async fn create(
         ));
     }
 
-    tracing::info!(id = paste.id, author = who.subject, "paste created");
+    // Persist the per-file breakdown ONLY for a genuinely multi-file paste; a single file lives
+    // in `pastes.body` alone (byte-identical to the legacy single-content path).
+    if files.len() >= 2 {
+        let rows = build_file_rows(&paste.id, &files);
+        state.store.set_files(&paste.id, &rows).await?;
+    }
+
+    tracing::info!(id = paste.id, author = who.subject, files = files.len(), "paste created");
 
     // Tamper-evident trail: record the create AFTER the store insert succeeded. `detail` is
     // value-free metadata (never the body) — only whether the paste self-destructs on read.
@@ -459,19 +476,9 @@ pub async fn unlock(
 // GET/POST /edit/{id} — owner edits their paste (append-only history)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
-pub struct EditForm {
-    #[serde(default)]
-    pub csrf_token: String,
-    #[serde(default)]
-    pub title: String,
-    #[serde(default)]
-    pub language: String,
-    #[serde(default)]
-    pub body: String,
-}
-
-/// `GET /edit/{id}` — render the edit form pre-filled with the current content. Owner-only.
+/// `GET /edit/{id}` — render the edit form pre-filled with the current files. Owner-only. A
+/// legacy/single-content paste is shown as one file row (its body); a multi-file paste shows one
+/// row per file.
 pub async fn edit_form(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -485,29 +492,24 @@ pub async fn edit_form(
             "You can only edit your own pastes.".to_string(),
         ));
     }
+    let files = load_file_inputs(&state, &paste).await;
     let csrf = auth::new_csrf_token();
-    let html = render_edit(
-        &who,
-        &paste.id,
-        None,
-        &paste.title,
-        &paste.language,
-        &paste.body,
-        &csrf,
-    );
+    let html = render_edit(&who, &paste.id, None, &paste.title, &paste.language, &files, &csrf);
     Ok(html_with_csrf(StatusCode::OK, html, &csrf))
 }
 
-/// `POST /edit/{id}` — CSRF-checked, ownership-scoped edit. The pre-edit content is appended to
-/// `paste_revisions` (idempotently) and the paste row is overwritten with the new content; an edit
+/// `POST /edit/{id}` — CSRF-checked, ownership-scoped edit (multi-file capable; still accepts the
+/// legacy single-`body` field). The pre-edit content is appended to `paste_revisions`
+/// (idempotently) and the paste row + `paste_files` are overwritten with the new content; an edit
 /// that changes nothing is a no-op (no spurious revision). Then 302 to `/p/{id}`.
 pub async fn edit(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Form(form): Form<EditForm>,
+    body: String,
 ) -> Result<Response, AppError> {
-    if !auth::verify_csrf(&headers, &form.csrf_token) {
+    let pairs = parse_pairs(&body);
+    if !auth::verify_csrf(&headers, field(&pairs, "csrf_token")) {
         return Err(AppError::BadRequest(
             "Your session token expired. Reload the page and submit again.".to_string(),
         ));
@@ -521,17 +523,26 @@ pub async fn edit(
         ));
     }
 
-    let new_title: String = form.title.trim().chars().take(MAX_TITLE_CHARS).collect();
-    let new_language = normalize_language(&form.language);
+    let new_title: String = field(&pairs, "title").trim().chars().take(MAX_TITLE_CHARS).collect();
+    let new_language = normalize_language(field(&pairs, "language"));
+    let files = collect_files_or_legacy(&pairs);
 
-    if let Some(msg) = body_problem(&form.body) {
+    if let Some(msg) = files_problem(&files) {
         let csrf = auth::new_csrf_token();
-        let html = render_edit(&who, &paste.id, Some(msg), &new_title, &new_language, &form.body, &csrf);
+        let html = render_edit(&who, &paste.id, Some(msg), &new_title, &new_language, &files, &csrf);
         return Ok(html_with_csrf(StatusCode::BAD_REQUEST, html, &csrf));
     }
 
-    // Idempotent no-op: an edit that changes nothing writes no revision and does not touch the row.
-    if new_title == paste.title && form.body == paste.body && new_language == paste.language {
+    let new_body = combined_body(&files);
+    let current_files = load_file_inputs(&state, &paste).await;
+
+    // Idempotent no-op: an edit that changes nothing (title, language, body AND file layout)
+    // writes no revision and does not touch the row.
+    if new_title == paste.title
+        && new_body == paste.body
+        && new_language == paste.language
+        && files == current_files
+    {
         return Ok(redirect_found(&format!("/p/{}", paste.id)));
     }
 
@@ -548,8 +559,16 @@ pub async fn edit(
     state.store.add_revision(&rev).await?;
     state
         .store
-        .update_paste(&id, &who.subject, &new_title, &form.body, &new_language)
+        .update_paste(&id, &who.subject, &new_title, &new_body, &new_language)
         .await?;
+    // Overwrite the per-file breakdown: multi-file -> replace rows; single-file -> clear rows so
+    // the paste collapses back to its `pastes.body` representation.
+    if files.len() >= 2 {
+        let rows = build_file_rows(&paste.id, &files);
+        state.store.set_files(&paste.id, &rows).await?;
+    } else {
+        state.store.set_files(&paste.id, &[]).await?;
+    }
 
     tracing::info!(id = paste.id, author = who.subject, revision = next, "paste edited");
     let actor = if who.email.is_empty() { &who.subject } else { &who.email };
@@ -573,10 +592,11 @@ pub struct ForkForm {
     pub csrf_token: String,
 }
 
-/// `POST /fork/{id}` — CSRF-checked. Copy a live paste's content into a brand-new paste owned by
-/// the current user, crediting the source via `source_id`. A password-protected source can only be
-/// forked by its owner (a non-owner must not exfiltrate a protected body by forking it). The fork
-/// is a fresh, unprotected, non-burn, never-expiring copy. Then 302 to `/p/{new_id}`.
+/// `POST /fork/{id}` — CSRF-checked. Copy a live paste's content (INCLUDING all of a multi-file
+/// paste's named files) into a brand-new paste owned by the current user, crediting the source via
+/// `source_id`. A password-protected source can only be forked by its owner (a non-owner must not
+/// exfiltrate a protected body by forking it). The fork is a fresh, unprotected, non-burn,
+/// never-expiring copy. Then 302 to `/p/{new_id}`.
 pub async fn fork(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -625,6 +645,24 @@ pub async fn fork(
         return Err(AppError::Internal(
             "could not allocate a unique paste id".to_string(),
         ));
+    }
+
+    // Copy the source's per-file breakdown, if any (a multi-file paste forks all its files with
+    // fresh ids under the new paste). A single-content source has no rows, so nothing to copy.
+    let source_files = state.store.list_files(&source.id).await.unwrap_or_default();
+    if !source_files.is_empty() {
+        let rows: Vec<PasteFile> = source_files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| PasteFile {
+                id: random_alnum(FILE_ID_LEN),
+                paste_id: paste.id.clone(),
+                filename: f.filename.clone(),
+                content: f.content.clone(),
+                position: i as i64,
+            })
+            .collect();
+        state.store.set_files(&paste.id, &rows).await?;
     }
 
     tracing::info!(id = paste.id, source = source.id, author = who.subject, "paste forked");
@@ -693,15 +731,183 @@ pub async fn view_revision(
 // Rendering helpers
 // ---------------------------------------------------------------------------
 
-/// Validate the submitted body. Returns a user-facing message when it is unacceptable.
-fn body_problem(body: &str) -> Option<&'static str> {
-    if body.trim().is_empty() {
+/// Validate the submitted files. Returns a user-facing message when they are unacceptable. The
+/// empty-files message matches the legacy single-body wording so nothing downstream changes.
+fn files_problem(files: &[FileInput]) -> Option<&'static str> {
+    if files.is_empty() {
         return Some("Paste body cannot be empty.");
     }
-    if body.len() > MAX_BODY_BYTES {
-        return Some("Paste is too large (256 KiB maximum).");
+    let total: usize = files.iter().map(|f| f.content.len()).sum();
+    if total > MAX_BODY_BYTES {
+        return Some("Paste is too large (256 KiB maximum across all files).");
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Form-body parsing (hand-rolled: a multi-file paste submits REPEATED `file_name` /
+// `file_content` fields, which `serde_urlencoded` cannot map into a sequence).
+// ---------------------------------------------------------------------------
+
+/// Decode one `application/x-www-form-urlencoded` token (`+` -> space, `%XX` -> byte), lossily
+/// to UTF-8 (identical semantics to a standard form decoder for our ASCII field names/values).
+fn form_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                match (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
+                    (Some(h), Some(l)) => {
+                        out.push((h << 4) | l);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Hex digit -> nibble value (`None` for a non-hex byte).
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Parse a urlencoded body into ordered, decoded `(key, value)` pairs. Order is preserved so the
+/// repeated `file_name`/`file_content` fields keep their on-form row order.
+fn parse_pairs(body: &str) -> Vec<(String, String)> {
+    body.split('&')
+        .filter(|s| !s.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((k, v)) => (form_decode(k), form_decode(v)),
+            None => (form_decode(pair), String::new()),
+        })
+        .collect()
+}
+
+/// The first decoded value for `key` (empty string when absent) — the scalar-field accessor.
+fn field<'a>(pairs: &'a [(String, String)], key: &str) -> &'a str {
+    pairs
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("")
+}
+
+/// Collect the repeated `file_name`/`file_content` rows (in form order) into [`FileInput`]s,
+/// dropping any row whose content is blank and capping at [`MAX_FILES`]. A `file_name` is trimmed
+/// and length-capped; it is matched to the `file_content` at the same 0-based row index.
+fn collect_file_inputs(pairs: &[(String, String)]) -> Vec<FileInput> {
+    let names: Vec<&str> = pairs
+        .iter()
+        .filter(|(k, _)| k == "file_name")
+        .map(|(_, v)| v.as_str())
+        .collect();
+    pairs
+        .iter()
+        .filter(|(k, _)| k == "file_content")
+        .enumerate()
+        .filter(|(_, (_, c))| !c.trim().is_empty())
+        .map(|(i, (_, c))| FileInput {
+            filename: names
+                .get(i)
+                .copied()
+                .unwrap_or("")
+                .trim()
+                .chars()
+                .take(MAX_FILENAME_CHARS)
+                .collect(),
+            content: c.clone(),
+        })
+        .take(MAX_FILES)
+        .collect()
+}
+
+/// The paste's files from the submitted form: the multi-file rows if present, else the legacy
+/// single `body` field (so pre-existing clients/tests that post one `body` still work).
+fn collect_files_or_legacy(pairs: &[(String, String)]) -> Vec<FileInput> {
+    let files = collect_file_inputs(pairs);
+    if !files.is_empty() {
+        return files;
+    }
+    let legacy = field(pairs, "body");
+    if legacy.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![FileInput {
+            filename: String::new(),
+            content: legacy.to_string(),
+        }]
+    }
+}
+
+/// The content stored in `pastes.body`. A single file is stored verbatim (byte-identical to the
+/// legacy single-content path); a multi-file paste stores a readable, `filename`-delimited
+/// concatenation so `/raw` and the similarity index stay useful.
+fn combined_body(files: &[FileInput]) -> String {
+    if files.len() == 1 {
+        return files[0].content.clone();
+    }
+    files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| format!("===== {} =====\n{}", display_filename(&f.filename, i), f.content))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Assign fresh ids + ascending positions to the submitted files for persistence.
+fn build_file_rows(paste_id: &str, files: &[FileInput]) -> Vec<PasteFile> {
+    files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| PasteFile {
+            id: random_alnum(FILE_ID_LEN),
+            paste_id: paste_id.to_string(),
+            filename: f.filename.clone(),
+            content: f.content.clone(),
+            position: i as i64,
+        })
+        .collect()
+}
+
+/// The current files of a paste as [`FileInput`]s: the persisted `paste_files` rows, or — for a
+/// legacy/single-content paste with no rows — one synthesized file from `pastes.body`. This is the
+/// lazy read-side migration: pre-existing pastes present as exactly one file with no DB write.
+async fn load_file_inputs(state: &AppState, paste: &Paste) -> Vec<FileInput> {
+    let files = state.store.list_files(&paste.id).await.unwrap_or_default();
+    if files.is_empty() {
+        return vec![FileInput {
+            filename: String::new(),
+            content: paste.body.clone(),
+        }];
+    }
+    files
+        .into_iter()
+        .map(|f| FileInput {
+            filename: f.filename,
+            content: f.content,
+        })
+        .collect()
 }
 
 /// Clamp a submitted language token to the trusted allow-list (default `plaintext`).
@@ -798,7 +1004,7 @@ fn render_new(
     language: &str,
     expiry: &str,
     burn: bool,
-    body: &str,
+    files: &[FileInput],
 ) -> String {
     let error_block = match error {
         Some(msg) => format!(
@@ -817,10 +1023,42 @@ fn render_new(
         .replace("{{LANGUAGE_OPTIONS}}", &language_options(language))
         .replace("{{EXPIRY_OPTIONS}}", &expiry_options(expiry))
         .replace("{{BURN_CHECKED}}", burn_checked)
-        .replace("{{BODY}}", &esc(body))
+        .replace("{{FILE_ROWS}}", &render_file_rows(files))
         .replace("{{CSRF}}", &esc(csrf))
         .replace("{{RECENT}}", &render_recent(recent))
         .replace("{{LOAD_OLDER}}", load_older)
+}
+
+/// Render the compose/edit file rows (one `<div class="file-row">` per file), always emitting at
+/// least one row so a fresh form starts with a single empty file. Every user string is escaped.
+fn render_file_rows(files: &[FileInput]) -> String {
+    if files.is_empty() {
+        return render_file_row("", "");
+    }
+    files
+        .iter()
+        .map(|f| render_file_row(&f.filename, &f.content))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// A single compose/edit file row: a filename input + a content textarea (matching the static
+/// `<template>` the add-file JS clones), with both values HTML-escaped.
+fn render_file_row(filename: &str, content: &str) -> String {
+    format!(
+        "<div class=\"file-row\" data-file-row>\
+           <div class=\"file-row__head\">\
+             <div class=\"field field--grow\">\
+               <label>Filename <span class=\"field-hint\">optional</span></label>\
+               <input type=\"text\" name=\"file_name\" maxlength=\"128\" value=\"{name}\" placeholder=\"e.g. main.rs\">\
+             </div>\
+             <button class=\"btn btn-ghost btn-sm\" type=\"button\" data-file-remove>Remove</button>\
+           </div>\
+           <textarea name=\"file_content\" class=\"code-input\" spellcheck=\"false\" autocomplete=\"off\" placeholder=\"Paste this file's content here…\">{content}</textarea>\
+         </div>",
+        name = esc(filename),
+        content = esc(content),
+    )
 }
 
 /// The author's recent-pastes list (already filtered/ordered by the store).
@@ -908,6 +1146,11 @@ async fn render_paste_view(
         .await
         .unwrap_or_default()
         .len();
+    // Multi-file pastes render each file as its own titled, line-numbered block; a
+    // legacy/single-content paste (no `paste_files` rows) renders one unlabeled block exactly
+    // as before, and the `?lines=` line-range highlight still applies to it.
+    let files = state.store.list_files(&paste.id).await.unwrap_or_default();
+    let body_html = render_body_html(paste, &files, highlight_lines);
     let burned = paste.burn_after_read && !is_owner;
     render_view_html(
         paste,
@@ -916,9 +1159,54 @@ async fn render_paste_view(
         burned,
         &similar,
         csrf,
-        highlight_lines,
+        &body_html,
         revision_count,
     )
+}
+
+/// Render a paste's code area: one titled block per file for a multi-file paste, or a single
+/// unlabeled `code-pre code-lines` block for a legacy/single-content paste (byte-identical to the
+/// old view — the `?lines=` highlight only applies in the single-file case).
+fn render_body_html(
+    paste: &Paste,
+    files: &[PasteFile],
+    highlight_lines: Option<(usize, usize)>,
+) -> String {
+    if files.is_empty() {
+        return format!(
+            "<div class=\"code-pre code-lines\">{}</div>",
+            highlight::render_lines(&paste.language, &paste.body, highlight_lines)
+        );
+    }
+    let count = files.len();
+    files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            format!(
+                "<div class=\"file-block\">\
+                   <div class=\"file-block__head\">{icon}<span>{name}</span>\
+                     <span class=\"file-block__count\">{n} of {count}</span></div>\
+                   <div class=\"code-pre code-lines\">{lines}</div>\
+                 </div>",
+                icon = FILE_ICON_SVG,
+                name = esc(&display_filename(&f.filename, i)),
+                n = i + 1,
+                count = count,
+                lines = highlight::render_lines(&paste.language, &f.content, None),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// A file's display name, or the `File {n}` placeholder when it has no name.
+fn display_filename(filename: &str, index: usize) -> String {
+    if filename.trim().is_empty() {
+        format!("File {}", index + 1)
+    } else {
+        filename.to_string()
+    }
 }
 
 /// The per-paste action buttons (`{{TOOLS}}`). Raw/history/fork honor the password gate; edit and
@@ -981,7 +1269,7 @@ fn render_view_html(
     burned: bool,
     similar: &[(f64, Paste)],
     csrf: &str,
-    highlight_lines: Option<(usize, usize)>,
+    body_html: &str,
     revision_count: usize,
 ) -> String {
     let expiry = match paste.expires_at {
@@ -1021,9 +1309,8 @@ fn render_view_html(
     };
 
     let tools = view_tools(paste, is_owner, csrf, revision_count);
-    // Syntax-highlighted body, rendered as numbered line rows (each with an `id="L{n}"` anchor).
-    // `render_lines` HTML-escapes every character, so this is never less safe than plain `esc`.
-    let body_html = highlight::render_lines(&paste.language, &paste.body, highlight_lines);
+    // `body_html` is pre-rendered by [`render_body_html`] (every character already HTML-escaped
+    // by `highlight::render_lines`), so this is never less safe than a plain `esc(body)`.
     fill_view(
         &viewer.email,
         &title_or_untitled(&paste.title),
@@ -1033,7 +1320,7 @@ fn render_view_html(
         &source_credit(paste),
         &paste.id,
         &tools,
-        &body_html,
+        body_html,
         &render_similar(similar),
     )
 }
@@ -1086,7 +1373,10 @@ fn render_revision(viewer: &Identity, paste_id: &str, rev: &PasteRevision) -> St
          <a class=\"btn btn-ghost btn-sm\" href=\"/p/{id}/history\">History</a>",
         id = esc(paste_id),
     );
-    let body_html = highlight::render_lines(&rev.language, &rev.body, None);
+    let body_html = format!(
+        "<div class=\"code-pre code-lines\">{}</div>",
+        highlight::render_lines(&rev.language, &rev.body, None)
+    );
     fill_view(
         &viewer.email,
         &title_or_untitled(&rev.title),
@@ -1113,7 +1403,7 @@ fn render_unlock(viewer: &Identity, id: &str, csrf: &str, error: Option<&str>) -
         .replace("{{CSRF}}", &esc(csrf))
 }
 
-/// Render the edit form pre-filled with the current (or resubmitted) content.
+/// Render the edit form pre-filled with the current (or resubmitted) files.
 #[allow(clippy::too_many_arguments)]
 fn render_edit(
     who: &Identity,
@@ -1121,7 +1411,7 @@ fn render_edit(
     error: Option<&str>,
     title: &str,
     language: &str,
-    body: &str,
+    files: &[FileInput],
     csrf: &str,
 ) -> String {
     EDIT_HTML
@@ -1133,7 +1423,7 @@ fn render_edit(
         .replace("{{CSRF}}", &esc(csrf))
         .replace("{{TITLE}}", &esc(title))
         .replace("{{LANGUAGE_OPTIONS}}", &language_options(language))
-        .replace("{{BODY}}", &esc(body))
+        .replace("{{FILE_ROWS}}", &render_file_rows(files))
 }
 
 /// Render the revision-history page: the current version plus every archived revision, newest

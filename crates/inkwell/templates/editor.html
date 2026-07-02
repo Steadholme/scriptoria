@@ -38,6 +38,14 @@
         <div class="field field--inline">
           <label class="check"><input type="checkbox" name="published" {{PUBLISHED_CHECKED}}> Published</label>
         </div>
+        <div class="field">
+          <label for="publish_at">Publish at <span class="muted">(UTC, optional)</span></label>
+          <input type="datetime-local" id="publish_at" name="publish_at" value="{{PUBLISH_AT_VALUE}}">
+          <p class="field__hint muted">Leave blank to publish immediately.</p>
+        </div>
+        <div class="field field--inline">
+          <label class="check"><input type="checkbox" name="pinned" {{PINNED_CHECKED}}> Pinned</label>
+        </div>
         <div class="editor__actions">
           <button class="btn btn-primary" type="submit">{{SUBMIT_LABEL}}</button>
           <a class="btn btn-ghost" href="{{CANCEL_HREF}}">Cancel</a>

@@ -58,13 +58,27 @@
               <input type="password" id="password" name="password" autocomplete="new-password" placeholder="Leave blank for no password — anyone but you must enter it to view">
             </div>
             <div class="field">
-              <label for="body">Content</label>
-              <textarea id="body" name="body" class="code-input" spellcheck="false" autocomplete="off" placeholder="Paste your snippet here…">{{BODY}}</textarea>
+              <label>Files</label>
+              <div class="file-editor" id="fileEditor">{{FILE_ROWS}}</div>
+              <button class="btn btn-ghost btn-sm" type="button" id="addFileBtn">+ Add file</button>
             </div>
             <div class="actions">
               <button class="btn btn-primary" type="submit">Create paste</button>
             </div>
           </form>
+
+          <template id="fileRowTemplate">
+            <div class="file-row" data-file-row>
+              <div class="file-row__head">
+                <div class="field field--grow">
+                  <label>Filename <span class="field-hint">optional</span></label>
+                  <input type="text" name="file_name" maxlength="128" value="" placeholder="e.g. main.rs">
+                </div>
+                <button class="btn btn-ghost btn-sm" type="button" data-file-remove>Remove</button>
+              </div>
+              <textarea name="file_content" class="code-input" spellcheck="false" autocomplete="off" placeholder="Paste this file's content here…"></textarea>
+            </div>
+          </template>
         </div>
       </section>
 
@@ -79,5 +93,27 @@
       </section>
     </div>
   </main>
+
+  <script>
+    // Multi-file compose: add/remove file rows. The row markup is cloned from a static
+    // <template> (no user/remote strings interpolated), so this never injects untrusted HTML.
+    (function () {
+      var editor = document.getElementById('fileEditor');
+      var addBtn = document.getElementById('addFileBtn');
+      var tpl = document.getElementById('fileRowTemplate');
+      if (!editor || !addBtn || !tpl) { return; }
+      addBtn.addEventListener('click', function () {
+        editor.appendChild(tpl.content.cloneNode(true));
+      });
+      editor.addEventListener('click', function (ev) {
+        var btn = ev.target.closest('[data-file-remove]');
+        if (!btn) { return; }
+        var rows = editor.querySelectorAll('[data-file-row]');
+        if (rows.length <= 1) { return; } // always keep at least one row
+        var row = btn.closest('[data-file-row]');
+        if (row) { row.remove(); }
+      });
+    })();
+  </script>
 </body>
 </html>

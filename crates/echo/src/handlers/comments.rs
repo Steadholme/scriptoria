@@ -13,15 +13,16 @@ use axum::Form;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
-use crate::auth;
 use crate::audit::AuditEvent;
+use crate::auth;
 use crate::config::{
-    clamp_page, is_reaction_kind, COMMENT_PAGE, MAX_BODY_CHARS, REACTION_KINDS, RECENT_LIMIT,
+    clamp_page, is_reaction_kind, COMMENT_PAGE, MAX_BODY_CHARS, MAX_REPORT_REASON_CHARS,
+    REACTION_KINDS, RECENT_LIMIT,
 };
 use crate::error::AppError;
 use crate::handlers::{esc, fmt_datetime, topbar, APP_CSS};
 use crate::markdown;
-use crate::store::{Comment, CommentCursor, Reaction, Sort, Thread};
+use crate::store::{Comment, CommentCursor, CommentReport, CommentVote, Reaction, Sort, Thread};
 use crate::{now_nanos, now_secs, rand_suffix, AppState};
 
 const DASHBOARD_HTML: &str = include_str!("../../templates/dashboard.html");
@@ -98,6 +99,34 @@ pub struct ReactForm {
     pub csrf_token: String,
 }
 
+/// `POST /api/comment/vote` body — toggle one `+1` or `-1` vote on one comment. Identity is the
+/// gateway subject; one `(comment_id, voter_sub)` row may exist at a time.
+#[derive(Debug, Deserialize)]
+pub struct VoteForm {
+    #[serde(default)]
+    pub comment_id: String,
+    #[serde(default)]
+    pub value: String,
+    #[serde(default)]
+    pub return_to: String,
+    #[serde(default)]
+    pub csrf_token: String,
+}
+
+/// `POST /api/comment/report` body — report one comment with a short reason. Identity is the
+/// gateway subject; one `(comment_id, reporter_sub)` row may exist at a time.
+#[derive(Debug, Deserialize)]
+pub struct ReportForm {
+    #[serde(default)]
+    pub comment_id: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub return_to: String,
+    #[serde(default)]
+    pub csrf_token: String,
+}
+
 /// `GET /?before=<created_at>_<id>&limit=<n>` — keyset-pagination cursor + page size for the
 /// dashboard thread list. Both are optional; a bare `GET /` returns the newest page.
 #[derive(Debug, Deserialize)]
@@ -108,10 +137,10 @@ pub struct DashboardQuery {
     pub limit: Option<i64>,
 }
 
-/// `GET /t/{key}?sort=<newest|oldest|reacted>&before=<cursor>` (also `/embed/{key}`) — the sort
-/// order + keyset cursor for a thread's top-level comments. Both optional; the bare view is the
-/// newest page. The `before` cursor is `<created_at>_<id>` for the time sorts and
-/// `<reactions>~<created_at>_<id>` for most-reacted (see [`parse_comment_before`]).
+/// `GET /t/{key}?sort=<newest|oldest|top|reacted>&before=<cursor>` (also `/embed/{key}`) — the sort
+/// order + keyset cursor for a thread's top-level comments. Both optional; the bare view keeps the
+/// legacy chronological sort. The `before` cursor is `<created_at>_<id>` for the time sorts and
+/// `<rank>~<created_at>_<id>` for top / most-reacted (see [`parse_comment_before`]).
 #[derive(Debug, Deserialize)]
 pub struct ThreadQuery {
     #[serde(default)]
@@ -246,11 +275,13 @@ pub async fn thread_view(
     let comments_html = render_comment_tree(
         &page.comments,
         &page.reactions,
+        &page.votes,
         &csrf,
         &key,
         &return_to,
         true,
         &viewer_sub,
+        false,
     );
     let more_html = render_load_more(&return_to, page.sort, page.next.as_ref());
     let composer = render_composer(&csrf, &key, "", &return_to, thread_url(&thread));
@@ -295,15 +326,19 @@ pub async fn embed_view(
 
     let sort_html = sort_control(page.sort, &return_to);
     // No moderation controls in the embed — it is the end-user reading/posting surface — but an
-    // author still gets self-edit/delete + reactions on their OWN comments.
+    // author still gets self-edit/delete + reactions on their OWN comments. Vote/report controls
+    // render only when the gateway supplied identity; anonymous embeds keep the score and otherwise
+    // stay inert so the iframe never trips over missing SSO.
     let comments_html = render_comment_tree(
         &page.comments,
         &page.reactions,
+        &page.votes,
         &csrf,
         &key,
         &return_to,
         false,
         &viewer_sub,
+        true,
     );
     let more_html = render_load_more(&return_to, page.sort, page.next.as_ref());
     let composer = render_composer(&csrf, &key, "", &return_to, thread_url(&page.thread));
@@ -323,19 +358,20 @@ pub async fn embed_view(
 // ---------------------------------------------------------------------------
 
 /// One rendered page of a thread: the thread row (if any), the ordered top-level comments PLUS
-/// their replies, the folded reaction state, the effective sort, the total comment count for the
-/// meta line, and the next keyset cursor (`Some` only when a full page came back).
+/// their replies, the folded reaction/vote state, the effective sort, the total comment count for
+/// the meta line, and the next keyset cursor (`Some` only when a full page came back).
 struct ThreadPage {
     thread: Option<Thread>,
     comments: Vec<Comment>,
     reactions: Reactions,
+    votes: Votes,
     sort: Sort,
     total: i64,
     next: Option<CommentCursor>,
 }
 
-/// Load one sorted, keyset-paginated page of a thread's comments + their reactions. A key with no
-/// thread yet yields an empty page (its composer will create the thread on first post).
+/// Load one sorted, keyset-paginated page of a thread's comments + their reactions/votes. A key
+/// with no thread yet yields an empty page (its composer will create the thread on first post).
 async fn load_thread_page(
     state: &AppState,
     key: &str,
@@ -352,6 +388,7 @@ async fn load_thread_page(
             thread: None,
             comments: Vec::new(),
             reactions: Reactions::empty(),
+            votes: Votes::empty(),
             sort,
             total: 0,
             next: None,
@@ -359,7 +396,10 @@ async fn load_thread_page(
     };
 
     let total = state.store.count_comments(&t.id).await;
-    let (tops, replies) = state.store.list_thread_page(&t.id, sort, before, limit).await;
+    let (tops, replies) = state
+        .store
+        .list_thread_page(&t.id, sort, before, limit)
+        .await;
 
     // Fold the reactions of every comment on this page (top-level + replies) into counts + the
     // viewer's own state.
@@ -370,13 +410,18 @@ async fn load_thread_page(
         .collect();
     let rows = state.store.reactions_for(&ids).await;
     let reactions = Reactions::build(&rows, viewer_sub);
+    let vote_rows = state.store.votes_for(&ids).await;
+    let votes = Votes::build(&vote_rows, viewer_sub);
 
     // A FULL page of top-level comments means older ones may remain: derive the next cursor from
-    // the last (page-terminal) top-level comment. For most-reacted the cursor also carries its
-    // total reaction count.
+    // the last (page-terminal) top-level comment. Ranked sorts also carry their rank value.
     let next = if tops.len() as i64 == limit {
         tops.last().map(|c| CommentCursor {
-            reactions: reactions.total(&c.id),
+            reactions: match sort {
+                Sort::Top => votes.score(&c.id),
+                Sort::MostReacted => reactions.total(&c.id),
+                _ => 0,
+            },
             created_at: c.created_at,
             id: c.id.clone(),
         })
@@ -391,6 +436,7 @@ async fn load_thread_page(
         thread,
         comments,
         reactions,
+        votes,
         sort,
         total,
         next,
@@ -418,14 +464,20 @@ pub async fn post_comment(
 
     let key = form.thread_key.trim();
     if key.is_empty() {
-        return Err(AppError::InvalidRequest("thread_key is required".to_string()));
+        return Err(AppError::InvalidRequest(
+            "thread_key is required".to_string(),
+        ));
     }
     let body = form.body.trim();
     if body.is_empty() {
-        return Err(AppError::InvalidRequest("comment body is required".to_string()));
+        return Err(AppError::InvalidRequest(
+            "comment body is required".to_string(),
+        ));
     }
     if body.chars().count() > MAX_BODY_CHARS {
-        return Err(AppError::InvalidRequest("comment body is too long".to_string()));
+        return Err(AppError::InvalidRequest(
+            "comment body is too long".to_string(),
+        ));
     }
 
     let now = now_secs();
@@ -456,12 +508,20 @@ pub async fn post_comment(
     state.store.create_comment(&comment).await?;
     tracing::info!(thread = %thread.key, comment = %comment.id, "comment posted");
 
-    let actor = if email.is_empty() { &comment.author_sub } else { &email };
+    let actor = if email.is_empty() {
+        &comment.author_sub
+    } else {
+        &email
+    };
     state.audit.emit(AuditEvent::info(
         "echo.comment.post",
         actor,
         &thread.key,
-        if parent_id.is_empty() { "top-level" } else { "reply" },
+        if parent_id.is_empty() {
+            "top-level"
+        } else {
+            "reply"
+        },
     ));
 
     Ok(redirect(&local_redirect(
@@ -488,7 +548,9 @@ pub async fn moderate(
 
     let id = form.comment_id.trim();
     if id.is_empty() {
-        return Err(AppError::InvalidRequest("comment_id is required".to_string()));
+        return Err(AppError::InvalidRequest(
+            "comment_id is required".to_string(),
+        ));
     }
     let hidden = match form.action.trim() {
         "hide" => true,
@@ -535,14 +597,20 @@ pub async fn edit_comment(
 
     let id = form.comment_id.trim();
     if id.is_empty() {
-        return Err(AppError::InvalidRequest("comment_id is required".to_string()));
+        return Err(AppError::InvalidRequest(
+            "comment_id is required".to_string(),
+        ));
     }
     let body = form.body.trim();
     if body.is_empty() {
-        return Err(AppError::InvalidRequest("comment body is required".to_string()));
+        return Err(AppError::InvalidRequest(
+            "comment body is required".to_string(),
+        ));
     }
     if body.chars().count() > MAX_BODY_CHARS {
-        return Err(AppError::InvalidRequest("comment body is too long".to_string()));
+        return Err(AppError::InvalidRequest(
+            "comment body is too long".to_string(),
+        ));
     }
 
     let updated = state.store.update_comment_body(id, &sub, body).await?;
@@ -552,9 +620,12 @@ pub async fn edit_comment(
     tracing::info!(comment = %id, "comment edited by author");
 
     let actor = if email.is_empty() { &sub } else { &email };
-    state
-        .audit
-        .emit(AuditEvent::info("echo.comment.edit", actor, id, "self-edit"));
+    state.audit.emit(AuditEvent::info(
+        "echo.comment.edit",
+        actor,
+        id,
+        "self-edit",
+    ));
 
     Ok(redirect(&local_redirect(&form.return_to, "/")))
 }
@@ -571,7 +642,9 @@ pub async fn delete_comment(
 
     let id = form.comment_id.trim();
     if id.is_empty() {
-        return Err(AppError::InvalidRequest("comment_id is required".to_string()));
+        return Err(AppError::InvalidRequest(
+            "comment_id is required".to_string(),
+        ));
     }
 
     let deleted = state.store.delete_comment(id, &sub).await?;
@@ -581,9 +654,12 @@ pub async fn delete_comment(
     tracing::info!(comment = %id, "comment deleted by author");
 
     let actor = if email.is_empty() { &sub } else { &email };
-    state
-        .audit
-        .emit(AuditEvent::notice("echo.comment.delete", actor, id, "self-delete"));
+    state.audit.emit(AuditEvent::notice(
+        "echo.comment.delete",
+        actor,
+        id,
+        "self-delete",
+    ));
 
     Ok(redirect(&local_redirect(&form.return_to, "/")))
 }
@@ -609,11 +685,15 @@ pub async fn react(
 
     let comment_id = form.comment_id.trim();
     if comment_id.is_empty() {
-        return Err(AppError::InvalidRequest("comment_id is required".to_string()));
+        return Err(AppError::InvalidRequest(
+            "comment_id is required".to_string(),
+        ));
     }
     let kind = form.kind.trim();
     if !is_reaction_kind(kind) {
-        return Err(AppError::InvalidRequest(format!("unknown reaction kind {kind}")));
+        return Err(AppError::InvalidRequest(format!(
+            "unknown reaction kind {kind}"
+        )));
     }
     // The reaction must attach to a real comment (else a 404, same shape as a missing comment).
     if state.store.get_comment(comment_id).await.is_none() {
@@ -637,6 +717,129 @@ pub async fn react(
         actor,
         comment_id,
         if added { kind } else { "removed" },
+    ));
+
+    Ok(redirect(&local_redirect(&form.return_to, "/")))
+}
+
+// ---------------------------------------------------------------------------
+// Vote (toggle + score)
+// ---------------------------------------------------------------------------
+
+/// `POST /api/comment/vote` — toggle one `+1`/`-1` vote on one comment for the gateway identity.
+/// Behind SSO; CSRF required. Same-direction votes clear, opposite-direction votes flip. A blocked
+/// author may not vote; an unknown value or missing comment is rejected.
+pub async fn vote(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<VoteForm>,
+) -> Result<Response, AppError> {
+    let (sub, email) = auth::require_author(&headers)?;
+    auth::verify_csrf(&headers, &form.csrf_token)?;
+
+    if state.store.is_blocked(&sub).await {
+        return Err(AppError::Forbidden("author is blocked".to_string()));
+    }
+
+    let comment_id = form.comment_id.trim();
+    if comment_id.is_empty() {
+        return Err(AppError::InvalidRequest(
+            "comment_id is required".to_string(),
+        ));
+    }
+    let value = match form.value.trim() {
+        "1" | "+1" => 1,
+        "-1" => -1,
+        other => {
+            return Err(AppError::InvalidRequest(format!(
+                "unknown vote value {other} (use 1|-1)"
+            )))
+        }
+    };
+    if state.store.get_comment(comment_id).await.is_none() {
+        return Err(AppError::NotFound("no such comment".to_string()));
+    }
+
+    let current = state
+        .store
+        .toggle_vote(&CommentVote {
+            comment_id: comment_id.to_string(),
+            voter_sub: sub.clone(),
+            value,
+            created_at: now_secs(),
+        })
+        .await?;
+    tracing::info!(comment = %comment_id, value, current, "vote toggled");
+
+    let actor = if email.is_empty() { &sub } else { &email };
+    let detail = match current {
+        1 => "up",
+        -1 => "down",
+        _ => "cleared",
+    };
+    state.audit.emit(AuditEvent::info(
+        "echo.comment.vote",
+        actor,
+        comment_id,
+        detail,
+    ));
+
+    Ok(redirect(&local_redirect(&form.return_to, "/")))
+}
+
+// ---------------------------------------------------------------------------
+// Report / flag
+// ---------------------------------------------------------------------------
+
+/// `POST /api/comment/report` — report one comment with a short reason for the moderation queue.
+/// Behind SSO; CSRF required. The reporter identity is scoped to the gateway subject, so a repeat
+/// report by the same user updates their one row instead of creating duplicates.
+pub async fn report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ReportForm>,
+) -> Result<Response, AppError> {
+    let (sub, email) = auth::require_author(&headers)?;
+    auth::verify_csrf(&headers, &form.csrf_token)?;
+
+    let comment_id = form.comment_id.trim();
+    if comment_id.is_empty() {
+        return Err(AppError::InvalidRequest(
+            "comment_id is required".to_string(),
+        ));
+    }
+    let reason = form.reason.trim();
+    if reason.is_empty() {
+        return Err(AppError::InvalidRequest(
+            "report reason is required".to_string(),
+        ));
+    }
+    if reason.chars().count() > MAX_REPORT_REASON_CHARS {
+        return Err(AppError::InvalidRequest(
+            "report reason is too long".to_string(),
+        ));
+    }
+    if state.store.get_comment(comment_id).await.is_none() {
+        return Err(AppError::NotFound("no such comment".to_string()));
+    }
+
+    let created = state
+        .store
+        .report_comment(&CommentReport {
+            comment_id: comment_id.to_string(),
+            reporter_sub: sub.clone(),
+            reason: reason.to_string(),
+            created_at: now_secs(),
+        })
+        .await?;
+    tracing::info!(comment = %comment_id, created, "comment reported");
+
+    let actor = if email.is_empty() { &sub } else { &email };
+    state.audit.emit(AuditEvent::notice(
+        "echo.comment.report",
+        actor,
+        comment_id,
+        if created { "new" } else { "updated" },
     ));
 
     Ok(redirect(&local_redirect(&form.return_to, "/")))
@@ -678,7 +881,10 @@ fn thread_meta_url(thread: &Option<Thread>) -> String {
     if url.is_empty() {
         String::new()
     } else {
-        format!(r#" · <a href="{u}" rel="noopener noreferrer">source</a>"#, u = esc(url))
+        format!(
+            r#" · <a href="{u}" rel="noopener noreferrer">source</a>"#,
+            u = esc(url)
+        )
     }
 }
 
@@ -706,10 +912,7 @@ fn render_activity_item(
     csrf: &str,
 ) -> String {
     let (thread_link, thread_label) = match by_id.get(&c.thread_id) {
-        Some((key, title)) => (
-            format!("/t/{}", path_seg(key)),
-            title.clone(),
-        ),
+        Some((key, title)) => (format!("/t/{}", path_seg(key)), title.clone()),
         None => ("/".to_string(), c.thread_id.clone()),
     };
     let preview = markdown::preview(&c.body, 160);
@@ -744,11 +947,13 @@ fn render_activity_item(
 fn render_comment_tree(
     comments: &[Comment],
     rx: &Reactions,
+    votes: &Votes,
     csrf: &str,
     thread_key: &str,
     return_to: &str,
     moderate: bool,
     viewer_sub: &str,
+    embed: bool,
 ) -> String {
     if comments.is_empty() {
         return r#"<p class="muted comment-list__empty">No comments yet. Be the first to comment.</p>"#
@@ -765,13 +970,13 @@ fn render_comment_tree(
     let mut out = String::new();
     for c in comments.iter().filter(|c| c.parent_id.is_empty()) {
         out.push_str(&render_comment(
-            c, rx, csrf, thread_key, return_to, moderate, false, viewer_sub,
+            c, rx, votes, csrf, thread_key, return_to, moderate, false, viewer_sub, embed,
         ));
         if let Some(kids) = replies.get(c.id.as_str()) {
             out.push_str(r#"<div class="replies">"#);
             for k in kids {
                 out.push_str(&render_comment(
-                    k, rx, csrf, thread_key, return_to, moderate, true, viewer_sub,
+                    k, rx, votes, csrf, thread_key, return_to, moderate, true, viewer_sub, embed,
                 ));
             }
             out.push_str("</div>");
@@ -786,12 +991,14 @@ fn render_comment_tree(
 fn render_comment(
     c: &Comment,
     rx: &Reactions,
+    votes: &Votes,
     csrf: &str,
     thread_key: &str,
     return_to: &str,
     moderate: bool,
     is_reply: bool,
     viewer_sub: &str,
+    embed: bool,
 ) -> String {
     let body_html = if c.hidden {
         r#"<em class="comment__hidden">[comment hidden by a moderator]</em>"#.to_string()
@@ -817,6 +1024,17 @@ fn render_comment(
     } else {
         reaction_bar(c, rx, csrf, return_to)
     };
+    let vote_controls = !embed || !viewer_sub.is_empty();
+    let vote_html = if c.hidden {
+        String::new()
+    } else {
+        vote_bar(c, votes, csrf, return_to, vote_controls)
+    };
+    let report_html = if c.hidden || !vote_controls {
+        String::new()
+    } else {
+        report_control(c, csrf, return_to)
+    };
     let reply_form = if is_reply {
         String::new()
     } else {
@@ -830,16 +1048,20 @@ fn render_comment(
     {control}
   </div>
   <div class="comment__body">{body}</div>
+  {votes}
   {reactions}
   {self_ctl}
+  {report}
   {reply}
 </article>"#,
         author = esc(&author_label(c)),
         date = esc(&fmt_datetime(c.created_at)),
         control = control,
         body = body_html,
+        votes = vote_html,
         reactions = reactions,
         self_ctl = self_ctl,
+        report = report_html,
         reply = reply_form,
     )
 }
@@ -871,13 +1093,19 @@ impl Reactions {
         let mut mine: HashSet<(String, String)> = HashSet::new();
         let mut totals: HashMap<String, i64> = HashMap::new();
         for r in rows {
-            *counts.entry((r.comment_id.clone(), r.kind.clone())).or_insert(0) += 1;
+            *counts
+                .entry((r.comment_id.clone(), r.kind.clone()))
+                .or_insert(0) += 1;
             *totals.entry(r.comment_id.clone()).or_insert(0) += 1;
             if !viewer_sub.is_empty() && r.user_sub == viewer_sub {
                 mine.insert((r.comment_id.clone(), r.kind.clone()));
             }
         }
-        Reactions { counts, mine, totals }
+        Reactions {
+            counts,
+            mine,
+            totals,
+        }
     }
 
     fn count(&self, comment_id: &str, kind: &str) -> i64 {
@@ -888,7 +1116,8 @@ impl Reactions {
     }
 
     fn reacted(&self, comment_id: &str, kind: &str) -> bool {
-        self.mine.contains(&(comment_id.to_string(), kind.to_string()))
+        self.mine
+            .contains(&(comment_id.to_string(), kind.to_string()))
     }
 
     /// Total reactions across all kinds on `comment_id` (backs the most-reacted cursor).
@@ -928,10 +1157,109 @@ fn reaction_bar(c: &Comment, rx: &Reactions, csrf: &str, return_to: &str) -> Str
 }
 
 // ---------------------------------------------------------------------------
+// Votes: folded score/current-user state + the render bar
+// ---------------------------------------------------------------------------
+
+/// Vote state for the comments on one rendered page: per-comment score plus the viewer's current
+/// vote value (`+1`, `-1`, or absent).
+struct Votes {
+    scores: HashMap<String, i64>,
+    mine: HashMap<String, i64>,
+}
+
+impl Votes {
+    fn empty() -> Self {
+        Votes {
+            scores: HashMap::new(),
+            mine: HashMap::new(),
+        }
+    }
+
+    fn build(rows: &[CommentVote], viewer_sub: &str) -> Self {
+        let mut scores: HashMap<String, i64> = HashMap::new();
+        let mut mine: HashMap<String, i64> = HashMap::new();
+        for v in rows {
+            *scores.entry(v.comment_id.clone()).or_insert(0) += v.value;
+            if !viewer_sub.is_empty() && v.voter_sub == viewer_sub {
+                mine.insert(v.comment_id.clone(), v.value);
+            }
+        }
+        Votes { scores, mine }
+    }
+
+    fn score(&self, comment_id: &str) -> i64 {
+        self.scores.get(comment_id).copied().unwrap_or(0)
+    }
+
+    fn mine(&self, comment_id: &str) -> i64 {
+        self.mine.get(comment_id).copied().unwrap_or(0)
+    }
+}
+
+/// The vote score + up/down controls. Full thread pages render active forms; anonymous embeds keep
+/// only the inert score so the widget stays stable without gateway identity.
+fn vote_bar(c: &Comment, votes: &Votes, csrf: &str, return_to: &str, controls: bool) -> String {
+    let score = votes.score(&c.id);
+    if !controls {
+        return format!(
+            r#"<div class="votes"><span class="vote-score">Score <b>{score}</b></span></div>"#,
+            score = score,
+        );
+    }
+    let mine = votes.mine(&c.id);
+    let button = |value: i64, label: &str| {
+        let on = mine == value;
+        format!(
+            r#"<form class="inline-form vote-form" method="post" action="/api/comment/vote">
+  <input type="hidden" name="csrf_token" value="{csrf}">
+  <input type="hidden" name="comment_id" value="{id}">
+  <input type="hidden" name="value" value="{value}">
+  <input type="hidden" name="return_to" value="{ret}">
+  <button class="vote-btn{on_cls}" type="submit" aria-pressed="{pressed}">{label}</button>
+</form>"#,
+            csrf = esc(csrf),
+            id = esc(&c.id),
+            value = value,
+            ret = esc(return_to),
+            on_cls = if on { " vote-btn--on" } else { "" },
+            pressed = if on { "true" } else { "false" },
+            label = label,
+        )
+    };
+    format!(
+        r#"<div class="votes">{up}<span class="vote-score">Score <b>{score}</b></span>{down}</div>"#,
+        up = button(1, "Up"),
+        score = score,
+        down = button(-1, "Down"),
+    )
+}
+
+/// A compact report form. It is rendered only for visible comments and only when the surface is
+/// allowed to submit report mutations (full page always; embed only with gateway identity).
+fn report_control(c: &Comment, csrf: &str, return_to: &str) -> String {
+    format!(
+        r#"<details class="report-toggle">
+  <summary>Report</summary>
+  <form class="composer-form composer-form--reply report-form" method="post" action="/api/comment/report">
+    <input type="hidden" name="csrf_token" value="{csrf}">
+    <input type="hidden" name="comment_id" value="{id}">
+    <input type="hidden" name="return_to" value="{ret}">
+    <textarea name="reason" class="composer__body report__reason" maxlength="{max}" required placeholder="Reason"></textarea>
+    <div class="composer__actions"><button class="btn btn-secondary btn-sm" type="submit">Report</button></div>
+  </form>
+</details>"#,
+        csrf = esc(csrf),
+        id = esc(&c.id),
+        ret = esc(return_to),
+        max = MAX_REPORT_REASON_CHARS,
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Sort control + comment pagination
 // ---------------------------------------------------------------------------
 
-/// The newest / oldest / most-reacted sort tabs for a thread view. `base` is the view's own path
+/// The newest / oldest / top / most-reacted sort tabs for a thread view. `base` is the view's own path
 /// (`/t/<seg>` or `/embed/<seg>`); each tab links to `base?sort=<value>` (paging resets on a sort
 /// change). The active sort is styled "on".
 fn sort_control(current: Sort, base: &str) -> String {
@@ -950,9 +1278,10 @@ fn sort_control(current: Sort, base: &str) -> String {
         )
     };
     format!(
-        r#"<nav class="sort-control" aria-label="Sort comments">{n}{o}{r}</nav>"#,
+        r#"<nav class="sort-control" aria-label="Sort comments">{n}{o}{t}{r}</nav>"#,
         n = tab(Sort::Newest, "Newest"),
         o = tab(Sort::Oldest, "Oldest"),
+        t = tab(Sort::Top, "Top"),
         r = tab(Sort::MostReacted, "Most reacted"),
     )
 }
@@ -975,15 +1304,15 @@ fn render_load_more(base: &str, sort: Sort, next: Option<&CommentCursor>) -> Str
 /// most-reacted prefixes the total reaction count as `<reactions>~<created_at>_<id>`.
 fn format_comment_cursor(cur: &CommentCursor, sort: Sort) -> String {
     match sort {
-        Sort::MostReacted => format!("{}~{}_{}", cur.reactions, cur.created_at, cur.id),
+        Sort::Top | Sort::MostReacted => format!("{}~{}_{}", cur.reactions, cur.created_at, cur.id),
         _ => format!("{}_{}", cur.created_at, cur.id),
     }
 }
 
 /// Parse a `?before=` comment cursor for `sort`. Returns `None` for a missing/blank/malformed
 /// cursor (which falls back to the first page). The optional `<reactions>~` prefix carries the
-/// most-reacted count; `<created_at>` is a plain integer split on the FIRST `_`, so the id keeps
-/// its own underscores.
+/// top score or most-reacted count; `<created_at>` is a plain integer split on the FIRST `_`, so
+/// the id keeps its own underscores.
 fn parse_comment_before(before: Option<&str>, _sort: Sort) -> Option<CommentCursor> {
     let raw = before?.trim();
     if raw.is_empty() {
@@ -1137,10 +1466,7 @@ async fn resolve_parent(state: &AppState, thread_id: &str, requested: &str) -> S
 /// `default` otherwise.
 pub(crate) fn local_redirect(return_to: &str, default: &str) -> String {
     let t = return_to.trim();
-    if t.starts_with('/')
-        && !t.starts_with("//")
-        && !t.contains(|c: char| c.is_ascii_control())
-    {
+    if t.starts_with('/') && !t.starts_with("//") && !t.contains(|c: char| c.is_ascii_control()) {
         t.to_string()
     } else {
         default.to_string()
@@ -1152,7 +1478,9 @@ pub(crate) fn path_seg(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }

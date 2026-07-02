@@ -69,13 +69,25 @@ pub struct ReactionCount {
 
 /// A single post in a thread (maps 1:1 to a `posts` row). The first post of a thread is the
 /// original post; the rest are replies. `body_md` is raw CommonMark, rendered (sanitised) at
-/// display time.
+/// display time. `quoted_post_id` is empty for normal posts; when set it points at another post in
+/// the same thread whose escaped body renders above this reply as a quote.
 #[derive(Clone, Debug, Serialize)]
 pub struct Post {
     pub id: String,
     pub thread_id: String,
     pub body_md: String,
+    pub quoted_post_id: String,
     pub author_sub: String,
     pub author_email: String,
+    pub created_at: i64,
+}
+
+/// One parsed `@username` occurrence for a post. Usernames are normalised to lowercase at write
+/// time and are matched against the viewer's gateway email local-part.
+#[derive(Clone, Debug, Serialize)]
+pub struct Mention {
+    pub post_id: String,
+    pub thread_id: String,
+    pub mentioned_username: String,
     pub created_at: i64,
 }

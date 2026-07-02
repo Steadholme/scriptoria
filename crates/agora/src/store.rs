@@ -15,15 +15,18 @@
 //! - `categories(id TEXT PK, name TEXT, sort_order BIGINT)`
 //! - `threads(id TEXT PK, category_id TEXT, title TEXT, author_sub TEXT, author_email TEXT,
 //!    created_at BIGINT, last_at BIGINT)`
-//! - `posts(id TEXT PK, thread_id TEXT, body_md TEXT, author_sub TEXT, author_email TEXT,
-//!    created_at BIGINT)`
+//! - `posts(id TEXT PK, thread_id TEXT, body_md TEXT, quoted_post_id TEXT, author_sub TEXT,
+//!    author_email TEXT, created_at BIGINT)`
+//! - `post_mentions(post_id TEXT, thread_id TEXT, mentioned_username TEXT, created_at BIGINT)`
+//! - `thread_subscriptions(thread_id TEXT, subscriber_sub TEXT, created_at BIGINT)`
 
+use std::collections::HashSet;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::model::{BannedAuthor, Category, Post, ReactionCount, Thread, ThreadDigest};
+use crate::model::{BannedAuthor, Category, Mention, Post, ReactionCount, Thread, ThreadDigest};
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
 #[derive(Debug, Error)]
@@ -48,6 +51,14 @@ pub enum ReplyAnchor {
     After(i64, String),
     Before(i64, String),
     Latest,
+}
+
+/// Sort mode for thread lists. `Latest` is the legacy/default ordering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThreadSort {
+    Latest,
+    Top,
+    Hot,
 }
 
 /// Pluggable forum store. All methods are `async` and `.await`ed on the serving runtime.
@@ -80,6 +91,16 @@ pub trait Store: Send + Sync {
         &self,
         category_id: &str,
         limit: i64,
+    ) -> Result<Vec<Thread>, StoreError>;
+    /// Threads optionally filtered by category and/or current subscriber, sorted by the requested
+    /// list mode. Used by public lists; `Latest` preserves the legacy pinned/latest order.
+    async fn list_threads(
+        &self,
+        category_id: Option<&str>,
+        sort: ThreadSort,
+        subscribed_sub: Option<&str>,
+        limit: i64,
+        now: i64,
     ) -> Result<Vec<Thread>, StoreError>;
     /// A single thread by id, if it exists.
     async fn get_thread(&self, id: &str) -> Result<Option<Thread>, StoreError>;
@@ -117,6 +138,23 @@ pub trait Store: Send + Sync {
     /// Append a reply and bump the parent thread's `last_at` to the reply's timestamp.
     async fn add_reply(&self, post: &Post) -> Result<(), StoreError>;
 
+    /// Replace the parsed mentions for one post with the supplied normalised usernames.
+    async fn replace_mentions(
+        &self,
+        post_id: &str,
+        thread_id: &str,
+        mentioned_usernames: &[String],
+        created_at: i64,
+    ) -> Result<(), StoreError>;
+    /// Count mentions for one normalised username.
+    async fn count_mentions_for_user(&self, mentioned_username: &str) -> Result<i64, StoreError>;
+    /// Most recent mentions for one normalised username.
+    async fn mentions_for_user(
+        &self,
+        mentioned_username: &str,
+        limit: i64,
+    ) -> Result<Vec<Mention>, StoreError>;
+
     /// Edit a thread's title AND its original-post body, atomically. `op_post_id` is the
     /// thread's original post; its `body_md` and the denormalised `first_body_md` (which powers
     /// compose-time similarity) are updated together so they never desync. Author authorisation
@@ -149,6 +187,21 @@ pub trait Store: Send + Sync {
     /// author/admin marked as the accepted answer. Idempotent (setting the same value twice is a
     /// no-op change). Authorisation is enforced by the caller.
     async fn set_accepted_post(&self, thread_id: &str, post_id: &str) -> Result<(), StoreError>;
+
+    /// Toggle one user's subscription to a thread. Returns `true` when subscribed, `false` when the
+    /// existing subscription was removed.
+    async fn toggle_thread_subscription(
+        &self,
+        thread_id: &str,
+        subscriber_sub: &str,
+        created_at: i64,
+    ) -> Result<bool, StoreError>;
+    /// Whether a user is currently subscribed to a thread.
+    async fn is_thread_subscribed(
+        &self,
+        thread_id: &str,
+        subscriber_sub: &str,
+    ) -> Result<bool, StoreError>;
 
     /// Toggle one user's reaction of `kind` on a post. Idempotent per `(post_id, user_sub, kind)`:
     /// if the reaction already exists it is removed and `false` returned; otherwise it is inserted
@@ -189,6 +242,8 @@ pub struct InMemoryStore {
     categories: Mutex<Vec<Category>>,
     threads: Mutex<Vec<Thread>>,
     posts: Mutex<Vec<Post>>,
+    mentions: Mutex<Vec<Mention>>,
+    subscriptions: Mutex<Vec<ThreadSubscription>>,
     banned: Mutex<Vec<BannedAuthor>>,
     /// One row per `(post_id, user_sub, kind)` — the in-memory mirror of `post_reactions`.
     reactions: Mutex<Vec<Reaction>>,
@@ -202,6 +257,14 @@ struct Reaction {
     kind: String,
     #[allow(dead_code)]
     created_at: i64,
+}
+
+/// A single stored subscription (in-memory mirror of a `thread_subscriptions` row).
+#[derive(Clone, Debug)]
+struct ThreadSubscription {
+    thread_id: String,
+    subscriber_sub: String,
+    _created_at: i64,
 }
 
 impl InMemoryStore {
@@ -228,7 +291,11 @@ impl Store for InMemoryStore {
             .lock()
             .expect("categories lock poisoned")
             .clone();
-        v.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then_with(|| a.name.cmp(&b.name)));
+        v.sort_by(|a, b| {
+            a.sort_order
+                .cmp(&b.sort_order)
+                .then_with(|| a.name.cmp(&b.name))
+        });
         Ok(v)
     }
 
@@ -309,6 +376,47 @@ impl Store for InMemoryStore {
         Ok(v)
     }
 
+    async fn list_threads(
+        &self,
+        category_id: Option<&str>,
+        sort: ThreadSort,
+        subscribed_sub: Option<&str>,
+        limit: i64,
+        now: i64,
+    ) -> Result<Vec<Thread>, StoreError> {
+        let subscribed_threads: Option<HashSet<String>> = subscribed_sub.map(|sub| {
+            self.subscriptions
+                .lock()
+                .expect("subscriptions lock poisoned")
+                .iter()
+                .filter(|s| s.subscriber_sub == sub)
+                .map(|s| s.thread_id.clone())
+                .collect()
+        });
+        let posts = self.posts.lock().expect("posts lock poisoned").clone();
+        let mut rows: Vec<(Thread, i64)> = self
+            .threads
+            .lock()
+            .expect("threads lock poisoned")
+            .iter()
+            .filter(|t| category_id.map(|cid| t.category_id == cid).unwrap_or(true))
+            .filter(|t| {
+                subscribed_threads
+                    .as_ref()
+                    .map(|ids| ids.contains(&t.id))
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .map(|t| {
+                let post_count = posts.iter().filter(|p| p.thread_id == t.id).count() as i64;
+                (t, (post_count - 1).max(0))
+            })
+            .collect();
+        sort_thread_rows(&mut rows, sort, now);
+        rows.truncate(limit.max(0) as usize);
+        Ok(rows.into_iter().map(|(t, _)| t).collect())
+    }
+
     async fn get_thread(&self, id: &str) -> Result<Option<Thread>, StoreError> {
         Ok(self
             .threads
@@ -322,7 +430,11 @@ impl Store for InMemoryStore {
     async fn thread_digests(&self, limit: i64) -> Result<Vec<ThreadDigest>, StoreError> {
         // Most-recently-active threads, capped — same ordering as `recent_threads`.
         let mut threads: Vec<Thread> = self.threads.lock().expect("threads lock poisoned").clone();
-        threads.sort_by(|a, b| b.last_at.cmp(&a.last_at).then_with(|| b.created_at.cmp(&a.created_at)));
+        threads.sort_by(|a, b| {
+            b.last_at
+                .cmp(&a.last_at)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+        });
         threads.truncate(limit.max(0) as usize);
         // Clone the posts once, then pick each thread's original post (oldest, id-tiebroken).
         let posts: Vec<Post> = self.posts.lock().expect("posts lock poisoned").clone();
@@ -332,7 +444,11 @@ impl Store for InMemoryStore {
                 let first_body_md = posts
                     .iter()
                     .filter(|p| p.thread_id == t.id)
-                    .min_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)))
+                    .min_by(|a, b| {
+                        a.created_at
+                            .cmp(&b.created_at)
+                            .then_with(|| a.id.cmp(&b.id))
+                    })
                     .map(|p| p.body_md.clone())
                     .unwrap_or_default();
                 ThreadDigest {
@@ -375,7 +491,11 @@ impl Store for InMemoryStore {
             .filter(|p| p.thread_id == thread_id)
             .cloned()
             .collect();
-        v.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+        v.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         Ok(v)
     }
 
@@ -386,7 +506,11 @@ impl Store for InMemoryStore {
             .expect("posts lock poisoned")
             .iter()
             .filter(|p| p.thread_id == thread_id)
-            .min_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)))
+            .min_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| a.id.cmp(&b.id))
+            })
             .cloned())
     }
 
@@ -410,19 +534,31 @@ impl Store for InMemoryStore {
         match anchor {
             ReplyAnchor::First | ReplyAnchor::Latest => {}
             ReplyAnchor::After(ts, id) => {
-                v.retain(|p| p.created_at > *ts || (p.created_at == *ts && p.id.as_str() > id.as_str()));
+                v.retain(|p| {
+                    p.created_at > *ts || (p.created_at == *ts && p.id.as_str() > id.as_str())
+                });
             }
             ReplyAnchor::Before(ts, id) => {
-                v.retain(|p| p.created_at < *ts || (p.created_at == *ts && p.id.as_str() < id.as_str()));
+                v.retain(|p| {
+                    p.created_at < *ts || (p.created_at == *ts && p.id.as_str() < id.as_str())
+                });
             }
         }
         // First/After walk ascending; Before/Latest walk descending — matching the SQL ORDER BY.
         match anchor {
             ReplyAnchor::First | ReplyAnchor::After(..) => {
-                v.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+                v.sort_by(|a, b| {
+                    a.created_at
+                        .cmp(&b.created_at)
+                        .then_with(|| a.id.cmp(&b.id))
+                });
             }
             ReplyAnchor::Before(..) | ReplyAnchor::Latest => {
-                v.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+                v.sort_by(|a, b| {
+                    b.created_at
+                        .cmp(&a.created_at)
+                        .then_with(|| b.id.cmp(&a.id))
+                });
             }
         }
         v.truncate(limit.max(0) as usize);
@@ -447,6 +583,61 @@ impl Store for InMemoryStore {
             t.last_at = post.created_at;
         }
         Ok(())
+    }
+
+    async fn replace_mentions(
+        &self,
+        post_id: &str,
+        thread_id: &str,
+        mentioned_usernames: &[String],
+        created_at: i64,
+    ) -> Result<(), StoreError> {
+        let mut mentions = self.mentions.lock().expect("mentions lock poisoned");
+        mentions.retain(|m| m.post_id != post_id);
+        let mut seen = HashSet::new();
+        for name in mentioned_usernames {
+            if seen.insert(name.as_str()) {
+                mentions.push(Mention {
+                    post_id: post_id.to_string(),
+                    thread_id: thread_id.to_string(),
+                    mentioned_username: name.to_string(),
+                    created_at,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    async fn count_mentions_for_user(&self, mentioned_username: &str) -> Result<i64, StoreError> {
+        Ok(self
+            .mentions
+            .lock()
+            .expect("mentions lock poisoned")
+            .iter()
+            .filter(|m| m.mentioned_username == mentioned_username)
+            .count() as i64)
+    }
+
+    async fn mentions_for_user(
+        &self,
+        mentioned_username: &str,
+        limit: i64,
+    ) -> Result<Vec<Mention>, StoreError> {
+        let mut v: Vec<Mention> = self
+            .mentions
+            .lock()
+            .expect("mentions lock poisoned")
+            .iter()
+            .filter(|m| m.mentioned_username == mentioned_username)
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.post_id.cmp(&a.post_id))
+        });
+        v.truncate(limit.max(0) as usize);
+        Ok(v)
     }
 
     async fn update_thread(
@@ -490,6 +681,13 @@ impl Store for InMemoryStore {
         }
         let mut reactions = self.reactions.lock().expect("reactions lock poisoned");
         reactions.retain(|r| !removed_ids.iter().any(|id| id == &r.post_id));
+        let mut mentions = self.mentions.lock().expect("mentions lock poisoned");
+        mentions.retain(|m| m.thread_id != thread_id);
+        let mut subscriptions = self
+            .subscriptions
+            .lock()
+            .expect("subscriptions lock poisoned");
+        subscriptions.retain(|s| s.thread_id != thread_id);
         Ok(())
     }
 
@@ -504,12 +702,19 @@ impl Store for InMemoryStore {
     async fn delete_post(&self, post_id: &str) -> Result<(), StoreError> {
         {
             let mut posts = self.posts.lock().expect("posts lock poisoned");
+            for p in posts.iter_mut().filter(|p| p.quoted_post_id == post_id) {
+                p.quoted_post_id.clear();
+            }
             posts.retain(|p| p.id != post_id);
         }
         // Drop this post's reactions, and clear it as any thread's accepted answer.
         {
             let mut reactions = self.reactions.lock().expect("reactions lock poisoned");
             reactions.retain(|r| r.post_id != post_id);
+        }
+        {
+            let mut mentions = self.mentions.lock().expect("mentions lock poisoned");
+            mentions.retain(|m| m.post_id != post_id);
         }
         let mut threads = self.threads.lock().expect("threads lock poisoned");
         for t in threads.iter_mut().filter(|t| t.accepted_post_id == post_id) {
@@ -548,6 +753,45 @@ impl Store for InMemoryStore {
             t.accepted_post_id = post_id.to_string();
         }
         Ok(())
+    }
+
+    async fn toggle_thread_subscription(
+        &self,
+        thread_id: &str,
+        subscriber_sub: &str,
+        created_at: i64,
+    ) -> Result<bool, StoreError> {
+        let mut subscriptions = self
+            .subscriptions
+            .lock()
+            .expect("subscriptions lock poisoned");
+        if let Some(pos) = subscriptions
+            .iter()
+            .position(|s| s.thread_id == thread_id && s.subscriber_sub == subscriber_sub)
+        {
+            subscriptions.remove(pos);
+            Ok(false)
+        } else {
+            subscriptions.push(ThreadSubscription {
+                thread_id: thread_id.to_string(),
+                subscriber_sub: subscriber_sub.to_string(),
+                _created_at: created_at,
+            });
+            Ok(true)
+        }
+    }
+
+    async fn is_thread_subscribed(
+        &self,
+        thread_id: &str,
+        subscriber_sub: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(self
+            .subscriptions
+            .lock()
+            .expect("subscriptions lock poisoned")
+            .iter()
+            .any(|s| s.thread_id == thread_id && s.subscriber_sub == subscriber_sub))
     }
 
     async fn toggle_reaction(
@@ -602,7 +846,11 @@ impl Store for InMemoryStore {
 
     async fn list_bans(&self) -> Result<Vec<BannedAuthor>, StoreError> {
         let mut v: Vec<BannedAuthor> = self.banned.lock().expect("banned lock poisoned").clone();
-        v.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.author_sub.cmp(&b.author_sub)));
+        v.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a.author_sub.cmp(&b.author_sub))
+        });
         Ok(v)
     }
 
@@ -640,6 +888,37 @@ fn thread_display_order(a: &Thread, b: &Thread) -> std::cmp::Ordering {
         .cmp(&a.pinned)
         .then_with(|| b.last_at.cmp(&a.last_at))
         .then_with(|| b.created_at.cmp(&a.created_at))
+}
+
+/// Sort threads with their reply counts. Pinned threads remain first for every mode; each
+/// non-latest mode falls back to the legacy latest order for deterministic ties.
+fn sort_thread_rows(rows: &mut [(Thread, i64)], sort: ThreadSort, now: i64) {
+    rows.sort_by(|(a, ac), (b, bc)| {
+        b.pinned.cmp(&a.pinned).then_with(|| match sort {
+            ThreadSort::Latest => b
+                .last_at
+                .cmp(&a.last_at)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| b.id.cmp(&a.id)),
+            ThreadSort::Top => bc
+                .cmp(ac)
+                .then_with(|| b.last_at.cmp(&a.last_at))
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| b.id.cmp(&a.id)),
+            ThreadSort::Hot => hot_score(*bc, b.created_at, now)
+                .partial_cmp(&hot_score(*ac, a.created_at, now))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| bc.cmp(ac))
+                .then_with(|| b.last_at.cmp(&a.last_at))
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| b.id.cmp(&a.id)),
+        })
+    });
+}
+
+fn hot_score(reply_count: i64, created_at: i64, now: i64) -> f64 {
+    let age_hours = now.saturating_sub(created_at).max(0) as f64 / 3600.0;
+    reply_count.max(0) as f64 / (age_hours + 2.0).powf(1.5)
 }
 
 // --------------------------------------------------------------------------------------
@@ -702,17 +981,23 @@ impl PgStore {
         // Additive, idempotent: denormalised copy of the original-post body, populated on
         // create_thread. Powers compose-time similarity without joining `posts`. Pre-existing
         // rows default to '' and still match on their title — graceful degradation.
-        sqlx::query("ALTER TABLE threads ADD COLUMN IF NOT EXISTS first_body_md TEXT NOT NULL DEFAULT ''")
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "ALTER TABLE threads ADD COLUMN IF NOT EXISTS first_body_md TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(&self.pool)
+        .await?;
         // Admin moderation flags: locked (no new replies) + pinned (sort first). Additive,
         // idempotent; pre-existing rows default to unlocked/unpinned. Portable BOOLEAN only.
-        sqlx::query("ALTER TABLE threads ADD COLUMN IF NOT EXISTS locked BOOLEAN NOT NULL DEFAULT FALSE")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("ALTER TABLE threads ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT FALSE")
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "ALTER TABLE threads ADD COLUMN IF NOT EXISTS locked BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE threads ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(&self.pool)
+        .await?;
         // Additive, idempotent: the reply the author/admin marked as the accepted answer. Empty
         // string means none. Portable TEXT NOT NULL DEFAULT '' — pre-existing rows read as unset.
         sqlx::query("ALTER TABLE threads ADD COLUMN IF NOT EXISTS accepted_post_id TEXT NOT NULL DEFAULT ''")
@@ -729,6 +1014,7 @@ impl PgStore {
                  id TEXT PRIMARY KEY, \
                  thread_id TEXT NOT NULL, \
                  body_md TEXT NOT NULL, \
+                 quoted_post_id TEXT NOT NULL DEFAULT '', \
                  author_sub TEXT NOT NULL, \
                  author_email TEXT NOT NULL, \
                  created_at BIGINT NOT NULL\
@@ -736,7 +1022,50 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+        sqlx::query(
+            "ALTER TABLE posts ADD COLUMN IF NOT EXISTS quoted_post_id TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(&self.pool)
+        .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_posts_thread ON posts (thread_id)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_posts_quote ON posts (quoted_post_id)")
+            .execute(&self.pool)
+            .await?;
+        // Parsed @mentions. One row per post + mentioned username; usernames are normalised by the
+        // handler before write. No cross-service notification is attempted here.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS post_mentions (\
+                 post_id TEXT NOT NULL, \
+                 thread_id TEXT NOT NULL, \
+                 mentioned_username TEXT NOT NULL, \
+                 created_at BIGINT NOT NULL, \
+                 PRIMARY KEY (post_id, mentioned_username)\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_mentions_user ON post_mentions (mentioned_username)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_mentions_thread ON post_mentions (thread_id)")
+            .execute(&self.pool)
+            .await?;
+        // Per-thread subscriptions. The composite primary key gives one subscription per user/thread.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS thread_subscriptions (\
+                 thread_id TEXT NOT NULL, \
+                 subscriber_sub TEXT NOT NULL, \
+                 created_at BIGINT NOT NULL, \
+                 PRIMARY KEY (thread_id, subscriber_sub)\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_subscriptions_user ON thread_subscriptions (subscriber_sub)")
             .execute(&self.pool)
             .await?;
         // Per-user post reactions. One row is one user's single reaction of a kind; the composite
@@ -798,6 +1127,7 @@ impl PgStore {
             id: row.try_get("id")?,
             thread_id: row.try_get("thread_id")?,
             body_md: row.try_get("body_md")?,
+            quoted_post_id: row.try_get("quoted_post_id")?,
             author_sub: row.try_get("author_sub")?,
             author_email: row.try_get("author_email")?,
             created_at: row.try_get("created_at")?,
@@ -807,7 +1137,7 @@ impl PgStore {
     const THREAD_COLS: &'static str =
         "id, category_id, title, author_sub, author_email, created_at, last_at, locked, pinned, accepted_post_id";
     const POST_COLS: &'static str =
-        "id, thread_id, body_md, author_sub, author_email, created_at";
+        "id, thread_id, body_md, quoted_post_id, author_sub, author_email, created_at";
 
     async fn seed_async(&self, defaults: &[Category]) -> Result<(), sqlx::Error> {
         let row = sqlx::query("SELECT COUNT(*) AS n FROM categories")
@@ -832,9 +1162,10 @@ impl PgStore {
     }
 
     async fn list_categories_async(&self) -> Result<Vec<Category>, sqlx::Error> {
-        let rows = sqlx::query("SELECT id, name, sort_order FROM categories ORDER BY sort_order, name")
-            .fetch_all(&self.pool)
-            .await?;
+        let rows =
+            sqlx::query("SELECT id, name, sort_order FROM categories ORDER BY sort_order, name")
+                .fetch_all(&self.pool)
+                .await?;
         rows.iter().map(Self::category_from_row).collect()
     }
 
@@ -919,9 +1250,81 @@ impl PgStore {
         rows.iter().map(Self::thread_from_row).collect()
     }
 
+    async fn list_threads_async(
+        &self,
+        category_id: Option<&str>,
+        sort: ThreadSort,
+        subscribed_sub: Option<&str>,
+        limit: i64,
+        now: i64,
+    ) -> Result<Vec<Thread>, sqlx::Error> {
+        let cols = "t.id AS id, t.category_id AS category_id, t.title AS title, \
+                    t.author_sub AS author_sub, t.author_email AS author_email, \
+                    t.created_at AS created_at, t.last_at AS last_at, t.locked AS locked, \
+                    t.pinned AS pinned, t.accepted_post_id AS accepted_post_id";
+        let group_cols = "t.id, t.category_id, t.title, t.author_sub, t.author_email, \
+                          t.created_at, t.last_at, t.locked, t.pinned, t.accepted_post_id";
+
+        let mut sql = format!(
+            "SELECT {cols}, COUNT(p.id) AS post_count \
+             FROM threads t \
+             LEFT JOIN posts p ON p.thread_id = t.id"
+        );
+        let mut where_parts: Vec<String> = Vec::new();
+        let mut next_param = 1;
+        let category_param = category_id.map(|_| {
+            let n = next_param;
+            next_param += 1;
+            n
+        });
+        let subscriber_param = subscribed_sub.map(|_| {
+            let n = next_param;
+            next_param += 1;
+            n
+        });
+        if let Some(n) = category_param {
+            where_parts.push(format!("t.category_id = ${n}"));
+        }
+        if let Some(n) = subscriber_param {
+            sql.push_str(
+                " JOIN thread_subscriptions s ON s.thread_id = t.id AND s.subscriber_sub = $",
+            );
+            sql.push_str(&n.to_string());
+        }
+        if !where_parts.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_parts.join(" AND "));
+        }
+        sql.push_str(" GROUP BY ");
+        sql.push_str(group_cols);
+
+        let mut query = sqlx::query(&sql);
+        if let Some(category_id) = category_id {
+            query = query.bind(category_id);
+        }
+        if let Some(subscriber_sub) = subscribed_sub {
+            query = query.bind(subscriber_sub);
+        }
+        let rows = query.fetch_all(&self.pool).await?;
+        let mut threads_with_counts: Vec<(Thread, i64)> = rows
+            .iter()
+            .map(|row| {
+                let thread = Self::thread_from_row(row)?;
+                let post_count: i64 = row.try_get("post_count")?;
+                Ok((thread, (post_count - 1).max(0)))
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
+        sort_thread_rows(&mut threads_with_counts, sort, now);
+        threads_with_counts.truncate(limit.max(0) as usize);
+        Ok(threads_with_counts.into_iter().map(|(t, _)| t).collect())
+    }
+
     async fn get_thread_async(&self, id: &str) -> Result<Option<Thread>, sqlx::Error> {
         let sql = format!("SELECT {} FROM threads WHERE id = $1", Self::THREAD_COLS);
-        let row = sqlx::query(&sql).bind(id).fetch_optional(&self.pool).await?;
+        let row = sqlx::query(&sql)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
         row.as_ref().map(Self::thread_from_row).transpose()
     }
 
@@ -955,7 +1358,10 @@ impl PgStore {
 
     async fn get_post_async(&self, id: &str) -> Result<Option<Post>, sqlx::Error> {
         let sql = format!("SELECT {} FROM posts WHERE id = $1", Self::POST_COLS);
-        let row = sqlx::query(&sql).bind(id).fetch_optional(&self.pool).await?;
+        let row = sqlx::query(&sql)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
         row.as_ref().map(Self::post_from_row).transpose()
     }
 
@@ -971,7 +1377,10 @@ impl PgStore {
         rows.iter().map(Self::post_from_row).collect()
     }
 
-    async fn first_post_in_thread_async(&self, thread_id: &str) -> Result<Option<Post>, sqlx::Error> {
+    async fn first_post_in_thread_async(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<Post>, sqlx::Error> {
         let sql = format!(
             "SELECT {} FROM posts WHERE thread_id = $1 ORDER BY created_at ASC, id ASC LIMIT 1",
             Self::POST_COLS
@@ -1082,12 +1491,13 @@ impl PgStore {
         .await?;
         sqlx::query(
             "INSERT INTO posts \
-                 (id, thread_id, body_md, author_sub, author_email, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+                 (id, thread_id, body_md, quoted_post_id, author_sub, author_email, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(&first_post.id)
         .bind(&first_post.thread_id)
         .bind(&first_post.body_md)
+        .bind(&first_post.quoted_post_id)
         .bind(&first_post.author_sub)
         .bind(&first_post.author_email)
         .bind(first_post.created_at)
@@ -1101,12 +1511,13 @@ impl PgStore {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO posts \
-                 (id, thread_id, body_md, author_sub, author_email, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+                 (id, thread_id, body_md, quoted_post_id, author_sub, author_email, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(&post.id)
         .bind(&post.thread_id)
         .bind(&post.body_md)
+        .bind(&post.quoted_post_id)
         .bind(&post.author_sub)
         .bind(&post.author_email)
         .bind(post.created_at)
@@ -1119,6 +1530,72 @@ impl PgStore {
             .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn replace_mentions_async(
+        &self,
+        post_id: &str,
+        thread_id: &str,
+        mentioned_usernames: &[String],
+        created_at: i64,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM post_mentions WHERE post_id = $1")
+            .bind(post_id)
+            .execute(&mut *tx)
+            .await?;
+        for name in mentioned_usernames {
+            sqlx::query(
+                "INSERT INTO post_mentions (post_id, thread_id, mentioned_username, created_at) \
+                 VALUES ($1, $2, $3, $4) ON CONFLICT (post_id, mentioned_username) DO NOTHING",
+            )
+            .bind(post_id)
+            .bind(thread_id)
+            .bind(name)
+            .bind(created_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn count_mentions_for_user_async(
+        &self,
+        mentioned_username: &str,
+    ) -> Result<i64, sqlx::Error> {
+        let row =
+            sqlx::query("SELECT COUNT(*) AS n FROM post_mentions WHERE mentioned_username = $1")
+                .bind(mentioned_username)
+                .fetch_one(&self.pool)
+                .await?;
+        row.try_get("n")
+    }
+
+    async fn mentions_for_user_async(
+        &self,
+        mentioned_username: &str,
+        limit: i64,
+    ) -> Result<Vec<Mention>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT post_id, thread_id, mentioned_username, created_at \
+             FROM post_mentions WHERE mentioned_username = $1 \
+             ORDER BY created_at DESC, post_id DESC LIMIT $2",
+        )
+        .bind(mentioned_username)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(Mention {
+                    post_id: row.try_get("post_id")?,
+                    thread_id: row.try_get("thread_id")?,
+                    mentioned_username: row.try_get("mentioned_username")?,
+                    created_at: row.try_get("created_at")?,
+                })
+            })
+            .collect()
     }
 
     async fn update_thread_async(
@@ -1154,6 +1631,14 @@ impl PgStore {
         .bind(thread_id)
         .execute(&mut *tx)
         .await?;
+        sqlx::query("DELETE FROM post_mentions WHERE thread_id = $1")
+            .bind(thread_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM thread_subscriptions WHERE thread_id = $1")
+            .bind(thread_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM posts WHERE thread_id = $1")
             .bind(thread_id)
             .execute(&mut *tx)
@@ -1181,6 +1666,14 @@ impl PgStore {
             .bind(post_id)
             .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM post_mentions WHERE post_id = $1")
+            .bind(post_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE posts SET quoted_post_id = '' WHERE quoted_post_id = $1")
+            .bind(post_id)
+            .execute(&mut *tx)
+            .await?;
         // Clear it wherever it was the accepted answer, so no thread points at a gone post.
         sqlx::query("UPDATE threads SET accepted_post_id = '' WHERE accepted_post_id = $1")
             .bind(post_id)
@@ -1194,7 +1687,11 @@ impl PgStore {
         Ok(())
     }
 
-    async fn set_thread_locked_async(&self, thread_id: &str, locked: bool) -> Result<(), sqlx::Error> {
+    async fn set_thread_locked_async(
+        &self,
+        thread_id: &str,
+        locked: bool,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE threads SET locked = $1 WHERE id = $2")
             .bind(locked)
             .bind(thread_id)
@@ -1203,7 +1700,11 @@ impl PgStore {
         Ok(())
     }
 
-    async fn set_thread_pinned_async(&self, thread_id: &str, pinned: bool) -> Result<(), sqlx::Error> {
+    async fn set_thread_pinned_async(
+        &self,
+        thread_id: &str,
+        pinned: bool,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE threads SET pinned = $1 WHERE id = $2")
             .bind(pinned)
             .bind(thread_id)
@@ -1212,7 +1713,11 @@ impl PgStore {
         Ok(())
     }
 
-    async fn move_thread_async(&self, thread_id: &str, category_id: &str) -> Result<(), sqlx::Error> {
+    async fn move_thread_async(
+        &self,
+        thread_id: &str,
+        category_id: &str,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE threads SET category_id = $1 WHERE id = $2")
             .bind(category_id)
             .bind(thread_id)
@@ -1221,13 +1726,63 @@ impl PgStore {
         Ok(())
     }
 
-    async fn set_accepted_post_async(&self, thread_id: &str, post_id: &str) -> Result<(), sqlx::Error> {
+    async fn set_accepted_post_async(
+        &self,
+        thread_id: &str,
+        post_id: &str,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE threads SET accepted_post_id = $1 WHERE id = $2")
             .bind(post_id)
             .bind(thread_id)
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    async fn toggle_thread_subscription_async(
+        &self,
+        thread_id: &str,
+        subscriber_sub: &str,
+        created_at: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let inserted = sqlx::query(
+            "INSERT INTO thread_subscriptions (thread_id, subscriber_sub, created_at) \
+             VALUES ($1, $2, $3) ON CONFLICT (thread_id, subscriber_sub) DO NOTHING",
+        )
+        .bind(thread_id)
+        .bind(subscriber_sub)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if inserted > 0 {
+            return Ok(true);
+        }
+        sqlx::query(
+            "DELETE FROM thread_subscriptions WHERE thread_id = $1 AND subscriber_sub = $2",
+        )
+        .bind(thread_id)
+        .bind(subscriber_sub)
+        .execute(&self.pool)
+        .await?;
+        Ok(false)
+    }
+
+    async fn is_thread_subscribed_async(
+        &self,
+        thread_id: &str,
+        subscriber_sub: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS n FROM thread_subscriptions \
+             WHERE thread_id = $1 AND subscriber_sub = $2",
+        )
+        .bind(thread_id)
+        .bind(subscriber_sub)
+        .fetch_one(&self.pool)
+        .await?;
+        let n: i64 = row.try_get("n")?;
+        Ok(n > 0)
     }
 
     async fn toggle_reaction_async(
@@ -1253,12 +1808,14 @@ impl PgStore {
         if inserted > 0 {
             return Ok(true);
         }
-        sqlx::query("DELETE FROM post_reactions WHERE post_id = $1 AND user_sub = $2 AND kind = $3")
-            .bind(post_id)
-            .bind(user_sub)
-            .bind(kind)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "DELETE FROM post_reactions WHERE post_id = $1 AND user_sub = $2 AND kind = $3",
+        )
+        .bind(post_id)
+        .bind(user_sub)
+        .bind(kind)
+        .execute(&self.pool)
+        .await?;
         Ok(false)
     }
 
@@ -1370,7 +1927,9 @@ impl Store for PgStore {
     }
 
     async fn set_category_order(&self, id: &str, sort_order: i64) -> Result<(), StoreError> {
-        self.set_category_order_async(id, sort_order).await.map_err(backend)
+        self.set_category_order_async(id, sort_order)
+            .await
+            .map_err(backend)
     }
 
     async fn delete_category(&self, id: &str) -> Result<(), StoreError> {
@@ -1387,6 +1946,19 @@ impl Store for PgStore {
         limit: i64,
     ) -> Result<Vec<Thread>, StoreError> {
         self.threads_in_category_async(category_id, limit)
+            .await
+            .map_err(backend)
+    }
+
+    async fn list_threads(
+        &self,
+        category_id: Option<&str>,
+        sort: ThreadSort,
+        subscribed_sub: Option<&str>,
+        limit: i64,
+        now: i64,
+    ) -> Result<Vec<Thread>, StoreError> {
+        self.list_threads_async(category_id, sort, subscribed_sub, limit, now)
             .await
             .map_err(backend)
     }
@@ -1412,7 +1984,9 @@ impl Store for PgStore {
     }
 
     async fn first_post_in_thread(&self, thread_id: &str) -> Result<Option<Post>, StoreError> {
-        self.first_post_in_thread_async(thread_id).await.map_err(backend)
+        self.first_post_in_thread_async(thread_id)
+            .await
+            .map_err(backend)
     }
 
     async fn replies_page(
@@ -1437,6 +2011,34 @@ impl Store for PgStore {
         self.add_reply_async(post).await.map_err(backend)
     }
 
+    async fn replace_mentions(
+        &self,
+        post_id: &str,
+        thread_id: &str,
+        mentioned_usernames: &[String],
+        created_at: i64,
+    ) -> Result<(), StoreError> {
+        self.replace_mentions_async(post_id, thread_id, mentioned_usernames, created_at)
+            .await
+            .map_err(backend)
+    }
+
+    async fn count_mentions_for_user(&self, mentioned_username: &str) -> Result<i64, StoreError> {
+        self.count_mentions_for_user_async(mentioned_username)
+            .await
+            .map_err(backend)
+    }
+
+    async fn mentions_for_user(
+        &self,
+        mentioned_username: &str,
+        limit: i64,
+    ) -> Result<Vec<Mention>, StoreError> {
+        self.mentions_for_user_async(mentioned_username, limit)
+            .await
+            .map_err(backend)
+    }
+
     async fn update_thread(
         &self,
         thread_id: &str,
@@ -1454,7 +2056,9 @@ impl Store for PgStore {
     }
 
     async fn update_post(&self, post_id: &str, body_md: &str) -> Result<(), StoreError> {
-        self.update_post_async(post_id, body_md).await.map_err(backend)
+        self.update_post_async(post_id, body_md)
+            .await
+            .map_err(backend)
     }
 
     async fn delete_post(&self, post_id: &str) -> Result<(), StoreError> {
@@ -1462,19 +2066,48 @@ impl Store for PgStore {
     }
 
     async fn set_thread_locked(&self, thread_id: &str, locked: bool) -> Result<(), StoreError> {
-        self.set_thread_locked_async(thread_id, locked).await.map_err(backend)
+        self.set_thread_locked_async(thread_id, locked)
+            .await
+            .map_err(backend)
     }
 
     async fn set_thread_pinned(&self, thread_id: &str, pinned: bool) -> Result<(), StoreError> {
-        self.set_thread_pinned_async(thread_id, pinned).await.map_err(backend)
+        self.set_thread_pinned_async(thread_id, pinned)
+            .await
+            .map_err(backend)
     }
 
     async fn move_thread(&self, thread_id: &str, category_id: &str) -> Result<(), StoreError> {
-        self.move_thread_async(thread_id, category_id).await.map_err(backend)
+        self.move_thread_async(thread_id, category_id)
+            .await
+            .map_err(backend)
     }
 
     async fn set_accepted_post(&self, thread_id: &str, post_id: &str) -> Result<(), StoreError> {
-        self.set_accepted_post_async(thread_id, post_id).await.map_err(backend)
+        self.set_accepted_post_async(thread_id, post_id)
+            .await
+            .map_err(backend)
+    }
+
+    async fn toggle_thread_subscription(
+        &self,
+        thread_id: &str,
+        subscriber_sub: &str,
+        created_at: i64,
+    ) -> Result<bool, StoreError> {
+        self.toggle_thread_subscription_async(thread_id, subscriber_sub, created_at)
+            .await
+            .map_err(backend)
+    }
+
+    async fn is_thread_subscribed(
+        &self,
+        thread_id: &str,
+        subscriber_sub: &str,
+    ) -> Result<bool, StoreError> {
+        self.is_thread_subscribed_async(thread_id, subscriber_sub)
+            .await
+            .map_err(backend)
     }
 
     async fn toggle_reaction(
@@ -1519,4 +2152,169 @@ impl Store for PgStore {
 /// Map an sqlx error into a [`StoreError`].
 fn backend(e: sqlx::Error) -> StoreError {
     StoreError::Backend(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn thread(id: &str, title: &str, created_at: i64) -> Thread {
+        Thread {
+            id: id.to_string(),
+            category_id: "general".to_string(),
+            title: title.to_string(),
+            author_sub: "u_alice".to_string(),
+            author_email: "alice@holdfast.local".to_string(),
+            created_at,
+            last_at: created_at,
+            locked: false,
+            pinned: false,
+            accepted_post_id: String::new(),
+        }
+    }
+
+    fn post(
+        id: &str,
+        thread_id: &str,
+        body_md: &str,
+        quoted_post_id: &str,
+        created_at: i64,
+    ) -> Post {
+        Post {
+            id: id.to_string(),
+            thread_id: thread_id.to_string(),
+            body_md: body_md.to_string(),
+            quoted_post_id: quoted_post_id.to_string(),
+            author_sub: "u_bob".to_string(),
+            author_email: "bob@holdfast.local".to_string(),
+            created_at,
+        }
+    }
+
+    async fn seed_thread(store: &InMemoryStore, id: &str, title: &str, created_at: i64) {
+        let t = thread(id, title, created_at);
+        let first = post(&format!("p_{id}_op"), id, "OP", "", created_at);
+        store.create_thread(&t, &first).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn in_memory_quote_mentions_and_cleanup() {
+        let store = InMemoryStore::new();
+        seed_thread(&store, "t_quote", "Quote", 100).await;
+
+        let reply = post(
+            "p_reply",
+            "t_quote",
+            "Thanks @Alice and @alice.",
+            "p_t_quote_op",
+            110,
+        );
+        store.add_reply(&reply).await.unwrap();
+        store
+            .replace_mentions(
+                &reply.id,
+                &reply.thread_id,
+                &["alice".to_string()],
+                reply.created_at,
+            )
+            .await
+            .unwrap();
+
+        let posts = store.posts_in_thread("t_quote").await.unwrap();
+        assert_eq!(posts[1].quoted_post_id, "p_t_quote_op");
+        assert_eq!(store.count_mentions_for_user("alice").await.unwrap(), 1);
+        let mentions = store.mentions_for_user("alice", 10).await.unwrap();
+        assert_eq!(mentions[0].post_id, "p_reply");
+
+        store.delete_post("p_t_quote_op").await.unwrap();
+        let reply = store.get_post("p_reply").await.unwrap().unwrap();
+        assert!(
+            reply.quoted_post_id.is_empty(),
+            "deleted quoted posts are cleared from replies"
+        );
+
+        store.delete_post("p_reply").await.unwrap();
+        assert_eq!(store.count_mentions_for_user("alice").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn in_memory_subscriptions_toggle_and_filter() {
+        let store = InMemoryStore::new();
+        seed_thread(&store, "t_one", "One", 100).await;
+        seed_thread(&store, "t_two", "Two", 200).await;
+
+        assert!(store
+            .toggle_thread_subscription("t_one", "u_alice", 300)
+            .await
+            .unwrap());
+        assert!(store
+            .is_thread_subscribed("t_one", "u_alice")
+            .await
+            .unwrap());
+        let subscribed = store
+            .list_threads(None, ThreadSort::Latest, Some("u_alice"), 10, 400)
+            .await
+            .unwrap();
+        assert_eq!(subscribed.len(), 1);
+        assert_eq!(subscribed[0].id, "t_one");
+
+        assert!(!store
+            .toggle_thread_subscription("t_one", "u_alice", 301)
+            .await
+            .unwrap());
+        assert!(!store
+            .is_thread_subscribed("t_one", "u_alice")
+            .await
+            .unwrap());
+        assert!(store
+            .list_threads(None, ThreadSort::Latest, Some("u_alice"), 10, 400)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn in_memory_thread_sort_top_and_hot() {
+        let store = InMemoryStore::new();
+        let now = 10_000;
+        seed_thread(&store, "t_old_busy", "Old busy", now - 7 * 86_400).await;
+        seed_thread(&store, "t_recent_small", "Recent small", now - 3_600).await;
+
+        for i in 0..20 {
+            store
+                .add_reply(&post(
+                    &format!("p_old_{i}"),
+                    "t_old_busy",
+                    "old reply",
+                    "",
+                    now - 7 * 86_400 + i,
+                ))
+                .await
+                .unwrap();
+        }
+        for i in 0..4 {
+            store
+                .add_reply(&post(
+                    &format!("p_recent_{i}"),
+                    "t_recent_small",
+                    "recent reply",
+                    "",
+                    now - 3_600 + i,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let top = store
+            .list_threads(None, ThreadSort::Top, None, 10, now)
+            .await
+            .unwrap();
+        assert_eq!(top[0].id, "t_old_busy", "top sorts by reply count");
+
+        let hot = store
+            .list_threads(None, ThreadSort::Hot, None, 10, now)
+            .await
+            .unwrap();
+        assert_eq!(hot[0].id, "t_recent_small", "hot decays older reply volume");
+    }
 }

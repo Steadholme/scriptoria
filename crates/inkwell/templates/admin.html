@@ -46,6 +46,8 @@
         <input type="hidden" name="csrf_token" value="{{CSRF}}">
         <label for="bulk-action">Bulk action</label>
         <select id="bulk-action" name="action">
+          <option value="pin">Pin</option>
+          <option value="unpin">Unpin</option>
           <option value="feature">Feature</option>
           <option value="unfeature">Unfeature</option>
           <option value="unpublish">Unpublish</option>
@@ -60,6 +62,7 @@
             <th>Title</th>
             <th>Author</th>
             <th>Status</th>
+            <th>Pinned</th>
             <th>Featured</th>
             <th>Actions</th>
           </tr>

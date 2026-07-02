@@ -427,6 +427,11 @@ body.page { max-width:none; margin:0; padding:0; }
 
 /* thread list */
 .thread-list { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--sh-xs); overflow: hidden; }
+.thread-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 0 0 12px; }
+.thread-controls label { font-size: 13px; font-weight: 550; color: var(--ink-2); }
+.thread-controls select { width: auto; min-width: 120px; height: 32px; font-size: 13px; }
+.thread-filter { display: inline-flex; align-items: center; gap: 7px; }
+.thread-filter input { width: 16px; height: 16px; accent-color: var(--accent); }
 .thread-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 18px; border-bottom: 1px solid var(--border); color: var(--ink); }
 .thread-row:last-child { border-bottom: 0; }
 .thread-row:hover { background: var(--surface-2); color: inherit; }
@@ -439,6 +444,9 @@ body.page { max-width:none; margin:0; padding:0; }
 /* thread head */
 .thread-head { margin-bottom: 20px; }
 .thread-head h1 { margin: 0 0 8px; font-size: 28px; font-weight: 600; letter-spacing: -.025em; }
+.subscription-form { margin-top: 12px; display: inline-block; }
+.mentions__title { display: flex; align-items: center; gap: 8px; }
+.mention-badge { margin-left: 0; }
 
 /* posts */
 .posts { display: flex; flex-direction: column; gap: 16px; margin-bottom: 32px; }
@@ -522,6 +530,9 @@ body.page { max-width:none; margin:0; padding:0; }
 .markdown a { color: var(--accent-2); text-decoration: underline; }
 .markdown a:hover { color: var(--accent); }
 .markdown blockquote { margin: 0 0 12px; padding: 8px 16px; border-left: 3px solid var(--border-2); color: var(--ink-2); background: var(--surface-2); border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
+.quote-preview { margin: 4px 0 8px; }
+.quote-preview blockquote, .post-quote { font-size: 13.5px; }
+.quote-preview__by, .post-quote__by { margin: 0 0 4px; font-weight: 600; color: var(--ink); }
 .markdown pre { background: var(--surface-2); color: var(--ink); border: 1px solid var(--border); padding: 14px 16px; border-radius: var(--radius-sm); overflow-x: auto; font-size: 12.5px; line-height: 1.55; }
 .markdown pre code { background: transparent; border: 0; padding: 0; color: inherit; }
 .markdown code { background: var(--surface-2); border: 1px solid var(--border); padding: 1px 6px; border-radius: 5px; font-size: .92em; font-family: var(--mono); color: var(--ink); }

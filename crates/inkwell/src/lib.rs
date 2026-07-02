@@ -78,8 +78,15 @@ pub fn app(state: AppState) -> Router {
         .route("/admin", get(handlers::admin::index))
         .route("/admin/settings", post(handlers::admin::update_settings))
         .route("/admin/posts/bulk", post(handlers::admin::bulk))
-        .route("/admin/posts/{slug}/feature", post(handlers::admin::feature))
-        .route("/admin/posts/{slug}/unpublish", post(handlers::admin::unpublish))
+        .route("/admin/posts/{slug}/pin", post(handlers::admin::pin))
+        .route(
+            "/admin/posts/{slug}/feature",
+            post(handlers::admin::feature),
+        )
+        .route(
+            "/admin/posts/{slug}/unpublish",
+            post(handlers::admin::unpublish),
+        )
         .route("/admin/posts/{slug}/delete", post(handlers::admin::delete))
         // "Ask your blog" — retrieval over the blog's own published posts (additive).
         .route("/ask", get(handlers::ask::ask_page))
@@ -145,7 +152,11 @@ pub async fn build_state_from_env() -> Result<AppState, String> {
             Arc::new(pg)
         }
         "memory" => Arc::new(InMemoryStore::new()),
-        other => return Err(format!("unknown INKWELL_STORE={other} (use memory|postgres)")),
+        other => {
+            return Err(format!(
+                "unknown INKWELL_STORE={other} (use memory|postgres)"
+            ))
+        }
     };
 
     let audit = AuditSink::start(
@@ -217,8 +228,9 @@ pub async fn unique_slug(store: &dyn Store, title: &str, fallback: &str) -> Stri
 /// (Re)index a single post. A PUBLISHED post is chunked into the index; a DRAFT (or any unpublished
 /// post) is de-indexed so it never surfaces in an answer. Best-effort: errors are logged only.
 pub async fn reindex_post(store: &dyn Store, post: &Post) {
-    let chunks = if post.published {
-        index::build_post_chunks(&post.slug, &post.title, &post.body_md, now_secs())
+    let now = now_secs();
+    let chunks = if post.is_public_at(now) {
+        index::build_post_chunks(&post.slug, &post.title, &post.body_md, now)
     } else {
         Vec::new()
     };
@@ -241,7 +253,7 @@ pub async fn build_full_index(store: &dyn Store) -> i64 {
     let now = now_secs();
     let mut chunks = Vec::new();
     for p in store.list_posts(None, crate::config::MAX_PAGE).await {
-        if p.published {
+        if p.is_public_at(now) {
             chunks.extend(index::build_post_chunks(&p.slug, &p.title, &p.body_md, now));
         }
     }

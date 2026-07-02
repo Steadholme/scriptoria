@@ -343,6 +343,7 @@ async fn seed_replies(state: &AppState, tid: &str, count: usize) {
             id: format!("p_seed_{i:04}"),
             thread_id: tid.to_string(),
             body_md: format!("reply-body-{i:03}"),
+            quoted_post_id: String::new(),
             author_sub: BOB_SUB.to_string(),
             author_email: BOB_EMAIL.to_string(),
             created_at: base + i as i64,

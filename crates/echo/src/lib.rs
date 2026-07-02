@@ -17,6 +17,8 @@
 //! - `POST /api/comment/edit`   author self-edit of one's OWN comment (CSRF)
 //! - `POST /api/comment/delete` author self-delete of one's OWN comment (CSRF)
 //! - `POST /api/comment/react`  toggle a reaction on a comment (CSRF)
+//! - `POST /api/comment/vote`   toggle an up/down vote on a comment (CSRF)
+//! - `POST /api/comment/report` report/flag a comment for moderation (CSRF)
 //! - `POST /api/moderate`   hide / unhide a comment (CSRF + moderator group)
 //! - `GET  /embed/{key}`    a minimal, iframe-able thread + composer (X-Frame-Options SAMEORIGIN)
 //! - `GET  /admin`          moderation panel: all comments + bulk controls + author blocklist (admin)
@@ -60,8 +62,13 @@ pub fn app(state: AppState) -> Router {
         .route("/embed/{key}", get(handlers::comments::embed_view))
         .route("/api/comment", post(handlers::comments::post_comment))
         .route("/api/comment/edit", post(handlers::comments::edit_comment))
-        .route("/api/comment/delete", post(handlers::comments::delete_comment))
+        .route(
+            "/api/comment/delete",
+            post(handlers::comments::delete_comment),
+        )
         .route("/api/comment/react", post(handlers::comments::react))
+        .route("/api/comment/vote", post(handlers::comments::vote))
+        .route("/api/comment/report", post(handlers::comments::report))
         .route("/api/moderate", post(handlers::comments::moderate))
         // Admin panel subtree — every route is gated by `require_admin` (403 for non-admins).
         .route("/admin", get(handlers::admin::dashboard))

@@ -26,10 +26,18 @@ async fn admin_dashboard_is_gated_to_admins() {
     // Ordinary signed-in user (non-admin groups) -> 403.
     let (status, _) = call(
         &state,
-        get_g("/admin", Some(("u_eve", "eve@hf")), Some("readers,moderators")),
+        get_g(
+            "/admin",
+            Some(("u_eve", "eve@hf")),
+            Some("readers,moderators"),
+        ),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "non-admin user cannot see /admin");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "non-admin user cannot see /admin"
+    );
 
     // `admins` group -> 200 and the panel renders.
     let (status, body) = call(
@@ -44,7 +52,11 @@ async fn admin_dashboard_is_gated_to_admins() {
     // `infra-admins` also unlocks it.
     let (status, _) = call(
         &state,
-        get_g("/admin", Some(("u_ops", "ops@hf")), Some("dev,infra-admins")),
+        get_g(
+            "/admin",
+            Some(("u_ops", "ops@hf")),
+            Some("dev,infra-admins"),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "infra-admins group unlocks /admin");
@@ -58,22 +70,44 @@ async fn admin_moderate_is_gated_and_csrf_protected() {
     let id = extract_comment_id(&view).expect("comment id");
 
     // Non-admin cannot bulk-moderate -> 403 (gating runs before CSRF).
-    let body = form(&[("comment_id", &id), ("action", "hide"), ("csrf_token", CSRF)]);
+    let body = form(&[
+        ("comment_id", &id),
+        ("action", "hide"),
+        ("csrf_token", CSRF),
+    ]);
     let (status, _) = call(
         &state,
-        post_g("/admin/moderate", &body, Some(("u_eve", "eve@hf")), Some("moderators")),
+        post_g(
+            "/admin/moderate",
+            &body,
+            Some(("u_eve", "eve@hf")),
+            Some("moderators"),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "non-admin cannot moderate");
 
     // Admin but bad CSRF -> 401.
-    let bad = form(&[("comment_id", &id), ("action", "hide"), ("csrf_token", "WRONG")]);
+    let bad = form(&[
+        ("comment_id", &id),
+        ("action", "hide"),
+        ("csrf_token", "WRONG"),
+    ]);
     let (status, _) = call(
         &state,
-        post_g("/admin/moderate", &bad, Some(("u_root", "root@hf")), Some("admins")),
+        post_g(
+            "/admin/moderate",
+            &bad,
+            Some(("u_root", "root@hf")),
+            Some("admins"),
+        ),
     )
     .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "admin CSRF mismatch -> 401");
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "admin CSRF mismatch -> 401"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -106,15 +140,26 @@ async fn admin_bulk_hide_unhide_and_delete() {
     );
 
     // Bulk UNHIDE just the first.
-    let body = form(&[("comment_id", &id0), ("action", "unhide"), ("csrf_token", CSRF)]);
+    let body = form(&[
+        ("comment_id", &id0),
+        ("action", "unhide"),
+        ("csrf_token", CSRF),
+    ]);
     let (status, _) = admin_post(&state, "/admin/moderate", &body).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     let (_, view) = call(&state, get("/t/k")).await;
     assert!(view.contains("one"), "first comment restored");
-    assert!(view.contains("[comment hidden by a moderator]"), "second still hidden");
+    assert!(
+        view.contains("[comment hidden by a moderator]"),
+        "second still hidden"
+    );
 
     // DELETE-ANY the second (admin deletes a comment it does not own).
-    let body = form(&[("comment_id", &id1), ("action", "delete"), ("csrf_token", CSRF)]);
+    let body = form(&[
+        ("comment_id", &id1),
+        ("action", "delete"),
+        ("csrf_token", CSRF),
+    ]);
     let (status, _) = admin_post(&state, "/admin/moderate", &body).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     let (_, view) = call(&state, get("/t/k")).await;
@@ -122,7 +167,11 @@ async fn admin_bulk_hide_unhide_and_delete() {
     assert!(view.contains("one"), "first comment remains");
 
     // An unknown action is rejected.
-    let body = form(&[("comment_id", &id0), ("action", "nuke"), ("csrf_token", CSRF)]);
+    let body = form(&[
+        ("comment_id", &id0),
+        ("action", "nuke"),
+        ("csrf_token", CSRF),
+    ]);
     let (status, _) = admin_post(&state, "/admin/moderate", &body).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "unknown action -> 400");
 
@@ -142,7 +191,11 @@ async fn admin_block_hides_and_rejects_then_unblock_restores() {
     seed_comment(&state, "k", "spammy comment", ("u_spam", "spam@hf")).await;
 
     // Block the author.
-    let body = form(&[("author_sub", "u_spam"), ("reason", "spam"), ("csrf_token", CSRF)]);
+    let body = form(&[
+        ("author_sub", "u_spam"),
+        ("reason", "spam"),
+        ("csrf_token", CSRF),
+    ]);
     let (status, _) = admin_post(&state, "/admin/block", &body).await;
     assert_eq!(status, StatusCode::SEE_OTHER, "block ok");
 
@@ -178,27 +231,204 @@ async fn admin_block_hides_and_rejects_then_unblock_restores() {
         post_g("/api/comment", &body, Some(("u_ok", "ok@hf")), None),
     )
     .await;
-    assert_eq!(status, StatusCode::SEE_OTHER, "unblocked author still posts");
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "unblocked author still posts"
+    );
 
     // Unblock restores the author's comment and re-permits posting.
     let body = form(&[("author_sub", "u_spam"), ("csrf_token", CSRF)]);
     let (status, _) = admin_post(&state, "/admin/unblock", &body).await;
     assert_eq!(status, StatusCode::SEE_OTHER, "unblock ok");
     let (_, view) = call(&state, get("/t/k")).await;
-    assert!(view.contains("spammy comment"), "unblock restored the comment");
+    assert!(
+        view.contains("spammy comment"),
+        "unblock restored the comment"
+    );
 
-    let body = form(&[("thread_key", "k"), ("body", "back again"), ("csrf_token", CSRF)]);
+    let body = form(&[
+        ("thread_key", "k"),
+        ("body", "back again"),
+        ("csrf_token", CSRF),
+    ]);
     let (status, _) = call(
         &state,
         post_g("/api/comment", &body, Some(("u_spam", "spam@hf")), None),
     )
     .await;
-    assert_eq!(status, StatusCode::SEE_OTHER, "unblocked author can post again");
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "unblocked author can post again"
+    );
 
     // Unblocking a never-blocked author -> 404.
     let body = form(&[("author_sub", "u_nobody"), ("csrf_token", CSRF)]);
     let (status, _) = admin_post(&state, "/admin/unblock", &body).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "unknown block -> 404");
+}
+
+// ---------------------------------------------------------------------------
+// Reports
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn report_comment_surfaces_in_admin_queue() {
+    let state = build_dev_state();
+    seed_comment(&state, "k", "reportable comment", ("u_alice", "alice@hf")).await;
+    let (_, view) = call(&state, get("/t/k")).await;
+    let id = extract_comment_id(&view).expect("comment id");
+
+    // No identity -> 401.
+    let body = form(&[
+        ("comment_id", &id),
+        ("reason", "spam"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, _) = call(&state, post_g("/api/comment/report", &body, None, None)).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "report needs SSO identity"
+    );
+
+    // Bad CSRF -> 401.
+    let bad = form(&[
+        ("comment_id", &id),
+        ("reason", "spam"),
+        ("csrf_token", "WRONG"),
+    ]);
+    let (status, _) = call(
+        &state,
+        post_g("/api/comment/report", &bad, Some(("u_bob", "bob@hf")), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "report needs CSRF");
+
+    // Blank reason -> 400.
+    let blank = form(&[("comment_id", &id), ("reason", "   "), ("csrf_token", CSRF)]);
+    let (status, _) = call(
+        &state,
+        post_g(
+            "/api/comment/report",
+            &blank,
+            Some(("u_bob", "bob@hf")),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "blank report reason rejected"
+    );
+
+    // Missing comment -> 404.
+    let miss = form(&[
+        ("comment_id", "cmt_nope"),
+        ("reason", "spam"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, _) = call(
+        &state,
+        post_g(
+            "/api/comment/report",
+            &miss,
+            Some(("u_bob", "bob@hf")),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "report on missing comment -> 404"
+    );
+
+    // First report is stored and rendered in the existing admin moderation queue.
+    let reason = "rude <script>alert(1)</script>";
+    let body = form(&[
+        ("comment_id", &id),
+        ("reason", reason),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, _) = call(
+        &state,
+        post_g(
+            "/api/comment/report",
+            &body,
+            Some(("u_bob", "bob@hf")),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "report ok");
+
+    let (_, admin) = call(
+        &state,
+        get_g("/admin", Some(("u_root", "root@hf")), Some("admins")),
+    )
+    .await;
+    assert!(admin.contains("1 report"), "report count shown");
+    assert!(admin.contains("rude &lt;script&gt;"), "reason is escaped");
+    assert!(
+        !admin.contains("<script>alert"),
+        "raw reason never rendered"
+    );
+
+    // Same reporter updates their one row; count stays 1 and the reason changes.
+    let update = form(&[
+        ("comment_id", &id),
+        ("reason", "updated reason"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, _) = call(
+        &state,
+        post_g(
+            "/api/comment/report",
+            &update,
+            Some(("u_bob", "bob@hf")),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "report update ok");
+    let (_, admin) = call(
+        &state,
+        get_g("/admin", Some(("u_root", "root@hf")), Some("admins")),
+    )
+    .await;
+    assert!(
+        admin.contains("1 report"),
+        "same reporter still counts once"
+    );
+    assert!(admin.contains("updated reason"), "updated reason shown");
+
+    // A second reporter increments the count.
+    let second = form(&[
+        ("comment_id", &id),
+        ("reason", "harassment"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, _) = call(
+        &state,
+        post_g(
+            "/api/comment/report",
+            &second,
+            Some(("u_carol", "carol@hf")),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "second reporter ok");
+    let (_, admin) = call(
+        &state,
+        get_g("/admin", Some(("u_root", "root@hf")), Some("admins")),
+    )
+    .await;
+    assert!(admin.contains("2 reports"), "two reporters counted");
+    assert!(admin.contains("harassment"), "second reason shown");
 }
 
 // ---------------------------------------------------------------------------
@@ -208,7 +438,9 @@ async fn admin_block_hides_and_rejects_then_unblock_restores() {
 async fn call(state: &echo::AppState, req: Request<Body>) -> (StatusCode, String) {
     let resp = app(state.clone()).oneshot(req).await.unwrap();
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     (status, String::from_utf8_lossy(&bytes).to_string())
 }
 
@@ -238,7 +470,9 @@ fn get_g(uri: &str, ident: Option<(&str, &str)>, groups: Option<&str>) -> Reques
         .uri(uri)
         .header(header::COOKIE, format!("__Host-csrf={CSRF}"));
     if let Some((sub, email)) = ident {
-        b = b.header("x-auth-subject", sub).header("x-auth-email", email);
+        b = b
+            .header("x-auth-subject", sub)
+            .header("x-auth-email", email);
     }
     if let Some(g) = groups {
         b = b.header("x-auth-groups", g);
@@ -259,7 +493,9 @@ fn post_g(
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header(header::COOKIE, format!("__Host-csrf={CSRF}"));
     if let Some((sub, email)) = ident {
-        b = b.header("x-auth-subject", sub).header("x-auth-email", email);
+        b = b
+            .header("x-auth-subject", sub)
+            .header("x-auth-email", email);
     }
     if let Some(g) = groups {
         b = b.header("x-auth-groups", g);
@@ -279,7 +515,9 @@ fn enc(s: &str) -> String {
     let mut o = String::new();
     for b in s.bytes() {
         match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => o.push(b as char),
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                o.push(b as char)
+            }
             b' ' => o.push('+'),
             _ => o.push_str(&format!("%{b:02X}")),
         }

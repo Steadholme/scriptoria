@@ -112,12 +112,13 @@ pub async fn sitemap_xml(State(state): State<AppState>) -> Response {
 
 /// One bounded, newest-first page of the PUBLISHED posts (drafts filtered out — never syndicated).
 async fn published_newest_first(state: &AppState) -> Vec<Post> {
+    let now = crate::now_secs();
     state
         .store
         .list_posts(None, MAX_PAGE)
         .await
         .into_iter()
-        .filter(|p| p.published)
+        .filter(|p| p.is_public_at(now))
         .collect()
 }
 

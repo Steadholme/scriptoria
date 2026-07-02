@@ -18,6 +18,8 @@ pub const COMMENT_LIMIT: usize = 500;
 pub const RECENT_LIMIT: usize = 30;
 /// Hard cap on a comment body, in characters (defense against unbounded input).
 pub const MAX_BODY_CHARS: usize = 16 * 1024;
+/// Hard cap on a report reason, in characters (keeps moderation rows bounded).
+pub const MAX_REPORT_REASON_CHARS: usize = 1_000;
 /// How many TOP-LEVEL comments a thread/embed view renders per keyset page (their replies come
 /// along with them). Long threads page BACKWARD with `?before=` from the "Load more" control.
 pub const COMMENT_PAGE: i64 = 20;

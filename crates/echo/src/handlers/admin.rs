@@ -15,6 +15,7 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use axum::Form;
 use serde::Deserialize;
+use std::collections::HashMap;
 
 use crate::audit::AuditEvent;
 use crate::auth;
@@ -23,7 +24,7 @@ use crate::error::AppError;
 use crate::handlers::comments::{html_with_cookie, local_redirect, path_seg, redirect};
 use crate::handlers::{esc, fmt_datetime, topbar, APP_CSS};
 use crate::markdown;
-use crate::store::{BlockedAuthor, Comment, Thread};
+use crate::store::{BlockedAuthor, Comment, CommentReport, Thread};
 use crate::{now_secs, AppState};
 
 const ADMIN_HTML: &str = include_str!("../../templates/admin.html");
@@ -58,23 +59,32 @@ pub struct UnblockForm {
 
 /// `GET /admin` — the moderation panel: every comment (grouped under its thread) with a bulk
 /// hide/unhide/delete form, plus the author blocklist. Admin-gated; a non-admin gets a 403 page.
-pub async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, AppError> {
+pub async fn dashboard(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
     auth::require_admin(&headers)?;
     let email = auth::display_email(&headers);
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
 
     // Newest threads first; for each, its comments oldest-first (the store's natural order).
     let threads = state.store.list_threads(None, MAX_PAGE).await;
-    let mut rows = String::new();
+    let mut queue: Vec<(Thread, Comment)> = Vec::new();
     for t in &threads {
         for c in &state.store.list_comments(&t.id).await {
-            rows.push_str(&render_mod_row(t, c));
+            queue.push((t.clone(), c.clone()));
         }
     }
+    let ids: Vec<String> = queue.iter().map(|(_, c)| c.id.clone()).collect();
+    let reports = state.store.reports_for(&ids).await;
+    let report_summary = ReportSummaries::build(&reports);
+
+    let mut rows = String::new();
+    for (t, c) in &queue {
+        rows.push_str(&render_mod_row(t, c, &report_summary));
+    }
     if rows.is_empty() {
-        rows.push_str(
-            r#"<tr><td colspan="6" class="table__empty">No comments yet.</td></tr>"#,
-        );
+        rows.push_str(r#"<tr><td colspan="7" class="table__empty">No comments yet.</td></tr>"#);
     }
     let moderation = render_moderation_form(&rows, &csrf);
 
@@ -137,7 +147,7 @@ pub async fn moderate(
         other => {
             return Err(AppError::InvalidRequest(format!(
                 "unknown action {other} (use hide|unhide|delete)"
-            )))
+            )));
         }
     };
     if ids.is_empty() {
@@ -184,9 +194,15 @@ pub async fn block(
 
     let target = form.author_sub.trim();
     if target.is_empty() {
-        return Err(AppError::InvalidRequest("author_sub is required".to_string()));
+        return Err(AppError::InvalidRequest(
+            "author_sub is required".to_string(),
+        ));
     }
-    let actor = if email.is_empty() { sub.clone() } else { email.clone() };
+    let actor = if email.is_empty() {
+        sub.clone()
+    } else {
+        email.clone()
+    };
 
     let entry = BlockedAuthor {
         author_sub: target.to_string(),
@@ -222,11 +238,15 @@ pub async fn unblock(
 
     let target = form.author_sub.trim();
     if target.is_empty() {
-        return Err(AppError::InvalidRequest("author_sub is required".to_string()));
+        return Err(AppError::InvalidRequest(
+            "author_sub is required".to_string(),
+        ));
     }
     let removed = state.store.unblock_author(target).await?;
     if !removed {
-        return Err(AppError::NotFound("author is not on the blocklist".to_string()));
+        return Err(AppError::NotFound(
+            "author is not on the blocklist".to_string(),
+        ));
     }
     // Symmetric with block: unblocking restores the author's previously auto-hidden comments.
     let restored = state.store.set_hidden_by_author(target, false).await?;
@@ -265,20 +285,48 @@ fn author_label(c: &Comment) -> String {
     }
 }
 
+/// Reports folded by comment id for the moderation table.
+struct ReportSummaries {
+    by_comment: HashMap<String, Vec<CommentReport>>,
+}
+
+impl ReportSummaries {
+    fn build(rows: &[CommentReport]) -> Self {
+        let mut by_comment: HashMap<String, Vec<CommentReport>> = HashMap::new();
+        for r in rows {
+            by_comment
+                .entry(r.comment_id.clone())
+                .or_default()
+                .push(r.clone());
+        }
+        ReportSummaries { by_comment }
+    }
+
+    fn for_comment(&self, comment_id: &str) -> &[CommentReport] {
+        self.by_comment
+            .get(comment_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+}
+
 /// One row of the bulk-moderation table: a select checkbox, the thread link, author, a body
-/// preview, the hidden/visible status, and the created time. Every field is HTML-escaped.
-fn render_mod_row(t: &Thread, c: &Comment) -> String {
+/// preview, the report summary, the hidden/visible status, and the created time. Every field is
+/// HTML-escaped.
+fn render_mod_row(t: &Thread, c: &Comment, reports: &ReportSummaries) -> String {
     let status = if c.hidden {
         r#"<span class="badge badge-hidden">Hidden</span>"#
     } else {
         r#"<span class="muted">Visible</span>"#
     };
+    let report_html = render_report_summary(reports.for_comment(&c.id));
     format!(
         r#"<tr>
   <td><input type="checkbox" name="comment_id" value="{id}"></td>
   <td><a href="/t/{key}">{title}</a></td>
   <td>{author}</td>
   <td>{preview}</td>
+  <td>{reports}</td>
   <td>{status}</td>
   <td class="muted">{created}</td>
 </tr>"#,
@@ -287,9 +335,44 @@ fn render_mod_row(t: &Thread, c: &Comment) -> String {
         title = esc(&display_title(t)),
         author = esc(&author_label(c)),
         preview = esc(&markdown::preview(&c.body, 120)),
+        reports = report_html,
         status = status,
         created = esc(&fmt_datetime(c.created_at)),
     )
+}
+
+fn render_report_summary(reports: &[CommentReport]) -> String {
+    if reports.is_empty() {
+        return r#"<span class="muted">None</span>"#.to_string();
+    }
+    let mut reasons = String::new();
+    for r in reports {
+        reasons.push_str(&format!(
+            r#"<li><span class="mono">{who}</span>: {reason}</li>"#,
+            who = esc(&r.reporter_sub),
+            reason = esc(&preview_text(&r.reason, 120)),
+        ));
+    }
+    let label = if reports.len() == 1 {
+        "report"
+    } else {
+        "reports"
+    };
+    format!(
+        r#"<div class="report-summary"><span class="badge badge-warn">{n} {label}</span><ul>{reasons}</ul></div>"#,
+        n = reports.len(),
+        label = label,
+        reasons = reasons,
+    )
+}
+
+fn preview_text(s: &str, max_chars: usize) -> String {
+    let trimmed = s.trim();
+    let mut out: String = trimmed.chars().take(max_chars).collect();
+    if trimmed.chars().count() > max_chars {
+        out.push_str("...");
+    }
+    out
 }
 
 /// Wrap the comment rows in the bulk-action form. Three submit buttons share the `action` name so
@@ -300,7 +383,7 @@ fn render_moderation_form(rows: &str, csrf: &str) -> String {
   <input type="hidden" name="csrf_token" value="{csrf}">
   <input type="hidden" name="return_to" value="/admin">
   <table class="table">
-    <thead><tr><th></th><th>Thread</th><th>Author</th><th>Comment</th><th>Status</th><th>Created</th></tr></thead>
+    <thead><tr><th></th><th>Thread</th><th>Author</th><th>Comment</th><th>Reports</th><th>Status</th><th>Created</th></tr></thead>
     <tbody>{rows}</tbody>
   </table>
   <div class="composer__actions">

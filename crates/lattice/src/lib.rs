@@ -19,6 +19,7 @@
 //! - `GET /history/{slug}` — the revision list (or a line-level diff of two revisions via
 //!   `?from=<rev_id>&to=<rev_id>`); each older revision offers a CSRF-protected revert.
 //! - `POST /revert/{slug}` — re-save an old revision's body as a new revision (CSRF + audit).
+//! - `POST /move/{slug}` — re-parent a page in the nested tree (CSRF + audit).
 //! - `GET /coherence` — maintenance view: stale pages + contradiction candidates (additive).
 
 pub mod audit;
@@ -36,7 +37,7 @@ pub mod store;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 
 use crate::audit::AuditSink;
@@ -63,7 +64,8 @@ pub fn app(state: AppState) -> Router {
             get(handlers::pages::edit_form).post(handlers::pages::edit_submit),
         )
         .route("/history/{slug}", get(handlers::pages::history))
-        .route("/revert/{slug}", axum::routing::post(handlers::pages::revert_submit))
+        .route("/revert/{slug}", post(handlers::pages::revert_submit))
+        .route("/move/{slug}", post(handlers::pages::move_submit))
         .route("/coherence", get(handlers::coherence::coherence))
         .fallback(handlers::pages::not_found)
         // Reject a forged gateway identity (spoofed X-Auth-* from a rogue in-network peer):
@@ -127,7 +129,11 @@ pub async fn build_state_from_env() -> Result<AppState, String> {
             Arc::new(pg)
         }
         "memory" => Arc::new(InMemoryStore::new()),
-        other => return Err(format!("unknown LATTICE_STORE={other} (use memory|postgres)")),
+        other => {
+            return Err(format!(
+                "unknown LATTICE_STORE={other} (use memory|postgres)"
+            ))
+        }
     };
 
     let audit = AuditSink::start(

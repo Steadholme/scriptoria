@@ -561,6 +561,171 @@ async fn recent_list_default_page_has_no_load_older_when_short() {
     assert!(!listing.body.contains("Load older"));
 }
 
+#[tokio::test]
+async fn multi_file_create_view_and_raw() {
+    let app = app(build_dev_state());
+    // A two-file paste: repeated file_name / file_content rows.
+    let (id, _) = create_paste(
+        &app,
+        "alice",
+        &[
+            ("title", "gist-like"),
+            ("language", "plaintext"),
+            ("file_name", "alpha.txt"),
+            ("file_content", "alpha file body"),
+            ("file_name", "bravo.txt"),
+            ("file_content", "bravo file body"),
+            ("expiry", "never"),
+        ],
+    )
+    .await;
+
+    // The view renders each file with its own header + numbered lines.
+    let view = send(&app, get(&format!("/p/{id}"), Some("alice"))).await;
+    assert_eq!(view.status, StatusCode::OK);
+    assert!(view.body.contains("<div class=\"file-block\">"), "multi-file view uses per-file blocks");
+    assert!(view.body.contains("<span>alpha.txt</span>"));
+    assert!(view.body.contains("<span>bravo.txt</span>"));
+    assert!(view.body.contains("1 of 2"));
+    assert!(view.body.contains("2 of 2"));
+    assert!(view.body.contains("alpha file body"));
+    assert!(view.body.contains("bravo file body"));
+
+    // Raw serves a readable, filename-delimited concatenation of every file.
+    let raw = send(&app, get(&format!("/raw/{id}"), Some("alice"))).await;
+    assert_eq!(raw.status, StatusCode::OK);
+    assert!(raw.body.contains("alpha file body"));
+    assert!(raw.body.contains("bravo file body"));
+    assert!(raw.body.contains("alpha.txt"));
+}
+
+#[tokio::test]
+async fn single_file_paste_has_no_file_headers() {
+    // Backward compatibility: a one-file paste (via the legacy `body` field OR a single file row)
+    // renders exactly one unlabeled code block — no per-file header.
+    let app = app(build_dev_state());
+    let (id, _) = create_paste(
+        &app,
+        "alice",
+        &[
+            ("title", "just one"),
+            ("language", "plaintext"),
+            ("body", "only one file here"),
+            ("expiry", "never"),
+        ],
+    )
+    .await;
+    let view = send(&app, get(&format!("/p/{id}"), Some("alice"))).await;
+    assert_eq!(view.status, StatusCode::OK);
+    assert!(view.body.contains("only one file here"));
+    assert!(!view.body.contains("<div class=\"file-block\">"), "single-file paste has no per-file header");
+}
+
+#[tokio::test]
+async fn multi_file_filenames_are_html_escaped() {
+    let app = app(build_dev_state());
+    let (id, _) = create_paste(
+        &app,
+        "alice",
+        &[
+            ("language", "plaintext"),
+            ("file_name", "<script>x</script>.js"),
+            ("file_content", "safe content one"),
+            ("file_name", "b.js"),
+            ("file_content", "safe content two"),
+        ],
+    )
+    .await;
+    let view = send(&app, get(&format!("/p/{id}"), Some("alice"))).await;
+    assert!(view.body.contains("&lt;script&gt;x&lt;/script&gt;.js"));
+    assert!(!view.body.contains("<script>x</script>.js"));
+}
+
+#[tokio::test]
+async fn fork_copies_all_files() {
+    let app = app(build_dev_state());
+    let (id, _) = create_paste(
+        &app,
+        "alice",
+        &[
+            ("title", "multi source"),
+            ("language", "plaintext"),
+            ("file_name", "one.txt"),
+            ("file_content", "content of file one"),
+            ("file_name", "two.txt"),
+            ("file_content", "content of file two"),
+        ],
+    )
+    .await;
+
+    // Bob forks the multi-file paste; the fork carries every file + a "forked from" credit.
+    let view = send(&app, get(&format!("/p/{id}"), Some("bob"))).await;
+    let csrf = view.csrf_cookie().unwrap();
+    let forked = send(
+        &app,
+        post_form(&format!("/fork/{id}"), &[("csrf_token", &csrf)], &csrf, Some("bob")),
+    )
+    .await;
+    assert_eq!(forked.status, StatusCode::FOUND);
+    let fork_id = forked.location().trim_start_matches("/p/").to_string();
+    assert_ne!(fork_id, id);
+
+    let fview = send(&app, get(&format!("/p/{fork_id}"), Some("bob"))).await;
+    assert!(fview.body.contains("<span>one.txt</span>"));
+    assert!(fview.body.contains("<span>two.txt</span>"));
+    assert!(fview.body.contains("content of file one"));
+    assert!(fview.body.contains("content of file two"));
+    assert!(fview.body.contains(&format!("Forked from <a href=\"/p/{id}\">")));
+}
+
+#[tokio::test]
+async fn edit_single_into_multi_file_snapshots_revision() {
+    let app = app(build_dev_state());
+    // Start as a legacy single-content paste.
+    let (id, _) = create_paste(
+        &app,
+        "alice",
+        &[
+            ("title", "grows up"),
+            ("language", "plaintext"),
+            ("body", "originally one file"),
+        ],
+    )
+    .await;
+    let view = send(&app, get(&format!("/p/{id}"), Some("alice"))).await;
+    assert!(!view.body.contains("<div class=\"file-block\">"));
+    let ecsrf = view.csrf_cookie().unwrap();
+
+    // Edit into two named files.
+    let edited = send(
+        &app,
+        post_form(
+            &format!("/edit/{id}"),
+            &[
+                ("csrf_token", &ecsrf),
+                ("title", "grows up"),
+                ("language", "plaintext"),
+                ("file_name", "first.txt"),
+                ("file_content", "the first file"),
+                ("file_name", "second.txt"),
+                ("file_content", "the second file"),
+            ],
+            &ecsrf,
+            Some("alice"),
+        ),
+    )
+    .await;
+    assert_eq!(edited.status, StatusCode::FOUND);
+
+    // The current view is now multi-file; the pre-edit content is archived as revision 1.
+    let v2 = send(&app, get(&format!("/p/{id}"), Some("alice"))).await;
+    assert!(v2.body.contains("<span>first.txt</span>"));
+    assert!(v2.body.contains("<span>second.txt</span>"));
+    assert!(v2.body.contains(&format!("/p/{id}/history")));
+    let rev = send(&app, get(&format!("/p/{id}/rev/1"), Some("alice"))).await;
+    assert!(rev.body.contains("originally one file"));
+}
+
 /// Create a paste as `subject` via the router, returning `(paste_id, fresh_csrf_cookie)`.
 async fn create_paste(
     app: &axum::Router,

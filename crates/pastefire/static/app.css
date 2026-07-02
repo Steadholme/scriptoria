@@ -439,6 +439,20 @@ body.page { max-width:none; margin:0; padding:0; }
 .ln-no:hover { color: var(--accent); }
 .ln-code { flex: 1 1 auto; white-space: pre; min-height: 1.6em; }
 
+/* multi-file pastes — one titled block per file, stacked (single-file pastes render one
+   unlabeled block, exactly as before) */
+.file-block + .file-block { border-top: 1px solid var(--border); }
+.file-block__head { display: flex; align-items: center; gap: 8px; padding: 10px 20px; font-family: var(--mono); font-size: 12.5px; font-weight: 600; color: var(--ink-2); background: var(--surface-2); border-bottom: 1px solid var(--border); }
+.file-block__head svg { width: 15px; height: 15px; color: var(--ink-3); flex: 0 0 auto; }
+.file-block__count { margin-left: auto; font-weight: 500; color: var(--ink-3); }
+
+/* multi-file compose editor — repeatable filename + content rows */
+.file-editor { display: flex; flex-direction: column; gap: 14px; margin-bottom: 12px; }
+.file-row { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px 16px; background: var(--surface-2); }
+.file-row__head { display: flex; align-items: flex-end; gap: 12px; margin-bottom: 10px; }
+.file-row__head .field { margin-bottom: 0; }
+.file-row .code-input { min-height: 160px; }
+
 /* syntax-highlight tokens (emitted by highlight.rs) */
 .tok-kw  { color: var(--accent-2); font-weight: 550; }
 .tok-str { color: var(--ok-ink); }

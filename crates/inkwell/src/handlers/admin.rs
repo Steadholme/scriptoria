@@ -51,7 +51,10 @@ pub struct SettingsForm {
 // ---------------------------------------------------------------------------
 
 /// `GET /admin` — the all-posts table (across every author) + the site-settings form.
-pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, AppError> {
+pub async fn index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
     auth::require_admin(&headers)?;
     let email = auth::display_email(&headers);
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
@@ -61,11 +64,12 @@ pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Result<
     let posts = state.store.list_posts(None, MAX_PAGE).await;
 
     let mut rows = String::new();
+    let now = now_secs();
     for p in &posts {
-        rows.push_str(&render_row(p, &csrf));
+        rows.push_str(&render_row(p, &csrf, now));
     }
     if posts.is_empty() {
-        rows.push_str(r#"<tr><td colspan="6" class="admin-table__empty">No posts yet.</td></tr>"#);
+        rows.push_str(r#"<tr><td colspan="7" class="admin-table__empty">No posts yet.</td></tr>"#);
     }
 
     let page = ADMIN_HTML
@@ -82,8 +86,16 @@ pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Result<
 
 /// One admin table row: selection checkbox (bound to the external bulk form via `form=`),
 /// title/author/status/featured cells, and the per-row action forms. Every field is escaped.
-fn render_row(p: &Post, csrf: &str) -> String {
-    let status = if p.published { "Published" } else { "Draft" };
+fn render_row(p: &Post, csrf: &str, now: i64) -> String {
+    let status = if !p.published {
+        "Draft"
+    } else if p.is_scheduled_at(now) {
+        "Scheduled"
+    } else {
+        "Published"
+    };
+    let pinned = if p.pinned { "Yes" } else { "—" };
+    let pin_label = if p.pinned { "Unpin" } else { "Pin" };
     let featured = if p.featured { "Yes" } else { "—" };
     let feature_label = if p.featured { "Unfeature" } else { "Feature" };
     let slug = esc(&p.slug);
@@ -94,8 +106,13 @@ fn render_row(p: &Post, csrf: &str) -> String {
             <td><a href="/p/{slug}">{title}</a></td>
             <td>{author}</td>
             <td>{status}</td>
+            <td>{pinned}</td>
             <td>{featured}</td>
             <td class="admin-table__actions">
+              <form class="inline-form" method="post" action="/admin/posts/{slug}/pin">
+                <input type="hidden" name="csrf_token" value="{csrf}">
+                <button class="btn btn-secondary btn-sm" type="submit">{pin_label}</button>
+              </form>
               <form class="inline-form" method="post" action="/admin/posts/{slug}/feature">
                 <input type="hidden" name="csrf_token" value="{csrf}">
                 <button class="btn btn-secondary btn-sm" type="submit">{feature_label}</button>
@@ -116,6 +133,8 @@ fn render_row(p: &Post, csrf: &str) -> String {
         title = esc(&p.title),
         author = esc(&p.author_email),
         status = status,
+        pinned = pinned,
+        pin_label = pin_label,
         featured = featured,
         feature_label = feature_label,
         csrf = csrf,
@@ -137,7 +156,9 @@ pub async fn update_settings(
 
     let title = form.title.trim();
     if title.is_empty() {
-        return Err(AppError::InvalidRequest("blog title is required".to_string()));
+        return Err(AppError::InvalidRequest(
+            "blog title is required".to_string(),
+        ));
     }
     // Fall back to the current value on a non-numeric input; clamp into the sane page bounds.
     let current = state.store.get_settings().await;
@@ -170,6 +191,32 @@ pub async fn update_settings(
 // Per-post admin actions
 // ---------------------------------------------------------------------------
 
+/// `POST /admin/posts/{slug}/pin` — toggle a post's public-index pin.
+pub async fn pin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+    Form(form): Form<CsrfForm>,
+) -> Result<Response, AppError> {
+    auth::require_admin(&headers)?;
+    auth::verify_csrf(&headers, &form.csrf_token)?;
+
+    let mut post = load(&state, &slug).await?;
+    post.pinned = !post.pinned;
+    post.updated_at = now_secs();
+    state.store.update_post(&post).await?;
+    tracing::info!(slug = %slug, pinned = post.pinned, "admin toggled pinned");
+
+    state.audit.emit(AuditEvent::info(
+        "admin.post.pin",
+        &actor(&headers),
+        &slug,
+        if post.pinned { "pinned" } else { "unpinned" },
+    ));
+
+    Ok(redirect("/admin"))
+}
+
 /// `POST /admin/posts/{slug}/feature` — toggle a post's featured flag.
 pub async fn feature(
     State(state): State<AppState>,
@@ -190,7 +237,11 @@ pub async fn feature(
         "admin.post.feature",
         &actor(&headers),
         &slug,
-        if post.featured { "featured" } else { "unfeatured" },
+        if post.featured {
+            "featured"
+        } else {
+            "unfeatured"
+        },
     ));
 
     Ok(redirect("/admin"))
@@ -256,7 +307,7 @@ pub async fn delete(
 // POST /admin/posts/bulk — apply one action to the selected slugs
 // ---------------------------------------------------------------------------
 
-/// `POST /admin/posts/bulk` — apply `action` (feature|unfeature|unpublish|delete) to every
+/// `POST /admin/posts/bulk` — apply `action` (pin|unpin|feature|unfeature|unpublish|delete) to every
 /// checked `slugs` value. Parsed from the raw body: repeated `slugs=` keys don't round-trip
 /// through `serde_urlencoded` into a `Vec`, so the body is decoded by hand here.
 pub async fn bulk(
@@ -280,6 +331,19 @@ pub async fn bulk(
     let actor = actor(&headers);
     for slug in &slugs {
         match action.as_str() {
+            "pin" | "unpin" => {
+                if let Some(mut post) = state.store.get_post(slug).await {
+                    post.pinned = action == "pin";
+                    post.updated_at = now_secs();
+                    state.store.update_post(&post).await?;
+                    state.audit.emit(AuditEvent::info(
+                        "admin.post.pin",
+                        &actor,
+                        slug,
+                        if post.pinned { "pinned" } else { "unpinned" },
+                    ));
+                }
+            }
             "feature" | "unfeature" => {
                 if let Some(mut post) = state.store.get_post(slug).await {
                     post.featured = action == "feature";
@@ -289,7 +353,11 @@ pub async fn bulk(
                         "admin.post.feature",
                         &actor,
                         slug,
-                        if post.featured { "featured" } else { "unfeatured" },
+                        if post.featured {
+                            "featured"
+                        } else {
+                            "unfeatured"
+                        },
                     ));
                 }
             }
@@ -320,7 +388,9 @@ pub async fn bulk(
                 }
             }
             other => {
-                return Err(AppError::InvalidRequest(format!("unknown bulk action: {other}")));
+                return Err(AppError::InvalidRequest(format!(
+                    "unknown bulk action: {other}"
+                )));
             }
         }
     }
@@ -414,7 +484,10 @@ fn hex_val(b: u8) -> Option<u8> {
 fn redirect(location: &str) -> Response {
     (
         StatusCode::SEE_OTHER,
-        [(header::LOCATION, HeaderValue::from_str(location).expect("valid location"))],
+        [(
+            header::LOCATION,
+            HeaderValue::from_str(location).expect("valid location"),
+        )],
     )
         .into_response()
 }

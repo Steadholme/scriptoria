@@ -40,7 +40,10 @@ async fn full_create_edit_history_flow() {
     assert_eq!(status, StatusCode::OK);
     let cookie = set_cookie(&headers).expect("editor sets a CSRF cookie");
     let csrf = cookie_value(&cookie).expect("csrf cookie value");
-    assert!(body.contains(&format!("value=\"{csrf}\"")), "hidden field matches cookie");
+    assert!(
+        body.contains(&format!("value=\"{csrf}\"")),
+        "hidden field matches cookie"
+    );
 
     // Save the page (gateway injects the editor email; CSRF cookie + field present).
     let save = post_form(
@@ -50,7 +53,10 @@ async fn full_create_edit_history_flow() {
         &[
             ("csrf_token", &csrf),
             ("title", "Home"),
-            ("body_md", "Welcome.\n\nSee [[Runbook]] and [[Glossary|the glossary]]."),
+            (
+                "body_md",
+                "Welcome.\n\nSee [[Runbook]] and [[Glossary|the glossary]].",
+            ),
         ],
     );
     let (status, headers, _b) = call(&state, save).await;
@@ -69,7 +75,10 @@ async fn full_create_edit_history_flow() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("<p>Welcome.</p>"));
     assert!(body.contains(r#"href="/w/runbook""#));
-    assert!(body.contains("wikilink--new"), "missing target is a red link");
+    assert!(
+        body.contains("wikilink--new"),
+        "missing target is a red link"
+    );
     assert!(body.contains(r#"href="/w/glossary""#));
     assert!(body.contains(">the glossary</a>"), "pipe label honored");
 
@@ -89,7 +98,12 @@ async fn full_create_edit_history_flow() {
         "/edit/home",
         &cookie2,
         Some("bob@holdfast.local"),
-        &[("csrf_token", &csrf2), ("base_rev", &base2), ("title", "Home"), ("body_md", "Updated body.")],
+        &[
+            ("csrf_token", &csrf2),
+            ("base_rev", &base2),
+            ("title", "Home"),
+            ("body_md", "Updated body."),
+        ],
     );
     let (status, _h, _b) = call(&state, save2).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
@@ -102,6 +116,216 @@ async fn full_create_edit_history_flow() {
     // Both editors appear in the history list.
     assert!(body.contains("alice@holdfast.local"));
     assert!(body.contains("bob@holdfast.local"));
+}
+
+#[tokio::test]
+async fn template_prefills_new_page_body() {
+    let state = build_dev_state();
+
+    let (status, headers, _body) =
+        call(&state, get("/new?title=Retro&template=meeting-notes")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        location(&headers).as_deref(),
+        Some("/edit/retro?template=meeting-notes")
+    );
+
+    let (status, _headers, body) = call(&state, get("/edit/retro?template=meeting-notes")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("# Meeting notes"),
+        "meeting notes template body is prefilled: {body}"
+    );
+    assert!(body.contains("## Attendees"));
+
+    let (status, _headers, body) = call(&state, get("/edit/blank?template=not-real")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !body.contains("# Meeting notes"),
+        "unknown template yields a blank body"
+    );
+    assert!(!body.contains("# Decision record"));
+}
+
+#[tokio::test]
+async fn move_page_flow_renders_tree_breadcrumb_and_rejects_cycles() {
+    let state = build_dev_state();
+    save_page_http(
+        &state,
+        "parent",
+        "Parent",
+        "Parent body.",
+        "alice@holdfast.local",
+    )
+    .await;
+    save_page_http(
+        &state,
+        "child",
+        "Child",
+        "Child body.",
+        "alice@holdfast.local",
+    )
+    .await;
+
+    let (status, _headers, body) = call(
+        &state,
+        post_form(
+            "/move/child",
+            "",
+            Some("alice@holdfast.local"),
+            &[("csrf_token", "anything"), ("parent_id", "parent")],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body.contains("CSRF"));
+    assert_eq!(
+        state
+            .store
+            .get_page("child")
+            .await
+            .unwrap()
+            .unwrap()
+            .parent_id,
+        None
+    );
+
+    let (status, headers, body) = call(&state, get("/w/child")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("action=\"/move/child\""),
+        "page view includes move form"
+    );
+    let cookie = set_cookie(&headers).expect("page view mints a CSRF cookie for move");
+    let csrf = cookie_value(&cookie).unwrap();
+    let (status, headers, _body) = call(
+        &state,
+        post_form(
+            "/move/child",
+            &cookie,
+            Some("alice@holdfast.local"),
+            &[("csrf_token", &csrf), ("parent_id", "parent")],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers).as_deref(), Some("/w/child"));
+    assert_eq!(
+        state
+            .store
+            .get_page("child")
+            .await
+            .unwrap()
+            .unwrap()
+            .parent_id
+            .as_deref(),
+        Some("parent")
+    );
+
+    let (status, _headers, body) = call(&state, get("/w/child")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("Page tree"),
+        "nested wiki renders the sidebar tree: {body}"
+    );
+    assert!(
+        body.contains("class=\"breadcrumb\""),
+        "child page renders breadcrumb"
+    );
+    assert!(
+        body.contains(r#"href="/w/parent">Parent</a>"#),
+        "breadcrumb links to parent"
+    );
+
+    let (_status, headers, _body) = call(&state, get("/w/parent")).await;
+    let cycle_cookie = set_cookie(&headers).unwrap();
+    let cycle_csrf = cookie_value(&cycle_cookie).unwrap();
+    let (status, _headers, body) = call(
+        &state,
+        post_form(
+            "/move/parent",
+            &cycle_cookie,
+            Some("alice@holdfast.local"),
+            &[("csrf_token", &cycle_csrf), ("parent_id", "child")],
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "moving a page under a descendant is rejected"
+    );
+    assert!(body.contains("descendants"));
+    assert_eq!(
+        state
+            .store
+            .get_page("parent")
+            .await
+            .unwrap()
+            .unwrap()
+            .parent_id,
+        None
+    );
+}
+
+#[tokio::test]
+async fn persisted_backlinks_are_updated_on_each_save() {
+    let state = build_dev_state();
+    save_page_http(
+        &state,
+        "runbook",
+        "Runbook",
+        "Target page.",
+        "alice@holdfast.local",
+    )
+    .await;
+    save_page_http(
+        &state,
+        "guide",
+        "Guide",
+        "Another target.",
+        "alice@holdfast.local",
+    )
+    .await;
+    save_page_http(
+        &state,
+        "home",
+        "Home",
+        "See [[Runbook]] and [Guide](/w/guide#top).",
+        "alice@holdfast.local",
+    )
+    .await;
+
+    assert_eq!(
+        state.store.outgoing_links("home").await.unwrap(),
+        vec!["guide".to_string(), "runbook".to_string()]
+    );
+    let (status, _headers, body) = call(&state, get("/w/runbook")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("Linked from"),
+        "persisted backlinks list is rendered"
+    );
+    assert!(
+        body.contains(r#"href="/w/home""#),
+        "home is a persisted backlink: {body}"
+    );
+
+    save_page_http(
+        &state,
+        "home",
+        "Home",
+        "No explicit links now.",
+        "bob@holdfast.local",
+    )
+    .await;
+    assert!(state.store.outgoing_links("home").await.unwrap().is_empty());
+    let (status, _headers, body) = call(&state, get("/w/runbook")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !body.contains(r#"href="/w/home""#),
+        "stale backlink was removed: {body}"
+    );
 }
 
 #[tokio::test]
@@ -118,7 +342,11 @@ async fn history_diff_and_revert_flow() {
             "/edit/notes",
             &c1,
             Some("alice@holdfast.local"),
-            &[("csrf_token", &t1), ("title", "Notes"), ("body_md", "line one\nline two\nline three")],
+            &[
+                ("csrf_token", &t1),
+                ("title", "Notes"),
+                ("body_md", "line one\nline two\nline three"),
+            ],
         ),
     )
     .await;
@@ -127,14 +355,25 @@ async fn history_diff_and_revert_flow() {
     let (_s, h2, _b) = call(&state, get("/edit/notes")).await;
     let c2 = set_cookie(&h2).unwrap();
     let t2 = cookie_value(&c2).unwrap();
-    let base2 = state.store.head_revision("notes").await.unwrap().unwrap().id;
+    let base2 = state
+        .store
+        .head_revision("notes")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
     let (s, _h, _b) = call(
         &state,
         post_form(
             "/edit/notes",
             &c2,
             Some("bob@holdfast.local"),
-            &[("csrf_token", &t2), ("base_rev", &base2), ("title", "Notes"), ("body_md", "line one\nCHANGED two\nline three")],
+            &[
+                ("csrf_token", &t2),
+                ("base_rev", &base2),
+                ("title", "Notes"),
+                ("body_md", "line one\nCHANGED two\nline three"),
+            ],
         ),
     )
     .await;
@@ -143,9 +382,18 @@ async fn history_diff_and_revert_flow() {
     // History lists a compare form + a revert button, and mints a CSRF cookie for the revert.
     let (status, hist_headers, body) = call(&state, get("/history/notes")).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("class=\"compare-form\""), "compare form present with 2 revisions");
-    assert!(body.contains("action=\"/revert/notes\""), "revert form present");
-    assert!(body.contains(">current</span>"), "newest revision marked current");
+    assert!(
+        body.contains("class=\"compare-form\""),
+        "compare form present with 2 revisions"
+    );
+    assert!(
+        body.contains("action=\"/revert/notes\""),
+        "revert form present"
+    );
+    assert!(
+        body.contains(">current</span>"),
+        "newest revision marked current"
+    );
     let revert_cookie = set_cookie(&hist_headers).expect("history mints a CSRF cookie");
     let revert_csrf = cookie_value(&revert_cookie).unwrap();
 
@@ -156,11 +404,23 @@ async fn history_diff_and_revert_flow() {
     let oldest = &revs[1];
 
     // Diff view (from oldest -> newest): the changed line shows as - old / + new, context stays.
-    let (status, _h, diff) =
-        call(&state, get(&format!("/history/notes?from={}&to={}", oldest.id, newest.id))).await;
+    let (status, _h, diff) = call(
+        &state,
+        get(&format!(
+            "/history/notes?from={}&to={}",
+            oldest.id, newest.id
+        )),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(diff.contains("diff__line--del"), "a removed line is rendered");
-    assert!(diff.contains("diff__line--add"), "an added line is rendered");
+    assert!(
+        diff.contains("diff__line--del"),
+        "a removed line is rendered"
+    );
+    assert!(
+        diff.contains("diff__line--add"),
+        "an added line is rendered"
+    );
     assert!(diff.contains("CHANGED two"), "the new text appears");
     assert!(diff.contains(">line one<"), "unchanged context line kept");
 
@@ -181,9 +441,16 @@ async fn history_diff_and_revert_flow() {
     // The page body is back to the old content, recorded by the reverting user as a 3rd revision.
     let (_s, _h, page) = call(&state, get("/w/notes")).await;
     assert!(page.contains("line two"), "reverted body restored");
-    assert!(!page.contains("CHANGED two"), "reverted away from the newer body");
+    assert!(
+        !page.contains("CHANGED two"),
+        "reverted away from the newer body"
+    );
     let revs2 = state.store.list_revisions("notes").await.unwrap();
-    assert_eq!(revs2.len(), 3, "revert appends a new revision (append-only history)");
+    assert_eq!(
+        revs2.len(),
+        3,
+        "revert appends a new revision (append-only history)"
+    );
     assert_eq!(revs2[0].editor_email, "carol@holdfast.local");
     assert_eq!(revs2[0].body_md, "line one\nline two\nline three");
 }
@@ -221,7 +488,11 @@ async fn revert_requires_csrf() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert!(body.contains("CSRF"));
-    assert_eq!(state.store.list_revisions("doc").await.unwrap().len(), 1, "no revision added");
+    assert_eq!(
+        state.store.list_revisions("doc").await.unwrap().len(),
+        1,
+        "no revision added"
+    );
 }
 
 #[tokio::test]
@@ -232,7 +503,11 @@ async fn csrf_required_on_post() {
         "/edit/home",
         "", // no cookie
         Some("alice@holdfast.local"),
-        &[("csrf_token", "anything"), ("title", "Home"), ("body_md", "x")],
+        &[
+            ("csrf_token", "anything"),
+            ("title", "Home"),
+            ("body_md", "x"),
+        ],
     );
     let (status, _h, body) = call(&state, req).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -274,7 +549,10 @@ async fn stored_html_is_sanitized() {
     assert_eq!(status, StatusCode::SEE_OTHER);
 
     let (_s, _h, body) = call(&state, get("/w/xss")).await;
-    assert!(!body.contains("<script>alert(1)</script>"), "script must be escaped");
+    assert!(
+        !body.contains("<script>alert(1)</script>"),
+        "script must be escaped"
+    );
     assert!(body.contains("&lt;script&gt;"));
 }
 
@@ -294,7 +572,10 @@ async fn toc_and_heading_anchors_render() {
                 ("csrf_token", &csrf),
                 ("base_rev", ""),
                 ("title", "Guide"),
-                ("body_md", "# Overview\n\nintro\n\n## Setup\n\nsteps\n\n## Setup\n\nmore"),
+                (
+                    "body_md",
+                    "# Overview\n\nintro\n\n## Setup\n\nsteps\n\n## Setup\n\nmore",
+                ),
             ],
         ),
     )
@@ -306,7 +587,10 @@ async fn toc_and_heading_anchors_render() {
     // Heading anchors are stamped, and duplicate headings get unique ids.
     assert!(body.contains("<h1 id=\"overview\">Overview</h1>"), "{body}");
     assert!(body.contains("id=\"setup\""), "{body}");
-    assert!(body.contains("id=\"setup-1\""), "duplicate heading disambiguated: {body}");
+    assert!(
+        body.contains("id=\"setup-1\""),
+        "duplicate heading disambiguated: {body}"
+    );
     // The TOC box links to those anchors.
     assert!(body.contains("class=\"toc\""), "toc box rendered: {body}");
     assert!(body.contains("href=\"#overview\""), "{body}");
@@ -327,7 +611,12 @@ async fn edit_conflict_is_rejected_with_both_versions() {
             "/edit/spec",
             &c0,
             Some("alice@holdfast.local"),
-            &[("csrf_token", &t0), ("base_rev", ""), ("title", "Spec"), ("body_md", "original")],
+            &[
+                ("csrf_token", &t0),
+                ("base_rev", ""),
+                ("title", "Spec"),
+                ("body_md", "original"),
+            ],
         ),
     )
     .await;
@@ -347,7 +636,12 @@ async fn edit_conflict_is_rejected_with_both_versions() {
             "/edit/spec",
             &ca,
             Some("alice@holdfast.local"),
-            &[("csrf_token", &ta), ("base_rev", &base), ("title", "Spec"), ("body_md", "alice update")],
+            &[
+                ("csrf_token", &ta),
+                ("base_rev", &base),
+                ("title", "Spec"),
+                ("body_md", "alice update"),
+            ],
         ),
     )
     .await;
@@ -363,21 +657,36 @@ async fn edit_conflict_is_rejected_with_both_versions() {
             "/edit/spec",
             &cb,
             Some("bob@holdfast.local"),
-            &[("csrf_token", &tb), ("base_rev", &base), ("title", "Spec"), ("body_md", "bob update")],
+            &[
+                ("csrf_token", &tb),
+                ("base_rev", &base),
+                ("title", "Spec"),
+                ("body_md", "bob update"),
+            ],
         ),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "stale base_rev is rejected");
     assert!(body.contains("Edit conflict"), "{body}");
-    assert!(body.contains("alice update"), "shows the version that landed: {body}");
-    assert!(body.contains("bob update"), "shows the rejected submission: {body}");
+    assert!(
+        body.contains("alice update"),
+        "shows the version that landed: {body}"
+    );
+    assert!(
+        body.contains("bob update"),
+        "shows the rejected submission: {body}"
+    );
 
     // Bob's write did NOT land: the page + history still hold alice's version only.
     let (_s, _h, page) = call(&state, get("/w/spec")).await;
     assert!(page.contains("alice update"));
     assert!(!page.contains("bob update"));
     // original + alice update == 2 revisions (bob's rejected).
-    assert_eq!(state.store.list_revisions("spec").await.unwrap().len(), 2, "conflict wrote nothing");
+    assert_eq!(
+        state.store.list_revisions("spec").await.unwrap().len(),
+        2,
+        "conflict wrote nothing"
+    );
 }
 
 #[tokio::test]
@@ -393,7 +702,12 @@ async fn matching_base_rev_saves_normally() {
             "/edit/doc2",
             &c0,
             Some("alice@holdfast.local"),
-            &[("csrf_token", &t0), ("base_rev", ""), ("title", "Doc2"), ("body_md", "v1")],
+            &[
+                ("csrf_token", &t0),
+                ("base_rev", ""),
+                ("title", "Doc2"),
+                ("body_md", "v1"),
+            ],
         ),
     )
     .await;
@@ -401,7 +715,10 @@ async fn matching_base_rev_saves_normally() {
     // Reopen the editor: the hidden base_rev now carries the current head id.
     let (_s, h1, edit_body) = call(&state, get("/edit/doc2")).await;
     let head = state.store.head_revision("doc2").await.unwrap().unwrap();
-    assert!(edit_body.contains(&format!("name=\"base_rev\" value=\"{}\"", head.id)), "editor carries head rev");
+    assert!(
+        edit_body.contains(&format!("name=\"base_rev\" value=\"{}\"", head.id)),
+        "editor carries head rev"
+    );
     let c1 = set_cookie(&h1).unwrap();
     let t1 = cookie_value(&c1).unwrap();
 
@@ -412,7 +729,12 @@ async fn matching_base_rev_saves_normally() {
             "/edit/doc2",
             &c1,
             Some("alice@holdfast.local"),
-            &[("csrf_token", &t1), ("base_rev", &head.id), ("title", "Doc2"), ("body_md", "v2")],
+            &[
+                ("csrf_token", &t1),
+                ("base_rev", &head.id),
+                ("title", "Doc2"),
+                ("body_md", "v2"),
+            ],
         ),
     )
     .await;
@@ -430,11 +752,46 @@ async fn unknown_route_renders_404() {
 
 // --- helpers ---------------------------------------------------------------------------
 
+async fn save_page_http(state: &AppState, slug: &str, title: &str, body: &str, email: &str) {
+    let (_status, headers, _body) = call(state, get(&format!("/edit/{slug}"))).await;
+    let cookie = set_cookie(&headers).expect("editor sets CSRF cookie");
+    let csrf = cookie_value(&cookie).unwrap();
+    let base_rev = state
+        .store
+        .head_revision(slug)
+        .await
+        .unwrap()
+        .map(|r| r.id)
+        .unwrap_or_default();
+    let (status, _headers, _body) = call(
+        state,
+        post_form(
+            &format!("/edit/{slug}"),
+            &cookie,
+            Some(email),
+            &[
+                ("csrf_token", &csrf),
+                ("base_rev", &base_rev),
+                ("title", title),
+                ("body_md", body),
+            ],
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "save_page_http should save {slug}"
+    );
+}
+
 async fn call(state: &AppState, req: Request<Body>) -> (StatusCode, axum::http::HeaderMap, String) {
     let resp = app(state.clone()).oneshot(req).await.unwrap();
     let status = resp.status();
     let headers = resp.headers().clone();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     (status, headers, String::from_utf8(bytes.to_vec()).unwrap())
 }
 

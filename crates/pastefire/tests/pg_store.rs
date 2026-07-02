@@ -174,6 +174,53 @@ async fn pg_store_full_integration() {
     let got_locked = store.get("lockaa11").await.unwrap().unwrap();
     assert!(pastefire::auth::verify_password("s3cret", got_locked.password_hash.as_deref().unwrap()));
 
+    // --- multi-file: set_files overwrite + position order + delete cascade --
+    use pastefire::model::PasteFile;
+    store.create(&paste("multi111", "alice", now + 80, None)).await.unwrap();
+    store
+        .set_files(
+            "multi111",
+            &[
+                PasteFile {
+                    id: "multi111-1".into(),
+                    paste_id: "multi111".into(),
+                    filename: "b.rs".into(),
+                    content: "fn b() {}".into(),
+                    position: 1,
+                },
+                PasteFile {
+                    id: "multi111-0".into(),
+                    paste_id: "multi111".into(),
+                    filename: "a.rs".into(),
+                    content: "fn a() {}".into(),
+                    position: 0,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    let files = store.list_files("multi111").await.unwrap();
+    let fnames: Vec<&str> = files.iter().map(|f| f.filename.as_str()).collect();
+    assert_eq!(fnames, vec!["a.rs", "b.rs"], "files come back position-ordered");
+    // Whole-set overwrite replaces the prior set.
+    store
+        .set_files(
+            "multi111",
+            &[PasteFile {
+                id: "multi111-only".into(),
+                paste_id: "multi111".into(),
+                filename: "only.rs".into(),
+                content: "fn only() {}".into(),
+                position: 0,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.list_files("multi111").await.unwrap().len(), 1);
+    // Deleting the paste cascades its files.
+    assert!(store.delete("multi111", "alice").await.unwrap());
+    assert!(store.list_files("multi111").await.unwrap().is_empty(), "files cascade on delete");
+
     // --- ownership-scoped delete -------------------------------------------
     assert!(!store.delete("aaaaaa11", "bob").await.unwrap(), "bob cannot delete alice's");
     assert!(store.get("aaaaaa11").await.unwrap().is_some());

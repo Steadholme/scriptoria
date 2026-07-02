@@ -7,7 +7,7 @@
 //! CommonMark, rendered through the sanitiser in [`crate::markdown`]; all other interpolated
 //! text is HTML-escaped.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use axum::extract::{Form, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -18,11 +18,9 @@ use crate::audit::AuditEvent;
 use crate::auth;
 use crate::error::AppError;
 use crate::handlers::insight::thread_summary;
-use crate::handlers::{
-    email_display, esc, fmt_ts, rel_time, render_page, replies_label,
-};
+use crate::handlers::{email_display, esc, fmt_ts, rel_time, render_page, replies_label};
 use crate::model::{Post, ReactionCount, Thread};
-use crate::store::ReplyAnchor;
+use crate::store::{ReplyAnchor, ThreadSort};
 use crate::{markdown, new_id, now_secs, AppState};
 
 /// Most-recent threads shown on the home page.
@@ -32,6 +30,8 @@ const RECENT_LIMIT: i64 = 20;
 pub const REPLIES_PER_PAGE: i64 = 20;
 /// Threads listed on a category page.
 const CATEGORY_LIMIT: i64 = 200;
+/// Recent mentions shown on the home page for the signed-in viewer.
+const MENTION_LIMIT: i64 = 5;
 /// Caps on user input (defense against absurd payloads; the store columns are TEXT).
 const MAX_TITLE: usize = 200;
 const MAX_BODY: usize = 20_000;
@@ -110,14 +110,66 @@ const SUMMARY_MIN_WORDS: usize = 60;
 // GET / — categories (with thread counts) + recent threads
 // ===========================================================================
 
-pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Result<Html<String>, AppError> {
+/// Shared query for thread lists (`/` and `/c/{id}`): optional sort selector and a current-user
+/// subscription filter. Missing/unknown sort preserves the legacy latest ordering.
+#[derive(Debug, Deserialize, Default)]
+pub struct ThreadListQuery {
+    #[serde(default)]
+    pub sort: Option<String>,
+    #[serde(default)]
+    pub filter: Option<String>,
+}
+
+impl ThreadListQuery {
+    fn sort(&self) -> ThreadSort {
+        match self.sort.as_deref().unwrap_or("latest") {
+            "top" => ThreadSort::Top,
+            "hot" => ThreadSort::Hot,
+            _ => ThreadSort::Latest,
+        }
+    }
+
+    fn sort_key(&self) -> &'static str {
+        match self.sort() {
+            ThreadSort::Latest => "latest",
+            ThreadSort::Top => "top",
+            ThreadSort::Hot => "hot",
+        }
+    }
+
+    fn subscribed_only(&self) -> bool {
+        self.filter.as_deref() == Some("subscribed")
+    }
+}
+
+pub async fn home(
+    State(state): State<AppState>,
+    Query(q): Query<ThreadListQuery>,
+    headers: HeaderMap,
+) -> Result<Html<String>, AppError> {
     let now = now_secs();
     let categories = state.store.list_categories().await?;
-    let recent = state.store.recent_threads(RECENT_LIMIT).await?;
+    let viewer_sub = auth::identity_subject(&headers);
+    let recent = if q.subscribed_only() && viewer_sub.is_none() {
+        Vec::new()
+    } else {
+        state
+            .store
+            .list_threads(
+                None,
+                q.sort(),
+                subscribed_subject(&q, viewer_sub.as_deref()),
+                RECENT_LIMIT,
+                now,
+            )
+            .await?
+    };
 
     // id -> name map so recent rows can name their category.
-    let cat_names: HashMap<&str, &str> =
-        categories.iter().map(|c| (c.id.as_str(), c.name.as_str())).collect();
+    let cat_names: HashMap<&str, &str> = categories
+        .iter()
+        .map(|c| (c.id.as_str(), c.name.as_str()))
+        .collect();
 
     let mut cats_html = String::new();
     for c in &categories {
@@ -138,6 +190,8 @@ pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Result<H
     }
 
     let recent_html = render_thread_rows(&recent, now, Some(&cat_names));
+    let mentions_html = render_mentions_panel(&state, &headers).await?;
+    let thread_controls = render_thread_list_controls("/", &q, viewer_sub.is_some());
 
     let content = format!(
         r#"<div class="page-head">
@@ -151,15 +205,28 @@ pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Result<H
   <h2 class="section__title">Categories</h2>
   <div class="cat-grid">{cats}</div>
 </section>
+{mentions}
 <section class="section">
-  <h2 class="section__title">Recent activity</h2>
+  <h2 class="section__title">{thread_title}</h2>
+  {controls}
   <div class="thread-list">{recent}</div>
 </section>"#,
         cats = cats_html,
+        mentions = mentions_html,
+        thread_title = if q.subscribed_only() {
+            "Subscribed threads"
+        } else {
+            "Recent activity"
+        },
+        controls = thread_controls,
         recent = recent_html,
     );
 
-    Ok(Html(render_page("Forum", &email_display(&headers), &content)))
+    Ok(Html(render_page(
+        "Forum",
+        &email_display(&headers),
+        &content,
+    )))
 }
 
 // ===========================================================================
@@ -169,6 +236,7 @@ pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Result<H
 pub async fn category(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<ThreadListQuery>,
     headers: HeaderMap,
 ) -> Result<Html<String>, AppError> {
     let now = now_secs();
@@ -177,13 +245,32 @@ pub async fn category(
         .get_category(&id)
         .await?
         .ok_or_else(|| AppError::NotFound("category not found".to_string()))?;
-    let threads = state.store.threads_in_category(&id, CATEGORY_LIMIT).await?;
+    let viewer_sub = auth::identity_subject(&headers);
+    let threads = if q.subscribed_only() && viewer_sub.is_none() {
+        Vec::new()
+    } else {
+        state
+            .store
+            .list_threads(
+                Some(&id),
+                q.sort(),
+                subscribed_subject(&q, viewer_sub.as_deref()),
+                CATEGORY_LIMIT,
+                now,
+            )
+            .await?
+    };
 
     let crumbs = format!(
         r#"<nav class="crumbs"><a href="/">Home</a><span class="crumbs__sep">/</span><span>{name}</span></nav>"#,
         name = esc(&category.name),
     );
     let list = render_thread_rows(&threads, now, None);
+    let controls = render_thread_list_controls(
+        &format!("/c/{}", esc(&category.id)),
+        &q,
+        viewer_sub.is_some(),
+    );
 
     let content = format!(
         r#"{crumbs}
@@ -195,17 +282,27 @@ pub async fn category(
   <a class="btn btn-primary" href="/new?cat={id}">New thread</a>
 </div>
 <section class="section">
+  {controls}
   <div class="thread-list">{list}</div>
 </section>"#,
         crumbs = crumbs,
         name = esc(&category.name),
         count = threads.len(),
-        tw = if threads.len() == 1 { "thread" } else { "threads" },
+        tw = if threads.len() == 1 {
+            "thread"
+        } else {
+            "threads"
+        },
         id = esc(&category.id),
+        controls = controls,
         list = list,
     );
 
-    Ok(Html(render_page(&category.name, &email_display(&headers), &content)))
+    Ok(Html(render_page(
+        &category.name,
+        &email_display(&headers),
+        &content,
+    )))
 }
 
 // ===========================================================================
@@ -223,6 +320,8 @@ pub struct ThreadQuery {
     pub after: Option<String>,
     #[serde(default)]
     pub latest: Option<String>,
+    #[serde(default)]
+    pub quote: Option<String>,
 }
 
 pub async fn thread(
@@ -301,6 +400,20 @@ pub async fn thread(
     let viewer = auth::identity_subject(&headers);
     let is_admin = auth::is_admin(&headers);
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
+    let subscription_action = if let Some(sub) = viewer.as_deref() {
+        let subscribed = state.store.is_thread_subscribed(&thread.id, sub).await?;
+        render_subscription_form(&thread.id, &csrf, subscribed)
+    } else {
+        String::new()
+    };
+    let quote_target = match q.quote.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(pid) => state
+            .store
+            .get_post(pid)
+            .await?
+            .filter(|p| p.thread_id == thread.id),
+        None => None,
+    };
 
     // Admin moderation toolbar (lock/pin/move/delete) — only for admins. The move dropdown
     // needs the full category list, fetched only on the admin path.
@@ -348,6 +461,7 @@ pub async fn thread(
     // Display order: the original post stays first, then the accepted reply (if any), then the
     // rest in their natural oldest-first order. Reordering a clone never touches storage.
     let ordered = order_posts_accepted_first(&posts, &thread.accepted_post_id);
+    let quoted_posts = load_quoted_posts(&state, &thread.id, &ordered).await?;
 
     // Per-post reaction aggregates (counts + whether THIS viewer reacted), keyed by post id.
     let mut reactions: HashMap<String, Vec<ReactionCount>> = HashMap::new();
@@ -372,6 +486,7 @@ pub async fn thread(
         &thread.accepted_post_id,
         can_accept,
         &reactions,
+        &quoted_posts,
     );
 
     // A locked thread shows a notice instead of the reply form (admins still moderate above).
@@ -379,11 +494,13 @@ pub async fn thread(
         r#"<section class="card pad"><p class="muted">This thread is locked — no new replies.</p></section>"#
             .to_string()
     } else {
+        let quote_fields = render_reply_quote_fields(quote_target.as_ref());
         format!(
-            r#"<section class="card pad">
+            r#"<section id="reply" class="card pad">
   <h2 class="section__title">Reply</h2>
   <form class="form" method="post" action="/t/{tid}/reply">
     <input type="hidden" name="csrf" value="{csrf}">
+    {quote}
     <label for="reply-body">Your reply <span class="muted">(Markdown supported)</span></label>
     <textarea id="reply-body" name="body" rows="5" placeholder="Write a reply…" required></textarea>
     <div class="form__actions">
@@ -393,6 +510,7 @@ pub async fn thread(
 </section>"#,
             tid = esc(&thread.id),
             csrf = esc(&csrf),
+            quote = quote_fields,
         )
     };
 
@@ -411,6 +529,7 @@ pub async fn thread(
   <h1>{title}{badges}</h1>
   <p class="muted">Started by <strong>{author}</strong> · {when} · {replies}</p>
   {actions}
+  {subscription}
   {admin_actions}
 </div>
 {summary}
@@ -424,6 +543,7 @@ pub async fn thread(
         when = esc(&fmt_ts(thread.created_at)),
         replies = esc(&replies_label(post_count)),
         actions = thread_actions,
+        subscription = subscription_action,
         admin_actions = admin_actions,
         summary = summary_html,
         posts = posts_html,
@@ -529,10 +649,14 @@ pub async fn create(
 
     let title = form.title.trim();
     if title.is_empty() {
-        return Err(AppError::InvalidRequest("thread title is required".to_string()));
+        return Err(AppError::InvalidRequest(
+            "thread title is required".to_string(),
+        ));
     }
     if title.chars().count() > MAX_TITLE {
-        return Err(AppError::InvalidRequest("thread title is too long".to_string()));
+        return Err(AppError::InvalidRequest(
+            "thread title is too long".to_string(),
+        ));
     }
     let category_id = form.category.trim();
     if state.store.get_category(category_id).await?.is_none() {
@@ -540,10 +664,14 @@ pub async fn create(
     }
     let body = form.body.trim();
     if body.is_empty() {
-        return Err(AppError::InvalidRequest("post body is required".to_string()));
+        return Err(AppError::InvalidRequest(
+            "post body is required".to_string(),
+        ));
     }
     if body.chars().count() > MAX_BODY {
-        return Err(AppError::InvalidRequest("post body is too long".to_string()));
+        return Err(AppError::InvalidRequest(
+            "post body is too long".to_string(),
+        ));
     }
 
     let now = now_secs();
@@ -563,12 +691,26 @@ pub async fn create(
         id: new_id("p"),
         thread_id: thread.id.clone(),
         body_md: body.to_string(),
+        quoted_post_id: String::new(),
         author_sub: author.sub,
         author_email: author.email,
         created_at: now,
     };
     state.store.create_thread(&thread, &first_post).await?;
-    tracing::info!(thread = thread.id, author = thread.author_email, "thread created");
+    state
+        .store
+        .replace_mentions(
+            &first_post.id,
+            &thread.id,
+            &extract_mentions(&first_post.body_md),
+            first_post.created_at,
+        )
+        .await?;
+    tracing::info!(
+        thread = thread.id,
+        author = thread.author_email,
+        "thread created"
+    );
 
     let actor = if thread.author_email.is_empty() {
         &thread.author_sub
@@ -593,6 +735,8 @@ pub async fn create(
 pub struct ReplyForm {
     #[serde(default)]
     pub csrf: String,
+    #[serde(default)]
+    pub quote_post_id: String,
     #[serde(default)]
     pub body: String,
 }
@@ -623,22 +767,50 @@ pub async fn reply(
     }
     let body = form.body.trim();
     if body.is_empty() {
-        return Err(AppError::InvalidRequest("reply body is required".to_string()));
+        return Err(AppError::InvalidRequest(
+            "reply body is required".to_string(),
+        ));
     }
     if body.chars().count() > MAX_BODY {
-        return Err(AppError::InvalidRequest("reply body is too long".to_string()));
+        return Err(AppError::InvalidRequest(
+            "reply body is too long".to_string(),
+        ));
     }
+    let quoted_post_id = match form.quote_post_id.trim().is_empty() {
+        true => String::new(),
+        false => {
+            let quoted = state
+                .store
+                .get_post(form.quote_post_id.trim())
+                .await?
+                .filter(|p| p.thread_id == id)
+                .ok_or_else(|| {
+                    AppError::InvalidRequest("quoted post must belong to this thread".to_string())
+                })?;
+            quoted.id
+        }
+    };
 
     let now = now_secs();
     let post = Post {
         id: new_id("p"),
         thread_id: id.clone(),
         body_md: body.to_string(),
+        quoted_post_id,
         author_sub: author.sub,
         author_email: author.email,
         created_at: now,
     };
     state.store.add_reply(&post).await?;
+    state
+        .store
+        .replace_mentions(
+            &post.id,
+            &id,
+            &extract_mentions(&post.body_md),
+            post.created_at,
+        )
+        .await?;
     tracing::info!(thread = id, author = post.author_email, "reply posted");
 
     let actor = if post.author_email.is_empty() {
@@ -646,7 +818,9 @@ pub async fn reply(
     } else {
         &post.author_email
     };
-    state.audit.emit(AuditEvent::info("reply.create", actor, &post.id, &id));
+    state
+        .audit
+        .emit(AuditEvent::info("reply.create", actor, &post.id, &id));
 
     Ok(redirect_to(&format!("/t/{id}")))
 }
@@ -686,7 +860,9 @@ pub async fn edit_thread_form(
         .await?
         .ok_or_else(|| AppError::NotFound("thread not found".to_string()))?;
     if thread.author_sub != author.sub {
-        return Err(AppError::Forbidden("you can only edit your own threads".to_string()));
+        return Err(AppError::Forbidden(
+            "you can only edit your own threads".to_string(),
+        ));
     }
     let posts = state.store.posts_in_thread(&id).await?;
     let op_body = posts.first().map(|p| p.body_md.as_str()).unwrap_or("");
@@ -719,22 +895,32 @@ pub async fn update_thread(
         .await?
         .ok_or_else(|| AppError::NotFound("thread not found".to_string()))?;
     if thread.author_sub != author.sub {
-        return Err(AppError::Forbidden("you can only edit your own threads".to_string()));
+        return Err(AppError::Forbidden(
+            "you can only edit your own threads".to_string(),
+        ));
     }
 
     let title = form.title.trim();
     if title.is_empty() {
-        return Err(AppError::InvalidRequest("thread title is required".to_string()));
+        return Err(AppError::InvalidRequest(
+            "thread title is required".to_string(),
+        ));
     }
     if title.chars().count() > MAX_TITLE {
-        return Err(AppError::InvalidRequest("thread title is too long".to_string()));
+        return Err(AppError::InvalidRequest(
+            "thread title is too long".to_string(),
+        ));
     }
     let body = form.body.trim();
     if body.is_empty() {
-        return Err(AppError::InvalidRequest("post body is required".to_string()));
+        return Err(AppError::InvalidRequest(
+            "post body is required".to_string(),
+        ));
     }
     if body.chars().count() > MAX_BODY {
-        return Err(AppError::InvalidRequest("post body is too long".to_string()));
+        return Err(AppError::InvalidRequest(
+            "post body is too long".to_string(),
+        ));
     }
 
     // The original post is the oldest post in the thread (first in display order).
@@ -745,6 +931,10 @@ pub async fn update_thread(
         .ok_or_else(|| AppError::NotFound("thread has no original post".to_string()))?;
 
     state.store.update_thread(&id, title, &op_id, body).await?;
+    state
+        .store
+        .replace_mentions(&op_id, &id, &extract_mentions(body), now_secs())
+        .await?;
     tracing::info!(thread = id, author = thread.author_email, "thread updated");
 
     let actor = if thread.author_email.is_empty() {
@@ -752,9 +942,12 @@ pub async fn update_thread(
     } else {
         &thread.author_email
     };
-    state
-        .audit
-        .emit(AuditEvent::info("thread.update", actor, &thread.id, &thread.category_id));
+    state.audit.emit(AuditEvent::info(
+        "thread.update",
+        actor,
+        &thread.id,
+        &thread.category_id,
+    ));
 
     Ok(redirect_to(&format!("/t/{id}")))
 }
@@ -774,7 +967,9 @@ pub async fn delete_thread(
         .await?
         .ok_or_else(|| AppError::NotFound("thread not found".to_string()))?;
     if thread.author_sub != author.sub {
-        return Err(AppError::Forbidden("you can only delete your own threads".to_string()));
+        return Err(AppError::Forbidden(
+            "you can only delete your own threads".to_string(),
+        ));
     }
 
     state.store.delete_thread(&id).await?;
@@ -785,9 +980,12 @@ pub async fn delete_thread(
     } else {
         &thread.author_email
     };
-    state
-        .audit
-        .emit(AuditEvent::notice("thread.delete", actor, &thread.id, &thread.category_id));
+    state.audit.emit(AuditEvent::notice(
+        "thread.delete",
+        actor,
+        &thread.id,
+        &thread.category_id,
+    ));
 
     // Bounce back to the thread's category (or home if it is gone).
     Ok(redirect_to(&format!("/c/{}", thread.category_id)))
@@ -821,7 +1019,9 @@ fn locate_own_reply(posts: &[Post], pid: &str, author_sub: &str) -> Result<Post,
         .find(|p| p.id == pid)
         .ok_or_else(|| AppError::NotFound("reply not found".to_string()))?;
     if post.author_sub != author_sub {
-        return Err(AppError::Forbidden("you can only edit your own replies".to_string()));
+        return Err(AppError::Forbidden(
+            "you can only edit your own replies".to_string(),
+        ));
     }
     Ok(post.clone())
 }
@@ -862,13 +1062,21 @@ pub async fn update_reply(
 
     let body = form.body.trim();
     if body.is_empty() {
-        return Err(AppError::InvalidRequest("reply body is required".to_string()));
+        return Err(AppError::InvalidRequest(
+            "reply body is required".to_string(),
+        ));
     }
     if body.chars().count() > MAX_BODY {
-        return Err(AppError::InvalidRequest("reply body is too long".to_string()));
+        return Err(AppError::InvalidRequest(
+            "reply body is too long".to_string(),
+        ));
     }
 
     state.store.update_post(&pid, body).await?;
+    state
+        .store
+        .replace_mentions(&pid, &tid, &extract_mentions(body), now_secs())
+        .await?;
     tracing::info!(thread = tid, post = pid, "reply updated");
 
     let actor = if post.author_email.is_empty() {
@@ -876,7 +1084,9 @@ pub async fn update_reply(
     } else {
         &post.author_email
     };
-    state.audit.emit(AuditEvent::info("reply.update", actor, &pid, &tid));
+    state
+        .audit
+        .emit(AuditEvent::info("reply.update", actor, &pid, &tid));
 
     Ok(redirect_to(&format!("/t/{tid}")))
 }
@@ -901,7 +1111,9 @@ pub async fn delete_reply(
     } else {
         &post.author_email
     };
-    state.audit.emit(AuditEvent::notice("reply.delete", actor, &pid, &tid));
+    state
+        .audit
+        .emit(AuditEvent::notice("reply.delete", actor, &pid, &tid));
 
     Ok(redirect_to(&format!("/t/{tid}")))
 }
@@ -936,7 +1148,9 @@ pub async fn react(
 
     let kind = form.kind.trim();
     if !is_reaction_kind(kind) {
-        return Err(AppError::InvalidRequest("unknown reaction kind".to_string()));
+        return Err(AppError::InvalidRequest(
+            "unknown reaction kind".to_string(),
+        ));
     }
 
     // The post must exist AND belong to this thread (guards cross-thread id spoofing).
@@ -1018,7 +1232,11 @@ pub async fn accept_answer(
 
     // Toggle: re-accepting the currently accepted reply clears it; otherwise set it. Idempotent
     // (marking the same reply that is already accepted flips it off — a deliberate unmark).
-    let new_accepted = if thread.accepted_post_id == target { "" } else { target };
+    let new_accepted = if thread.accepted_post_id == target {
+        ""
+    } else {
+        target
+    };
     state.store.set_accepted_post(&tid, new_accepted).await?;
     tracing::info!(thread = tid, accepted = new_accepted, "accepted answer set");
 
@@ -1031,7 +1249,62 @@ pub async fn accept_answer(
         "thread.accept",
         actor,
         &tid,
-        if new_accepted.is_empty() { "cleared" } else { new_accepted },
+        if new_accepted.is_empty() {
+            "cleared"
+        } else {
+            new_accepted
+        },
+    ));
+
+    Ok(redirect_to(&format!("/t/{tid}")))
+}
+
+// ===========================================================================
+// POST /t/{id}/subscribe — toggle current user's thread subscription
+// ===========================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct SubscribeForm {
+    #[serde(default)]
+    pub csrf: String,
+}
+
+pub async fn toggle_subscription(
+    State(state): State<AppState>,
+    Path(tid): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<SubscribeForm>,
+) -> Result<Response, AppError> {
+    auth::verify_csrf(&headers, &form.csrf)?;
+    let author = auth::require_author(&headers)?;
+    state
+        .store
+        .get_thread(&tid)
+        .await?
+        .ok_or_else(|| AppError::NotFound("thread not found".to_string()))?;
+
+    let subscribed = state
+        .store
+        .toggle_thread_subscription(&tid, &author.sub, now_secs())
+        .await?;
+    let actor = if author.email.is_empty() {
+        &author.sub
+    } else {
+        &author.email
+    };
+    state.audit.emit(AuditEvent::info(
+        if subscribed {
+            "thread.subscribe"
+        } else {
+            "thread.unsubscribe"
+        },
+        actor,
+        &tid,
+        if subscribed {
+            "subscribed"
+        } else {
+            "unsubscribed"
+        },
     ));
 
     Ok(redirect_to(&format!("/t/{tid}")))
@@ -1040,6 +1313,228 @@ pub async fn accept_answer(
 // ===========================================================================
 // Render helpers
 // ===========================================================================
+
+fn subscribed_subject<'a>(q: &ThreadListQuery, viewer_sub: Option<&'a str>) -> Option<&'a str> {
+    if q.subscribed_only() {
+        viewer_sub
+    } else {
+        None
+    }
+}
+
+fn render_thread_list_controls(action: &str, q: &ThreadListQuery, show_subscribed: bool) -> String {
+    let sort = q.sort_key();
+    let selected = |key: &str| if sort == key { " selected" } else { "" };
+    let filter = if show_subscribed {
+        format!(
+            r#"<label class="thread-filter"><input type="checkbox" name="filter" value="subscribed"{checked}> Subscribed</label>"#,
+            checked = if q.subscribed_only() { " checked" } else { "" },
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<form class="thread-controls" method="get" action="{action}">
+  <label for="thread-sort">Sort</label>
+  <select id="thread-sort" name="sort">
+    <option value="latest"{latest}>Latest</option>
+    <option value="top"{top}>Top</option>
+    <option value="hot"{hot}>Hot</option>
+  </select>
+  {filter}
+  <button class="btn btn-secondary btn-sm" type="submit">Apply</button>
+</form>"#,
+        action = esc(action),
+        latest = selected("latest"),
+        top = selected("top"),
+        hot = selected("hot"),
+        filter = filter,
+    )
+}
+
+async fn render_mentions_panel(state: &AppState, headers: &HeaderMap) -> Result<String, AppError> {
+    let Some(username) = mention_username_from_headers(headers) else {
+        return Ok(String::new());
+    };
+    let count = state.store.count_mentions_for_user(&username).await?;
+    if count == 0 {
+        return Ok(String::new());
+    }
+    let mentions = state
+        .store
+        .mentions_for_user(&username, MENTION_LIMIT)
+        .await?;
+    let mut rows = String::new();
+    for mention in mentions {
+        if let Some(thread) = state.store.get_thread(&mention.thread_id).await? {
+            rows.push_str(&format!(
+                r##"<a class="thread-row" href="/t/{tid}#post-{pid}">
+  <span class="thread-row__main">
+    <span class="thread-row__title">{title}</span>
+    <span class="thread-row__sub">@{user} mentioned you</span>
+  </span>
+  <span class="thread-row__time">{when}</span>
+</a>"##,
+                tid = esc(&mention.thread_id),
+                pid = esc(&mention.post_id),
+                title = esc(&thread.title),
+                user = esc(&mention.mentioned_username),
+                when = esc(&fmt_ts(mention.created_at)),
+            ));
+        }
+    }
+    if rows.is_empty() {
+        return Ok(String::new());
+    }
+    Ok(format!(
+        r#"<section class="section mentions">
+  <h2 class="section__title mentions__title">Mentions <span class="badge mention-badge">@{count}</span></h2>
+  <div class="thread-list">{rows}</div>
+</section>"#,
+        count = count,
+        rows = rows,
+    ))
+}
+
+fn render_subscription_form(thread_id: &str, csrf: &str, subscribed: bool) -> String {
+    let label = if subscribed {
+        "Unsubscribe"
+    } else {
+        "Subscribe"
+    };
+    let class = if subscribed {
+        "btn btn-secondary btn-sm"
+    } else {
+        "btn btn-ghost btn-sm"
+    };
+    format!(
+        r#"<form class="inline-form subscription-form" method="post" action="/t/{tid}/subscribe">
+  <input type="hidden" name="csrf" value="{csrf}">
+  <button class="{class}" type="submit">{label}</button>
+</form>"#,
+        tid = esc(thread_id),
+        csrf = esc(csrf),
+        class = class,
+        label = label,
+    )
+}
+
+fn render_reply_quote_fields(quote: Option<&Post>) -> String {
+    let Some(quote) = quote else {
+        return String::new();
+    };
+    format!(
+        r#"<input type="hidden" name="quote_post_id" value="{pid}">
+    <div class="quote-preview">
+      <blockquote>
+        <p class="quote-preview__by">{author} wrote:</p>
+        <p>{body}</p>
+      </blockquote>
+    </div>"#,
+        pid = esc(&quote.id),
+        author = esc(&quote.author_email),
+        body = esc(&quote.body_md),
+    )
+}
+
+async fn load_quoted_posts(
+    state: &AppState,
+    thread_id: &str,
+    posts: &[Post],
+) -> Result<HashMap<String, Post>, AppError> {
+    let mut out = HashMap::new();
+    let mut seen = HashSet::new();
+    for p in posts {
+        if p.quoted_post_id.is_empty() || !seen.insert(p.quoted_post_id.as_str()) {
+            continue;
+        }
+        if let Some(quoted) = state
+            .store
+            .get_post(&p.quoted_post_id)
+            .await?
+            .filter(|qp| qp.thread_id == thread_id)
+        {
+            out.insert(quoted.id.clone(), quoted);
+        }
+    }
+    Ok(out)
+}
+
+fn render_quote_block(post: &Post, quoted_posts: &HashMap<String, Post>) -> String {
+    if post.quoted_post_id.is_empty() {
+        return String::new();
+    }
+    let Some(quoted) = quoted_posts.get(&post.quoted_post_id) else {
+        return String::new();
+    };
+    format!(
+        r#"<blockquote class="post-quote">
+  <p class="post-quote__by">{author} wrote:</p>
+  <p>{body}</p>
+</blockquote>"#,
+        author = esc(&quoted.author_email),
+        body = esc(&quoted.body_md),
+    )
+}
+
+fn mention_username_from_headers(headers: &HeaderMap) -> Option<String> {
+    auth::identity_email(headers)
+        .and_then(|email| email.split('@').next().and_then(normalize_mention_name))
+        .or_else(|| auth::identity_subject(headers).and_then(|sub| normalize_mention_name(&sub)))
+}
+
+fn extract_mentions(body: &str) -> Vec<String> {
+    let bytes = body.as_bytes();
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'@' || (i > 0 && is_mention_char(bytes[i - 1])) {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut end = start;
+        while end < bytes.len() && is_mention_char(bytes[end]) {
+            end += 1;
+        }
+        while end > start && matches!(bytes[end - 1], b'.' | b'-' | b'_') {
+            end -= 1;
+        }
+        if end > start {
+            if let Some(name) = normalize_mention_name(&body[start..end]) {
+                if seen.insert(name.clone()) {
+                    out.push(name);
+                }
+            }
+        }
+        i = end.max(start);
+    }
+    out
+}
+
+fn normalize_mention_name(raw: &str) -> Option<String> {
+    let s = raw.trim().trim_start_matches('@');
+    if s.is_empty() || s.len() > 64 {
+        return None;
+    }
+    if !s
+        .bytes()
+        .next()
+        .map(|b| b.is_ascii_alphanumeric())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    if !s.bytes().all(is_mention_char) {
+        return None;
+    }
+    Some(s.to_ascii_lowercase())
+}
+
+fn is_mention_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')
+}
 
 /// Render the admin moderation toolbar for a thread: toggle lock, toggle pin, move to another
 /// category, and delete the whole thread. Every action is a CSRF-guarded POST into the
@@ -1053,7 +1548,11 @@ pub(crate) fn render_admin_thread_toolbar(
     let pin_label = if thread.pinned { "Unpin" } else { "Pin" };
     let mut options = String::new();
     for c in categories {
-        let sel = if c.id == thread.category_id { " selected" } else { "" };
+        let sel = if c.id == thread.category_id {
+            " selected"
+        } else {
+            ""
+        };
         options.push_str(&format!(
             r#"<option value="{id}"{sel}>{name}</option>"#,
             id = esc(&c.id),
@@ -1227,7 +1726,11 @@ pub(crate) fn order_posts_accepted_first(posts: &[Post], accepted_post_id: &str)
 /// then `after` (newer); a missing/malformed cursor falls back to the first (oldest) page — the
 /// default view, so a bare `GET /t/{id}` is unchanged.
 fn resolve_anchor(q: &ThreadQuery) -> ReplyAnchor {
-    if q.latest.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false) {
+    if q.latest
+        .as_deref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+    {
         return ReplyAnchor::Latest;
     }
     if let Some((ts, id)) = parse_cursor(q.before.as_deref()) {
@@ -1294,7 +1797,12 @@ fn render_reply_pagination(
 /// Render the reaction button row for a post: one CSRF-guarded toggle form per allowed kind (in
 /// [`REACTION_KINDS`] order), each showing the glyph and its live count. The viewer's own active
 /// reactions carry `is-mine`. Every value is HTML-escaped.
-fn render_reactions(thread_id: &str, post_id: &str, csrf: &str, counts: &[ReactionCount]) -> String {
+fn render_reactions(
+    thread_id: &str,
+    post_id: &str,
+    csrf: &str,
+    counts: &[ReactionCount],
+) -> String {
     let mut buttons = String::new();
     for (kind, glyph) in REACTION_KINDS {
         let hit = counts.iter().find(|c| c.kind == *kind);
@@ -1328,7 +1836,8 @@ fn render_reactions(thread_id: &str, post_id: &str, csrf: &str, counts: &[Reacti
 /// that is edited/deleted via the thread controls) gets inline Edit/Delete controls when
 /// `viewer` is its author. Every post shows the reaction row; the reply marked as the accepted
 /// answer shows an "Accepted answer" badge, and when `can_accept` (thread author or admin) each
-/// reply gets a mark/unmark-accepted control.
+/// reply gets a mark/unmark-accepted control. A post with `quoted_post_id` renders an escaped
+/// quote block above its own markdown body when the referenced post still exists in this thread.
 #[allow(clippy::too_many_arguments)]
 fn render_posts(
     posts: &[Post],
@@ -1340,6 +1849,7 @@ fn render_posts(
     accepted_post_id: &str,
     can_accept: bool,
     reactions: &HashMap<String, Vec<ReactionCount>>,
+    quoted_posts: &HashMap<String, Post>,
 ) -> String {
     if posts.is_empty() {
         return r#"<div class="empty">This thread has no posts.</div>"#.to_string();
@@ -1380,7 +1890,11 @@ fn render_posts(
         };
         // Mark/unmark accepted: replies only (i > 0), gated to the thread author + admin.
         let accept_control = if i > 0 && can_accept {
-            let label = if is_accepted { "Unmark accepted" } else { "Mark accepted" };
+            let label = if is_accepted {
+                "Unmark accepted"
+            } else {
+                "Mark accepted"
+            };
             format!(
                 r#"<form class="inline-form" method="post" action="/t/{tid}/accept">
     <input type="hidden" name="csrf" value="{csrf}">
@@ -1395,6 +1909,11 @@ fn render_posts(
         } else {
             String::new()
         };
+        let quote_control = format!(
+            r##"<a class="btn btn-ghost btn-sm" href="/t/{tid}?quote={pid}#reply">Quote</a>"##,
+            tid = esc(thread_id),
+            pid = esc(&p.id),
+        );
         // Admin can delete ANY post (original post included). The admin route is group-gated.
         let admin_controls = if is_admin {
             format!(
@@ -1408,32 +1927,39 @@ fn render_posts(
         } else {
             String::new()
         };
-        let controls = if owner_controls.is_empty() && accept_control.is_empty() && admin_controls.is_empty() {
+        let controls = if quote_control.is_empty()
+            && owner_controls.is_empty()
+            && accept_control.is_empty()
+            && admin_controls.is_empty()
+        {
             String::new()
         } else {
             format!(
-                r#"<div class="owner-actions post__actions">{owner_controls}{accept_control}{admin_controls}</div>"#,
+                r#"<div class="owner-actions post__actions">{quote_control}{owner_controls}{accept_control}{admin_controls}</div>"#,
             )
         };
         let counts = reactions.get(&p.id).unwrap_or(&empty_counts);
         let reactions_html = render_reactions(thread_id, &p.id, csrf, counts);
+        let quote_html = render_quote_block(p, quoted_posts);
         out.push_str(&format!(
-            r#"<article class="post{op}">
+            r#"<article id="post-{pid}" class="post{op}">
   <header class="post__meta">
     <span class="post__author">{author}</span>
     <span class="post__dot">·</span>
     <time class="post__time" title="{abs}">{ago}</time>
     {tag}
   </header>
-  <div class="markdown">{body}</div>
+  <div class="markdown">{quote}{body}</div>
   {reactions}
   {controls}
 </article>"#,
+            pid = esc(&p.id),
             op = op,
             author = esc(&p.author_email),
             abs = esc(&fmt_ts(p.created_at)),
             ago = esc(&rel_time(p.created_at, now)),
             tag = tag,
+            quote = quote_html,
             body = markdown::render(&p.body_md),
             reactions = reactions_html,
             controls = controls,

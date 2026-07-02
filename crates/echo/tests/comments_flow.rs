@@ -24,26 +24,47 @@ async fn full_comments_flow_in_memory() {
     // --- empty dashboard ---------------------------------------------------
     let (status, body) = call(&state, get("/")).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("No threads yet"), "empty dashboard placeholder");
+    assert!(
+        body.contains("No threads yet"),
+        "empty dashboard placeholder"
+    );
 
     // --- GET /t/{key} mints a CSRF cookie even for a not-yet-existing thread
-    let resp = app(state.clone()).oneshot(get("/t/blog%2Fhello")).await.unwrap();
+    let resp = app(state.clone())
+        .oneshot(get("/t/blog%2Fhello"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let set_cookie = resp
         .headers()
         .get(header::SET_COOKIE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    assert!(set_cookie.contains("__Host-csrf="), "GET /t mints CSRF cookie");
+    assert!(
+        set_cookie.contains("__Host-csrf="),
+        "GET /t mints CSRF cookie"
+    );
 
     // --- POST /api/comment without identity -> 401 -------------------------
-    let body = form(&[("thread_key", "blog/hello"), ("body", "hi"), ("csrf_token", CSRF)]);
+    let body = form(&[
+        ("thread_key", "blog/hello"),
+        ("body", "hi"),
+        ("csrf_token", CSRF),
+    ]);
     let (status, _) = call(&state, post_csrf("/api/comment", &body, None)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "no X-Auth -> 401");
 
     // --- POST /api/comment with bad CSRF -> 401 ----------------------------
-    let body = form(&[("thread_key", "blog/hello"), ("body", "hi"), ("csrf_token", "WRONG")]);
-    let (status, _) = call(&state, post_csrf("/api/comment", &body, Some(("u_alice", "alice@hf")))).await;
+    let body = form(&[
+        ("thread_key", "blog/hello"),
+        ("body", "hi"),
+        ("csrf_token", "WRONG"),
+    ]);
+    let (status, _) = call(
+        &state,
+        post_csrf("/api/comment", &body, Some(("u_alice", "alice@hf"))),
+    )
+    .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "CSRF mismatch -> 401");
 
     // --- post a real top-level comment (creates the thread) ----------------
@@ -56,7 +77,11 @@ async fn full_comments_flow_in_memory() {
         ("csrf_token", CSRF),
     ]);
     let resp = app(state.clone())
-        .oneshot(post_csrf("/api/comment", &body, Some(("u_alice", "alice@hf"))))
+        .oneshot(post_csrf(
+            "/api/comment",
+            &body,
+            Some(("u_alice", "alice@hf")),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
@@ -65,15 +90,24 @@ async fn full_comments_flow_in_memory() {
 
     // --- dashboard now lists the thread + activity -------------------------
     let (_, dash) = call(&state, get("/")).await;
-    assert!(dash.contains("Hello World Post"), "thread title on dashboard");
+    assert!(
+        dash.contains("Hello World Post"),
+        "thread title on dashboard"
+    );
     assert!(dash.contains("alice@hf"), "author in activity feed");
 
     // --- thread view renders sanitized markdown + the comment -------------
     let (status, view) = call(&state, get("/t/blog%2Fhello")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(view.contains("<strong>bold</strong>"), "markdown rendered");
-    assert!(!view.contains("<script>alert(1)"), "raw script must be escaped");
-    assert!(view.contains("&lt;script&gt;"), "script shown as escaped text");
+    assert!(
+        !view.contains("<script>alert(1)"),
+        "raw script must be escaped"
+    );
+    assert!(
+        view.contains("&lt;script&gt;"),
+        "script shown as escaped text"
+    );
     assert!(!view.contains("javascript:alert"), "js: link neutralized");
     assert!(view.contains("/api/comment"), "composer present");
 
@@ -87,7 +121,11 @@ async fn full_comments_flow_in_memory() {
         ("parent_id", &comment_id),
         ("csrf_token", CSRF),
     ]);
-    let (status, _) = call(&state, post_csrf("/api/comment", &body, Some(("u_bob", "bob@hf")))).await;
+    let (status, _) = call(
+        &state,
+        post_csrf("/api/comment", &body, Some(("u_bob", "bob@hf"))),
+    )
+    .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     let (_, view) = call(&state, get("/t/blog%2Fhello")).await;
     assert!(view.contains("A reply to the first."), "reply rendered");
@@ -102,12 +140,20 @@ async fn full_comments_flow_in_memory() {
     ]);
     let (status, _) = call(
         &state,
-        post_csrf_g("/api/moderate", &body, Some(("u_mod", "mod@hf")), Some("moderators")),
+        post_csrf_g(
+            "/api/moderate",
+            &body,
+            Some(("u_mod", "mod@hf")),
+            Some("moderators"),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     let (_, view) = call(&state, get("/t/blog%2Fhello")).await;
-    assert!(view.contains("[comment hidden by a moderator]"), "hidden body replaced");
+    assert!(
+        view.contains("[comment hidden by a moderator]"),
+        "hidden body replaced"
+    );
     assert!(!view.contains("First!"), "hidden comment body not shown");
 
     // --- moderation: unhide restores ---------------------------------------
@@ -118,7 +164,12 @@ async fn full_comments_flow_in_memory() {
     ]);
     let (status, _) = call(
         &state,
-        post_csrf_g("/api/moderate", &body, Some(("u_mod", "mod@hf")), Some("moderators")),
+        post_csrf_g(
+            "/api/moderate",
+            &body,
+            Some(("u_mod", "mod@hf")),
+            Some("moderators"),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
@@ -126,24 +177,44 @@ async fn full_comments_flow_in_memory() {
     assert!(view.contains("First!"), "unhidden comment body restored");
 
     // --- moderation of a missing comment -> 404 ----------------------------
-    let body = form(&[("comment_id", "cmt_nope"), ("action", "hide"), ("csrf_token", CSRF)]);
+    let body = form(&[
+        ("comment_id", "cmt_nope"),
+        ("action", "hide"),
+        ("csrf_token", CSRF),
+    ]);
     let (status, _) = call(
         &state,
-        post_csrf_g("/api/moderate", &body, Some(("u_mod", "mod@hf")), Some("moderators")),
+        post_csrf_g(
+            "/api/moderate",
+            &body,
+            Some(("u_mod", "mod@hf")),
+            Some("moderators"),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "unknown comment -> 404");
 
     // --- empty body is rejected --------------------------------------------
-    let body = form(&[("thread_key", "blog/hello"), ("body", "   "), ("csrf_token", CSRF)]);
-    let (status, _) = call(&state, post_csrf("/api/comment", &body, Some(("u_alice", "alice@hf")))).await;
+    let body = form(&[
+        ("thread_key", "blog/hello"),
+        ("body", "   "),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, _) = call(
+        &state,
+        post_csrf("/api/comment", &body, Some(("u_alice", "alice@hf"))),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "blank body -> 400");
 }
 
 #[tokio::test]
 async fn embed_view_sets_frame_options() {
     let state = build_dev_state();
-    let resp = app(state.clone()).oneshot(get("/embed/wiki%2Fpage")).await.unwrap();
+    let resp = app(state.clone())
+        .oneshot(get("/embed/wiki%2Fpage"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let xfo = resp
         .headers()
@@ -151,7 +222,9 @@ async fn embed_view_sets_frame_options() {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     assert_eq!(xfo, "SAMEORIGIN", "embed allows same-origin framing");
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let html = String::from_utf8_lossy(&bytes);
     assert!(html.contains("page-embed"), "minimal embed chrome");
     assert!(html.contains("/api/comment"), "embed composer present");
@@ -163,25 +236,51 @@ async fn reply_to_reply_clamps_to_one_level() {
 
     // top-level comment
     let body = form(&[("thread_key", "k"), ("body", "root"), ("csrf_token", CSRF)]);
-    call(&state, post_csrf("/api/comment", &body, Some(("u1", "u1@hf")))).await;
+    call(
+        &state,
+        post_csrf("/api/comment", &body, Some(("u1", "u1@hf"))),
+    )
+    .await;
     let (_, view) = call(&state, get("/t/k")).await;
     let root_id = extract_comment_id(&view).expect("root id");
 
     // a reply onto the root
-    let body = form(&[("thread_key", "k"), ("body", "child"), ("parent_id", &root_id), ("csrf_token", CSRF)]);
-    call(&state, post_csrf("/api/comment", &body, Some(("u2", "u2@hf")))).await;
+    let body = form(&[
+        ("thread_key", "k"),
+        ("body", "child"),
+        ("parent_id", &root_id),
+        ("csrf_token", CSRF),
+    ]);
+    call(
+        &state,
+        post_csrf("/api/comment", &body, Some(("u2", "u2@hf"))),
+    )
+    .await;
     let (_, view) = call(&state, get("/t/k")).await;
     // the reply's own moderation form exposes its id; grab the first id after root in the replies block.
     let child_id = extract_nth_comment_id(&view, 1).expect("child id");
     assert_ne!(child_id, root_id);
 
     // a reply onto the reply -> must re-parent to the root, so the tree stays one level deep.
-    let body = form(&[("thread_key", "k"), ("body", "grandchild"), ("parent_id", &child_id), ("csrf_token", CSRF)]);
-    call(&state, post_csrf("/api/comment", &body, Some(("u3", "u3@hf")))).await;
+    let body = form(&[
+        ("thread_key", "k"),
+        ("body", "grandchild"),
+        ("parent_id", &child_id),
+        ("csrf_token", CSRF),
+    ]);
+    call(
+        &state,
+        post_csrf("/api/comment", &body, Some(("u3", "u3@hf"))),
+    )
+    .await;
     let (_, view) = call(&state, get("/t/k")).await;
     assert!(view.contains("grandchild"), "grandchild posted");
     // exactly one `.replies` container exists (no nested replies inside replies).
-    assert_eq!(view.matches(r#"<div class="replies">"#).count(), 1, "only one nesting level");
+    assert_eq!(
+        view.matches(r#"<div class="replies">"#).count(),
+        1,
+        "only one nesting level"
+    );
 }
 
 #[tokio::test]
@@ -190,14 +289,30 @@ async fn moderation_requires_moderator_group() {
 
     // a plain commenter posts.
     let body = form(&[("thread_key", "k"), ("body", "hi"), ("csrf_token", CSRF)]);
-    call(&state, post_csrf("/api/comment", &body, Some(("u_alice", "alice@hf")))).await;
+    call(
+        &state,
+        post_csrf("/api/comment", &body, Some(("u_alice", "alice@hf"))),
+    )
+    .await;
     let (_, view) = call(&state, get("/t/k")).await;
     let id = extract_comment_id(&view).expect("comment id");
 
     // authenticated, correct CSRF, but NO moderator group -> 403 (the security fix).
-    let mbody = form(&[("comment_id", &id), ("action", "hide"), ("csrf_token", CSRF)]);
-    let (status, _) = call(&state, post_csrf("/api/moderate", &mbody, Some(("u_eve", "eve@hf")))).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "non-moderator cannot moderate");
+    let mbody = form(&[
+        ("comment_id", &id),
+        ("action", "hide"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, _) = call(
+        &state,
+        post_csrf("/api/moderate", &mbody, Some(("u_eve", "eve@hf"))),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "non-moderator cannot moderate"
+    );
 
     // the hide was rejected, so the comment is NOT hidden.
     let (_, view) = call(&state, get("/t/k")).await;
@@ -209,21 +324,46 @@ async fn moderation_requires_moderator_group() {
     // a member of `moderators` succeeds.
     let (status, _) = call(
         &state,
-        post_csrf_g("/api/moderate", &mbody, Some(("u_mod", "mod@hf")), Some("moderators")),
+        post_csrf_g(
+            "/api/moderate",
+            &mbody,
+            Some(("u_mod", "mod@hf")),
+            Some("moderators"),
+        ),
     )
     .await;
-    assert_eq!(status, StatusCode::SEE_OTHER, "moderator group authorizes moderation");
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "moderator group authorizes moderation"
+    );
     let (_, view) = call(&state, get("/t/k")).await;
-    assert!(view.contains("[comment hidden by a moderator]"), "moderator hid the comment");
+    assert!(
+        view.contains("[comment hidden by a moderator]"),
+        "moderator hid the comment"
+    );
 
     // `infra-admins` (among other groups) is also authorized.
-    let ubody = form(&[("comment_id", &id), ("action", "unhide"), ("csrf_token", CSRF)]);
+    let ubody = form(&[
+        ("comment_id", &id),
+        ("action", "unhide"),
+        ("csrf_token", CSRF),
+    ]);
     let (status, _) = call(
         &state,
-        post_csrf_g("/api/moderate", &ubody, Some(("u_admin", "admin@hf")), Some("dev,infra-admins")),
+        post_csrf_g(
+            "/api/moderate",
+            &ubody,
+            Some(("u_admin", "admin@hf")),
+            Some("dev,infra-admins"),
+        ),
     )
     .await;
-    assert_eq!(status, StatusCode::SEE_OTHER, "infra-admins authorizes moderation");
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "infra-admins authorizes moderation"
+    );
 }
 
 #[tokio::test]
@@ -231,36 +371,83 @@ async fn author_self_edit_and_delete() {
     let state = build_dev_state();
 
     // alice posts a comment.
-    let body = form(&[("thread_key", "k"), ("body", "original text"), ("csrf_token", CSRF)]);
-    call(&state, post_csrf("/api/comment", &body, Some(("u_alice", "alice@hf")))).await;
+    let body = form(&[
+        ("thread_key", "k"),
+        ("body", "original text"),
+        ("csrf_token", CSRF),
+    ]);
+    call(
+        &state,
+        post_csrf("/api/comment", &body, Some(("u_alice", "alice@hf"))),
+    )
+    .await;
     let (_, view) = call(&state, get("/t/k")).await;
     let id = extract_comment_id(&view).expect("comment id");
 
     // the owner (viewer == author) sees self-edit + self-delete controls.
     let (_, owner_view) = call(&state, get_as("/t/k", "u_alice", "alice@hf")).await;
-    assert!(owner_view.contains("/api/comment/edit"), "owner sees edit control");
-    assert!(owner_view.contains("/api/comment/delete"), "owner sees delete control");
+    assert!(
+        owner_view.contains("/api/comment/edit"),
+        "owner sees edit control"
+    );
+    assert!(
+        owner_view.contains("/api/comment/delete"),
+        "owner sees delete control"
+    );
 
     // a different signed-in user does NOT see self controls on alice's comment.
     let (_, other_view) = call(&state, get_as("/t/k", "u_eve", "eve@hf")).await;
-    assert!(!other_view.contains("/api/comment/edit"), "non-owner sees no edit control");
-    assert!(!other_view.contains("/api/comment/delete"), "non-owner sees no delete control");
+    assert!(
+        !other_view.contains("/api/comment/edit"),
+        "non-owner sees no edit control"
+    );
+    assert!(
+        !other_view.contains("/api/comment/delete"),
+        "non-owner sees no delete control"
+    );
 
     // a non-owner cannot edit -> 404 (ownership enforced by the store).
-    let ebody = form(&[("comment_id", &id), ("body", "hacked"), ("csrf_token", CSRF)]);
-    let (status, _) = call(&state, post_csrf("/api/comment/edit", &ebody, Some(("u_eve", "eve@hf")))).await;
+    let ebody = form(&[
+        ("comment_id", &id),
+        ("body", "hacked"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, _) = call(
+        &state,
+        post_csrf("/api/comment/edit", &ebody, Some(("u_eve", "eve@hf"))),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "non-owner edit rejected");
     let (_, view) = call(&state, get("/t/k")).await;
-    assert!(view.contains("original text") && !view.contains("hacked"), "body unchanged");
+    assert!(
+        view.contains("original text") && !view.contains("hacked"),
+        "body unchanged"
+    );
 
     // edit requires CSRF: a mismatched form token (cookie is CSRF) -> 401, even for the owner.
     let bad = form(&[("comment_id", &id), ("body", "x"), ("csrf_token", "WRONG")]);
-    let (status, _) = call(&state, post_csrf("/api/comment/edit", &bad, Some(("u_alice", "alice@hf")))).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "edit CSRF mismatch -> 401");
+    let (status, _) = call(
+        &state,
+        post_csrf("/api/comment/edit", &bad, Some(("u_alice", "alice@hf"))),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "edit CSRF mismatch -> 401"
+    );
 
     // the owner edits successfully.
-    let ebody = form(&[("comment_id", &id), ("body", "edited text"), ("csrf_token", CSRF)]);
-    let (status, _) = call(&state, post_csrf("/api/comment/edit", &ebody, Some(("u_alice", "alice@hf")))).await;
+    let ebody = form(&[
+        ("comment_id", &id),
+        ("body", "edited text"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, _) = call(
+        &state,
+        post_csrf("/api/comment/edit", &ebody, Some(("u_alice", "alice@hf"))),
+    )
+    .await;
     assert_eq!(status, StatusCode::SEE_OTHER, "owner edit ok");
     let (_, view) = call(&state, get("/t/k")).await;
     assert!(view.contains("edited text"), "edited body shown");
@@ -268,13 +455,24 @@ async fn author_self_edit_and_delete() {
 
     // a non-owner cannot delete -> 404.
     let dbody = form(&[("comment_id", &id), ("csrf_token", CSRF)]);
-    let (status, _) = call(&state, post_csrf("/api/comment/delete", &dbody, Some(("u_eve", "eve@hf")))).await;
+    let (status, _) = call(
+        &state,
+        post_csrf("/api/comment/delete", &dbody, Some(("u_eve", "eve@hf"))),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "non-owner delete rejected");
     let (_, view) = call(&state, get("/t/k")).await;
-    assert!(view.contains("edited text"), "comment still present after rejected delete");
+    assert!(
+        view.contains("edited text"),
+        "comment still present after rejected delete"
+    );
 
     // the owner deletes their own comment.
-    let (status, _) = call(&state, post_csrf("/api/comment/delete", &dbody, Some(("u_alice", "alice@hf")))).await;
+    let (status, _) = call(
+        &state,
+        post_csrf("/api/comment/delete", &dbody, Some(("u_alice", "alice@hf"))),
+    )
+    .await;
     assert_eq!(status, StatusCode::SEE_OTHER, "owner delete ok");
     let (_, view) = call(&state, get("/t/k")).await;
     assert!(!view.contains("edited text"), "comment removed");
@@ -285,8 +483,16 @@ async fn reactions_toggle_count_and_guards() {
     let state = build_dev_state();
 
     // Seed a comment.
-    let body = form(&[("thread_key", "k"), ("body", "reactme"), ("csrf_token", CSRF)]);
-    call(&state, post_csrf("/api/comment", &body, Some(("u_alice", "alice@hf")))).await;
+    let body = form(&[
+        ("thread_key", "k"),
+        ("body", "reactme"),
+        ("csrf_token", CSRF),
+    ]);
+    call(
+        &state,
+        post_csrf("/api/comment", &body, Some(("u_alice", "alice@hf"))),
+    )
+    .await;
     let (_, view) = call(&state, get("/t/k")).await;
     let id = extract_comment_id(&view).expect("comment id");
 
@@ -301,34 +507,258 @@ async fn reactions_toggle_count_and_guards() {
 
     // Bad CSRF -> 401.
     let bad = form(&[("comment_id", &id), ("kind", "up"), ("csrf_token", "WRONG")]);
-    let (status, _) = call(&state, post_csrf("/api/comment/react", &bad, Some(("u_bob", "bob@hf")))).await;
+    let (status, _) = call(
+        &state,
+        post_csrf("/api/comment/react", &bad, Some(("u_bob", "bob@hf"))),
+    )
+    .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "react needs CSRF");
 
     // Unknown kind -> 400.
-    let junk = form(&[("comment_id", &id), ("kind", "explode"), ("csrf_token", CSRF)]);
-    let (status, _) = call(&state, post_csrf("/api/comment/react", &junk, Some(("u_bob", "bob@hf")))).await;
+    let junk = form(&[
+        ("comment_id", &id),
+        ("kind", "explode"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, _) = call(
+        &state,
+        post_csrf("/api/comment/react", &junk, Some(("u_bob", "bob@hf"))),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "unknown kind rejected");
 
     // Missing comment -> 404.
-    let miss = form(&[("comment_id", "cmt_nope"), ("kind", "up"), ("csrf_token", CSRF)]);
-    let (status, _) = call(&state, post_csrf("/api/comment/react", &miss, Some(("u_bob", "bob@hf")))).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "react on missing comment -> 404");
+    let miss = form(&[
+        ("comment_id", "cmt_nope"),
+        ("kind", "up"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, _) = call(
+        &state,
+        post_csrf("/api/comment/react", &miss, Some(("u_bob", "bob@hf"))),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "react on missing comment -> 404"
+    );
 
     // Bob reacts "up" -> count 1.
     let rbody = form(&[("comment_id", &id), ("kind", "up"), ("csrf_token", CSRF)]);
-    let (status, _) = call(&state, post_csrf("/api/comment/react", &rbody, Some(("u_bob", "bob@hf")))).await;
+    let (status, _) = call(
+        &state,
+        post_csrf("/api/comment/react", &rbody, Some(("u_bob", "bob@hf"))),
+    )
+    .await;
     assert_eq!(status, StatusCode::SEE_OTHER, "react ok");
     // Bob's own view shows his reaction as pressed.
     let (_, bview) = call(&state, get_as("/t/k", "u_bob", "bob@hf")).await;
-    assert!(bview.contains(r#"aria-pressed="true""#), "bob sees his reaction on");
-    assert!(bview.contains(r#"<span class="react-btn__count">1</span>"#), "count is 1");
+    assert!(
+        bview.contains(r#"aria-pressed="true""#),
+        "bob sees his reaction on"
+    );
+    assert!(
+        bview.contains(r#"<span class="react-btn__count">1</span>"#),
+        "count is 1"
+    );
 
     // Toggling again removes it -> count 0.
-    let (status, _) = call(&state, post_csrf("/api/comment/react", &rbody, Some(("u_bob", "bob@hf")))).await;
+    let (status, _) = call(
+        &state,
+        post_csrf("/api/comment/react", &rbody, Some(("u_bob", "bob@hf"))),
+    )
+    .await;
     assert_eq!(status, StatusCode::SEE_OTHER, "toggle-off ok");
     let (_, bview) = call(&state, get_as("/t/k", "u_bob", "bob@hf")).await;
-    assert!(bview.contains(r#"<span class="react-btn__count">0</span>"#), "count back to 0");
-    assert!(!bview.contains(r#"aria-pressed="true""#), "no longer pressed");
+    assert!(
+        bview.contains(r#"<span class="react-btn__count">0</span>"#),
+        "count back to 0"
+    );
+    assert!(
+        !bview.contains(r#"aria-pressed="true""#),
+        "no longer pressed"
+    );
+}
+
+#[tokio::test]
+async fn votes_toggle_score_and_top_sort() {
+    let state = build_dev_state();
+
+    let b1 = form(&[
+        ("thread_key", "k"),
+        ("body", "LOW-first"),
+        ("csrf_token", CSRF),
+    ]);
+    call(
+        &state,
+        post_csrf("/api/comment", &b1, Some(("u_alice", "alice@hf"))),
+    )
+    .await;
+    let b2 = form(&[
+        ("thread_key", "k"),
+        ("body", "HIGH-second"),
+        ("csrf_token", CSRF),
+    ]);
+    call(
+        &state,
+        post_csrf("/api/comment", &b2, Some(("u_carol", "carol@hf"))),
+    )
+    .await;
+    let (_, view) = call(&state, get("/t/k")).await;
+    let first_id = extract_nth_comment_id(&view, 0).expect("first id");
+    let second_id = extract_nth_comment_id(&view, 1).expect("second id");
+
+    assert!(view.contains("/api/comment/vote"), "vote controls present");
+    assert!(view.contains("?sort=top"), "top sort tab present");
+    assert!(view.contains(r#"<span class="vote-score">Score <b>0</b></span>"#));
+
+    // No identity -> 401.
+    let vbody = form(&[
+        ("comment_id", &first_id),
+        ("value", "1"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, _) = call(&state, post_csrf("/api/comment/vote", &vbody, None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "vote needs SSO identity");
+
+    // Bad CSRF -> 401.
+    let bad = form(&[
+        ("comment_id", &first_id),
+        ("value", "1"),
+        ("csrf_token", "WRONG"),
+    ]);
+    let (status, _) = call(
+        &state,
+        post_csrf("/api/comment/vote", &bad, Some(("u_bob", "bob@hf"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "vote needs CSRF");
+
+    // Invalid value -> 400.
+    let invalid = form(&[
+        ("comment_id", &first_id),
+        ("value", "2"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, _) = call(
+        &state,
+        post_csrf("/api/comment/vote", &invalid, Some(("u_bob", "bob@hf"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "invalid vote rejected");
+
+    // Missing comment -> 404.
+    let miss = form(&[
+        ("comment_id", "cmt_nope"),
+        ("value", "1"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, _) = call(
+        &state,
+        post_csrf("/api/comment/vote", &miss, Some(("u_bob", "bob@hf"))),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "vote on missing comment -> 404"
+    );
+
+    // Bob upvotes the first comment -> score 1 and his button is active.
+    let (status, _) = call(
+        &state,
+        post_csrf("/api/comment/vote", &vbody, Some(("u_bob", "bob@hf"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "upvote ok");
+    let (_, bview) = call(&state, get_as("/t/k", "u_bob", "bob@hf")).await;
+    assert!(bview.contains(r#"<span class="vote-score">Score <b>1</b></span>"#));
+    assert!(bview.contains("vote-btn--on"), "bob sees his vote on");
+
+    // Same direction toggles off -> score 0.
+    let (status, _) = call(
+        &state,
+        post_csrf("/api/comment/vote", &vbody, Some(("u_bob", "bob@hf"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "toggle-off ok");
+    let (_, bview) = call(&state, get_as("/t/k", "u_bob", "bob@hf")).await;
+    assert!(bview.contains(r#"<span class="vote-score">Score <b>0</b></span>"#));
+
+    // Opposite direction flips to -1.
+    let down = form(&[
+        ("comment_id", &first_id),
+        ("value", "-1"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, _) = call(
+        &state,
+        post_csrf("/api/comment/vote", &down, Some(("u_bob", "bob@hf"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "downvote ok");
+    let (_, bview) = call(&state, get_as("/t/k", "u_bob", "bob@hf")).await;
+    assert!(bview.contains(r#"<span class="vote-score">Score <b>-1</b></span>"#));
+
+    // Make the second comment the top-ranked comment.
+    let up_second = form(&[
+        ("comment_id", &second_id),
+        ("value", "1"),
+        ("csrf_token", CSRF),
+    ]);
+    call(
+        &state,
+        post_csrf("/api/comment/vote", &up_second, Some(("u_bob", "bob@hf"))),
+    )
+    .await;
+    call(
+        &state,
+        post_csrf("/api/comment/vote", &up_second, Some(("u_dave", "dave@hf"))),
+    )
+    .await;
+    let (_, top) = call(&state, get("/t/k?sort=top")).await;
+    let pos_second = top.find("HIGH-second").expect("second present");
+    let pos_first = top.find("LOW-first").expect("first present");
+    assert!(pos_second < pos_first, "top sort orders by score desc");
+}
+
+#[tokio::test]
+async fn embed_vote_and_report_controls_degrade_without_identity() {
+    let state = build_dev_state();
+
+    let body = form(&[
+        ("thread_key", "embed-k"),
+        ("body", "embed body"),
+        ("csrf_token", CSRF),
+    ]);
+    call(
+        &state,
+        post_csrf("/api/comment", &body, Some(("u_alice", "alice@hf"))),
+    )
+    .await;
+
+    let (_, anon) = call(&state, get("/embed/embed-k")).await;
+    assert!(anon.contains("embed body"), "comment still renders");
+    assert!(anon.contains(r#"<span class="vote-score">Score <b>0</b></span>"#));
+    assert!(
+        !anon.contains("/api/comment/vote"),
+        "anonymous embed hides vote POST controls"
+    );
+    assert!(
+        !anon.contains("/api/comment/report"),
+        "anonymous embed hides report POST controls"
+    );
+
+    let (_, signed) = call(&state, get_as("/embed/embed-k", "u_reader", "reader@hf")).await;
+    assert!(
+        signed.contains("/api/comment/vote"),
+        "signed embed can vote"
+    );
+    assert!(
+        signed.contains("/api/comment/report"),
+        "signed embed can report"
+    );
 }
 
 #[tokio::test]
@@ -336,29 +766,62 @@ async fn sort_control_and_most_reacted_order() {
     let state = build_dev_state();
 
     // Two top-level comments; the second gets an upvote.
-    let b1 = form(&[("thread_key", "k"), ("body", "AAA-first"), ("csrf_token", CSRF)]);
-    call(&state, post_csrf("/api/comment", &b1, Some(("u1", "u1@hf")))).await;
-    let b2 = form(&[("thread_key", "k"), ("body", "BBB-second"), ("csrf_token", CSRF)]);
-    call(&state, post_csrf("/api/comment", &b2, Some(("u2", "u2@hf")))).await;
+    let b1 = form(&[
+        ("thread_key", "k"),
+        ("body", "AAA-first"),
+        ("csrf_token", CSRF),
+    ]);
+    call(
+        &state,
+        post_csrf("/api/comment", &b1, Some(("u1", "u1@hf"))),
+    )
+    .await;
+    let b2 = form(&[
+        ("thread_key", "k"),
+        ("body", "BBB-second"),
+        ("csrf_token", CSRF),
+    ]);
+    call(
+        &state,
+        post_csrf("/api/comment", &b2, Some(("u2", "u2@hf"))),
+    )
+    .await;
 
     // The default view carries the sort tabs.
     let (_, view) = call(&state, get("/t/k")).await;
-    assert!(view.contains(r#"class="sort-control"#), "sort control rendered");
+    assert!(
+        view.contains(r#"class="sort-control"#),
+        "sort control rendered"
+    );
     assert!(view.contains("?sort=reacted"), "most-reacted tab present");
     assert!(view.contains("?sort=newest"), "newest tab present");
 
     // Grab the second comment's id (default sort is oldest -> index 1 is the second post).
     let second_id = extract_nth_comment_id(&view, 1).expect("second id");
-    let rbody = form(&[("comment_id", &second_id), ("kind", "heart"), ("csrf_token", CSRF)]);
-    call(&state, post_csrf("/api/comment/react", &rbody, Some(("u3", "u3@hf")))).await;
+    let rbody = form(&[
+        ("comment_id", &second_id),
+        ("kind", "heart"),
+        ("csrf_token", CSRF),
+    ]);
+    call(
+        &state,
+        post_csrf("/api/comment/react", &rbody, Some(("u3", "u3@hf"))),
+    )
+    .await;
 
     // Under most-reacted, the upvoted second comment ranks first.
     let (_, reacted) = call(&state, get("/t/k?sort=reacted")).await;
     let pos_second = reacted.find("BBB-second").expect("second present");
     let pos_first = reacted.find("AAA-first").expect("first present");
-    assert!(pos_second < pos_first, "most-reacted puts the reacted comment first");
+    assert!(
+        pos_second < pos_first,
+        "most-reacted puts the reacted comment first"
+    );
     // The active tab is marked on.
-    assert!(reacted.contains("sort-tab sort-tab--on"), "active sort styled on");
+    assert!(
+        reacted.contains("sort-tab sort-tab--on"),
+        "active sort styled on"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -368,7 +831,9 @@ async fn sort_control_and_most_reacted_order() {
 async fn call(state: &echo::AppState, req: Request<Body>) -> (StatusCode, String) {
     let resp = app(state.clone()).oneshot(req).await.unwrap();
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     (status, String::from_utf8_lossy(&bytes).to_string())
 }
 
@@ -403,7 +868,9 @@ fn post_csrf_g(
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header(header::COOKIE, format!("__Host-csrf={CSRF}"));
     if let Some((sub, email)) = ident {
-        b = b.header("x-auth-subject", sub).header("x-auth-email", email);
+        b = b
+            .header("x-auth-subject", sub)
+            .header("x-auth-email", email);
     }
     if let Some(g) = groups {
         b = b.header("x-auth-groups", g);
@@ -435,7 +902,9 @@ fn enc(s: &str) -> String {
     let mut o = String::new();
     for b in s.bytes() {
         match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => o.push(b as char),
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                o.push(b as char)
+            }
             b' ' => o.push('+'),
             _ => o.push_str(&format!("%{b:02X}")),
         }

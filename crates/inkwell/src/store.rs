@@ -11,6 +11,7 @@
 //! and `PgStore` drives sqlx natively — there is NO `block_in_place` and NO sync-over-async
 //! bridge, so a DB round-trip never blocks a worker thread.
 
+use std::collections::HashSet;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -30,9 +31,15 @@ pub struct Post {
     pub created_at: i64,
     pub updated_at: i64,
     pub published: bool,
+    /// UTC epoch seconds when a published post becomes public. `0` preserves legacy immediate
+    /// publication; a future value makes the post behave like a draft on public surfaces.
+    pub publish_at: i64,
     /// Admin-set "featured" flag: surfaced with a badge on the index and toggled from /admin.
     /// Additive; defaults to FALSE for every existing row.
     pub featured: bool,
+    /// Author/admin-set pin: public index ordering floats pinned posts before ordinary posts.
+    /// Additive; defaults to FALSE for every existing row.
+    pub pinned: bool,
     /// Comma-separated tags (e.g. `rust, async`). Backed by a nullable TEXT column; empty string
     /// when the post has no tags. Parsed/slugged by [`crate::tags`] for the tag chips and the
     /// `/tag/{slug}` listing. Additive: pre-existing rows read back as NULL -> empty string.
@@ -42,6 +49,36 @@ pub struct Post {
     /// an arbitrary third-party host. Backed by a nullable TEXT column; empty string when the post
     /// has no cover. Additive: pre-existing rows read back as NULL -> empty string.
     pub cover_url: String,
+}
+
+impl Post {
+    /// Public visibility at `now`: published and not scheduled for the future.
+    pub fn is_public_at(&self, now: i64) -> bool {
+        self.published && (self.publish_at == 0 || self.publish_at <= now)
+    }
+
+    /// True when this is a checked "published" post whose publish time is still in the future.
+    pub fn is_scheduled_at(&self, now: i64) -> bool {
+        self.published && self.publish_at > now
+    }
+}
+
+/// Public index cursor matching `ORDER BY pinned DESC, created_at DESC, id DESC`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PostCursor {
+    pub pinned: bool,
+    pub created_at: i64,
+    pub id: String,
+}
+
+impl PostCursor {
+    pub fn from_post(post: &Post) -> Self {
+        Self {
+            pinned: post.pinned,
+            created_at: post.created_at,
+            id: post.id.clone(),
+        }
+    }
 }
 
 /// Single-row site settings, editable from /admin and applied to the index/head. Kept in its own
@@ -100,6 +137,31 @@ pub trait Store: Send + Sync {
     async fn list_posts(&self, before: Option<(i64, String)>, limit: i64) -> Vec<Post>;
     /// One post by its unique slug.
     async fn get_post(&self, slug: &str) -> Option<Post>;
+    /// Public/reader-visible keyset page (`pinned DESC, created_at DESC, id DESC`). Anonymous
+    /// readers see only posts whose publish time has arrived; an author also sees their own drafts
+    /// and scheduled posts.
+    async fn list_visible_posts(
+        &self,
+        before: Option<PostCursor>,
+        limit: i64,
+        now: i64,
+        viewer_sub: Option<&str>,
+    ) -> Vec<Post>;
+    /// One reader-visible post by slug, with the same publish-time predicate as the public index.
+    async fn get_visible_post(
+        &self,
+        slug: &str,
+        now: i64,
+        viewer_sub: Option<&str>,
+    ) -> Option<Post>;
+    /// Up to `limit` public posts sharing tags with `tags`, ranked by shared-tag count.
+    async fn related_posts_by_tags(
+        &self,
+        slug: &str,
+        tags: &str,
+        now: i64,
+        limit: i64,
+    ) -> Vec<Post>;
     /// Insert a new post. Errors with [`StoreError::Conflict`] if the slug is taken.
     async fn create_post(&self, post: &Post) -> Result<(), StoreError>;
     /// Update an existing post's mutable fields (title/body/published/updated_at) by slug.
@@ -128,8 +190,11 @@ pub trait Store: Send + Sync {
     async fn replace_all_chunks(&self, chunks: Vec<Chunk>) -> Result<i64, StoreError>;
     /// Replace just one post's chunks: drop every chunk for `post_id`, then insert `chunks`
     /// (empty `chunks` simply de-indexes the post — e.g. when it becomes a draft).
-    async fn replace_post_chunks(&self, post_id: &str, chunks: Vec<Chunk>)
-        -> Result<(), StoreError>;
+    async fn replace_post_chunks(
+        &self,
+        post_id: &str,
+        chunks: Vec<Chunk>,
+    ) -> Result<(), StoreError>;
     /// Drop every chunk for `post_id` (on post delete).
     async fn delete_post_chunks(&self, post_id: &str) -> Result<(), StoreError>;
 }
@@ -184,6 +249,62 @@ impl Store for InMemoryStore {
             .cloned()
     }
 
+    async fn list_visible_posts(
+        &self,
+        before: Option<PostCursor>,
+        limit: i64,
+        now: i64,
+        viewer_sub: Option<&str>,
+    ) -> Vec<Post> {
+        let limit = limit.clamp(1, MAX_PAGE) as usize;
+        let posts = self.posts.lock().expect("posts lock poisoned");
+        let mut v: Vec<Post> = posts
+            .iter()
+            .filter(|p| p.is_public_at(now) || viewer_sub == Some(p.author_sub.as_str()))
+            .cloned()
+            .collect();
+        sort_public(&mut v);
+        if let Some(cursor) = before {
+            v.retain(|p| after_public_cursor(p, &cursor));
+        }
+        v.truncate(limit);
+        v
+    }
+
+    async fn get_visible_post(
+        &self,
+        slug: &str,
+        now: i64,
+        viewer_sub: Option<&str>,
+    ) -> Option<Post> {
+        self.posts
+            .lock()
+            .expect("posts lock poisoned")
+            .iter()
+            .find(|p| {
+                p.slug == slug && (p.is_public_at(now) || viewer_sub == Some(p.author_sub.as_str()))
+            })
+            .cloned()
+    }
+
+    async fn related_posts_by_tags(
+        &self,
+        slug: &str,
+        tags: &str,
+        now: i64,
+        limit: i64,
+    ) -> Vec<Post> {
+        let candidates: Vec<Post> = self
+            .posts
+            .lock()
+            .expect("posts lock poisoned")
+            .iter()
+            .filter(|p| p.slug != slug && p.is_public_at(now))
+            .cloned()
+            .collect();
+        rank_related_by_tags(candidates, slug, tags, limit)
+    }
+
     async fn create_post(&self, post: &Post) -> Result<(), StoreError> {
         let mut posts = self.posts.lock().expect("posts lock poisoned");
         if posts.iter().any(|p| p.slug == post.slug) {
@@ -200,13 +321,18 @@ impl Store for InMemoryStore {
                 existing.title = post.title.clone();
                 existing.body_md = post.body_md.clone();
                 existing.published = post.published;
+                existing.publish_at = post.publish_at;
                 existing.updated_at = post.updated_at;
                 existing.featured = post.featured;
+                existing.pinned = post.pinned;
                 existing.tags = post.tags.clone();
                 existing.cover_url = post.cover_url.clone();
                 Ok(())
             }
-            None => Err(StoreError::Backend(format!("no post with slug {}", post.slug))),
+            None => Err(StoreError::Backend(format!(
+                "no post with slug {}",
+                post.slug
+            ))),
         }
     }
 
@@ -236,7 +362,11 @@ impl Store for InMemoryStore {
     async fn fetch_chunks(&self) -> Vec<Chunk> {
         let mut v: Vec<Chunk> = self.chunks.lock().expect("chunks lock poisoned").clone();
         // Newest-indexed first; ties broken by id so output is stable.
-        v.sort_by(|a, b| b.indexed_at.cmp(&a.indexed_at).then_with(|| a.id.cmp(&b.id)));
+        v.sort_by(|a, b| {
+            b.indexed_at
+                .cmp(&a.indexed_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         v
     }
 
@@ -267,6 +397,63 @@ impl Store for InMemoryStore {
     }
 }
 
+/// Public ordering shared by memory tests and SQL (`pinned DESC, created_at DESC, id DESC`).
+fn sort_public(posts: &mut [Post]) {
+    posts.sort_by(|a, b| {
+        b.pinned
+            .cmp(&a.pinned)
+            .then_with(|| b.created_at.cmp(&a.created_at))
+            .then_with(|| b.id.cmp(&a.id))
+    });
+}
+
+/// Whether `post` sorts strictly after `cursor` in the public keyset order.
+fn after_public_cursor(post: &Post, cursor: &PostCursor) -> bool {
+    if post.pinned != cursor.pinned {
+        return cursor.pinned && !post.pinned;
+    }
+    post.created_at < cursor.created_at
+        || (post.created_at == cursor.created_at && post.id < cursor.id)
+}
+
+fn tag_slug_set(raw: &str) -> HashSet<String> {
+    crate::tags::parse_tags(raw)
+        .into_iter()
+        .map(|t| crate::tags::tag_slug(&t))
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn rank_related_by_tags(candidates: Vec<Post>, slug: &str, tags: &str, limit: i64) -> Vec<Post> {
+    let source = tag_slug_set(tags);
+    if source.is_empty() {
+        return Vec::new();
+    }
+    let limit = limit.clamp(1, MAX_PAGE) as usize;
+    let mut scored: Vec<(usize, Post)> = candidates
+        .into_iter()
+        .filter(|p| p.slug != slug)
+        .filter_map(|p| {
+            let overlap = tag_slug_set(&p.tags)
+                .iter()
+                .filter(|tag| source.contains(*tag))
+                .count();
+            if overlap == 0 {
+                None
+            } else {
+                Some((overlap, p))
+            }
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.created_at.cmp(&a.1.created_at))
+            .then_with(|| a.1.slug.cmp(&b.1.slug))
+    });
+    scored.truncate(limit);
+    scored.into_iter().map(|(_, p)| p).collect()
+}
+
 // --------------------------------------------------------------------------------------
 // PostgreSQL-backed store (portable: standard SQL, runtime queries, no macros).
 // --------------------------------------------------------------------------------------
@@ -280,6 +467,11 @@ use sqlx::Row;
 
 /// Hard cap on how many chunks the ask handler scans per query (keeps the in-memory rank bounded).
 const CHUNK_SCAN_LIMIT: i64 = 20_000;
+
+const POST_COLS: &str = "SELECT id, slug, title, body_md, author_sub, author_email, \
+                         created_at, updated_at, published, publish_at, featured, pinned, \
+                         tags, cover_url \
+                         FROM posts";
 
 /// PostgreSQL-backed [`Store`]. Holds a `PgPool`; the async `Mutex` serializes index rebuilds so a
 /// full reindex and a per-post reindex never interleave their delete/insert.
@@ -330,6 +522,18 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+        // Additive scheduled-publish timestamp. `0` is the legacy immediate-publish behavior.
+        sqlx::query(
+            "ALTER TABLE posts ADD COLUMN IF NOT EXISTS publish_at BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Additive public-index pin. Existing rows stay ordinary (not pinned).
+        sqlx::query(
+            "ALTER TABLE posts ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(&self.pool)
+        .await?;
         // Additive nullable tags column (comma-separated). IF NOT EXISTS keeps the migration
         // idempotent and backward compatible — existing rows read back as NULL -> empty string.
         sqlx::query("ALTER TABLE posts ADD COLUMN IF NOT EXISTS tags TEXT")
@@ -344,6 +548,12 @@ impl PgStore {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts (created_at)")
             .execute(&self.pool)
             .await?;
+        // Backs the public index order (`pinned DESC, created_at DESC, id DESC`).
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_posts_public_order ON posts (pinned, created_at)",
+        )
+        .execute(&self.pool)
+        .await?;
         // Single-row site settings (blog title / tagline / posts-per-page), edited from /admin.
         // Standard SQL only; the one row is keyed by a constant `id = 'singleton'`.
         sqlx::query(
@@ -473,11 +683,17 @@ impl PgStore {
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
             published: row.try_get("published")?,
+            publish_at: row.try_get("publish_at")?,
             featured: row.try_get("featured")?,
+            pinned: row.try_get("pinned")?,
             // Nullable column: a pre-migration row (or a post with no tags) reads back as NULL.
-            tags: row.try_get::<Option<String>, _>("tags")?.unwrap_or_default(),
+            tags: row
+                .try_get::<Option<String>, _>("tags")?
+                .unwrap_or_default(),
             // Nullable column: a pre-migration row (or a post with no cover) reads back as NULL.
-            cover_url: row.try_get::<Option<String>, _>("cover_url")?.unwrap_or_default(),
+            cover_url: row
+                .try_get::<Option<String>, _>("cover_url")?
+                .unwrap_or_default(),
         })
     }
 
@@ -519,21 +735,20 @@ impl PgStore {
         limit: i64,
     ) -> Result<Vec<Post>, sqlx::Error> {
         let limit = limit.clamp(1, MAX_PAGE);
-        const COLS: &str = "SELECT id, slug, title, body_md, author_sub, author_email, \
-                            created_at, updated_at, published, featured, tags, cover_url \
-                            FROM posts";
         // The `ORDER BY created_at DESC, id DESC` IS the keyset. With a cursor, add the standard
         // "strictly older" tuple comparison before the ORDER BY so paging never skips a tie.
         let rows = match before {
             None => {
-                sqlx::query(&format!("{COLS} ORDER BY created_at DESC, id DESC LIMIT $1"))
-                    .bind(limit)
-                    .fetch_all(&self.pool)
-                    .await?
+                sqlx::query(&format!(
+                    "{POST_COLS} ORDER BY created_at DESC, id DESC LIMIT $1"
+                ))
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
             }
             Some((b_ts, b_id)) => {
                 sqlx::query(&format!(
-                    "{COLS} WHERE (created_at < $1 OR (created_at = $1 AND id < $2)) \
+                    "{POST_COLS} WHERE (created_at < $1 OR (created_at = $1 AND id < $2)) \
                      ORDER BY created_at DESC, id DESC LIMIT $3"
                 ))
                 .bind(b_ts)
@@ -547,26 +762,145 @@ impl PgStore {
     }
 
     async fn get_post_async(&self, slug: &str) -> Result<Option<Post>, sqlx::Error> {
-        let row = sqlx::query(
-            "SELECT id, slug, title, body_md, author_sub, author_email, created_at, updated_at, \
-                    published, featured, tags, cover_url \
-             FROM posts WHERE slug = $1",
-        )
-        .bind(slug)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query(&format!("{POST_COLS} WHERE slug = $1"))
+            .bind(slug)
+            .fetch_optional(&self.pool)
+            .await?;
         match row {
             Some(r) => Ok(Some(Self::post_from_row(&r)?)),
             None => Ok(None),
         }
     }
 
+    async fn list_visible_posts_async(
+        &self,
+        before: Option<PostCursor>,
+        limit: i64,
+        now: i64,
+        viewer_sub: Option<&str>,
+    ) -> Result<Vec<Post>, sqlx::Error> {
+        let limit = limit.clamp(1, MAX_PAGE);
+        let order = "ORDER BY pinned DESC, created_at DESC, id DESC";
+        let rows = match (viewer_sub, before) {
+            (None, None) => {
+                sqlx::query(&format!(
+                    "{POST_COLS} WHERE published = TRUE AND (publish_at = 0 OR publish_at <= $1) \
+                     {order} LIMIT $2",
+                ))
+                .bind(now)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, Some(c)) => {
+                sqlx::query(&format!(
+                    "{POST_COLS} WHERE published = TRUE AND (publish_at = 0 OR publish_at <= $1) \
+                     AND (($2 = TRUE AND pinned = FALSE) OR \
+                          (pinned = $2 AND (created_at < $3 OR (created_at = $3 AND id < $4)))) \
+                     {order} LIMIT $5",
+                ))
+                .bind(now)
+                .bind(c.pinned)
+                .bind(c.created_at)
+                .bind(c.id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Some(viewer), None) => {
+                sqlx::query(&format!(
+                    "{POST_COLS} WHERE author_sub = $1 OR \
+                         (published = TRUE AND (publish_at = 0 OR publish_at <= $2)) \
+                     {order} LIMIT $3",
+                ))
+                .bind(viewer)
+                .bind(now)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Some(viewer), Some(c)) => {
+                sqlx::query(&format!(
+                    "{POST_COLS} WHERE (author_sub = $1 OR \
+                         (published = TRUE AND (publish_at = 0 OR publish_at <= $2))) \
+                     AND (($3 = TRUE AND pinned = FALSE) OR \
+                          (pinned = $3 AND (created_at < $4 OR (created_at = $4 AND id < $5)))) \
+                     {order} LIMIT $6",
+                ))
+                .bind(viewer)
+                .bind(now)
+                .bind(c.pinned)
+                .bind(c.created_at)
+                .bind(c.id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        rows.iter().map(Self::post_from_row).collect()
+    }
+
+    async fn get_visible_post_async(
+        &self,
+        slug: &str,
+        now: i64,
+        viewer_sub: Option<&str>,
+    ) -> Result<Option<Post>, sqlx::Error> {
+        let row = match viewer_sub {
+            Some(viewer) => {
+                sqlx::query(&format!(
+                    "{POST_COLS} WHERE slug = $1 AND \
+                     (author_sub = $2 OR (published = TRUE AND (publish_at = 0 OR publish_at <= $3)))",
+                ))
+                .bind(slug)
+                .bind(viewer)
+                .bind(now)
+                .fetch_optional(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(&format!(
+                    "{POST_COLS} WHERE slug = $1 AND published = TRUE \
+                     AND (publish_at = 0 OR publish_at <= $2)",
+                ))
+                .bind(slug)
+                .bind(now)
+                .fetch_optional(&self.pool)
+                .await?
+            }
+        };
+        match row {
+            Some(r) => Ok(Some(Self::post_from_row(&r)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn related_posts_by_tags_async(
+        &self,
+        slug: &str,
+        tags: &str,
+        now: i64,
+        limit: i64,
+    ) -> Result<Vec<Post>, sqlx::Error> {
+        let rows = sqlx::query(&format!(
+            "{POST_COLS} WHERE slug <> $1 AND published = TRUE \
+             AND (publish_at = 0 OR publish_at <= $2)"
+        ))
+        .bind(slug)
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?;
+        let candidates: Result<Vec<Post>, sqlx::Error> =
+            rows.iter().map(Self::post_from_row).collect();
+        Ok(rank_related_by_tags(candidates?, slug, tags, limit))
+    }
+
     async fn create_post_async(&self, p: &Post) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO posts \
                  (id, slug, title, body_md, author_sub, author_email, created_at, updated_at, \
-                  published, featured, tags, cover_url) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                  published, publish_at, featured, pinned, tags, cover_url) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
         )
         .bind(&p.id)
         .bind(&p.slug)
@@ -577,7 +911,9 @@ impl PgStore {
         .bind(p.created_at)
         .bind(p.updated_at)
         .bind(p.published)
+        .bind(p.publish_at)
         .bind(p.featured)
+        .bind(p.pinned)
         .bind(&p.tags)
         .bind(&p.cover_url)
         .execute(&self.pool)
@@ -588,14 +924,16 @@ impl PgStore {
     async fn update_post_async(&self, p: &Post) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE posts SET title = $1, body_md = $2, published = $3, updated_at = $4, \
-                    featured = $5, tags = $6, cover_url = $7 \
-             WHERE slug = $8",
+                    publish_at = $5, featured = $6, pinned = $7, tags = $8, cover_url = $9 \
+             WHERE slug = $10",
         )
         .bind(&p.title)
         .bind(&p.body_md)
         .bind(p.published)
         .bind(p.updated_at)
+        .bind(p.publish_at)
         .bind(p.featured)
+        .bind(p.pinned)
         .bind(&p.tags)
         .bind(&p.cover_url)
         .bind(&p.slug)
@@ -621,10 +959,12 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
 #[async_trait]
 impl Store for PgStore {
     async fn list_posts(&self, before: Option<(i64, String)>, limit: i64) -> Vec<Post> {
-        self.list_posts_async(before, limit).await.unwrap_or_else(|e| {
-            tracing::error!(error = %e, "pg list_posts failed");
-            Vec::new()
-        })
+        self.list_posts_async(before, limit)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "pg list_posts failed");
+                Vec::new()
+            })
     }
 
     async fn get_post(&self, slug: &str) -> Option<Post> {
@@ -632,6 +972,50 @@ impl Store for PgStore {
             tracing::error!(error = %e, "pg get_post failed");
             None
         })
+    }
+
+    async fn list_visible_posts(
+        &self,
+        before: Option<PostCursor>,
+        limit: i64,
+        now: i64,
+        viewer_sub: Option<&str>,
+    ) -> Vec<Post> {
+        self.list_visible_posts_async(before, limit, now, viewer_sub)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "pg list_visible_posts failed");
+                Vec::new()
+            })
+    }
+
+    async fn get_visible_post(
+        &self,
+        slug: &str,
+        now: i64,
+        viewer_sub: Option<&str>,
+    ) -> Option<Post> {
+        self.get_visible_post_async(slug, now, viewer_sub)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "pg get_visible_post failed");
+                None
+            })
+    }
+
+    async fn related_posts_by_tags(
+        &self,
+        slug: &str,
+        tags: &str,
+        now: i64,
+        limit: i64,
+    ) -> Vec<Post> {
+        self.related_posts_by_tags_async(slug, tags, now, limit)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "pg related_posts_by_tags failed");
+                Vec::new()
+            })
     }
 
     async fn create_post(&self, post: &Post) -> Result<(), StoreError> {
@@ -722,7 +1106,9 @@ mod tests {
             created_at,
             updated_at: created_at,
             published: true,
+            publish_at: 0,
             featured: false,
+            pinned: false,
             tags: String::new(),
             cover_url: String::new(),
         }
@@ -734,23 +1120,41 @@ mod tests {
     async fn list_posts_keyset_pages_backward() {
         let store = InMemoryStore::new();
         for i in 1..=5 {
-            store.create_post(&post(&format!("post_{i}"), i)).await.unwrap();
+            store
+                .create_post(&post(&format!("post_{i}"), i))
+                .await
+                .unwrap();
         }
 
         let page1 = store.list_posts(None, 2).await;
-        assert_eq!(page1.iter().map(|p| p.created_at).collect::<Vec<_>>(), vec![5, 4]);
+        assert_eq!(
+            page1.iter().map(|p| p.created_at).collect::<Vec<_>>(),
+            vec![5, 4]
+        );
 
         let last = page1.last().unwrap();
-        let page2 = store.list_posts(Some((last.created_at, last.id.clone())), 2).await;
-        assert_eq!(page2.iter().map(|p| p.created_at).collect::<Vec<_>>(), vec![3, 2]);
+        let page2 = store
+            .list_posts(Some((last.created_at, last.id.clone())), 2)
+            .await;
+        assert_eq!(
+            page2.iter().map(|p| p.created_at).collect::<Vec<_>>(),
+            vec![3, 2]
+        );
 
         let last = page2.last().unwrap();
-        let page3 = store.list_posts(Some((last.created_at, last.id.clone())), 2).await;
-        assert_eq!(page3.iter().map(|p| p.created_at).collect::<Vec<_>>(), vec![1]);
+        let page3 = store
+            .list_posts(Some((last.created_at, last.id.clone())), 2)
+            .await;
+        assert_eq!(
+            page3.iter().map(|p| p.created_at).collect::<Vec<_>>(),
+            vec![1]
+        );
 
         // Past the end: nothing older than the last row.
         let last = page3.last().unwrap();
-        let page4 = store.list_posts(Some((last.created_at, last.id.clone())), 2).await;
+        let page4 = store
+            .list_posts(Some((last.created_at, last.id.clone())), 2)
+            .await;
         assert!(page4.is_empty(), "no rows older than the oldest post");
     }
 
@@ -778,7 +1182,11 @@ mod tests {
     #[tokio::test]
     async fn settings_default_then_roundtrip() {
         let store = InMemoryStore::new();
-        assert_eq!(store.get_settings().await, Settings::default(), "default before any save");
+        assert_eq!(
+            store.get_settings().await,
+            Settings::default(),
+            "default before any save"
+        );
 
         let s = Settings {
             title: "My Blog".to_string(),
@@ -789,7 +1197,10 @@ mod tests {
         assert_eq!(store.get_settings().await, s, "saved settings read back");
 
         // A second save replaces the single row (no accumulation).
-        let s2 = Settings { title: "Renamed".to_string(), ..s.clone() };
+        let s2 = Settings {
+            title: "Renamed".to_string(),
+            ..s.clone()
+        };
         store.update_settings(&s2).await.unwrap();
         assert_eq!(store.get_settings().await, s2);
     }
@@ -799,11 +1210,116 @@ mod tests {
     async fn featured_flag_persists() {
         let store = InMemoryStore::new();
         store.create_post(&post("p1", 1)).await.unwrap();
-        assert!(!store.get_post("p1").await.unwrap().featured, "defaults to not featured");
+        assert!(
+            !store.get_post("p1").await.unwrap().featured,
+            "defaults to not featured"
+        );
         let mut p = store.get_post("p1").await.unwrap();
         p.featured = true;
         store.update_post(&p).await.unwrap();
-        assert!(store.get_post("p1").await.unwrap().featured, "featured persisted");
+        assert!(
+            store.get_post("p1").await.unwrap().featured,
+            "featured persisted"
+        );
+    }
+
+    /// Scheduled posts use a store-level time predicate on reader-visible reads, while the author
+    /// still sees their own scheduled work.
+    #[tokio::test]
+    async fn visible_posts_apply_publish_at_predicate() {
+        let store = InMemoryStore::new();
+        let now = 1_000;
+        let mut scheduled = post("scheduled", now - 10);
+        scheduled.publish_at = now + 3_600;
+        store.create_post(&scheduled).await.unwrap();
+
+        assert!(
+            store
+                .list_visible_posts(None, 10, now, None)
+                .await
+                .is_empty(),
+            "future publish_at hidden from anonymous list",
+        );
+        assert!(
+            store
+                .get_visible_post("scheduled", now, None)
+                .await
+                .is_none(),
+            "future publish_at hidden from anonymous read",
+        );
+        assert!(
+            store
+                .get_visible_post("scheduled", now, Some("u"))
+                .await
+                .is_some(),
+            "author can read scheduled post",
+        );
+        assert_eq!(
+            store.list_visible_posts(None, 10, now + 3_600, None).await[0].slug,
+            "scheduled",
+            "post becomes public once publish_at arrives",
+        );
+    }
+
+    /// Public index ordering floats pinned posts ahead of newer ordinary posts.
+    #[tokio::test]
+    async fn visible_posts_sort_pinned_first() {
+        let store = InMemoryStore::new();
+        let mut older = post("older", 10);
+        older.pinned = true;
+        store.create_post(&older).await.unwrap();
+        store.create_post(&post("newer", 20)).await.unwrap();
+
+        let page = store.list_visible_posts(None, 10, 30, None).await;
+        assert_eq!(
+            page.iter().map(|p| p.slug.as_str()).collect::<Vec<_>>(),
+            vec!["older", "newer"],
+            "pinned post floats before newer ordinary post",
+        );
+
+        let cursor = PostCursor::from_post(&page[0]);
+        let next = store.list_visible_posts(Some(cursor), 10, 30, None).await;
+        assert_eq!(
+            next[0].slug, "newer",
+            "public cursor crosses pinned boundary"
+        );
+    }
+
+    /// Related posts are ranked by shared tag overlap, excluding drafts/future scheduled posts and
+    /// breaking ties deterministically.
+    #[tokio::test]
+    async fn related_posts_rank_by_shared_tags() {
+        let store = InMemoryStore::new();
+        let mut current = post("current", 10);
+        current.tags = "rust, async, gateway".to_string();
+        store.create_post(&current).await.unwrap();
+
+        let mut one = post("one", 20);
+        one.tags = "rust".to_string();
+        store.create_post(&one).await.unwrap();
+
+        let mut two = post("two", 15);
+        two.tags = "rust, async".to_string();
+        store.create_post(&two).await.unwrap();
+
+        let mut draft = post("draft", 30);
+        draft.published = false;
+        draft.tags = "rust, async, gateway".to_string();
+        store.create_post(&draft).await.unwrap();
+
+        let mut future = post("future", 40);
+        future.publish_at = 10_000;
+        future.tags = "rust, async, gateway".to_string();
+        store.create_post(&future).await.unwrap();
+
+        let related = store
+            .related_posts_by_tags("current", &current.tags, 100, 3)
+            .await;
+        assert_eq!(
+            related.iter().map(|p| p.slug.as_str()).collect::<Vec<_>>(),
+            vec!["two", "one"],
+            "highest shared-tag overlap wins; non-public posts are excluded",
+        );
     }
 
     /// The comma-separated `tags` field persists through create + update (nullable column, so a
@@ -814,12 +1330,20 @@ mod tests {
         let mut p = post("p1", 1);
         p.tags = "rust, async".to_string();
         store.create_post(&p).await.unwrap();
-        assert_eq!(store.get_post("p1").await.unwrap().tags, "rust, async", "tags stored on create");
+        assert_eq!(
+            store.get_post("p1").await.unwrap().tags,
+            "rust, async",
+            "tags stored on create"
+        );
 
         let mut edited = store.get_post("p1").await.unwrap();
         edited.tags = "gateway".to_string();
         store.update_post(&edited).await.unwrap();
-        assert_eq!(store.get_post("p1").await.unwrap().tags, "gateway", "tags replaced on update");
+        assert_eq!(
+            store.get_post("p1").await.unwrap().tags,
+            "gateway",
+            "tags replaced on update"
+        );
     }
 
     /// The nullable `cover_url` field persists through create + update (a cover-less post
@@ -840,7 +1364,11 @@ mod tests {
         let mut edited = store.get_post("p1").await.unwrap();
         edited.cover_url = String::new();
         store.update_post(&edited).await.unwrap();
-        assert_eq!(store.get_post("p1").await.unwrap().cover_url, "", "cover cleared on update");
+        assert_eq!(
+            store.get_post("p1").await.unwrap().cover_url,
+            "",
+            "cover cleared on update"
+        );
     }
 
     /// A caller asking for more than [`MAX_PAGE`] rows is clamped, so a single page stays bounded.
@@ -848,7 +1376,10 @@ mod tests {
     async fn list_posts_clamps_limit_to_max() {
         let store = InMemoryStore::new();
         for i in 0..(MAX_PAGE + 10) {
-            store.create_post(&post(&format!("post_{i:05}"), i)).await.unwrap();
+            store
+                .create_post(&post(&format!("post_{i:05}"), i))
+                .await
+                .unwrap();
         }
         let page = store.list_posts(None, MAX_PAGE + 100).await;
         assert_eq!(page.len() as i64, MAX_PAGE, "limit clamped to MAX_PAGE");

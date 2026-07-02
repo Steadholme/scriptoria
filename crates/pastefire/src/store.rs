@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::config::MAX_PAGE;
-use crate::model::{Paste, PasteRevision};
+use crate::model::{Paste, PasteFile, PasteRevision};
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
 #[derive(Debug, Error)]
@@ -91,6 +91,17 @@ pub trait Store: Send + Sync {
         now: i64,
         limit: i64,
     ) -> Result<Vec<Paste>, StoreError>;
+
+    /// Replace the entire set of named files for a paste (delete-then-insert), so a paste's
+    /// `paste_files` rows always reflect its current multi-file layout. An empty slice clears the
+    /// rows, collapsing the paste back to its single-content (`pastes.body`) representation. The
+    /// caller owns id/position assignment; this is a whole-set overwrite, never a partial merge.
+    async fn set_files(&self, paste_id: &str, files: &[PasteFile]) -> Result<(), StoreError>;
+
+    /// All files for a paste, ascending by `position` (then `id` as a deterministic tiebreak).
+    /// Empty for a legacy/single-content paste — the caller then synthesizes one file from the
+    /// paste body, so pre-existing pastes render exactly as before.
+    async fn list_files(&self, paste_id: &str) -> Result<Vec<PasteFile>, StoreError>;
 }
 
 // --------------------------------------------------------------------------------------
@@ -103,6 +114,7 @@ pub trait Store: Send + Sync {
 pub struct InMemoryStore {
     pastes: Mutex<Vec<Paste>>,
     revisions: Mutex<Vec<PasteRevision>>,
+    files: Mutex<Vec<PasteFile>>,
 }
 
 impl InMemoryStore {
@@ -163,7 +175,15 @@ impl Store for InMemoryStore {
         let mut pastes = self.pastes.lock().expect("pastes lock poisoned");
         let before = pastes.len();
         pastes.retain(|p| !(p.id == id && p.author_sub == author_sub));
-        Ok(pastes.len() != before)
+        let removed = pastes.len() != before;
+        // Cascade: an owned paste's files go with it (never orphan `paste_files` rows).
+        if removed {
+            self.files
+                .lock()
+                .expect("files lock poisoned")
+                .retain(|f| f.paste_id != id);
+        }
+        Ok(removed)
     }
 
     async fn update_paste(
@@ -243,6 +263,22 @@ impl Store for InMemoryStore {
         out.truncate(limit.max(0) as usize);
         Ok(out)
     }
+
+    async fn set_files(&self, paste_id: &str, files: &[PasteFile]) -> Result<(), StoreError> {
+        let mut store = self.files.lock().expect("files lock poisoned");
+        // Whole-set overwrite: drop the paste's current rows, then insert the new set.
+        store.retain(|f| f.paste_id != paste_id);
+        store.extend(files.iter().cloned());
+        Ok(())
+    }
+
+    async fn list_files(&self, paste_id: &str) -> Result<Vec<PasteFile>, StoreError> {
+        let store = self.files.lock().expect("files lock poisoned");
+        let mut out: Vec<PasteFile> =
+            store.iter().filter(|f| f.paste_id == paste_id).cloned().collect();
+        out.sort_by(|a, b| a.position.cmp(&b.position).then_with(|| a.id.cmp(&b.id)));
+        Ok(out)
+    }
 }
 
 // --------------------------------------------------------------------------------------
@@ -262,6 +298,9 @@ const COLS: &str = "id, title, body, language, author_sub, author_email, created
 
 /// Column list for the `paste_revisions` history table, shared by its SELECTs.
 const REV_COLS: &str = "paste_id, revision, title, body, language, created_at";
+
+/// Column list for the `paste_files` multi-file table, shared by its SELECTs.
+const FILE_COLS: &str = "id, paste_id, filename, content, position";
 
 /// PostgreSQL-backed [`Store`]. Holds a pooled connection; the async trait methods drive sqlx
 /// natively, so no worker thread is ever blocked on a DB round-trip.
@@ -339,6 +378,26 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+        // Multi-file pastes (GitHub Gist-style). A paste with NO rows here is a legacy/single
+        // paste rendered from `pastes.body`, so this table is purely additive — pre-existing
+        // pastes are untouched. The index backs the per-paste, position-ordered file lookup.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS paste_files (\
+                 id TEXT PRIMARY KEY, \
+                 paste_id TEXT NOT NULL, \
+                 filename TEXT NOT NULL, \
+                 content TEXT NOT NULL, \
+                 position BIGINT NOT NULL\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_paste_files_paste \
+             ON paste_files (paste_id, position)",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -366,6 +425,16 @@ impl PgStore {
             body: row.try_get("body")?,
             language: row.try_get("language")?,
             created_at: row.try_get("created_at")?,
+        })
+    }
+
+    fn file_from_row(row: &sqlx::postgres::PgRow) -> Result<PasteFile, sqlx::Error> {
+        Ok(PasteFile {
+            id: row.try_get("id")?,
+            paste_id: row.try_get("paste_id")?,
+            filename: row.try_get("filename")?,
+            content: row.try_get("content")?,
+            position: row.try_get("position")?,
         })
     }
 
@@ -451,7 +520,15 @@ impl PgStore {
             .bind(author_sub)
             .execute(&self.pool)
             .await?;
-        Ok(result.rows_affected() > 0)
+        let removed = result.rows_affected() > 0;
+        // Cascade: an owned paste's files go with it (never orphan `paste_files` rows).
+        if removed {
+            sqlx::query("DELETE FROM paste_files WHERE paste_id = $1")
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(removed)
     }
 
     async fn update_paste_async(
@@ -542,6 +619,40 @@ impl PgStore {
         .await?;
         rows.iter().map(Self::paste_from_row).collect()
     }
+
+    async fn set_files_async(&self, paste_id: &str, files: &[PasteFile]) -> Result<(), sqlx::Error> {
+        // Whole-set overwrite in one transaction so a reader never sees a half-replaced set.
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM paste_files WHERE paste_id = $1")
+            .bind(paste_id)
+            .execute(&mut *tx)
+            .await?;
+        for f in files {
+            sqlx::query(
+                "INSERT INTO paste_files (id, paste_id, filename, content, position) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(&f.id)
+            .bind(&f.paste_id)
+            .bind(&f.filename)
+            .bind(&f.content)
+            .bind(f.position)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await
+    }
+
+    async fn list_files_async(&self, paste_id: &str) -> Result<Vec<PasteFile>, sqlx::Error> {
+        let rows = sqlx::query(&format!(
+            "SELECT {FILE_COLS} FROM paste_files WHERE paste_id = $1 \
+             ORDER BY position ASC, id ASC"
+        ))
+        .bind(paste_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::file_from_row).collect()
+    }
 }
 
 #[async_trait]
@@ -618,6 +729,18 @@ impl Store for PgStore {
         limit: i64,
     ) -> Result<Vec<Paste>, StoreError> {
         self.list_for_similarity_async(author_sub, now, limit)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn set_files(&self, paste_id: &str, files: &[PasteFile]) -> Result<(), StoreError> {
+        self.set_files_async(paste_id, files)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn list_files(&self, paste_id: &str) -> Result<Vec<PasteFile>, StoreError> {
+        self.list_files_async(paste_id)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
@@ -786,5 +909,65 @@ mod tests {
         let r2 = s.get_revision("a", 2).await.unwrap().unwrap();
         assert_eq!(r2.body, "b2");
         assert!(s.get_revision("a", 99).await.unwrap().is_none());
+    }
+
+    fn file(paste_id: &str, filename: &str, position: i64) -> PasteFile {
+        PasteFile {
+            id: format!("{paste_id}-{position}"),
+            paste_id: paste_id.into(),
+            filename: filename.into(),
+            content: format!("content of {filename}"),
+            position,
+        }
+    }
+
+    #[tokio::test]
+    async fn set_files_overwrites_whole_set_and_lists_in_position_order() {
+        let s = InMemoryStore::new();
+        // Legacy/single paste: no rows yet.
+        assert!(s.list_files("p").await.unwrap().is_empty());
+
+        // Insert two files out of order — they come back ordered by position.
+        s.set_files("p", &[file("p", "b.rs", 1), file("p", "a.rs", 0)])
+            .await
+            .unwrap();
+        let names: Vec<String> = s
+            .list_files("p")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| f.filename)
+            .collect();
+        assert_eq!(names, vec!["a.rs", "b.rs"]);
+
+        // A whole-set overwrite replaces (never merges) the prior set.
+        s.set_files("p", &[file("p", "only.rs", 0)]).await.unwrap();
+        let names: Vec<String> = s
+            .list_files("p")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| f.filename)
+            .collect();
+        assert_eq!(names, vec!["only.rs"]);
+
+        // The empty set collapses the paste back to single-content (no rows).
+        s.set_files("p", &[]).await.unwrap();
+        assert!(s.list_files("p").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleting_a_paste_cascades_its_files() {
+        let s = InMemoryStore::new();
+        s.create(&paste("p", "u", 1, None)).await.unwrap();
+        s.set_files("p", &[file("p", "a.rs", 0), file("p", "b.rs", 1)])
+            .await
+            .unwrap();
+        // A non-owner delete leaves the files intact (ownership-scoped, no cascade).
+        assert!(!s.delete("p", "intruder").await.unwrap());
+        assert_eq!(s.list_files("p").await.unwrap().len(), 2);
+        // The owner's delete removes the paste AND its files.
+        assert!(s.delete("p", "u").await.unwrap());
+        assert!(s.list_files("p").await.unwrap().is_empty());
     }
 }

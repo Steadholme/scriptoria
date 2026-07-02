@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
-use echo::store::{Comment, PgStore, Reaction, Sort, Store, Thread};
+use echo::store::{Comment, CommentReport, CommentVote, PgStore, Reaction, Sort, Store, Thread};
 use echo::{app, build_dev_state, now_secs, AppState};
 use tower::ServiceExt;
 
@@ -30,7 +30,9 @@ async fn pg_store_full_integration() {
     };
 
     // --- connect / migrate (idempotent: run twice) -------------------------
-    let pg = PgStore::connect(&url).await.expect("connect TEST_DATABASE_URL");
+    let pg = PgStore::connect(&url)
+        .await
+        .expect("connect TEST_DATABASE_URL");
     pg.migrate().await.expect("migrate");
     pg.migrate().await.expect("migrate is idempotent");
     let pg = Arc::new(pg);
@@ -87,7 +89,12 @@ async fn pg_store_full_integration() {
     // --- moderation round-trip ---------------------------------------------
     assert!(pg.set_comment_hidden("cmt_pg_1", true).await.expect("hide"));
     assert!(pg.get_comment("cmt_pg_1").await.expect("get").hidden);
-    assert!(!pg.set_comment_hidden("cmt_missing", true).await.expect("miss"), "no row -> false");
+    assert!(
+        !pg.set_comment_hidden("cmt_missing", true)
+            .await
+            .expect("miss"),
+        "no row -> false"
+    );
 
     // --- recent feed across threads ----------------------------------------
     let recent = pg.recent_comments(10).await;
@@ -96,14 +103,21 @@ async fn pg_store_full_integration() {
 
     // --- author self-edit / self-delete (ownership enforced by author_sub) --
     assert!(
-        !pg.update_comment_body("cmt_pg_2", "u_alice", "nope").await.expect("edit"),
+        !pg.update_comment_body("cmt_pg_2", "u_alice", "nope")
+            .await
+            .expect("edit"),
         "non-owner edit updates no row"
     );
     assert!(
-        pg.update_comment_body("cmt_pg_2", "u_bob", "an edited reply").await.expect("edit"),
+        pg.update_comment_body("cmt_pg_2", "u_bob", "an edited reply")
+            .await
+            .expect("edit"),
         "owner edit updates the row"
     );
-    assert_eq!(pg.get_comment("cmt_pg_2").await.expect("get").body, "an edited reply");
+    assert_eq!(
+        pg.get_comment("cmt_pg_2").await.expect("get").body,
+        "an edited reply"
+    );
     assert!(
         !pg.delete_comment("cmt_pg_2", "u_alice").await.expect("del"),
         "non-owner delete removes no row"
@@ -112,8 +126,15 @@ async fn pg_store_full_integration() {
         pg.delete_comment("cmt_pg_2", "u_bob").await.expect("del"),
         "owner delete removes the row"
     );
-    assert!(pg.get_comment("cmt_pg_2").await.is_none(), "row is gone after self-delete");
-    assert_eq!(pg.count_comments("thr_pg_1").await, 1, "only the root remains");
+    assert!(
+        pg.get_comment("cmt_pg_2").await.is_none(),
+        "row is gone after self-delete"
+    );
+    assert_eq!(
+        pg.count_comments("thr_pg_1").await,
+        1,
+        "only the root remains"
+    );
 
     // --- reactions: idempotent toggle + counts + most-reacted page ---------
     let react = |who: &str, kind: &str| Reaction {
@@ -122,16 +143,83 @@ async fn pg_store_full_integration() {
         kind: kind.to_string(),
         created_at: now,
     };
-    assert!(pg.toggle_reaction(&react("u_alice", "up")).await.expect("react"), "added");
-    assert!(pg.toggle_reaction(&react("u_bob", "up")).await.expect("react"), "added");
+    assert!(
+        pg.toggle_reaction(&react("u_alice", "up"))
+            .await
+            .expect("react"),
+        "added"
+    );
+    assert!(
+        pg.toggle_reaction(&react("u_bob", "up"))
+            .await
+            .expect("react"),
+        "added"
+    );
     // A repeat by the same user+kind toggles OFF.
-    assert!(!pg.toggle_reaction(&react("u_alice", "up")).await.expect("untoggle"), "removed");
+    assert!(
+        !pg.toggle_reaction(&react("u_alice", "up"))
+            .await
+            .expect("untoggle"),
+        "removed"
+    );
     let rx = pg.reactions_for(&["cmt_pg_1".to_string()]).await;
     assert_eq!(rx.len(), 1, "one reaction remains after alice toggled off");
     assert_eq!(rx[0].user_sub, "u_bob");
     // The paged top-level view surfaces the (reacted) root.
-    let (tops, _replies) = pg.list_thread_page("thr_pg_1", Sort::MostReacted, None, 10).await;
-    assert!(tops.iter().any(|c| c.id == "cmt_pg_1"), "root present in most-reacted page");
+    let (tops, _replies) = pg
+        .list_thread_page("thr_pg_1", Sort::MostReacted, None, 10)
+        .await;
+    assert!(
+        tops.iter().any(|c| c.id == "cmt_pg_1"),
+        "root present in most-reacted page"
+    );
+
+    // --- votes: one per user/comment + top sort ---------------------------
+    let vote = |who: &str, value: i64| CommentVote {
+        comment_id: "cmt_pg_1".to_string(),
+        voter_sub: who.to_string(),
+        value,
+        created_at: now,
+    };
+    assert_eq!(pg.toggle_vote(&vote("u_alice", 1)).await.expect("vote"), 1);
+    assert_eq!(
+        pg.toggle_vote(&vote("u_alice", -1)).await.expect("flip"),
+        -1
+    );
+    assert_eq!(
+        pg.toggle_vote(&vote("u_alice", -1)).await.expect("clear"),
+        0
+    );
+    assert_eq!(pg.toggle_vote(&vote("u_bob", 1)).await.expect("vote"), 1);
+    let votes = pg.votes_for(&["cmt_pg_1".to_string()]).await;
+    assert_eq!(votes.len(), 1, "alice cleared, bob remains");
+    assert_eq!(votes[0].value, 1);
+    let (tops, _replies) = pg.list_thread_page("thr_pg_1", Sort::Top, None, 10).await;
+    assert!(
+        tops.iter().any(|c| c.id == "cmt_pg_1"),
+        "root present in top page"
+    );
+
+    // --- reports: one per reporter/comment with reason update -------------
+    let report = |who: &str, reason: &str| CommentReport {
+        comment_id: "cmt_pg_1".to_string(),
+        reporter_sub: who.to_string(),
+        reason: reason.to_string(),
+        created_at: now,
+    };
+    assert!(pg
+        .report_comment(&report("u_alice", "spam"))
+        .await
+        .expect("report"));
+    assert!(
+        !pg.report_comment(&report("u_alice", "updated"))
+            .await
+            .expect("update report"),
+        "same reporter updates one row"
+    );
+    let reports = pg.reports_for(&["cmt_pg_1".to_string()]).await;
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].reason, "updated");
 
     // --- full HTTP flow through the PG-backed app --------------------------
     let mut state: AppState = build_dev_state();
@@ -154,17 +242,26 @@ async fn pg_store_full_integration() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     assert_eq!(
-        resp.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()),
+        resp.headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
         Some("/t/pg%2Fhttp")
     );
 
     // Read it back through the PG-backed thread view.
     let resp = app(state.clone())
-        .oneshot(Request::builder().uri("/t/pg%2Fhttp").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/t/pg%2Fhttp")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     assert!(String::from_utf8_lossy(&bytes).contains("hello"));
 
     println!(

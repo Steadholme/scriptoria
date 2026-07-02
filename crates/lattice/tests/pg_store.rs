@@ -37,7 +37,9 @@ async fn pg_store_full_integration() {
     };
 
     // --- connect / migrate (idempotent: run twice) -------------------------
-    let pg = PgStore::connect(&url).await.expect("connect to TEST_DATABASE_URL");
+    let pg = PgStore::connect(&url)
+        .await
+        .expect("connect to TEST_DATABASE_URL");
     pg.migrate().await.expect("migrate");
     pg.migrate().await.expect("migrate is idempotent");
 
@@ -45,9 +47,23 @@ async fn pg_store_full_integration() {
     state.store = Arc::new(pg);
 
     // Raw pool for clean-slate setup, out-of-band asserts, and teardown.
-    let raw = PgPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
-    sqlx::query("DELETE FROM revisions").execute(&raw).await.unwrap();
-    sqlx::query("DELETE FROM pages").execute(&raw).await.unwrap();
+    let raw = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM page_links")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM revisions")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM pages")
+        .execute(&raw)
+        .await
+        .unwrap();
 
     // --- create a page through the real HTTP flow --------------------------
     let (_s, headers, _b) = call(&state, get("/edit/runbook")).await;
@@ -84,12 +100,24 @@ async fn pg_store_full_integration() {
     let (_s, headers2, _b) = call(&state, get("/edit/runbook")).await;
     let cookie2 = set_cookie(&headers2).unwrap();
     let csrf2 = cookie_value(&cookie2).unwrap();
+    let base2 = state
+        .store
+        .head_revision("runbook")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
     let save2 = post_form(
         &state,
         "/edit/runbook",
         &cookie2,
         "bob@holdfast.local",
-        &[("csrf_token", &csrf2), ("title", "Runbook v2"), ("body_md", "Rewritten.")],
+        &[
+            ("csrf_token", &csrf2),
+            ("base_rev", &base2),
+            ("title", "Runbook v2"),
+            ("body_md", "Rewritten."),
+        ],
     )
     .await;
     assert_eq!(save2.0, StatusCode::SEE_OTHER);
@@ -108,7 +136,10 @@ async fn pg_store_full_integration() {
     let updated_at: i64 = row.try_get("updated_at").unwrap();
     assert_eq!(title, "Runbook v2");
     assert_eq!(updated_by, "bob@holdfast.local");
-    assert!(created_at <= updated_at, "created_at preserved across the upsert");
+    assert!(
+        created_at <= updated_at,
+        "created_at preserved across the upsert"
+    );
 
     let page_count: i64 = sqlx::query("SELECT count(*) AS n FROM pages")
         .fetch_one(&raw)
@@ -139,7 +170,11 @@ async fn pg_store_full_integration() {
         "/edit/runbook",
         "", // no cookie
         "mallory@holdfast.local",
-        &[("csrf_token", "forged"), ("title", "Hacked"), ("body_md", "x")],
+        &[
+            ("csrf_token", "forged"),
+            ("title", "Hacked"),
+            ("body_md", "x"),
+        ],
     )
     .await;
     assert_eq!(bad.0, StatusCode::FORBIDDEN);
@@ -153,8 +188,18 @@ async fn pg_store_full_integration() {
     assert_eq!(rev_count_after, 2, "CSRF failure wrote nothing");
 
     // Teardown.
-    sqlx::query("DELETE FROM revisions").execute(&raw).await.unwrap();
-    sqlx::query("DELETE FROM pages").execute(&raw).await.unwrap();
+    sqlx::query("DELETE FROM page_links")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM revisions")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM pages")
+        .execute(&raw)
+        .await
+        .unwrap();
     println!(
         "PG STORE INTEGRATION OK: migrate (idempotent) + create/edit upsert + 2 revisions + \
          created_at preserved + wiki-links + CSRF enforced — all through Postgres."
@@ -169,7 +214,9 @@ async fn call(state: &AppState, req: Request<Body>) -> Resp {
     let resp = app(state.clone()).oneshot(req).await.unwrap();
     let status = resp.status();
     let headers = resp.headers().clone();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     (status, headers, String::from_utf8(bytes.to_vec()).unwrap())
 }
 
@@ -213,7 +260,10 @@ fn pct(s: &str) -> String {
 }
 
 fn set_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
-    headers.get(header::SET_COOKIE).and_then(|v| v.to_str().ok()).map(str::to_string)
+    headers
+        .get(header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
 }
 
 fn cookie_value(set_cookie: &str) -> Option<String> {
@@ -223,5 +273,8 @@ fn cookie_value(set_cookie: &str) -> Option<String> {
 }
 
 fn location(headers: &axum::http::HeaderMap) -> Option<String> {
-    headers.get(header::LOCATION).and_then(|v| v.to_str().ok()).map(str::to_string)
+    headers
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
 }

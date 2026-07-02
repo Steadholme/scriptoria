@@ -33,7 +33,9 @@ async fn pg_store_full_integration() {
     };
 
     // --- connect / migrate (idempotent: run twice) -------------------------
-    let pg = PgStore::connect(&url).await.expect("connect TEST_DATABASE_URL");
+    let pg = PgStore::connect(&url)
+        .await
+        .expect("connect TEST_DATABASE_URL");
     pg.migrate().await.expect("migrate");
     pg.migrate().await.expect("migrate is idempotent");
     let pg = Arc::new(pg);
@@ -50,7 +52,9 @@ async fn pg_store_full_integration() {
         created_at: now - 100,
         updated_at: now - 100,
         published: true,
+        publish_at: 0,
         featured: false,
+        pinned: false,
         tags: "rust, postgres".to_string(),
         cover_url: "https://drive.w33d.xyz/s/cover_tok".to_string(),
     };
@@ -62,7 +66,10 @@ async fn pg_store_full_integration() {
         ..post.clone()
     };
     assert!(
-        matches!(pg.create_post(&dup).await, Err(inkwell::store::StoreError::Conflict(_))),
+        matches!(
+            pg.create_post(&dup).await,
+            Err(inkwell::store::StoreError::Conflict(_))
+        ),
         "duplicate slug rejected"
     );
 
@@ -77,7 +84,9 @@ async fn pg_store_full_integration() {
         created_at: now,
         updated_at: now,
         published: true,
+        publish_at: 0,
         featured: false,
+        pinned: false,
         tags: String::new(),
         cover_url: String::new(),
     };
@@ -94,12 +103,66 @@ async fn pg_store_full_integration() {
         older.iter().all(|p| p.slug != "pg-second"),
         "newest row excluded by the before cursor"
     );
-    assert!(older.iter().any(|p| p.slug == "pg-hello"), "older row still reachable");
+    assert!(
+        older.iter().any(|p| p.slug == "pg-hello"),
+        "older row still reachable"
+    );
+
+    // Public reader-visible Store methods apply pinned ordering and the publish_at predicate.
+    let mut pinned = post.clone();
+    pinned.id = "post_pg_pinned".to_string();
+    pinned.slug = "pg-pinned".to_string();
+    pinned.title = "PG Pinned".to_string();
+    pinned.created_at = now - 200;
+    pinned.updated_at = now - 200;
+    pinned.pinned = true;
+    pg.create_post(&pinned).await.expect("create pinned");
+
+    let mut future = post.clone();
+    future.id = "post_pg_future".to_string();
+    future.slug = "pg-future".to_string();
+    future.title = "PG Future".to_string();
+    future.created_at = now + 10;
+    future.updated_at = now + 10;
+    future.publish_at = now + 3_600;
+    pg.create_post(&future).await.expect("create future");
+
+    let visible = pg
+        .list_visible_posts(None, inkwell::config::MAX_PAGE, now, None)
+        .await;
+    assert_eq!(
+        visible[0].slug, "pg-pinned",
+        "pinned public post floats to top"
+    );
+    assert!(
+        visible.iter().all(|p| p.slug != "pg-future"),
+        "future scheduled post hidden from anonymous list",
+    );
+    assert!(
+        pg.get_visible_post("pg-future", now, None).await.is_none(),
+        "future scheduled post hidden from anonymous read",
+    );
+    assert!(
+        pg.get_visible_post("pg-future", now, Some("u_alice"))
+            .await
+            .is_some(),
+        "author can read scheduled post",
+    );
+    let related = pg
+        .related_posts_by_tags("pg-pinned", "rust, postgres", now, 3)
+        .await;
+    assert!(
+        related.iter().any(|p| p.slug == "pg-hello"),
+        "shared-tag related post found"
+    );
 
     // Fetch + update (slug stays stable) + verify.
     let fetched = pg.get_post("pg-hello").await.expect("fetch");
     assert_eq!(fetched.title, "PG Hello");
-    assert_eq!(fetched.tags, "rust, postgres", "tags column round-trips through pg");
+    assert_eq!(
+        fetched.tags, "rust, postgres",
+        "tags column round-trips through pg"
+    );
     assert_eq!(
         fetched.cover_url, "https://drive.w33d.xyz/s/cover_tok",
         "cover_url column round-trips through pg",
@@ -172,8 +235,20 @@ async fn pg_store_full_integration() {
     use inkwell::store::Chunk;
     let now2 = now_secs();
     pg.replace_all_chunks(vec![
-        Chunk { id: "pg-hello__0000".into(), post_id: "pg-hello".into(), title: "PG Hello".into(), body: "alpha gateway beta".into(), indexed_at: now2 },
-        Chunk { id: "pg-second__0000".into(), post_id: "pg-second".into(), title: "PG Second".into(), body: "gamma delta".into(), indexed_at: now2 },
+        Chunk {
+            id: "pg-hello__0000".into(),
+            post_id: "pg-hello".into(),
+            title: "PG Hello".into(),
+            body: "alpha gateway beta".into(),
+            indexed_at: now2,
+        },
+        Chunk {
+            id: "pg-second__0000".into(),
+            post_id: "pg-second".into(),
+            title: "PG Second".into(),
+            body: "gamma delta".into(),
+            indexed_at: now2,
+        },
     ])
     .await
     .expect("replace_all_chunks");
@@ -182,16 +257,33 @@ async fn pg_store_full_integration() {
     // Per-post reindex replaces only that post's chunks.
     pg.replace_post_chunks(
         "pg-hello",
-        vec![Chunk { id: "pg-hello__0000".into(), post_id: "pg-hello".into(), title: "PG Hello".into(), body: "alpha gateway beta epsilon".into(), indexed_at: now2 }],
+        vec![Chunk {
+            id: "pg-hello__0000".into(),
+            post_id: "pg-hello".into(),
+            title: "PG Hello".into(),
+            body: "alpha gateway beta epsilon".into(),
+            indexed_at: now2,
+        }],
     )
     .await
     .expect("replace_post_chunks");
-    assert_eq!(pg.count_chunks().await, 2, "per-post reindex keeps the other post");
+    assert_eq!(
+        pg.count_chunks().await,
+        2,
+        "per-post reindex keeps the other post"
+    );
     let fetched = pg.fetch_chunks().await;
-    assert!(fetched.iter().any(|c| c.post_id == "pg-hello" && c.body.contains("epsilon")), "chunk updated");
+    assert!(
+        fetched
+            .iter()
+            .any(|c| c.post_id == "pg-hello" && c.body.contains("epsilon")),
+        "chunk updated"
+    );
 
     // De-index one post (the delete path).
-    pg.delete_post_chunks("pg-second").await.expect("delete_post_chunks");
+    pg.delete_post_chunks("pg-second")
+        .await
+        .expect("delete_post_chunks");
     assert_eq!(pg.count_chunks().await, 1, "one post de-indexed");
 
     println!(
