@@ -116,6 +116,53 @@ fn upload_req(csrf: &str, cookie: &str, subject: &str, filename: &str, ctype: &s
         .unwrap()
 }
 
+/// A `multipart/form-data` upload body carrying a `csrf_token`, a `folder_id` (the target level),
+/// then the `file` field — the gallery form's exact shape when uploading inside a folder.
+fn multipart_folder(csrf: &str, folder: &str, filename: &str, content_type: &str, data: &[u8]) -> Vec<u8> {
+    let mut body: Vec<u8> = Vec::new();
+    body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+    body.extend_from_slice(b"Content-Disposition: form-data; name=\"csrf_token\"\r\n\r\n");
+    body.extend_from_slice(csrf.as_bytes());
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+    body.extend_from_slice(b"Content-Disposition: form-data; name=\"folder_id\"\r\n\r\n");
+    body.extend_from_slice(folder.as_bytes());
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!("Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n")
+            .as_bytes(),
+    );
+    body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
+    body.extend_from_slice(data);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+    body
+}
+
+fn upload_req_folder(
+    csrf: &str,
+    cookie: &str,
+    subject: &str,
+    folder: &str,
+    filename: &str,
+    ctype: &str,
+    data: &[u8],
+) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/upload")
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .header(header::COOKIE, format!("__Host-csrf={cookie}"))
+        .header("x-auth-subject", subject)
+        .header("x-auth-email", format!("{subject}@w33d.xyz"))
+        .body(Body::from(multipart_folder(csrf, folder, filename, ctype, data)))
+        .unwrap()
+}
+
 /// A CSRF-cookie'd, SSO-identified `application/x-www-form-urlencoded` POST (share config / revoke).
 fn post_form(uri: &str, cookie: &str, subject: &str, body: String) -> Request<Body> {
     Request::builder()
@@ -594,15 +641,13 @@ async fn folder_create_move_filter_and_delete_lifecycle() {
     assert_eq!(moved.status, StatusCode::FOUND);
     assert_eq!(store.get(&id_a).await.unwrap().unwrap().folder_id.as_deref(), Some(fid.as_str()));
 
-    // The folder view now lists only A; the flat view still lists both.
+    // The folder view now lists only A; the ROOT view now lists only B (A left the root — a tree).
     let fv = send(&app, get(&format!("/?folder={fid}"), Some("alice"))).await;
     assert_eq!(card_ids(&fv.text()), vec![id_a.clone()]);
+    // The folder view breadcrumb names the folder.
+    assert!(fv.text().contains("breadcrumb"));
     let flat = send(&app, get("/", Some("alice"))).await;
-    let mut flat_ids = card_ids(&flat.text());
-    flat_ids.sort();
-    let mut both = vec![id_a.clone(), id_b.clone()];
-    both.sort();
-    assert_eq!(flat_ids, both, "flat view shows every file regardless of folder");
+    assert_eq!(card_ids(&flat.text()), vec![id_b.clone()], "root shows only unfiled files");
 
     // Rename the folder.
     let renamed = send(
@@ -613,7 +658,21 @@ async fn folder_create_move_filter_and_delete_lifecycle() {
     assert_eq!(renamed.status, StatusCode::FOUND);
     assert_eq!(store.get_folder(&fid, "alice").await.unwrap().unwrap().name, "Vacations");
 
-    // Delete the folder -> 302 / ; the file is kept but unfiled.
+    // Deleting a NON-empty folder (A is inside) is refused (400) — empty-only unless cascading.
+    let refused = send(
+        &app,
+        post_form(&format!("/folders/{fid}/delete"), &csrf, "alice", format!("csrf_token={csrf}")),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert!(store.get_folder(&fid, "alice").await.unwrap().is_some(), "refused delete kept the folder");
+
+    // Move A back to the root, then the now-empty folder deletes -> 302 to its parent (root).
+    send(
+        &app,
+        post_form(&format!("/f/{id_a}/move"), &csrf, "alice", format!("csrf_token={csrf}&folder_id=")),
+    )
+    .await;
     let deleted = send(
         &app,
         post_form(&format!("/folders/{fid}/delete"), &csrf, "alice", format!("csrf_token={csrf}")),
@@ -622,7 +681,7 @@ async fn folder_create_move_filter_and_delete_lifecycle() {
     assert_eq!(deleted.status, StatusCode::FOUND);
     assert_eq!(deleted.location(), "/");
     assert!(store.get_folder(&fid, "alice").await.unwrap().is_none());
-    assert!(store.get(&id_a).await.unwrap().unwrap().folder_id.is_none(), "file kept, unfiled");
+    assert!(store.get(&id_a).await.unwrap().unwrap().folder_id.is_none(), "file kept at root");
 }
 
 #[tokio::test]
@@ -1020,4 +1079,321 @@ async fn thumb_derived_blob_is_removed_on_delete() {
     assert_eq!(del.status, StatusCode::FOUND);
     // Both the original blob and its derived thumbnail are gone (no orphan).
     assert!(blobs.get(&format!("{id}.thumb")).await.is_err(), "derived thumbnail removed with file");
+}
+
+// ---------------------------------------------------------------------------
+// Folder TREE navigation + scoped upload
+// ---------------------------------------------------------------------------
+
+/// A second PNG whose bytes differ from `png_bytes()` (still a valid PNG magic) so a re-upload
+/// produces a distinguishable new current blob.
+fn png_bytes_alt() -> Vec<u8> {
+    let mut v = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    v.extend_from_slice(b"\x00\x09\x08 SECOND revision pixels \xaa\xbb\xcc");
+    v
+}
+
+#[tokio::test]
+async fn folder_tree_subfolders_breadcrumb_and_scoped_upload() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let (_root_file, csrf) = upload_png(&app, "alice").await; // a file at the ROOT
+
+    // Create a root folder, then a CHILD folder inside it (parent_id carried by the form).
+    let parent = send(&app, post_form("/folders", &csrf, "alice", format!("csrf_token={csrf}&name=Parent&parent_id="))).await;
+    let pfid = folder_from_location(&parent.location());
+    let child = send(&app, post_form("/folders", &csrf, "alice", format!("csrf_token={csrf}&name=Child&parent_id={pfid}"))).await;
+    assert_eq!(child.status, StatusCode::FOUND);
+    let cfid = folder_from_location(&child.location());
+    assert_eq!(store.get_folder(&cfid, "alice").await.unwrap().unwrap().parent_id.as_deref(), Some(pfid.as_str()));
+
+    // Root view: shows the Parent tile but NOT the (nested) Child.
+    let root = send(&app, get("/", Some("alice"))).await;
+    assert!(root.text().contains(&format!("/?folder={pfid}")), "root lists the parent folder");
+    assert!(!root.text().contains(&format!("/?folder={cfid}")), "root does not list a nested child");
+
+    // Parent view: breadcrumb back to All files, the Child tile, and an Up-to-root tile.
+    let pv = send(&app, get(&format!("/?folder={pfid}"), Some("alice"))).await;
+    assert!(pv.text().contains("breadcrumb"));
+    assert!(pv.text().contains(">All files<"), "breadcrumb links back to root");
+    assert!(pv.text().contains(&format!("/?folder={cfid}")), "child folder tile is shown");
+    assert!(pv.text().contains("Up one level"), "an Up tile is shown inside a folder");
+
+    // Upload a file INTO the child folder; it appears there, not at the root or in the parent.
+    let up = send(&app, upload_req_folder(&csrf, &csrf, "alice", &cfid, "deep.png", "image/png", &png_bytes())).await;
+    assert_eq!(up.status, StatusCode::FOUND, "{}", up.text());
+    let deep_id = up.location().trim_start_matches("/f/").to_string();
+    assert_eq!(store.get(&deep_id).await.unwrap().unwrap().folder_id.as_deref(), Some(cfid.as_str()));
+    let cv = send(&app, get(&format!("/?folder={cfid}"), Some("alice"))).await;
+    assert_eq!(card_ids(&cv.text()), vec![deep_id.clone()]);
+    let root2 = send(&app, get("/", Some("alice"))).await;
+    assert!(!card_ids(&root2.text()).contains(&deep_id), "a filed file never shows at the root");
+}
+
+#[tokio::test]
+async fn folder_delete_cascade_removes_subtree_and_blobs() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let blobs: Arc<dyn Blobs> = state.blobs.clone();
+    let app = app(state);
+    let (_f, csrf) = upload_png(&app, "alice").await;
+
+    let parent = send(&app, post_form("/folders", &csrf, "alice", format!("csrf_token={csrf}&name=Parent&parent_id="))).await;
+    let pfid = folder_from_location(&parent.location());
+    let child = send(&app, post_form("/folders", &csrf, "alice", format!("csrf_token={csrf}&name=Child&parent_id={pfid}"))).await;
+    let cfid = folder_from_location(&child.location());
+    // A file deep in the subtree.
+    let up = send(&app, upload_req_folder(&csrf, &csrf, "alice", &cfid, "deep.png", "image/png", &png_bytes())).await;
+    let deep_id = up.location().trim_start_matches("/f/").to_string();
+    let deep_key = store.get(&deep_id).await.unwrap().unwrap().object_key;
+    assert!(blobs.get(&deep_key).await.is_ok());
+
+    // Cascade-delete the parent -> whole subtree + the file (blob) are gone, redirect to root.
+    let del = send(&app, post_form(&format!("/folders/{pfid}/delete"), &csrf, "alice", format!("csrf_token={csrf}&cascade=1"))).await;
+    assert_eq!(del.status, StatusCode::FOUND);
+    assert_eq!(del.location(), "/");
+    assert!(store.get_folder(&pfid, "alice").await.unwrap().is_none());
+    assert!(store.get_folder(&cfid, "alice").await.unwrap().is_none());
+    assert!(store.get(&deep_id).await.unwrap().is_none(), "the nested file is deleted");
+    assert!(blobs.get(&deep_key).await.is_err(), "its blob is freed");
+}
+
+// ---------------------------------------------------------------------------
+// Versions: re-upload keeps a version; restore + prune + quota accounting
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn reupload_keeps_version_then_restore_swaps_current() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let (id, csrf) = upload_png(&app, "alice").await; // "shot.png", bytes = png_bytes()
+
+    // No versions yet.
+    let d0 = send(&app, get(&format!("/f/{id}"), Some("alice"))).await;
+    assert!(d0.text().contains("No earlier versions"));
+
+    // Re-upload the SAME name at the root with DIFFERENT bytes -> same id, one retained version.
+    let re = send(&app, upload_req(&csrf, &csrf, "alice", "shot.png", "image/png", &png_bytes_alt())).await;
+    assert_eq!(re.status, StatusCode::FOUND, "{}", re.text());
+    assert_eq!(re.location(), format!("/f/{id}"), "re-upload versions the SAME file (no new id)");
+    let versions = store.list_versions(&id).await.unwrap();
+    assert_eq!(versions.len(), 1, "the prior blob is retained as a version");
+    // Current serves the NEW bytes; the version holds the ORIGINAL bytes.
+    assert_eq!(send(&app, get(&format!("/f/{id}/raw"), Some("alice"))).await.body, png_bytes_alt());
+    let vid = versions[0].id.clone();
+    let vdl = send(&app, get(&format!("/f/{id}/versions/{vid}/raw"), Some("alice"))).await;
+    assert_eq!(vdl.status, StatusCode::OK);
+    assert_eq!(vdl.body, png_bytes(), "the version download is the original blob");
+    assert!(vdl.header(header::CONTENT_DISPOSITION).starts_with("attachment"));
+
+    // The detail page lists the version with download + restore controls.
+    let d1 = send(&app, get(&format!("/f/{id}"), Some("alice"))).await;
+    assert!(d1.text().contains(&format!("/f/{id}/versions/{vid}/raw")));
+    assert!(d1.text().contains("Restore"));
+
+    // Restore the version -> current swaps back to the original bytes; history is kept (still 1).
+    let rest = send(&app, post_form(&format!("/f/{id}/versions/{vid}/restore"), &csrf, "alice", format!("csrf_token={csrf}"))).await;
+    assert_eq!(rest.status, StatusCode::FOUND);
+    assert_eq!(send(&app, get(&format!("/f/{id}/raw"), Some("alice"))).await.body, png_bytes(), "restored to the original");
+    assert_eq!(store.list_versions(&id).await.unwrap().len(), 1, "restore keeps history (old current becomes a version)");
+}
+
+#[tokio::test]
+async fn versions_are_pruned_to_the_cap() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let (id, csrf) = upload_png(&app, "alice").await;
+
+    // Re-upload the same name 12 times -> history is capped at the newest 10.
+    for _ in 0..12 {
+        let re = send(&app, upload_req(&csrf, &csrf, "alice", "shot.png", "image/png", &png_bytes_alt())).await;
+        assert_eq!(re.status, StatusCode::FOUND, "{}", re.text());
+    }
+    assert_eq!(store.list_versions(&id).await.unwrap().len(), 10, "oldest versions are pruned to the cap");
+}
+
+#[tokio::test]
+async fn version_bytes_count_toward_quota() {
+    let png = png_bytes();
+    // Quota = exactly two PNGs of room.
+    let state = quota_state(2 * png.len() as i64);
+    let app = app(state);
+    let home = send(&app, get("/", Some("alice"))).await;
+    let csrf = home.csrf_cookie().unwrap();
+
+    // First upload (1 PNG). Re-upload same name: old blob becomes a version (1 PNG) + new (1 PNG) =
+    // exactly the quota -> allowed at the boundary. (Same-size bytes keep the boundary exact.)
+    assert_eq!(send(&app, upload_req(&csrf, &csrf, "alice", "shot.png", "image/png", &png)).await.status, StatusCode::FOUND);
+    let re1 = send(&app, upload_req(&csrf, &csrf, "alice", "shot.png", "image/png", &png)).await;
+    assert_eq!(re1.status, StatusCode::FOUND, "{}", re1.text());
+
+    // A THIRD copy would push usage (current + version) over the quota -> 413. Proves versions count.
+    let re2 = send(&app, upload_req(&csrf, &csrf, "alice", "shot.png", "image/png", &png)).await;
+    assert_eq!(re2.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(re2.text().contains("Not enough storage"));
+}
+
+// ---------------------------------------------------------------------------
+// Folder share: public index + expiry/password/revoke gates
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn folder_share_public_index_and_gates() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let (root_id, csrf) = upload_png(&app, "alice").await; // a file OUTSIDE the shared folder
+
+    // Folder with one file inside it.
+    let mk = send(&app, post_form("/folders", &csrf, "alice", format!("csrf_token={csrf}&name=Album&parent_id="))).await;
+    let fid = folder_from_location(&mk.location());
+    let up = send(&app, upload_req_folder(&csrf, &csrf, "alice", &fid, "pic.png", "image/png", &png_bytes())).await;
+    let inid = up.location().trim_start_matches("/f/").to_string();
+
+    // Create a folder share link (no password, never expires) via the owner form.
+    let sh = send(&app, post_form(&format!("/folders/{fid}/share"), &csrf, "alice", format!("csrf_token={csrf}&expiry=never"))).await;
+    assert_eq!(sh.status, StatusCode::FOUND);
+    let token = store.get_folder(&fid, "alice").await.unwrap().unwrap().share_token.unwrap();
+
+    // Public index (NO auth) lists the folder's file + a download link.
+    let idx = send(&app, get(&format!("/s/folder/{token}"), None)).await;
+    assert_eq!(idx.status, StatusCode::OK);
+    assert!(idx.text().contains("pic.png"));
+    assert!(idx.text().contains(&format!("/s/folder/{token}/f/{inid}")));
+    // Public download returns the bytes.
+    let dl = send(&app, get(&format!("/s/folder/{token}/f/{inid}"), None)).await;
+    assert_eq!(dl.status, StatusCode::OK);
+    assert_eq!(dl.body, png_bytes());
+    // The token cannot fetch a file that is NOT in the shared folder (the root file) -> 404.
+    let cross = send(&app, get(&format!("/s/folder/{token}/f/{root_id}"), None)).await;
+    assert_eq!(cross.status, StatusCode::NOT_FOUND);
+
+    // Force the expiry into the past -> the public index is 410 Gone.
+    store.configure_folder_share(&fid, "alice", Some(token.clone()), Some(1), None).await.unwrap();
+    assert_eq!(send(&app, get(&format!("/s/folder/{token}"), None)).await.status, StatusCode::GONE);
+
+    // Revoke -> the outstanding link is 404.
+    let rev = send(&app, post_form(&format!("/folders/{fid}/revoke"), &csrf, "alice", format!("csrf_token={csrf}"))).await;
+    assert_eq!(rev.status, StatusCode::FOUND);
+    assert_eq!(send(&app, get(&format!("/s/folder/{token}"), None)).await.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn folder_share_password_gate() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let (_r, csrf) = upload_png(&app, "alice").await;
+
+    let mk = send(&app, post_form("/folders", &csrf, "alice", format!("csrf_token={csrf}&name=Locked&parent_id="))).await;
+    let fid = folder_from_location(&mk.location());
+    let up = send(&app, upload_req_folder(&csrf, &csrf, "alice", &fid, "secret.png", "image/png", &png_bytes())).await;
+    let inid = up.location().trim_start_matches("/f/").to_string();
+
+    // Share WITH a password.
+    send(&app, post_form(&format!("/folders/{fid}/share"), &csrf, "alice", format!("csrf_token={csrf}&expiry=never&password=hunter2"))).await;
+    let token = store.get_folder(&fid, "alice").await.unwrap().unwrap().share_token.unwrap();
+
+    // Bare GET prompts for the password and does NOT reveal the file list.
+    let prompt = send(&app, get(&format!("/s/folder/{token}"), None)).await;
+    assert_eq!(prompt.status, StatusCode::OK);
+    assert!(prompt.text().contains("Password required"));
+    assert!(!prompt.text().contains("secret.png"));
+    // A direct GET download on a protected folder is refused (401), not served.
+    let locked = send(&app, get(&format!("/s/folder/{token}/f/{inid}"), None)).await;
+    assert_eq!(locked.status, StatusCode::UNAUTHORIZED);
+
+    // Wrong password -> 401 + prompt again.
+    let wrong = send(&app, post_public(&format!("/s/folder/{token}"), "password=nope".to_string())).await;
+    assert_eq!(wrong.status, StatusCode::UNAUTHORIZED);
+    assert!(wrong.text().contains("Incorrect password"));
+
+    // Correct password -> the index with per-file POST download forms carrying the password.
+    let ok = send(&app, post_public(&format!("/s/folder/{token}"), "password=hunter2".to_string())).await;
+    assert_eq!(ok.status, StatusCode::OK);
+    assert!(ok.text().contains("secret.png"));
+    assert!(ok.text().contains(&format!("action=\"/s/folder/{token}/f/{inid}\"")));
+    // Download via POST with the correct password serves the bytes.
+    let dl = send(&app, post_public(&format!("/s/folder/{token}/f/{inid}"), "password=hunter2".to_string())).await;
+    assert_eq!(dl.status, StatusCode::OK);
+    assert_eq!(dl.body, png_bytes());
+    // Wrong password on the download POST -> 401.
+    let dlw = send(&app, post_public(&format!("/s/folder/{token}/f/{inid}"), "password=nope".to_string())).await;
+    assert_eq!(dlw.status, StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// Inline preview: content-type routing on the detail page
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn preview_routing_by_content_type() {
+    let state = build_dev_state();
+    let app = app(state);
+    let (imgid, csrf) = upload_png(&app, "alice").await;
+
+    // Image -> inline <img> with the lightbox trigger.
+    let di = send(&app, get(&format!("/f/{imgid}"), Some("alice"))).await;
+    assert!(di.text().contains("preview-img"));
+    assert!(di.text().contains("lightbox-trigger"));
+
+    // Text -> escaped <pre> preview (never raw HTML).
+    let ut = send(&app, upload_req(&csrf, &csrf, "alice", "notes.txt", "text/plain", b"<script>alert(1)</script> hi")).await;
+    let tid = ut.location().trim_start_matches("/f/").to_string();
+    let dt = send(&app, get(&format!("/f/{tid}"), Some("alice"))).await;
+    assert!(dt.text().contains("preview-text"));
+    assert!(dt.text().contains("&lt;script&gt;alert(1)&lt;/script&gt;"), "text is escaped");
+    assert!(!dt.text().contains("<script>alert(1)</script>"), "no raw script survives");
+
+    // PDF -> sandboxed <iframe> of the inline preview bytes.
+    let (pdfid, _c) = upload_pdf(&app, "alice").await;
+    let dp = send(&app, get(&format!("/f/{pdfid}"), Some("alice"))).await;
+    assert!(dp.text().contains("preview-pdf"));
+    assert!(dp.text().contains(&format!("/f/{pdfid}/preview-raw")));
+    assert!(dp.text().contains("sandbox"));
+    // The preview-raw route serves the PDF inline, sandboxed, nosniff.
+    let pr = send(&app, get(&format!("/f/{pdfid}/preview-raw"), Some("alice"))).await;
+    assert_eq!(pr.status, StatusCode::OK);
+    assert_eq!(pr.header(header::CONTENT_TYPE), "application/pdf");
+    assert!(pr.header(header::CONTENT_DISPOSITION).starts_with("inline"));
+    assert_eq!(pr.header(header::X_CONTENT_TYPE_OPTIONS), "nosniff");
+    assert_eq!(pr.header(header::CONTENT_SECURITY_POLICY), "sandbox");
+
+    // Non-previewable binary -> the type icon + "No inline preview".
+    let ub = send(&app, upload_req(&csrf, &csrf, "alice", "blob.bin", "application/octet-stream", b"\x00\x01\x02rawbytes")).await;
+    let bid = ub.location().trim_start_matches("/f/").to_string();
+    let db = send(&app, get(&format!("/f/{bid}"), Some("alice"))).await;
+    assert!(db.text().contains("No inline preview"));
+
+    // preview-raw on a NON-pdf falls back to the safe attachment path (never inline execution).
+    let prb = send(&app, get(&format!("/f/{bid}/preview-raw"), Some("alice"))).await;
+    assert!(prb.header(header::CONTENT_DISPOSITION).starts_with("attachment"));
+}
+
+#[tokio::test]
+async fn preview_and_version_routes_are_owner_scoped() {
+    let state = build_dev_state();
+    let app = app(state);
+    let (id, csrf) = upload_png(&app, "alice").await;
+    // Give the file a version so the version route has a target.
+    send(&app, upload_req(&csrf, &csrf, "alice", "shot.png", "image/png", &png_bytes_alt())).await;
+    // Read the version id out of the detail page's version link.
+    let vid = {
+        let d = send(&app, get(&format!("/f/{id}"), Some("alice"))).await;
+        let t = d.text();
+        let marker = format!("/f/{id}/versions/");
+        let after = t.split(&marker).nth(1).unwrap().to_string();
+        after.chars().take_while(|&c| c != '/').collect::<String>()
+    };
+
+    // Bob cannot preview or touch Alice's file/version.
+    assert_eq!(send(&app, get(&format!("/f/{id}/preview-raw"), Some("bob"))).await.status, StatusCode::FORBIDDEN);
+    assert_eq!(send(&app, get(&format!("/f/{id}/versions/{vid}/raw"), Some("bob"))).await.status, StatusCode::FORBIDDEN);
+    let bob_home = send(&app, get("/", Some("bob"))).await;
+    let bob_csrf = bob_home.csrf_cookie().unwrap();
+    let restore = send(&app, post_form(&format!("/f/{id}/versions/{vid}/restore"), &bob_csrf, "bob", format!("csrf_token={bob_csrf}"))).await;
+    assert_eq!(restore.status, StatusCode::FORBIDDEN);
 }

@@ -51,9 +51,34 @@ pub struct FileRec {
     /// When set, the public `/s/{token}` fetch prompts for the password before serving the blob.
     pub share_password_hash: Option<String>,
     /// Optional owning folder id (a [`FolderRec`] belonging to the same `owner_sub`). `None` = the
-    /// file is unfiled and appears only in the flat "all files" view. A folder view (`?folder={id}`)
-    /// lists exactly the files whose `folder_id` matches.
+    /// file lives at the drive ROOT (the tree's top level). A folder view (`?folder={id}`) lists
+    /// exactly the files whose `folder_id` matches; the root view lists the files whose `folder_id`
+    /// IS NULL.
     pub folder_id: Option<String>,
+}
+
+/// A single blob snapshot kept when a file is re-uploaded under the same name in the same folder.
+/// The prior blob is retained under its own `object_key` instead of being overwritten, so the
+/// owner can download or restore it. Field order/types mirror the `file_versions` table exactly.
+///
+/// NOTE on columns: the schema keeps `content_type` alongside the spec's
+/// `id, file_id, object_key, size, created_at` so a restore can swap the file's content type back
+/// to the snapshotted blob's type (a same-name re-upload can still change the type); without it a
+/// restored blob would inherit the current row's — possibly wrong — type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VersionRec {
+    /// Short, random, URL-safe id (the version selector + primary key).
+    pub id: String,
+    /// The owning file's id (a [`FileRec::id`]). Ownership is enforced through that file.
+    pub file_id: String,
+    /// Object-store key holding this version's blob.
+    pub object_key: String,
+    /// Size in bytes (counts toward the owner's storage usage / quota).
+    pub size: i64,
+    /// The snapshotted blob's resolved content type (restored verbatim on a restore).
+    pub content_type: String,
+    /// Snapshot time (when this blob stopped being the current one), epoch seconds.
+    pub created_at: i64,
 }
 
 /// Aggregated per-owner storage usage (file count + total stored bytes), computed from the
@@ -69,19 +94,32 @@ pub struct OwnerUsage {
     pub bytes: i64,
 }
 
-/// A single owner-scoped folder (album) grouping a subset of the owner's files. Field
-/// order/types mirror the `folders` table exactly. Files reference it via [`FileRec::folder_id`];
-/// deleting a folder unfiles its files rather than deleting them.
+/// A single owner-scoped folder node in the drive's folder TREE. Field order/types mirror the
+/// `folders` table exactly. Files reference it via [`FileRec::folder_id`]; child folders reference
+/// it via [`FolderRec::parent_id`]. A folder can carry its OWN public share link (token / expiry /
+/// password), mirroring a file's share fields, so a whole folder can be shared as a public index.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FolderRec {
     /// Short, random, URL-safe id (the `?folder={id}` selector + primary key).
     pub id: String,
-    /// Owner subject from `X-Auth-Subject` (ownership key for list/rename/delete).
+    /// Owner subject from `X-Auth-Subject` (ownership key for list/rename/delete/share).
     pub owner_sub: String,
+    /// Optional parent folder id (a [`FolderRec`] of the same owner). `None` = a ROOT folder (top
+    /// of the tree). Folders are only ever created under the current level, so the parent chain can
+    /// never form a cycle.
+    pub parent_id: Option<String>,
     /// Display name as submitted (display only; escaped on render).
     pub name: String,
     /// Creation time, epoch seconds.
     pub created_at: i64,
+    /// Unguessable public share token (`/s/folder/{token}` lists this folder's files WITHOUT SSO). `None`
+    /// once revoked (or never shared) — the folder then has NO public surface.
+    pub share_token: Option<String>,
+    /// Optional folder-share expiry instant, epoch seconds. `None` = never expires. Past it the
+    /// public `/s/folder/{token}` index returns `410 Gone`.
+    pub expires_at: Option<i64>,
+    /// Optional salted-hash of a folder-share password (`{salt}${sha256_hex}`). `None` = no password.
+    pub share_password_hash: Option<String>,
 }
 
 impl FileRec {
@@ -97,6 +135,19 @@ impl FileRec {
     }
 
     /// True when the share link is password-protected.
+    pub fn share_has_password(&self) -> bool {
+        self.share_password_hash.is_some()
+    }
+}
+
+impl FolderRec {
+    /// True once `now` (epoch seconds) has reached the folder-share expiry instant. A `None` expiry
+    /// never expires. Mirrors [`FileRec::share_expired`].
+    pub fn share_expired(&self, now: i64) -> bool {
+        matches!(self.expires_at, Some(exp) if now >= exp)
+    }
+
+    /// True when the folder share link is password-protected.
     pub fn share_has_password(&self) -> bool {
         self.share_password_hash.is_some()
     }
@@ -131,6 +182,25 @@ mod tests {
             share_password_hash: None,
             folder_id: None,
         }
+    }
+
+    #[test]
+    fn folder_share_expired_and_password_helpers() {
+        let mut f = FolderRec {
+            id: "f".into(),
+            owner_sub: "u".into(),
+            parent_id: None,
+            name: "F".into(),
+            created_at: 0,
+            share_token: Some("t".into()),
+            expires_at: Some(1000),
+            share_password_hash: None,
+        };
+        assert!(!f.share_expired(999));
+        assert!(f.share_expired(1000)); // inclusive
+        assert!(!f.share_has_password());
+        f.share_password_hash = Some("salt$hash".into());
+        assert!(f.share_has_password());
     }
 
     #[test]

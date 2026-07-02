@@ -9,23 +9,33 @@
 //! - `GET /healthz` — liveness (public)
 //! - `GET /` — the signed-in user's drive (gallery grid + upload dropzone) [SSO]
 //! - `POST /upload` — multipart upload -> store blob in Cairn + metadata row -> 302 `/f/{id}` [SSO]
-//! - `GET /f/{id}` — file detail / preview page (owner-only) [SSO]
+//! - `GET /f/{id}` — file detail / preview page: inline image (lightbox) / text / sandboxed PDF,
+//!   version history, share + move controls (owner-only) [SSO]
 //! - `GET /f/{id}/raw` — stream the blob (inline image / attachment) (owner-only) [SSO]
+//! - `GET /f/{id}/preview-raw` — inline, sandboxed PDF bytes for the detail embed (owner-only) [SSO]
+//! - `GET /f/{id}/versions/{vid}/raw` — download a retained version's blob (owner-only) [SSO]
+//! - `POST /f/{id}/versions/{vid}/restore` — restore a version as the current blob (CSRF) [SSO]
 //! - `GET /d/{id}/thumb` — gallery thumbnail: 302 to the full image, else a cached, mime-keyed type
 //!   icon derived + cached as a `{object_key}.thumb` blob (owner-only) [SSO]
-//! - `POST /delete/{id}` — delete your own file (blob + row) -> 302 `/` (CSRF) [SSO]
+//! - `POST /delete/{id}` — delete your own file (blob + row + versions) -> 302 `/` (CSRF) [SSO]
 //! - `POST /f/{id}/share` — set the share link's expiry + optional password (CSRF) [SSO]
 //! - `POST /f/{id}/revoke` — revoke the share link (clears the token) (CSRF) [SSO]
 //! - `POST /f/{id}/move` — move the file into a folder (or back to the root) (CSRF) [SSO]
-//! - `GET /?folder={id}` — the gallery filtered to one owner folder (default: flat all-files) [SSO]
-//! - `POST /folders` — create an owner folder (CSRF) [SSO]
+//! - `GET /?folder={id}` — the drive tree at one folder level (default: root, `folder_id` NULL);
+//!   renders a breadcrumb, child-folder tiles, an "Up" tile and the level's files [SSO]
+//! - `POST /folders` — create a folder under the current level (`parent_id`) (CSRF) [SSO]
 //! - `POST /folders/{id}/rename` — rename an owner folder (CSRF) [SSO]
-//! - `POST /folders/{id}/delete` — delete an owner folder; its files are unfiled (CSRF) [SSO]
+//! - `POST /folders/{id}/delete` — delete a folder: empty-only, or `cascade=1` to remove the whole
+//!   subtree (subfolders + files + version blobs) (CSRF) [SSO]
+//! - `POST /folders/{id}/share` — set a folder's public share-link expiry + optional password (CSRF) [SSO]
+//! - `POST /folders/{id}/revoke` — revoke a folder's public share link (CSRF) [SSO]
 //! - `GET /admin` — per-owner storage usage + quota overrides (admin groups only) [SSO]
 //! - `POST /admin/quota` — set/clear an owner's quota override (CSRF) [SSO, admin]
 //! - `GET /s/{token}` — fetch a shared file by unguessable token, NO SSO (410 past expiry;
 //!   password prompt when protected) [PUBLIC `/s/` prefix]
 //! - `POST /s/{token}` — submit a protected share link's password, NO SSO [PUBLIC `/s/` prefix]
+//! - `GET /s/folder/{token}` — public index of a shared folder's files; `POST` unlocks a protected one;
+//!   `GET|POST /s/folder/{token}/f/{fid}` downloads one listed file, NO SSO [PUBLIC `/s/folder/` prefix]
 
 pub mod audit;
 pub mod auth;
@@ -71,6 +81,15 @@ pub fn app(state: AppState) -> Router {
         .route("/upload", post(handlers::files::upload))
         .route("/f/{id}", get(handlers::files::detail))
         .route("/f/{id}/raw", get(handlers::files::raw))
+        .route("/f/{id}/preview-raw", get(handlers::files::preview_raw))
+        .route(
+            "/f/{id}/versions/{vid}/raw",
+            get(handlers::files::download_version),
+        )
+        .route(
+            "/f/{id}/versions/{vid}/restore",
+            post(handlers::files::restore_version),
+        )
         .route("/d/{id}/thumb", get(handlers::files::thumb))
         .route("/delete/{id}", post(handlers::files::delete))
         .route("/f/{id}/share", post(handlers::files::configure_share))
@@ -79,9 +98,19 @@ pub fn app(state: AppState) -> Router {
         .route("/folders", post(handlers::files::create_folder))
         .route("/folders/{id}/rename", post(handlers::files::rename_folder))
         .route("/folders/{id}/delete", post(handlers::files::delete_folder))
+        .route("/folders/{id}/share", post(handlers::files::configure_folder_share))
+        .route("/folders/{id}/revoke", post(handlers::files::revoke_folder_share))
         .route(
             "/s/{token}",
             get(handlers::files::share).post(handlers::files::share_unlock),
+        )
+        .route(
+            "/s/folder/{token}",
+            get(handlers::files::share_folder).post(handlers::files::share_folder_unlock),
+        )
+        .route(
+            "/s/folder/{token}/f/{fid}",
+            get(handlers::files::share_folder_file).post(handlers::files::share_folder_file_unlock),
         )
         .merge(admin_router())
         .layer(DefaultBodyLimit::max(body_limit))

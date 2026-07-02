@@ -30,6 +30,7 @@
 
     <form id="uploadForm" class="dropzone" method="post" action="/upload" enctype="multipart/form-data">
       <input type="hidden" name="csrf_token" value="{{CSRF}}">
+      <input type="hidden" name="folder_id" value="{{UPLOAD_FOLDER}}">
       <input id="fileInput" class="dropzone__input" type="file" name="file" required>
       <label for="fileInput" class="dropzone__label">
         <span class="dropzone__icon" aria-hidden="true">&#8682;</span>
@@ -45,6 +46,7 @@
       {{SIDEBAR}}
 
       <div class="drive-content">
+        {{BREADCRUMB}}
         <div class="section-head">
           <h2>{{HEADING}}</h2>
           <span class="count-badge">{{COUNT}}</span>

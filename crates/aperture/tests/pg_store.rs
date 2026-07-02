@@ -19,8 +19,8 @@
 use std::sync::Arc;
 
 use aperture::blobs::MemoryBlobs;
-use aperture::model::{FileRec, FolderRec};
-use aperture::store::{PgStore, Store};
+use aperture::model::{FileRec, FolderRec, VersionRec};
+use aperture::store::{FolderDelete, PgStore, Store};
 use aperture::{app, build_dev_state, now_secs, AppState};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::Row;
@@ -128,12 +128,17 @@ async fn pg_store_full_integration() {
     );
 
     // --- folders (albums): create, filter, move, rename, delete-unfiles ----
+    sqlx::query("DELETE FROM file_versions").execute(&raw).await.unwrap();
     sqlx::query("DELETE FROM folders").execute(&raw).await.unwrap();
     let fld = |id: &str, owner: &str, name: &str| FolderRec {
         id: id.to_string(),
         owner_sub: owner.to_string(),
+        parent_id: None,
         name: name.to_string(),
         created_at: now,
+        share_token: None,
+        expires_at: None,
+        share_password_hash: None,
     };
     assert!(store.create_folder(&fld("fold000001", "alice", "Zeta")).await.unwrap());
     assert!(store.create_folder(&fld("fold000002", "alice", "alpha")).await.unwrap());
@@ -160,25 +165,112 @@ async fn pg_store_full_integration() {
         .await
         .unwrap();
     assert_eq!(in_folder.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["cccccccccc"]);
-    // The flat view still shows the file regardless of folder.
+    // list_files_in_folder returns the whole folder unpaginated.
+    assert_eq!(store.list_files_in_folder("fold000001", "alice").await.unwrap().len(), 1);
+    // The ROOT view (folder=None) now EXCLUDES the filed file (the tree model).
     assert!(store
         .list_by_owner("alice", None, None, 50)
         .await
         .unwrap()
         .iter()
-        .any(|f| f.id == "cccccccccc"));
+        .all(|f| f.id != "cccccccccc"));
+    // find_file_in_folder resolves same-name-per-level (portable IS NULL vs = branch).
+    assert_eq!(
+        store
+            .find_file_in_folder("alice", "cccccccccc.png", Some("fold000001"))
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        "cccccccccc"
+    );
     // A non-owner cannot move the file or rename/delete the folder.
     assert!(!store.move_file("cccccccccc", "bob", Some("fold000001")).await.unwrap());
     assert!(!store.rename_folder("fold000001", "bob", "hax").await.unwrap());
-    assert!(!store.delete_folder("fold000001", "bob").await.unwrap());
+    assert_eq!(
+        store.delete_folder_if_empty("fold000001", "bob").await.unwrap(),
+        FolderDelete::NotFound
+    );
     // Rename works for the owner.
     assert!(store.rename_folder("fold000001", "alice", "Renamed").await.unwrap());
     assert_eq!(store.get_folder("fold000001", "alice").await.unwrap().unwrap().name, "Renamed");
-    // Deleting the folder unfiles its file (kept, folder_id cleared).
-    assert!(store.delete_folder("fold000001", "alice").await.unwrap());
+
+    // --- folder TREE: a child folder makes the parent non-empty --------------
+    assert!(store
+        .create_folder(&FolderRec {
+            parent_id: Some("fold000001".to_string()),
+            ..fld("fold000009", "alice", "Child")
+        })
+        .await
+        .unwrap());
+    assert_eq!(
+        store.delete_folder_if_empty("fold000001", "alice").await.unwrap(),
+        FolderDelete::NotEmpty,
+        "a folder with a subfolder AND a file is not empty"
+    );
+
+    // --- folder public share link (portable token unique index) --------------
+    assert!(store
+        .configure_folder_share("fold000001", "alice", Some("folder-tok".into()), Some(now + 60), Some("s$h".into()))
+        .await
+        .unwrap());
+    let by_tok = store.get_folder_by_token("folder-tok").await.unwrap().unwrap();
+    assert_eq!(by_tok.id, "fold000001");
+    assert!(by_tok.share_has_password());
+    assert!(store.configure_folder_share("fold000001", "alice", None, None, None).await.unwrap());
+    assert!(store.get_folder_by_token("folder-tok").await.unwrap().is_none());
+
+    // --- cascade delete removes the subtree, keeping ccc (moved out first) ----
+    // Move ccc back to the root so it survives for the later usage assertions.
+    assert!(store.move_file("cccccccccc", "alice", None).await.unwrap());
+    let freed = store.delete_folder_cascade("fold000001", "alice").await.unwrap();
+    assert!(freed.is_empty(), "no files remained in the subtree, so no blob keys are freed");
     assert!(store.get_folder("fold000001", "alice").await.unwrap().is_none());
-    assert!(store.get("cccccccccc").await.unwrap().unwrap().folder_id.is_none());
+    assert!(store.get_folder("fold000009", "alice").await.unwrap().is_none(), "child removed too");
+    assert!(store.get("cccccccccc").await.unwrap().unwrap().folder_id.is_none(), "ccc kept at root");
     sqlx::query("DELETE FROM folders").execute(&raw).await.unwrap();
+
+    // --- versions: add / list (newest-first) / prune / update / usage --------
+    let ver = |id: &str, file_id: &str, size: i64, at: i64| VersionRec {
+        id: id.to_string(),
+        file_id: file_id.to_string(),
+        object_key: format!("{id}-blob"),
+        size,
+        content_type: "image/png".to_string(),
+        created_at: at,
+    };
+    // A throwaway file so ccc's size/type stay pristine for the usage section below.
+    store.create(&file("verfile000", "alice", "tok-ver", now + 40)).await.unwrap();
+    let base = store.usage_for_owner("alice").await.unwrap();
+    assert!(store.add_version(&ver("ver1", "verfile000", 100, now + 1)).await.unwrap());
+    assert!(store.add_version(&ver("ver2", "verfile000", 200, now + 2)).await.unwrap());
+    assert!(store.add_version(&ver("ver3", "verfile000", 300, now + 3)).await.unwrap());
+    let vids: Vec<String> = store
+        .list_versions("verfile000")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|v| v.id)
+        .collect();
+    assert_eq!(vids, vec!["ver3", "ver2", "ver1"], "newest-first");
+    // Version bytes (100+200+300) count toward usage on top of the file bytes.
+    assert_eq!(store.usage_for_owner("alice").await.unwrap(), base + 600);
+    let pruned = store.prune_versions("verfile000", 2).await.unwrap();
+    assert_eq!(pruned.iter().map(|v| v.id.as_str()).collect::<Vec<_>>(), vec!["ver1"]);
+    assert_eq!(store.list_versions("verfile000").await.unwrap().len(), 2);
+    // update_file_blob repoints the current pointer (the restore/re-upload primitive).
+    assert!(store
+        .update_file_blob("verfile000", "alice", "newkey", 42, "application/pdf", now + 99)
+        .await
+        .unwrap());
+    let repointed = store.get("verfile000").await.unwrap().unwrap();
+    assert_eq!(repointed.object_key, "newkey");
+    assert_eq!(repointed.content_type, "application/pdf");
+    // delete_versions_for_file returns the remaining rows for blob cleanup, then remove the file.
+    assert_eq!(store.delete_versions_for_file("verfile000").await.unwrap().len(), 2);
+    assert!(store.list_versions("verfile000").await.unwrap().is_empty());
+    store.delete("verfile000", "alice").await.unwrap();
+    sqlx::query("DELETE FROM file_versions").execute(&raw).await.unwrap();
 
     // --- ownership-scoped delete -------------------------------------------
     assert!(!store.delete("aaaaaaaaaa", "bob").await.unwrap(), "bob cannot delete alice's");

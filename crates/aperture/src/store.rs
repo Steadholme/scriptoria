@@ -15,13 +15,22 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::config::clamp_page;
-use crate::model::{FileRec, FolderRec, OwnerUsage};
+use crate::model::{FileRec, FolderRec, OwnerUsage, VersionRec};
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("store error: {0}")]
     Backend(String),
+}
+
+/// Outcome of an "empty-only" folder delete: either the row was removed, the folder still holds
+/// child folders / files (so a cascade is required), or it was absent / owned by someone else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderDelete {
+    Deleted,
+    NotEmpty,
+    NotFound,
 }
 
 /// Pluggable metadata store. `create` is collision-aware over BOTH the id and the share token
@@ -41,9 +50,9 @@ pub trait Store: Send + Sync {
 
     /// An owner's files, newest-first, one keyset page at a time.
     ///
-    /// `folder` filters the view: `None` is the flat "all files" view (every file the owner has,
-    /// regardless of folder — the default), while `Some(id)` returns only the files whose
-    /// `folder_id` equals that folder. Ordering is the fixed keyset `(created_at DESC, id DESC)`.
+    /// `folder` selects the tree level: `None` is the ROOT view (only files whose `folder_id` IS
+    /// NULL — the drive's top level), while `Some(id)` returns only the files whose `folder_id`
+    /// equals that folder. Ordering is the fixed keyset `(created_at DESC, id DESC)`.
     /// `before` is the exclusive `(created_at, id)` cursor of the last row already seen — pass
     /// `None` for the newest page, or the previous page's last (oldest) row to page BACKWARD into
     /// older files. `limit` is clamped to `[1, MAX_PAGE]` (see [`crate::config::clamp_page`]) so the
@@ -78,13 +87,19 @@ pub trait Store: Send + Sync {
     /// existed (the caller retries with a fresh id).
     async fn create_folder(&self, folder: &FolderRec) -> Result<bool, StoreError>;
 
-    /// An owner's folders, name-ordered (case-insensitive, id tiebreak) for a stable sidebar.
+    /// ALL of an owner's folders, name-ordered (case-insensitive, id tiebreak). The caller builds
+    /// the tree (breadcrumbs, per-level children) from the flat list in memory.
     async fn list_folders(&self, owner_sub: &str) -> Result<Vec<FolderRec>, StoreError>;
 
     /// Fetch one folder, ownership-scoped (used to validate a move target and to render the active
     /// folder's controls). `None` when it does not exist or belongs to someone else.
     async fn get_folder(&self, id: &str, owner_sub: &str)
         -> Result<Option<FolderRec>, StoreError>;
+
+    /// Fetch a folder by its public share token (the unauthenticated `/s/folder/{token}` index). `None`
+    /// when the token is unknown / revoked. The row carries `owner_sub`, so the public handler
+    /// scopes the file listing WITHOUT any request identity.
+    async fn get_folder_by_token(&self, token: &str) -> Result<Option<FolderRec>, StoreError>;
 
     /// Rename a folder only if it belongs to `owner_sub`. Returns `true` when a row was updated.
     async fn rename_folder(
@@ -94,14 +109,39 @@ pub trait Store: Send + Sync {
         name: &str,
     ) -> Result<bool, StoreError>;
 
-    /// Delete a folder only if it belongs to `owner_sub`, first UNFILING its files (their
-    /// `folder_id` is cleared to `NULL`) so no file is orphaned. Returns `true` when the folder row
-    /// was removed.
-    async fn delete_folder(&self, id: &str, owner_sub: &str) -> Result<bool, StoreError>;
+    /// Configure a folder's public share link, ownership-scoped. Sets all three share columns
+    /// atomically: `share_token` (`Some` to (re)enable, `None` to REVOKE), `expires_at`, and
+    /// `share_password_hash`. Returns `true` when the owner's row was updated. Mirrors
+    /// [`Store::configure_share`] for files.
+    async fn configure_folder_share(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        share_token: Option<String>,
+        expires_at: Option<i64>,
+        share_password_hash: Option<String>,
+    ) -> Result<bool, StoreError>;
 
-    /// Move a file into a folder (`Some(folder_id)`) or back to the root/unfiled view (`None`),
-    /// ownership-scoped. The caller validates that a `Some` target folder belongs to the owner.
-    /// Returns `true` when the owner's file row was updated.
+    /// Delete a folder ONLY when it is empty (no child folders AND no files) and owned by
+    /// `owner_sub`. Never touches file rows. See [`FolderDelete`] for the three outcomes.
+    async fn delete_folder_if_empty(
+        &self,
+        id: &str,
+        owner_sub: &str,
+    ) -> Result<FolderDelete, StoreError>;
+
+    /// Cascade-delete a folder and its WHOLE subtree — every descendant folder and every file in
+    /// them (file rows + their version rows) — ownership-scoped. Returns the object keys of every
+    /// removed blob (file currents AND versions) so the caller drops them from the object store.
+    async fn delete_folder_cascade(
+        &self,
+        id: &str,
+        owner_sub: &str,
+    ) -> Result<Vec<String>, StoreError>;
+
+    /// Move a file into a folder (`Some(folder_id)`) or back to the root (`None`), ownership-scoped.
+    /// The caller validates that a `Some` target folder belongs to the owner. Returns `true` when
+    /// the owner's file row was updated.
     async fn move_file(
         &self,
         id: &str,
@@ -109,12 +149,83 @@ pub trait Store: Send + Sync {
         folder_id: Option<&str>,
     ) -> Result<bool, StoreError>;
 
-    /// Total stored bytes for `owner_sub` (SUM of the owner's file sizes; `0` with no files).
+    /// ALL files directly in a folder (`folder_id` = `folder_id`), owner-scoped, newest-first.
+    /// Unpaginated — backs the public folder-share index and cascade cleanup, which need the whole
+    /// set. (The paged gallery uses [`Store::list_by_owner`] instead.)
+    async fn list_files_in_folder(
+        &self,
+        folder_id: &str,
+        owner_sub: &str,
+    ) -> Result<Vec<FileRec>, StoreError>;
+
+    /// The owner's file with the given display `name` at a specific tree level (`folder_id`: `None`
+    /// = root). Backs re-upload version detection ("same name in the same folder"). `None` when no
+    /// such file exists.
+    async fn find_file_in_folder(
+        &self,
+        owner_sub: &str,
+        name: &str,
+        folder_id: Option<&str>,
+    ) -> Result<Option<FileRec>, StoreError>;
+
+    /// Repoint a file's current blob (object key + size + content type) and bump `created_at`,
+    /// ownership-scoped. Used by a re-upload (point at the new blob) and a version restore (point
+    /// back at the snapshot). Returns `true` when the owner's row was updated.
+    async fn update_file_blob(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        object_key: &str,
+        size: i64,
+        content_type: &str,
+        created_at: i64,
+    ) -> Result<bool, StoreError>;
+
+    /// Append a version snapshot row.
+    async fn add_version(&self, version: &VersionRec) -> Result<bool, StoreError>;
+
+    /// A file's versions, newest-first (`created_at DESC, id DESC`). Scoped by `file_id`; the caller
+    /// has already ownership-checked the file.
+    async fn list_versions(&self, file_id: &str) -> Result<Vec<VersionRec>, StoreError>;
+
+    /// Fetch one version by id, scoped to its `file_id`. `None` when absent / not this file's.
+    async fn get_version(
+        &self,
+        version_id: &str,
+        file_id: &str,
+    ) -> Result<Option<VersionRec>, StoreError>;
+
+    /// Remove one version row (scoped to `file_id`) and return it, so the caller can decide whether
+    /// to drop its blob (a restore keeps the blob — it becomes current; an explicit prune drops it).
+    async fn delete_version(
+        &self,
+        version_id: &str,
+        file_id: &str,
+    ) -> Result<Option<VersionRec>, StoreError>;
+
+    /// Prune a file's OLDEST versions beyond the newest `keep`, returning the removed rows so the
+    /// caller drops their blobs. Keeps the version history bounded.
+    async fn prune_versions(
+        &self,
+        file_id: &str,
+        keep: i64,
+    ) -> Result<Vec<VersionRec>, StoreError>;
+
+    /// Remove ALL of a file's version rows (when the file itself is deleted), returning them so the
+    /// caller drops their blobs.
+    async fn delete_versions_for_file(
+        &self,
+        file_id: &str,
+    ) -> Result<Vec<VersionRec>, StoreError>;
+
+    /// Total stored bytes for `owner_sub`: the SUM of the owner's current file sizes PLUS the SUM of
+    /// all their retained version blobs (versions count toward usage). `0` with nothing stored.
     /// Backs the drive's usage meter and the upload quota precheck.
     async fn usage_for_owner(&self, owner_sub: &str) -> Result<i64, StoreError>;
 
     /// Aggregated usage for every owner with at least one file, largest first (`bytes` DESC,
-    /// `owner_sub` ASC tiebreak). Backs the `/admin` usage table.
+    /// `owner_sub` ASC tiebreak). `bytes` includes retained version blobs; `files` counts only the
+    /// current file rows. Backs the `/admin` usage table.
     async fn usage_by_owner(&self) -> Result<Vec<OwnerUsage>, StoreError>;
 
     /// The owner's per-owner quota override, when one exists. `None` means "no override" — the
@@ -138,6 +249,8 @@ pub trait Store: Send + Sync {
 pub struct InMemoryStore {
     files: Mutex<Vec<FileRec>>,
     folders: Mutex<Vec<FolderRec>>,
+    /// Retained blob snapshots (mirrors the `file_versions` table).
+    versions: Mutex<Vec<VersionRec>>,
     /// Per-owner quota override rows, `(owner_sub, quota_bytes)` — mirrors the `owner_quotas` table.
     quotas: Mutex<Vec<(String, i64)>>,
 }
@@ -189,9 +302,9 @@ impl Store for InMemoryStore {
         let mut out: Vec<FileRec> = files
             .iter()
             .filter(|f| f.owner_sub == owner_sub)
-            // Folder filter: `None` = the flat all-files view; `Some(id)` = only that folder.
+            // Tree level: `None` = the ROOT (folder_id IS NULL); `Some(id)` = only that folder.
             .filter(|f| match folder {
-                None => true,
+                None => f.folder_id.is_none(),
                 Some(fid) => f.folder_id.as_deref() == Some(fid),
             })
             // Keyset cursor: keep only rows strictly OLDER than `before` under (created_at, id).
@@ -279,6 +392,14 @@ impl Store for InMemoryStore {
             .cloned())
     }
 
+    async fn get_folder_by_token(&self, token: &str) -> Result<Option<FolderRec>, StoreError> {
+        let folders = self.folders.lock().expect("folders lock poisoned");
+        Ok(folders
+            .iter()
+            .find(|f| f.share_token.as_deref() == Some(token))
+            .cloned())
+    }
+
     async fn rename_folder(
         &self,
         id: &str,
@@ -298,20 +419,105 @@ impl Store for InMemoryStore {
         }
     }
 
-    async fn delete_folder(&self, id: &str, owner_sub: &str) -> Result<bool, StoreError> {
-        // Unfile the owner's files that point at this folder BEFORE removing it, so none is orphaned.
+    async fn configure_folder_share(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        share_token: Option<String>,
+        expires_at: Option<i64>,
+        share_password_hash: Option<String>,
+    ) -> Result<bool, StoreError> {
+        let mut folders = self.folders.lock().expect("folders lock poisoned");
+        match folders
+            .iter_mut()
+            .find(|f| f.id == id && f.owner_sub == owner_sub)
         {
-            let mut files = self.files.lock().expect("files lock poisoned");
-            for f in files.iter_mut() {
-                if f.owner_sub == owner_sub && f.folder_id.as_deref() == Some(id) {
-                    f.folder_id = None;
+            Some(f) => {
+                f.share_token = share_token;
+                f.expires_at = expires_at;
+                f.share_password_hash = share_password_hash;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn delete_folder_if_empty(
+        &self,
+        id: &str,
+        owner_sub: &str,
+    ) -> Result<FolderDelete, StoreError> {
+        let mut folders = self.folders.lock().expect("folders lock poisoned");
+        if !folders.iter().any(|f| f.id == id && f.owner_sub == owner_sub) {
+            return Ok(FolderDelete::NotFound);
+        }
+        // Empty = no child folder AND no file points at it (owner-scoped).
+        let has_subfolder = folders
+            .iter()
+            .any(|f| f.owner_sub == owner_sub && f.parent_id.as_deref() == Some(id));
+        let has_files = self
+            .files
+            .lock()
+            .expect("files lock poisoned")
+            .iter()
+            .any(|f| f.owner_sub == owner_sub && f.folder_id.as_deref() == Some(id));
+        if has_subfolder || has_files {
+            return Ok(FolderDelete::NotEmpty);
+        }
+        folders.retain(|f| !(f.id == id && f.owner_sub == owner_sub));
+        Ok(FolderDelete::Deleted)
+    }
+
+    async fn delete_folder_cascade(
+        &self,
+        id: &str,
+        owner_sub: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let mut folders = self.folders.lock().expect("folders lock poisoned");
+        if !folders.iter().any(|f| f.id == id && f.owner_sub == owner_sub) {
+            return Ok(Vec::new());
+        }
+        // Compute the descendant folder-id set (BFS on parent_id, owner-scoped, cycle-safe).
+        let mut set: Vec<String> = vec![id.to_string()];
+        let mut i = 0;
+        while i < set.len() {
+            let parent = set[i].clone();
+            for f in folders.iter() {
+                if f.owner_sub == owner_sub
+                    && f.parent_id.as_deref() == Some(parent.as_str())
+                    && !set.contains(&f.id)
+                {
+                    set.push(f.id.clone());
                 }
             }
+            i += 1;
         }
-        let mut folders = self.folders.lock().expect("folders lock poisoned");
-        let before = folders.len();
-        folders.retain(|f| !(f.id == id && f.owner_sub == owner_sub));
-        Ok(folders.len() != before)
+        // Remove every file in those folders (+ its versions), collecting the freed blob keys.
+        let mut keys: Vec<String> = Vec::new();
+        {
+            let mut files = self.files.lock().expect("files lock poisoned");
+            let mut versions = self.versions.lock().expect("versions lock poisoned");
+            let doomed: Vec<String> = files
+                .iter()
+                .filter(|f| {
+                    f.owner_sub == owner_sub
+                        && f.folder_id.as_deref().is_some_and(|fid| set.iter().any(|s| s == fid))
+                })
+                .map(|f| f.id.clone())
+                .collect();
+            for fid in &doomed {
+                if let Some(f) = files.iter().find(|f| &f.id == fid) {
+                    keys.push(f.object_key.clone());
+                }
+                for v in versions.iter().filter(|v| &v.file_id == fid) {
+                    keys.push(v.object_key.clone());
+                }
+            }
+            files.retain(|f| !doomed.contains(&f.id));
+            versions.retain(|v| !doomed.contains(&v.file_id));
+        }
+        folders.retain(|f| !(f.owner_sub == owner_sub && set.contains(&f.id)));
+        Ok(keys)
     }
 
     async fn move_file(
@@ -333,13 +539,167 @@ impl Store for InMemoryStore {
         }
     }
 
-    async fn usage_for_owner(&self, owner_sub: &str) -> Result<i64, StoreError> {
+    async fn list_files_in_folder(
+        &self,
+        folder_id: &str,
+        owner_sub: &str,
+    ) -> Result<Vec<FileRec>, StoreError> {
+        let files = self.files.lock().expect("files lock poisoned");
+        let mut out: Vec<FileRec> = files
+            .iter()
+            .filter(|f| f.owner_sub == owner_sub && f.folder_id.as_deref() == Some(folder_id))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+        Ok(out)
+    }
+
+    async fn find_file_in_folder(
+        &self,
+        owner_sub: &str,
+        name: &str,
+        folder_id: Option<&str>,
+    ) -> Result<Option<FileRec>, StoreError> {
         let files = self.files.lock().expect("files lock poisoned");
         Ok(files
             .iter()
+            .find(|f| {
+                f.owner_sub == owner_sub
+                    && f.name == name
+                    && f.folder_id.as_deref() == folder_id
+            })
+            .cloned())
+    }
+
+    async fn update_file_blob(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        object_key: &str,
+        size: i64,
+        content_type: &str,
+        created_at: i64,
+    ) -> Result<bool, StoreError> {
+        let mut files = self.files.lock().expect("files lock poisoned");
+        match files
+            .iter_mut()
+            .find(|f| f.id == id && f.owner_sub == owner_sub)
+        {
+            Some(f) => {
+                f.object_key = object_key.to_string();
+                f.size = size;
+                f.content_type = content_type.to_string();
+                f.created_at = created_at;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn add_version(&self, version: &VersionRec) -> Result<bool, StoreError> {
+        let mut versions = self.versions.lock().expect("versions lock poisoned");
+        if versions.iter().any(|v| v.id == version.id) {
+            return Ok(false);
+        }
+        versions.push(version.clone());
+        Ok(true)
+    }
+
+    async fn list_versions(&self, file_id: &str) -> Result<Vec<VersionRec>, StoreError> {
+        let versions = self.versions.lock().expect("versions lock poisoned");
+        let mut out: Vec<VersionRec> = versions
+            .iter()
+            .filter(|v| v.file_id == file_id)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+        Ok(out)
+    }
+
+    async fn get_version(
+        &self,
+        version_id: &str,
+        file_id: &str,
+    ) -> Result<Option<VersionRec>, StoreError> {
+        let versions = self.versions.lock().expect("versions lock poisoned");
+        Ok(versions
+            .iter()
+            .find(|v| v.id == version_id && v.file_id == file_id)
+            .cloned())
+    }
+
+    async fn delete_version(
+        &self,
+        version_id: &str,
+        file_id: &str,
+    ) -> Result<Option<VersionRec>, StoreError> {
+        let mut versions = self.versions.lock().expect("versions lock poisoned");
+        if let Some(pos) = versions
+            .iter()
+            .position(|v| v.id == version_id && v.file_id == file_id)
+        {
+            Ok(Some(versions.remove(pos)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn prune_versions(
+        &self,
+        file_id: &str,
+        keep: i64,
+    ) -> Result<Vec<VersionRec>, StoreError> {
+        let mut versions = self.versions.lock().expect("versions lock poisoned");
+        // Newest-first within this file; anything past the first `keep` is pruned (oldest go).
+        let mut mine: Vec<VersionRec> = versions
+            .iter()
+            .filter(|v| v.file_id == file_id)
+            .cloned()
+            .collect();
+        mine.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+        let keep = keep.max(0) as usize;
+        let pruned: Vec<VersionRec> = mine.into_iter().skip(keep).collect();
+        let pruned_ids: Vec<String> = pruned.iter().map(|v| v.id.clone()).collect();
+        versions.retain(|v| !pruned_ids.contains(&v.id));
+        Ok(pruned)
+    }
+
+    async fn delete_versions_for_file(
+        &self,
+        file_id: &str,
+    ) -> Result<Vec<VersionRec>, StoreError> {
+        let mut versions = self.versions.lock().expect("versions lock poisoned");
+        let removed: Vec<VersionRec> = versions
+            .iter()
+            .filter(|v| v.file_id == file_id)
+            .cloned()
+            .collect();
+        versions.retain(|v| v.file_id != file_id);
+        Ok(removed)
+    }
+
+    async fn usage_for_owner(&self, owner_sub: &str) -> Result<i64, StoreError> {
+        let files = self.files.lock().expect("files lock poisoned");
+        let file_bytes: i64 = files
+            .iter()
             .filter(|f| f.owner_sub == owner_sub)
             .map(|f| f.size)
-            .sum())
+            .sum();
+        // Retained version blobs of the owner's files also count toward usage.
+        let owned_ids: Vec<&str> = files
+            .iter()
+            .filter(|f| f.owner_sub == owner_sub)
+            .map(|f| f.id.as_str())
+            .collect();
+        let version_bytes: i64 = self
+            .versions
+            .lock()
+            .expect("versions lock poisoned")
+            .iter()
+            .filter(|v| owned_ids.contains(&v.file_id.as_str()))
+            .map(|v| v.size)
+            .sum();
+        Ok(file_bytes + version_bytes)
     }
 
     async fn usage_by_owner(&self) -> Result<Vec<OwnerUsage>, StoreError> {
@@ -356,6 +716,19 @@ impl Store for InMemoryStore {
                     files: 1,
                     bytes: f.size,
                 }),
+            }
+        }
+        // Fold each version's bytes into its file's owner (versions never add to the file COUNT).
+        let versions = self.versions.lock().expect("versions lock poisoned");
+        for v in versions.iter() {
+            if let Some(owner) = files
+                .iter()
+                .find(|f| f.id == v.file_id)
+                .map(|f| f.owner_sub.clone())
+            {
+                if let Some(u) = out.iter_mut().find(|u| u.owner_sub == owner) {
+                    u.bytes += v.size;
+                }
             }
         }
         // Largest first; owner as a deterministic tiebreak — matches the Pg ORDER BY.
@@ -401,7 +774,14 @@ const COLS: &str = "id, owner_sub, name, content_type, size, bucket, object_key,
      created_at, expires_at, share_password_hash, folder_id";
 
 /// Column list shared by every folder SELECT.
-const FOLDER_COLS: &str = "id, owner_sub, name, created_at";
+const FOLDER_COLS: &str =
+    "id, owner_sub, parent_id, name, created_at, share_token, expires_at, share_password_hash";
+
+/// Column list shared by every version SELECT.
+const VERSION_COLS: &str = "id, file_id, object_key, size, content_type, created_at";
+
+/// Keep at most this many versions per file; older snapshots are pruned (blobs deleted).
+pub const MAX_VERSIONS_PER_FILE: i64 = 10;
 
 /// PostgreSQL-backed [`Store`]. Holds a pooled connection; the async trait methods drive sqlx
 /// natively, so no worker thread is ever blocked on a DB round-trip.
@@ -484,10 +864,63 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+        // Deepen folders into a TREE: a nullable parent (NULL = a root folder). Additive +
+        // idempotent; pre-existing folders default to NULL parent (they become root folders),
+        // preserving today's flat behavior. Portable standard SQL only.
+        sqlx::query("ALTER TABLE folders ADD COLUMN IF NOT EXISTS parent_id TEXT")
+            .execute(&self.pool)
+            .await?;
+        // Folder-level public share link (mirrors the file share columns). Additive + idempotent;
+        // pre-existing folders default to NULL (no public surface). Portable standard SQL only.
+        sqlx::query("ALTER TABLE folders ADD COLUMN IF NOT EXISTS share_token TEXT")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("ALTER TABLE folders ADD COLUMN IF NOT EXISTS expires_at BIGINT")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("ALTER TABLE folders ADD COLUMN IF NOT EXISTS share_password_hash TEXT")
+            .execute(&self.pool)
+            .await?;
+        // The folder-share token gets its own unique index for the `/s/folder/{token}` lookup (NULLs are
+        // distinct, so many revoked/never-shared folders coexist).
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_folders_share_token \
+             ON folders (share_token)",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Backs per-level child-folder lookups (owner + parent).
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_folders_owner_parent \
+             ON folders (owner_sub, parent_id)",
+        )
+        .execute(&self.pool)
+        .await?;
         // Backs the folder-filtered gallery lookup (owner + folder filter, created ordering).
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_files_owner_folder \
              ON files (owner_sub, folder_id, created_at)",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Retained blob snapshots: a re-upload of the same name in the same folder keeps the prior
+        // blob here instead of overwriting it. `content_type` is stored so a restore swaps the file
+        // back to the snapshot's type. Additive + idempotent; portable standard SQL only.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS file_versions (\
+                 id TEXT PRIMARY KEY, \
+                 file_id TEXT NOT NULL, \
+                 object_key TEXT NOT NULL, \
+                 size BIGINT NOT NULL, \
+                 content_type TEXT NOT NULL, \
+                 created_at BIGINT NOT NULL\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_file_versions_file \
+             ON file_versions (file_id, created_at)",
         )
         .execute(&self.pool)
         .await?;
@@ -526,7 +959,22 @@ impl PgStore {
         Ok(FolderRec {
             id: row.try_get("id")?,
             owner_sub: row.try_get("owner_sub")?,
+            parent_id: row.try_get("parent_id")?,
             name: row.try_get("name")?,
+            created_at: row.try_get("created_at")?,
+            share_token: row.try_get("share_token")?,
+            expires_at: row.try_get("expires_at")?,
+            share_password_hash: row.try_get("share_password_hash")?,
+        })
+    }
+
+    fn version_from_row(row: &sqlx::postgres::PgRow) -> Result<VersionRec, sqlx::Error> {
+        Ok(VersionRec {
+            id: row.try_get("id")?,
+            file_id: row.try_get("file_id")?,
+            object_key: row.try_get("object_key")?,
+            size: row.try_get("size")?,
+            content_type: row.try_get("content_type")?,
             created_at: row.try_get("created_at")?,
         })
     }
@@ -611,7 +1059,7 @@ impl PgStore {
         let rows = match (folder, &before) {
             (None, None) => {
                 sqlx::query(&format!(
-                    "SELECT {COLS} FROM files WHERE owner_sub = $1 \
+                    "SELECT {COLS} FROM files WHERE owner_sub = $1 AND folder_id IS NULL \
                      ORDER BY created_at DESC, id DESC LIMIT $2"
                 ))
                 .bind(owner_sub)
@@ -621,7 +1069,7 @@ impl PgStore {
             }
             (None, Some((ts, id))) => {
                 sqlx::query(&format!(
-                    "SELECT {COLS} FROM files WHERE owner_sub = $1 \
+                    "SELECT {COLS} FROM files WHERE owner_sub = $1 AND folder_id IS NULL \
                      AND (created_at < $2 OR (created_at = $2 AND id < $3)) \
                      ORDER BY created_at DESC, id DESC LIMIT $4"
                 ))
@@ -663,13 +1111,19 @@ impl PgStore {
 
     async fn create_folder_async(&self, folder: &FolderRec) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
-            "INSERT INTO folders (id, owner_sub, name, created_at) \
-             VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+            "INSERT INTO folders \
+                 (id, owner_sub, parent_id, name, created_at, share_token, expires_at, \
+                  share_password_hash) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING",
         )
         .bind(&folder.id)
         .bind(&folder.owner_sub)
+        .bind(&folder.parent_id)
         .bind(&folder.name)
         .bind(folder.created_at)
+        .bind(&folder.share_token)
+        .bind(folder.expires_at)
+        .bind(&folder.share_password_hash)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
@@ -701,6 +1155,19 @@ impl PgStore {
         row.as_ref().map(Self::folder_from_row).transpose()
     }
 
+    async fn get_folder_by_token_async(
+        &self,
+        token: &str,
+    ) -> Result<Option<FolderRec>, sqlx::Error> {
+        let row = sqlx::query(&format!(
+            "SELECT {FOLDER_COLS} FROM folders WHERE share_token = $1"
+        ))
+        .bind(token)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(Self::folder_from_row).transpose()
+    }
+
     async fn rename_folder_async(
         &self,
         id: &str,
@@ -716,20 +1183,290 @@ impl PgStore {
         Ok(result.rows_affected() > 0)
     }
 
-    async fn delete_folder_async(&self, id: &str, owner_sub: &str) -> Result<bool, sqlx::Error> {
-        // Unfile the owner's files first (clear folder_id), then drop the folder row. Two portable
-        // statements — a file pointing at a missing folder is worse than a brief unfiled state.
-        sqlx::query("UPDATE files SET folder_id = NULL WHERE folder_id = $1 AND owner_sub = $2")
-            .bind(id)
-            .bind(owner_sub)
-            .execute(&self.pool)
-            .await?;
-        let result = sqlx::query("DELETE FROM folders WHERE id = $1 AND owner_sub = $2")
-            .bind(id)
-            .bind(owner_sub)
-            .execute(&self.pool)
-            .await?;
+    async fn configure_folder_share_async(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        share_token: Option<String>,
+        expires_at: Option<i64>,
+        share_password_hash: Option<String>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE folders SET share_token = $1, expires_at = $2, share_password_hash = $3 \
+             WHERE id = $4 AND owner_sub = $5",
+        )
+        .bind(&share_token)
+        .bind(expires_at)
+        .bind(&share_password_hash)
+        .bind(id)
+        .bind(owner_sub)
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    async fn delete_folder_if_empty_async(
+        &self,
+        id: &str,
+        owner_sub: &str,
+    ) -> Result<FolderDelete, sqlx::Error> {
+        // Absent / not owned?
+        let exists = sqlx::query("SELECT 1 FROM folders WHERE id = $1 AND owner_sub = $2")
+            .bind(id)
+            .bind(owner_sub)
+            .fetch_optional(&self.pool)
+            .await?;
+        if exists.is_none() {
+            return Ok(FolderDelete::NotFound);
+        }
+        // Any child folder or file (owner-scoped) => not empty.
+        let child = sqlx::query(
+            "SELECT 1 FROM folders WHERE parent_id = $1 AND owner_sub = $2 \
+             UNION ALL SELECT 1 FROM files WHERE folder_id = $1 AND owner_sub = $2 LIMIT 1",
+        )
+        .bind(id)
+        .bind(owner_sub)
+        .fetch_optional(&self.pool)
+        .await?;
+        if child.is_some() {
+            return Ok(FolderDelete::NotEmpty);
+        }
+        sqlx::query("DELETE FROM folders WHERE id = $1 AND owner_sub = $2")
+            .bind(id)
+            .bind(owner_sub)
+            .execute(&self.pool)
+            .await?;
+        Ok(FolderDelete::Deleted)
+    }
+
+    async fn delete_folder_cascade_async(
+        &self,
+        id: &str,
+        owner_sub: &str,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        // Load ALL of the owner's folders and compute the descendant id set in Rust (portable — no
+        // recursive CTE, so it runs unchanged on FusionDB), then delete files + versions + folders.
+        let rows = sqlx::query("SELECT id, parent_id FROM folders WHERE owner_sub = $1")
+            .bind(owner_sub)
+            .fetch_all(&self.pool)
+            .await?;
+        let all: Vec<(String, Option<String>)> = rows
+            .iter()
+            .map(|r| Ok((r.try_get("id")?, r.try_get("parent_id")?)))
+            .collect::<Result<_, sqlx::Error>>()?;
+        if !all.iter().any(|(fid, _)| fid == id) {
+            return Ok(Vec::new());
+        }
+        let mut set: Vec<String> = vec![id.to_string()];
+        let mut i = 0;
+        while i < set.len() {
+            let parent = set[i].clone();
+            for (fid, pid) in &all {
+                if pid.as_deref() == Some(parent.as_str()) && !set.contains(fid) {
+                    set.push(fid.clone());
+                }
+            }
+            i += 1;
+        }
+        let mut keys: Vec<String> = Vec::new();
+        for fid in &set {
+            // File current blobs + version blobs in this folder, then remove the rows.
+            let file_rows = sqlx::query(
+                "SELECT object_key, id FROM files WHERE folder_id = $1 AND owner_sub = $2",
+            )
+            .bind(fid)
+            .bind(owner_sub)
+            .fetch_all(&self.pool)
+            .await?;
+            for fr in &file_rows {
+                keys.push(fr.try_get("object_key")?);
+                let file_id: String = fr.try_get("id")?;
+                let vrows = sqlx::query("SELECT object_key FROM file_versions WHERE file_id = $1")
+                    .bind(&file_id)
+                    .fetch_all(&self.pool)
+                    .await?;
+                for vr in &vrows {
+                    keys.push(vr.try_get("object_key")?);
+                }
+                sqlx::query("DELETE FROM file_versions WHERE file_id = $1")
+                    .bind(&file_id)
+                    .execute(&self.pool)
+                    .await?;
+            }
+            sqlx::query("DELETE FROM files WHERE folder_id = $1 AND owner_sub = $2")
+                .bind(fid)
+                .bind(owner_sub)
+                .execute(&self.pool)
+                .await?;
+            sqlx::query("DELETE FROM folders WHERE id = $1 AND owner_sub = $2")
+                .bind(fid)
+                .bind(owner_sub)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(keys)
+    }
+
+    async fn list_files_in_folder_async(
+        &self,
+        folder_id: &str,
+        owner_sub: &str,
+    ) -> Result<Vec<FileRec>, sqlx::Error> {
+        let rows = sqlx::query(&format!(
+            "SELECT {COLS} FROM files WHERE folder_id = $1 AND owner_sub = $2 \
+             ORDER BY created_at DESC, id DESC"
+        ))
+        .bind(folder_id)
+        .bind(owner_sub)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::file_from_row).collect()
+    }
+
+    async fn find_file_in_folder_async(
+        &self,
+        owner_sub: &str,
+        name: &str,
+        folder_id: Option<&str>,
+    ) -> Result<Option<FileRec>, sqlx::Error> {
+        // NULL folder_id (root) needs `IS NULL`, not `= NULL`; branch to keep the bind order right.
+        let row = match folder_id {
+            None => {
+                sqlx::query(&format!(
+                    "SELECT {COLS} FROM files \
+                     WHERE owner_sub = $1 AND name = $2 AND folder_id IS NULL LIMIT 1"
+                ))
+                .bind(owner_sub)
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await?
+            }
+            Some(fid) => {
+                sqlx::query(&format!(
+                    "SELECT {COLS} FROM files \
+                     WHERE owner_sub = $1 AND name = $2 AND folder_id = $3 LIMIT 1"
+                ))
+                .bind(owner_sub)
+                .bind(name)
+                .bind(fid)
+                .fetch_optional(&self.pool)
+                .await?
+            }
+        };
+        row.as_ref().map(Self::file_from_row).transpose()
+    }
+
+    async fn update_file_blob_async(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        object_key: &str,
+        size: i64,
+        content_type: &str,
+        created_at: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE files SET object_key = $1, size = $2, content_type = $3, created_at = $4 \
+             WHERE id = $5 AND owner_sub = $6",
+        )
+        .bind(object_key)
+        .bind(size)
+        .bind(content_type)
+        .bind(created_at)
+        .bind(id)
+        .bind(owner_sub)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn add_version_async(&self, version: &VersionRec) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "INSERT INTO file_versions (id, file_id, object_key, size, content_type, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+        )
+        .bind(&version.id)
+        .bind(&version.file_id)
+        .bind(&version.object_key)
+        .bind(version.size)
+        .bind(&version.content_type)
+        .bind(version.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn list_versions_async(&self, file_id: &str) -> Result<Vec<VersionRec>, sqlx::Error> {
+        let rows = sqlx::query(&format!(
+            "SELECT {VERSION_COLS} FROM file_versions WHERE file_id = $1 \
+             ORDER BY created_at DESC, id DESC"
+        ))
+        .bind(file_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::version_from_row).collect()
+    }
+
+    async fn get_version_async(
+        &self,
+        version_id: &str,
+        file_id: &str,
+    ) -> Result<Option<VersionRec>, sqlx::Error> {
+        let row = sqlx::query(&format!(
+            "SELECT {VERSION_COLS} FROM file_versions WHERE id = $1 AND file_id = $2"
+        ))
+        .bind(version_id)
+        .bind(file_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(Self::version_from_row).transpose()
+    }
+
+    async fn delete_version_async(
+        &self,
+        version_id: &str,
+        file_id: &str,
+    ) -> Result<Option<VersionRec>, sqlx::Error> {
+        let existing = self.get_version_async(version_id, file_id).await?;
+        if existing.is_some() {
+            sqlx::query("DELETE FROM file_versions WHERE id = $1 AND file_id = $2")
+                .bind(version_id)
+                .bind(file_id)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(existing)
+    }
+
+    async fn prune_versions_async(
+        &self,
+        file_id: &str,
+        keep: i64,
+    ) -> Result<Vec<VersionRec>, sqlx::Error> {
+        let all = self.list_versions_async(file_id).await?; // newest-first
+        let keep = keep.max(0) as usize;
+        let pruned: Vec<VersionRec> = all.into_iter().skip(keep).collect();
+        for v in &pruned {
+            sqlx::query("DELETE FROM file_versions WHERE id = $1")
+                .bind(&v.id)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(pruned)
+    }
+
+    async fn delete_versions_for_file_async(
+        &self,
+        file_id: &str,
+    ) -> Result<Vec<VersionRec>, sqlx::Error> {
+        let all = self.list_versions_async(file_id).await?;
+        if !all.is_empty() {
+            sqlx::query("DELETE FROM file_versions WHERE file_id = $1")
+                .bind(file_id)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(all)
     }
 
     async fn move_file_async(
@@ -758,14 +1495,24 @@ impl PgStore {
 
     async fn usage_for_owner_async(&self, owner_sub: &str) -> Result<i64, sqlx::Error> {
         // SUM(BIGINT) widens to NUMERIC in PostgreSQL; the CAST keeps the decoded type BIGINT.
-        let row = sqlx::query(
+        // Current file bytes + retained version blobs of the owner's files (two portable SUMs).
+        let files_row = sqlx::query(
             "SELECT CAST(COALESCE(SUM(size), 0) AS BIGINT) AS bytes \
              FROM files WHERE owner_sub = $1",
         )
         .bind(owner_sub)
         .fetch_one(&self.pool)
         .await?;
-        row.try_get("bytes")
+        let file_bytes: i64 = files_row.try_get("bytes")?;
+        let ver_row = sqlx::query(
+            "SELECT CAST(COALESCE(SUM(v.size), 0) AS BIGINT) AS bytes \
+             FROM file_versions v JOIN files f ON v.file_id = f.id WHERE f.owner_sub = $1",
+        )
+        .bind(owner_sub)
+        .fetch_one(&self.pool)
+        .await?;
+        let version_bytes: i64 = ver_row.try_get("bytes")?;
+        Ok(file_bytes + version_bytes)
     }
 
     async fn usage_by_owner_async(&self) -> Result<Vec<OwnerUsage>, sqlx::Error> {
@@ -776,7 +1523,8 @@ impl PgStore {
         )
         .fetch_all(&self.pool)
         .await?;
-        rows.iter()
+        let mut out: Vec<OwnerUsage> = rows
+            .iter()
             .map(|row| {
                 Ok(OwnerUsage {
                     owner_sub: row.try_get("owner_sub")?,
@@ -784,7 +1532,23 @@ impl PgStore {
                     bytes: row.try_get("bytes")?,
                 })
             })
-            .collect()
+            .collect::<Result<_, sqlx::Error>>()?;
+        // Fold retained version bytes into each owner's total (a separate portable aggregate).
+        let vrows = sqlx::query(
+            "SELECT f.owner_sub AS owner_sub, CAST(COALESCE(SUM(v.size), 0) AS BIGINT) AS bytes \
+             FROM file_versions v JOIN files f ON v.file_id = f.id GROUP BY f.owner_sub",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for row in &vrows {
+            let owner: String = row.try_get("owner_sub")?;
+            let bytes: i64 = row.try_get("bytes")?;
+            if let Some(u) = out.iter_mut().find(|u| u.owner_sub == owner) {
+                u.bytes += bytes;
+            }
+        }
+        out.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.owner_sub.cmp(&b.owner_sub)));
+        Ok(out)
     }
 
     async fn get_quota_async(&self, owner_sub: &str) -> Result<Option<i64>, sqlx::Error> {
@@ -908,6 +1672,12 @@ impl Store for PgStore {
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
+    async fn get_folder_by_token(&self, token: &str) -> Result<Option<FolderRec>, StoreError> {
+        self.get_folder_by_token_async(token)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
     async fn rename_folder(
         &self,
         id: &str,
@@ -919,8 +1689,35 @@ impl Store for PgStore {
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
-    async fn delete_folder(&self, id: &str, owner_sub: &str) -> Result<bool, StoreError> {
-        self.delete_folder_async(id, owner_sub)
+    async fn configure_folder_share(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        share_token: Option<String>,
+        expires_at: Option<i64>,
+        share_password_hash: Option<String>,
+    ) -> Result<bool, StoreError> {
+        self.configure_folder_share_async(id, owner_sub, share_token, expires_at, share_password_hash)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn delete_folder_if_empty(
+        &self,
+        id: &str,
+        owner_sub: &str,
+    ) -> Result<FolderDelete, StoreError> {
+        self.delete_folder_if_empty_async(id, owner_sub)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn delete_folder_cascade(
+        &self,
+        id: &str,
+        owner_sub: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        self.delete_folder_cascade_async(id, owner_sub)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
@@ -932,6 +1729,92 @@ impl Store for PgStore {
         folder_id: Option<&str>,
     ) -> Result<bool, StoreError> {
         self.move_file_async(id, owner_sub, folder_id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn list_files_in_folder(
+        &self,
+        folder_id: &str,
+        owner_sub: &str,
+    ) -> Result<Vec<FileRec>, StoreError> {
+        self.list_files_in_folder_async(folder_id, owner_sub)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn find_file_in_folder(
+        &self,
+        owner_sub: &str,
+        name: &str,
+        folder_id: Option<&str>,
+    ) -> Result<Option<FileRec>, StoreError> {
+        self.find_file_in_folder_async(owner_sub, name, folder_id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn update_file_blob(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        object_key: &str,
+        size: i64,
+        content_type: &str,
+        created_at: i64,
+    ) -> Result<bool, StoreError> {
+        self.update_file_blob_async(id, owner_sub, object_key, size, content_type, created_at)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn add_version(&self, version: &VersionRec) -> Result<bool, StoreError> {
+        self.add_version_async(version)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn list_versions(&self, file_id: &str) -> Result<Vec<VersionRec>, StoreError> {
+        self.list_versions_async(file_id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn get_version(
+        &self,
+        version_id: &str,
+        file_id: &str,
+    ) -> Result<Option<VersionRec>, StoreError> {
+        self.get_version_async(version_id, file_id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn delete_version(
+        &self,
+        version_id: &str,
+        file_id: &str,
+    ) -> Result<Option<VersionRec>, StoreError> {
+        self.delete_version_async(version_id, file_id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn prune_versions(
+        &self,
+        file_id: &str,
+        keep: i64,
+    ) -> Result<Vec<VersionRec>, StoreError> {
+        self.prune_versions_async(file_id, keep)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn delete_versions_for_file(
+        &self,
+        file_id: &str,
+    ) -> Result<Vec<VersionRec>, StoreError> {
+        self.delete_versions_for_file_async(file_id)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
@@ -1117,7 +2000,36 @@ mod tests {
         FolderRec {
             id: id.into(),
             owner_sub: owner.into(),
+            parent_id: None,
             name: name.into(),
+            created_at,
+            share_token: None,
+            expires_at: None,
+            share_password_hash: None,
+        }
+    }
+
+    /// A child folder under `parent`.
+    fn subfolder(id: &str, owner: &str, parent: &str, name: &str) -> FolderRec {
+        FolderRec {
+            id: id.into(),
+            owner_sub: owner.into(),
+            parent_id: Some(parent.into()),
+            name: name.into(),
+            created_at: 0,
+            share_token: None,
+            expires_at: None,
+            share_password_hash: None,
+        }
+    }
+
+    fn version(id: &str, file_id: &str, size: i64, created_at: i64) -> VersionRec {
+        VersionRec {
+            id: id.into(),
+            file_id: file_id.into(),
+            object_key: format!("{id}-blob"),
+            size,
+            content_type: "image/png".into(),
             created_at,
         }
     }
@@ -1148,37 +2060,74 @@ mod tests {
         s.create_folder(&folder("f1", "u", "Old", 1)).await.unwrap();
         // A non-owner cannot rename or delete.
         assert!(!s.rename_folder("f1", "intruder", "Hax").await.unwrap());
-        assert!(!s.delete_folder("f1", "intruder").await.unwrap());
+        assert_eq!(
+            s.delete_folder_if_empty("f1", "intruder").await.unwrap(),
+            FolderDelete::NotFound
+        );
         // Owner renames.
         assert!(s.rename_folder("f1", "u", "New").await.unwrap());
         assert_eq!(s.get_folder("f1", "u").await.unwrap().unwrap().name, "New");
-        // Owner deletes.
-        assert!(s.delete_folder("f1", "u").await.unwrap());
+        // Owner deletes the empty folder.
+        assert_eq!(
+            s.delete_folder_if_empty("f1", "u").await.unwrap(),
+            FolderDelete::Deleted
+        );
         assert!(s.get_folder("f1", "u").await.unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn move_file_filters_the_folder_view() {
+    async fn move_file_filters_root_vs_folder_view() {
         let s = InMemoryStore::new();
         s.create_folder(&folder("f1", "u", "Album", 1)).await.unwrap();
         s.create(&file("a", "u", "ta", 10)).await.unwrap();
         s.create(&file("b", "u", "tb", 20)).await.unwrap();
 
-        // Both files start unfiled: the folder view is empty, the flat view has both.
+        // Both files start at ROOT: the folder view is empty, the root view has both.
         assert_eq!(s.list_by_owner("u", Some("f1"), None, 50).await.unwrap().len(), 0);
         assert_eq!(s.list_by_owner("u", None, None, 50).await.unwrap().len(), 2);
 
         // A non-owner cannot move the file.
         assert!(!s.move_file("a", "intruder", Some("f1")).await.unwrap());
-        // Owner moves "a" into the folder; only it shows in the folder view, both in the flat view.
+        // Owner moves "a" into the folder; the folder view shows only it, the ROOT view now shows
+        // only "b" (a filed file leaves the root — the tree model).
         assert!(s.move_file("a", "u", Some("f1")).await.unwrap());
         let in_folder = s.list_by_owner("u", Some("f1"), None, 50).await.unwrap();
         assert_eq!(in_folder.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["a"]);
-        assert_eq!(s.list_by_owner("u", None, None, 50).await.unwrap().len(), 2);
+        let root = s.list_by_owner("u", None, None, 50).await.unwrap();
+        assert_eq!(root.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["b"]);
+        // list_files_in_folder returns the whole folder unpaginated.
+        assert_eq!(s.list_files_in_folder("f1", "u").await.unwrap().len(), 1);
 
-        // Move "a" back to root -> the folder view empties again.
+        // Move "a" back to root -> the folder view empties, root has both again.
         assert!(s.move_file("a", "u", None).await.unwrap());
         assert_eq!(s.list_by_owner("u", Some("f1"), None, 50).await.unwrap().len(), 0);
+        assert_eq!(s.list_by_owner("u", None, None, 50).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn find_file_in_folder_scopes_by_name_and_level() {
+        let s = InMemoryStore::new();
+        s.create_folder(&folder("f1", "u", "Album", 1)).await.unwrap();
+        let mut root = file("r", "u", "tr", 1);
+        root.name = "same.png".into();
+        s.create(&root).await.unwrap();
+        let mut filed = file("g", "u", "tg", 2);
+        filed.name = "same.png".into();
+        filed.folder_id = Some("f1".into());
+        s.create(&filed).await.unwrap();
+
+        // Same name resolves per-level: root vs folder are distinct files.
+        assert_eq!(
+            s.find_file_in_folder("u", "same.png", None).await.unwrap().unwrap().id,
+            "r"
+        );
+        assert_eq!(
+            s.find_file_in_folder("u", "same.png", Some("f1")).await.unwrap().unwrap().id,
+            "g"
+        );
+        assert!(s.find_file_in_folder("u", "nope.png", None).await.unwrap().is_none());
+        // Owner-scoped.
+        assert!(s.find_file_in_folder("other", "same.png", None).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1233,16 +2182,123 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_folder_unfiles_its_files() {
+    async fn delete_folder_empty_only_then_cascade() {
         let s = InMemoryStore::new();
         s.create_folder(&folder("f1", "u", "Album", 1)).await.unwrap();
+        s.create_folder(&subfolder("f2", "u", "f1", "Sub")).await.unwrap();
         s.create(&file("a", "u", "ta", 10)).await.unwrap();
-        s.move_file("a", "u", Some("f1")).await.unwrap();
-        assert_eq!(s.get("a").await.unwrap().unwrap().folder_id.as_deref(), Some("f1"));
+        s.move_file("a", "u", Some("f2")).await.unwrap();
 
-        // Deleting the folder keeps the file but clears its folder_id (no orphaned reference).
-        assert!(s.delete_folder("f1", "u").await.unwrap());
-        assert!(s.get("a").await.unwrap().unwrap().folder_id.is_none());
-        assert_eq!(s.list_by_owner("u", None, None, 50).await.unwrap().len(), 1);
+        // f1 has a subfolder -> not empty; f2 has a file -> not empty.
+        assert_eq!(s.delete_folder_if_empty("f1", "u").await.unwrap(), FolderDelete::NotEmpty);
+        assert_eq!(s.delete_folder_if_empty("f2", "u").await.unwrap(), FolderDelete::NotEmpty);
+
+        // Cascade from f1 removes the whole subtree (f1, f2) AND the file, returning the freed keys.
+        let keys = s.delete_folder_cascade("f1", "u").await.unwrap();
+        assert!(keys.contains(&"a".to_string()), "the file's object key is freed for blob cleanup");
+        assert!(s.get_folder("f1", "u").await.unwrap().is_none());
+        assert!(s.get_folder("f2", "u").await.unwrap().is_none());
+        assert!(s.get("a").await.unwrap().is_none(), "cascade deletes the file too");
+    }
+
+    #[tokio::test]
+    async fn cascade_frees_version_blobs_and_is_owner_scoped() {
+        let s = InMemoryStore::new();
+        s.create_folder(&folder("f1", "u", "Album", 1)).await.unwrap();
+        let mut a = file("a", "u", "ta", 10);
+        a.object_key = "a".into();
+        a.folder_id = Some("f1".into());
+        s.create(&a).await.unwrap();
+        s.add_version(&version("v1", "a", 5, 1)).await.unwrap();
+
+        // A non-owner cascade removes nothing.
+        assert!(s.delete_folder_cascade("f1", "other").await.unwrap().is_empty());
+        assert!(s.get_folder("f1", "u").await.unwrap().is_some());
+
+        // Owner cascade frees the current blob AND the version blob.
+        let keys = s.delete_folder_cascade("f1", "u").await.unwrap();
+        assert!(keys.contains(&"a".to_string()));
+        assert!(keys.contains(&"v1-blob".to_string()));
+        assert!(s.list_versions("a").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn folder_share_configure_and_lookup_by_token() {
+        let s = InMemoryStore::new();
+        s.create_folder(&folder("f1", "u", "Shared", 1)).await.unwrap();
+        // Non-owner cannot configure.
+        assert!(!s
+            .configure_folder_share("f1", "intruder", Some("ftok".into()), None, None)
+            .await
+            .unwrap());
+        // Owner enables a share with an expiry + password.
+        assert!(s
+            .configure_folder_share("f1", "u", Some("ftok".into()), Some(999), Some("salt$h".into()))
+            .await
+            .unwrap());
+        let byf = s.get_folder_by_token("ftok").await.unwrap().unwrap();
+        assert_eq!(byf.id, "f1");
+        assert_eq!(byf.expires_at, Some(999));
+        assert!(byf.share_has_password());
+        // Revoke clears the token; the public lookup misses.
+        assert!(s.configure_folder_share("f1", "u", None, None, None).await.unwrap());
+        assert!(s.get_folder_by_token("ftok").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn versions_list_prune_and_delete_roundtrip() {
+        let s = InMemoryStore::new();
+        s.create(&file("a", "u", "ta", 100)).await.unwrap();
+        // Three snapshots, oldest-first by created_at.
+        s.add_version(&version("v1", "a", 10, 1)).await.unwrap();
+        s.add_version(&version("v2", "a", 20, 2)).await.unwrap();
+        s.add_version(&version("v3", "a", 30, 3)).await.unwrap();
+        // Newest-first ordering.
+        let ids: Vec<String> = s.list_versions("a").await.unwrap().into_iter().map(|v| v.id).collect();
+        assert_eq!(ids, vec!["v3", "v2", "v1"]);
+        // get is file-scoped.
+        assert!(s.get_version("v2", "a").await.unwrap().is_some());
+        assert!(s.get_version("v2", "other").await.unwrap().is_none());
+        // Prune to keep the newest 2 -> the oldest (v1) is returned for blob cleanup.
+        let pruned = s.prune_versions("a", 2).await.unwrap();
+        assert_eq!(pruned.iter().map(|v| v.id.as_str()).collect::<Vec<_>>(), vec!["v1"]);
+        assert_eq!(s.list_versions("a").await.unwrap().len(), 2);
+        // delete_version returns the removed row (caller decides whether to drop the blob).
+        let removed = s.delete_version("v2", "a").await.unwrap().unwrap();
+        assert_eq!(removed.object_key, "v2-blob");
+        assert_eq!(s.list_versions("a").await.unwrap().len(), 1);
+        // delete_versions_for_file clears the rest.
+        assert_eq!(s.delete_versions_for_file("a").await.unwrap().len(), 1);
+        assert!(s.list_versions("a").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn usage_counts_version_bytes() {
+        let s = InMemoryStore::new();
+        let mut a = file("a", "u", "ta", 1);
+        a.size = 100;
+        s.create(&a).await.unwrap();
+        assert_eq!(s.usage_for_owner("u").await.unwrap(), 100);
+        // A retained version adds its bytes to usage (but not to the file COUNT).
+        s.add_version(&version("v1", "a", 40, 1)).await.unwrap();
+        assert_eq!(s.usage_for_owner("u").await.unwrap(), 140);
+        let agg = s.usage_by_owner().await.unwrap();
+        assert_eq!(agg.len(), 1);
+        assert_eq!(agg[0].files, 1, "versions do not inflate the file count");
+        assert_eq!(agg[0].bytes, 140, "versions do inflate the byte total");
+    }
+
+    #[tokio::test]
+    async fn update_file_blob_repoints_current() {
+        let s = InMemoryStore::new();
+        s.create(&file("a", "u", "ta", 1)).await.unwrap();
+        assert!(s.update_file_blob("a", "u", "newkey", 77, "application/pdf", 999).await.unwrap());
+        let got = s.get("a").await.unwrap().unwrap();
+        assert_eq!(got.object_key, "newkey");
+        assert_eq!(got.size, 77);
+        assert_eq!(got.content_type, "application/pdf");
+        assert_eq!(got.created_at, 999);
+        // Owner-scoped.
+        assert!(!s.update_file_blob("a", "intruder", "x", 1, "text/plain", 1).await.unwrap());
     }
 }

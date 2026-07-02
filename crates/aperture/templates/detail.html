@@ -34,6 +34,10 @@
         <div class="card__body card__body--media">{{PREVIEW}}</div>
       </section>
 
+      <div id="lightbox" class="lightbox" hidden aria-hidden="true">
+        <img id="lightboxImg" class="lightbox__img" alt="">
+      </div>
+
       <section class="card">
         <div class="card__head"><h2>Details</h2></div>
         <div class="card__body">
@@ -42,6 +46,8 @@
           {{MOVE}}
 
           {{SHARE}}
+
+          {{VERSIONS}}
 
           <div class="actions actions--split">
             <a class="btn btn-primary" href="/f/{{ID}}/raw">Download</a>
@@ -69,6 +75,31 @@
           try { document.execCommand('copy'); done(); } catch (e) {}
         }
       });
+    })();
+
+    // Minimal image lightbox (no library): click the inline image to open it full size in an
+    // overlay; click the overlay or press Escape to close. Uses the same /f/{id}/raw source.
+    (function () {
+      var trigger = document.querySelector('.lightbox-trigger');
+      var box = document.getElementById('lightbox');
+      var boxImg = document.getElementById('lightboxImg');
+      var inline = trigger ? trigger.querySelector('img') : null;
+      if (!trigger || !box || !boxImg || !inline) { return; }
+      function open(e) {
+        e.preventDefault();
+        boxImg.src = trigger.getAttribute('href');
+        boxImg.alt = inline.getAttribute('alt') || '';
+        box.hidden = false;
+        box.setAttribute('aria-hidden', 'false');
+      }
+      function close() {
+        box.hidden = true;
+        box.setAttribute('aria-hidden', 'true');
+        boxImg.src = '';
+      }
+      trigger.addEventListener('click', open);
+      box.addEventListener('click', close);
+      document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !box.hidden) { close(); } });
     })();
   </script>
 </body>

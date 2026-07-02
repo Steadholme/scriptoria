@@ -23,23 +23,39 @@ use crate::handlers::{
     esc, expiry_options, fmt_ts, human_size, parse_expiry, resolve_content_type, safe_filename,
     userbox, APP_CSS, FILE_SVG, SHIELD_SVG,
 };
-use crate::model::{FileRec, FolderRec};
+use crate::model::{FileRec, FolderRec, VersionRec};
+use crate::store::{FolderDelete, MAX_VERSIONS_PER_FILE};
 use crate::{now_secs, random_alnum, AppState};
 
 /// Length of the short random file id / object key (62-symbol alphabet, ~59 bits at 10 chars).
 const FILE_ID_LEN: usize = 10;
 /// Length of the short random folder id.
 const FOLDER_ID_LEN: usize = 10;
+/// Length of a retained version's short random id.
+const VERSION_ID_LEN: usize = 10;
 /// Length of the unguessable public share token (~190 bits at 32 chars).
 const SHARE_TOKEN_LEN: usize = 32;
 /// Hard cap on a stored display file name (characters).
 const MAX_NAME_CHARS: usize = 255;
 /// Hard cap on a submitted share-link password (characters).
 const MAX_PASSWORD_CHARS: usize = 128;
+/// Hard cap on the byte prefix rendered inline for a text/markdown preview (256 KiB). Larger files
+/// still preview, but the tail is elided with a note.
+const MAX_TEXT_PREVIEW_BYTES: usize = 256 * 1024;
+/// Depth guard when walking a folder's parent chain to build breadcrumbs (defensive; the tree is
+/// acyclic by construction).
+const MAX_TREE_DEPTH: usize = 64;
 
 const GALLERY_HTML: &str = include_str!("../../templates/gallery.html");
 const DETAIL_HTML: &str = include_str!("../../templates/detail.html");
 const SHARE_PW_HTML: &str = include_str!("../../templates/share_password.html");
+const SHARE_FOLDER_HTML: &str = include_str!("../../templates/share_folder.html");
+
+/// Folder glyph for the drive's subfolder tiles (trusted, server-owned markup).
+const FOLDER_SVG: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h5l2 2.5h9a1 1 0 0 1 1 1V18a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Z"/></svg>"##;
+
+/// "Up one level" glyph for the tile that navigates to the parent folder.
+const FOLDER_UP_SVG: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h5l2 2.5h9a1 1 0 0 1 1 1V18a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Z"/><path d="m12 16 0-5"/><path d="m9.5 13 2.5-2.5 2.5 2.5"/></svg>"##;
 
 // ---------------------------------------------------------------------------
 // GET / — the signed-in user's drive (gallery grid + upload dropzone)
@@ -112,6 +128,7 @@ pub async fn gallery(
     );
 
     let html = render_gallery(
+        &state.config,
         &who,
         &csrf,
         &files,
@@ -150,6 +167,7 @@ pub async fn upload(
     let who = auth::identity(&headers);
 
     let mut csrf_field = String::new();
+    let mut folder_field = String::new();
     let mut file: Option<(String, String, Vec<u8>)> = None; // (name, client_type, bytes)
 
     loop {
@@ -165,6 +183,12 @@ pub async fn upload(
         match field.name().unwrap_or("") {
             "csrf_token" => {
                 csrf_field = field
+                    .text()
+                    .await
+                    .map_err(|e| AppError::BadRequest(e.to_string()))?;
+            }
+            "folder_id" => {
+                folder_field = field
                     .text()
                     .await
                     .map_err(|e| AppError::BadRequest(e.to_string()))?;
@@ -211,9 +235,22 @@ pub async fn upload(
     let size = bytes.len() as i64;
     let now = now_secs();
 
+    // Resolve the upload target level: blank => root; otherwise an owned folder (else 404). A file
+    // is uploaded INTO the folder currently being viewed (the gallery form carries its id).
+    let target: Option<String> = match folder_field.trim() {
+        "" => None,
+        fid => {
+            if state.store.get_folder(fid, &who.subject).await?.is_none() {
+                return Err(AppError::NotFound("No such folder.".to_string()));
+            }
+            Some(fid.to_string())
+        }
+    };
+
     // Enforce the owner's storage quota BEFORE reserving the row or writing the blob. The
     // effective quota is the per-owner override else the configured default; unlimited (the
-    // pre-quota default) skips the usage read entirely, so the fast path is unchanged.
+    // pre-quota default) skips the usage read entirely, so the fast path is unchanged. Usage
+    // already includes retained version blobs, so a re-upload is checked against the true total.
     if let Some(quota) = effective_quota(
         state.store.get_quota(&who.subject).await?,
         state.config.default_quota_bytes,
@@ -237,6 +274,16 @@ pub async fn upload(
         }
     }
 
+    // Re-upload of the SAME name in the SAME folder -> keep the prior blob as a version rather than
+    // overwriting it, and repoint the existing file at the new bytes.
+    if let Some(existing) = state
+        .store
+        .find_file_in_folder(&who.subject, &name, target.as_deref())
+        .await?
+    {
+        return reupload_as_version(&state, &who, existing, content_type, bytes, size, now).await;
+    }
+
     let mut rec = FileRec {
         id: String::new(),
         owner_sub: who.subject.clone(),
@@ -251,8 +298,8 @@ pub async fn upload(
         created_at: now,
         expires_at: None,
         share_password_hash: None,
-        // A fresh upload is unfiled (appears in the flat all-files view); the owner files it later.
-        folder_id: None,
+        // A fresh upload lands at the level it was uploaded into (root when unset).
+        folder_id: target,
     };
 
     // Reserve a unique row (id + share token) BEFORE writing the blob, retrying on the rare
@@ -290,6 +337,91 @@ pub async fn upload(
     Ok(redirect_found(&format!("/f/{}", rec.id)))
 }
 
+/// Re-upload path: snapshot the file's CURRENT blob as a version (it stays in place under its own
+/// object key), write the new bytes to a fresh key, repoint the file, then prune the oldest
+/// versions past the cap (deleting their blobs). Quota was already checked by the caller.
+async fn reupload_as_version(
+    state: &AppState,
+    who: &Identity,
+    existing: FileRec,
+    content_type: String,
+    bytes: Vec<u8>,
+    size: i64,
+    now: i64,
+) -> Result<Response, AppError> {
+    // Snapshot the current blob as a version row (retry on the rare id collision).
+    let mut snap = VersionRec {
+        id: random_alnum(VERSION_ID_LEN),
+        file_id: existing.id.clone(),
+        object_key: existing.object_key.clone(),
+        size: existing.size,
+        content_type: existing.content_type.clone(),
+        created_at: existing.created_at,
+    };
+    let mut snapped = false;
+    for _ in 0..6 {
+        if state.store.add_version(&snap).await? {
+            snapped = true;
+            break;
+        }
+        snap.id = random_alnum(VERSION_ID_LEN);
+    }
+    if !snapped {
+        return Err(AppError::Internal(
+            "could not allocate a unique version id".to_string(),
+        ));
+    }
+
+    // Allocate a fresh object key for the new current blob — never an existing file's id/key.
+    let mut new_key = String::new();
+    for _ in 0..6 {
+        let k = random_alnum(FILE_ID_LEN);
+        if state.store.get(&k).await?.is_none() {
+            new_key = k;
+            break;
+        }
+    }
+    if new_key.is_empty() {
+        let _ = state.store.delete_version(&snap.id, &existing.id).await;
+        return Err(AppError::Internal(
+            "could not allocate a unique object key".to_string(),
+        ));
+    }
+
+    // Write the new bytes; on failure undo the snapshot row so nothing is left half-applied.
+    if let Err(e) = state.blobs.put(&new_key, bytes).await {
+        let _ = state.store.delete_version(&snap.id, &existing.id).await;
+        return Err(e.into());
+    }
+
+    // Repoint the file to the new blob (bumps created_at + content type to the new bytes').
+    state
+        .store
+        .update_file_blob(&existing.id, &who.subject, &new_key, size, &content_type, now)
+        .await?;
+
+    // Prune the oldest versions past the cap and delete their blobs.
+    let pruned = state
+        .store
+        .prune_versions(&existing.id, MAX_VERSIONS_PER_FILE)
+        .await
+        .unwrap_or_default();
+    for v in pruned {
+        let _ = state.blobs.delete(&v.object_key).await;
+    }
+    // The old derived thumbnail (keyed off the prior object key) is now an orphan — drop it.
+    let _ = state.blobs.delete(&thumb_object_key(&existing.object_key)).await;
+
+    tracing::info!(id = existing.id, owner = who.subject, size, "file re-uploaded as new version");
+    state.audit.emit(AuditEvent::notice(
+        "file.version.add",
+        &who.subject,
+        &existing.id,
+        "new version",
+    ));
+    Ok(redirect_found(&format!("/f/{}", existing.id)))
+}
+
 // ---------------------------------------------------------------------------
 // GET /f/{id} — file detail / preview (owner-only)
 // ---------------------------------------------------------------------------
@@ -309,7 +441,9 @@ pub async fn detail(
         .list_folders(&viewer.subject)
         .await
         .unwrap_or_default();
-    let html = render_detail(&state.config, &rec, &viewer, &csrf, &folders);
+    let preview = build_preview(&state, &rec).await;
+    let versions = state.store.list_versions(&rec.id).await.unwrap_or_default();
+    let html = render_detail(&state.config, &rec, &viewer, &csrf, &folders, &preview, &versions);
     Ok(html_with_csrf(StatusCode::OK, html, &csrf))
 }
 
@@ -328,6 +462,134 @@ pub async fn raw(
     let rec = owned_file(&state, &id, &viewer).await?;
     let bytes = state.blobs.get(&rec.object_key).await?;
     Ok(serve_blob(&rec, bytes))
+}
+
+// ---------------------------------------------------------------------------
+// GET /f/{id}/preview-raw — inline, sandboxed PDF bytes for the detail embed (owner-only)
+// ---------------------------------------------------------------------------
+
+/// `GET /f/{id}/preview-raw` — serve a PDF INLINE (sandboxed) so the detail page can embed it in a
+/// sandboxed `<iframe>`. Owner-only. Only `application/pdf` is served inline: the bytes carry
+/// `Content-Type: application/pdf` + `nosniff` (so a file lying about its type can never be
+/// interpreted as HTML) and a `Content-Security-Policy: sandbox` (no scripts, no plugins). Every
+/// other type falls back to the safe attachment path.
+pub async fn preview_raw(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Response, AppError> {
+    let viewer = auth::identity(&headers);
+    let rec = owned_file(&state, &id, &viewer).await?;
+    let bytes = state.blobs.get(&rec.object_key).await?;
+    if rec.content_type == "application/pdf" {
+        Ok(serve_pdf_inline(&rec, bytes))
+    } else {
+        Ok(serve_blob(&rec, bytes))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Versions: download / restore a retained blob snapshot (owner-only)
+// ---------------------------------------------------------------------------
+
+/// `GET /f/{id}/versions/{vid}/raw` — download one retained version's blob (always as an
+/// attachment). Owner-only (through the file's ownership gate); the version is scoped to the file.
+pub async fn download_version(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, vid)): Path<(String, String)>,
+) -> Result<Response, AppError> {
+    let viewer = auth::identity(&headers);
+    let rec = owned_file(&state, &id, &viewer).await?;
+    let version = state
+        .store
+        .get_version(&vid, &rec.id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("No such version.".to_string()))?;
+    let bytes = state.blobs.get(&version.object_key).await?;
+    Ok(serve_version_download(&rec, bytes))
+}
+
+/// `POST /f/{id}/versions/{vid}/restore` — make a retained version the current blob. CSRF-checked,
+/// owner-scoped. The current blob is first snapshotted as a NEW version (history is kept), then the
+/// file is repointed at the chosen version's blob and that version row is consumed; finally the
+/// history is pruned to the cap. Then 302 to `/f/{id}`.
+pub async fn restore_version(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, vid)): Path<(String, String)>,
+    Form(form): Form<DeleteForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let actor = auth::identity(&headers);
+    let rec = owned_file(&state, &id, &actor).await?;
+    let version = state
+        .store
+        .get_version(&vid, &rec.id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("No such version.".to_string()))?;
+
+    // Snapshot the CURRENT blob as a new version first, so restoring never loses history.
+    let mut snap = VersionRec {
+        id: random_alnum(VERSION_ID_LEN),
+        file_id: rec.id.clone(),
+        object_key: rec.object_key.clone(),
+        size: rec.size,
+        content_type: rec.content_type.clone(),
+        created_at: rec.created_at,
+    };
+    let mut snapped = false;
+    for _ in 0..6 {
+        if state.store.add_version(&snap).await? {
+            snapped = true;
+            break;
+        }
+        snap.id = random_alnum(VERSION_ID_LEN);
+    }
+    if !snapped {
+        return Err(AppError::Internal(
+            "could not allocate a unique version id".to_string(),
+        ));
+    }
+
+    // Repoint the file at the chosen version's blob, then consume that version's row (its blob is
+    // now the current one, so do NOT delete it).
+    state
+        .store
+        .update_file_blob(
+            &rec.id,
+            &actor.subject,
+            &version.object_key,
+            version.size,
+            &version.content_type,
+            now_secs(),
+        )
+        .await?;
+    let _ = state.store.delete_version(&vid, &rec.id).await;
+
+    // Bound history + drop the stale thumbnail of the previous current blob.
+    let pruned = state
+        .store
+        .prune_versions(&rec.id, MAX_VERSIONS_PER_FILE)
+        .await
+        .unwrap_or_default();
+    for v in pruned {
+        let _ = state.blobs.delete(&v.object_key).await;
+    }
+    let _ = state.blobs.delete(&thumb_object_key(&rec.object_key)).await;
+
+    tracing::info!(id = rec.id, owner = actor.subject, version = vid, "file version restored");
+    state.audit.emit(AuditEvent::notice(
+        "file.version.restore",
+        &actor.subject,
+        &rec.id,
+        "restore version",
+    ));
+    Ok(redirect_found(&format!("/f/{}", rec.id)))
 }
 
 // ---------------------------------------------------------------------------
@@ -416,7 +678,7 @@ pub async fn share(
     let rec = load_shared(&state, &token).await?;
     // Password-protected: never serve the bytes on a bare GET — prompt for the password first.
     if rec.share_has_password() {
-        return Ok(render_share_prompt(&token, StatusCode::OK, None));
+        return Ok(render_share_prompt(&format!("/s/{token}"), StatusCode::OK, None));
     }
     serve_shared(&state, &rec).await
 }
@@ -445,11 +707,211 @@ pub async fn share_unlock(
         }
         None => serve_shared(&state, &rec).await,
         Some(_) => Ok(render_share_prompt(
-            &token,
+            &format!("/s/{token}"),
             StatusCode::UNAUTHORIZED,
             Some("Incorrect password."),
         )),
     }
+}
+
+// ---------------------------------------------------------------------------
+// GET/POST /s/folder/{token} + /s/folder/{token}/f/{fid} — public folder share (NO SSO)
+// ---------------------------------------------------------------------------
+
+/// `GET /s/folder/{token}` — the public index of a shared folder's files, WITHOUT SSO. Honors the same
+/// lifecycle as a file share: revoked/unknown token -> 404, expired -> 410, password-protected ->
+/// a password prompt (no listing). The owner comes from the folder row, never the request.
+pub async fn share_folder(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> Result<Response, AppError> {
+    let folder = load_shared_folder(&state, &token).await?;
+    if folder.share_has_password() {
+        return Ok(render_share_prompt(&format!("/s/folder/{token}"), StatusCode::OK, None));
+    }
+    let files = state
+        .store
+        .list_files_in_folder(&folder.id, &folder.owner_sub)
+        .await
+        .unwrap_or_default();
+    emit_folder_share_audit(&state, &folder);
+    Ok(render_folder_index(&folder, &files, &token, None))
+}
+
+/// `POST /s/folder/{token}` — verify a protected folder's password and, on success, render the index with
+/// per-file download FORMS that carry the just-entered password (so downloads stay gated). Wrong
+/// password re-prompts (401). Same 404/410 lifecycle as the GET.
+pub async fn share_folder_unlock(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+    Form(form): Form<SharePasswordForm>,
+) -> Result<Response, AppError> {
+    let folder = load_shared_folder(&state, &token).await?;
+    let unlocked = match &folder.share_password_hash {
+        Some(hash) => auth::verify_share_password(hash, &form.password),
+        None => true,
+    };
+    if !unlocked {
+        return Ok(render_share_prompt(
+            &format!("/s/folder/{token}"),
+            StatusCode::UNAUTHORIZED,
+            Some("Incorrect password."),
+        ));
+    }
+    let files = state
+        .store
+        .list_files_in_folder(&folder.id, &folder.owner_sub)
+        .await
+        .unwrap_or_default();
+    emit_folder_share_audit(&state, &folder);
+    // Non-password folders never reach this branch with a value; carry the password only when set.
+    let pw = folder.share_has_password().then_some(form.password.as_str());
+    Ok(render_folder_index(&folder, &files, &token, pw))
+}
+
+/// `GET /s/folder/{token}/f/{fid}` — download one file listed under a NON-password folder share. A
+/// password-protected folder can't authorize a bare GET, so it re-prompts; those downloads go
+/// through the POST form instead.
+pub async fn share_folder_file(
+    State(state): State<AppState>,
+    Path((token, fid)): Path<(String, String)>,
+) -> Result<Response, AppError> {
+    let folder = load_shared_folder(&state, &token).await?;
+    if folder.share_has_password() {
+        return Ok(render_share_prompt(
+            &format!("/s/folder/{token}"),
+            StatusCode::UNAUTHORIZED,
+            Some("Enter the folder password to download."),
+        ));
+    }
+    let file = shared_folder_file(&state, &folder, &fid).await?;
+    let bytes = state.blobs.get(&file.object_key).await?;
+    Ok(serve_blob(&file, bytes))
+}
+
+/// `POST /s/folder/{token}/f/{fid}` — download one file under a PASSWORD-protected folder share, gated by
+/// the folder password submitted with the form. Wrong password re-prompts (401).
+pub async fn share_folder_file_unlock(
+    State(state): State<AppState>,
+    Path((token, fid)): Path<(String, String)>,
+    Form(form): Form<SharePasswordForm>,
+) -> Result<Response, AppError> {
+    let folder = load_shared_folder(&state, &token).await?;
+    if let Some(hash) = &folder.share_password_hash {
+        if !auth::verify_share_password(hash, &form.password) {
+            return Ok(render_share_prompt(
+                &format!("/s/folder/{token}"),
+                StatusCode::UNAUTHORIZED,
+                Some("Incorrect password."),
+            ));
+        }
+    }
+    let file = shared_folder_file(&state, &folder, &fid).await?;
+    let bytes = state.blobs.get(&file.object_key).await?;
+    Ok(serve_blob(&file, bytes))
+}
+
+/// Load a folder by its public share token, enforcing the lifecycle (missing/revoked -> 404,
+/// expired -> 410 Gone). No request identity is consulted.
+async fn load_shared_folder(state: &AppState, token: &str) -> Result<FolderRec, AppError> {
+    let folder = state.store.get_folder_by_token(token).await?.ok_or_else(|| {
+        AppError::NotFound("This share link is invalid or has been removed.".to_string())
+    })?;
+    if folder.share_expired(now_secs()) {
+        return Err(AppError::Gone(
+            "This share link has expired and is no longer available.".to_string(),
+        ));
+    }
+    Ok(folder)
+}
+
+/// Resolve one file requested under a folder share: it MUST belong to the shared folder (same
+/// `folder_id`) AND the folder's owner, so a folder token can never fetch an unrelated file.
+async fn shared_folder_file(
+    state: &AppState,
+    folder: &FolderRec,
+    file_id: &str,
+) -> Result<FileRec, AppError> {
+    let file = state
+        .store
+        .get(file_id)
+        .await?
+        .filter(|f| f.owner_sub == folder.owner_sub && f.folder_id.as_deref() == Some(&folder.id))
+        .ok_or_else(|| AppError::NotFound("No such file in this shared folder.".to_string()))?;
+    Ok(file)
+}
+
+/// Attribute a public folder-share view to the folder's owner (no request identity on this route).
+fn emit_folder_share_audit(state: &AppState, folder: &FolderRec) {
+    state.audit.emit(AuditEvent::info(
+        "folder.share.view",
+        &folder.owner_sub,
+        &folder.id,
+        "folder",
+    ));
+}
+
+/// Render the public folder-share index page: a simple list of the folder's files with a download
+/// control each. `unlock_password` (`Some` only for a password-protected folder) is embedded in
+/// per-file POST forms so downloads stay password-gated; `None` renders plain GET download links.
+/// Every remote string is HTML-escaped.
+fn render_folder_index(
+    folder: &FolderRec,
+    files: &[FileRec],
+    token: &str,
+    unlock_password: Option<&str>,
+) -> Response {
+    let rows = if files.is_empty() {
+        "<li class=\"share-file share-file--empty\">This folder has no files.</li>".to_string()
+    } else {
+        files
+            .iter()
+            .map(|f| {
+                let download = match unlock_password {
+                    Some(pw) => format!(
+                        "<form class=\"share-file__dl\" method=\"post\" action=\"/s/folder/{token}/f/{fid}\">\
+                           <input type=\"hidden\" name=\"password\" value=\"{pw}\">\
+                           <button class=\"btn btn-secondary btn-sm\" type=\"submit\">Download</button>\
+                         </form>",
+                        token = esc(token),
+                        fid = esc(&f.id),
+                        pw = esc(pw),
+                    ),
+                    None => format!(
+                        "<a class=\"btn btn-secondary btn-sm\" href=\"/s/folder/{token}/f/{fid}\">Download</a>",
+                        token = esc(token),
+                        fid = esc(&f.id),
+                    ),
+                };
+                format!(
+                    "<li class=\"share-file\">\
+                       <div class=\"share-file__info\">\
+                         <span class=\"share-file__name\" title=\"{name}\">{name}</span>\
+                         <span class=\"share-file__meta\">{ctype} · {size}</span>\
+                       </div>\
+                       {download}\
+                     </li>",
+                    name = esc(&f.name),
+                    ctype = esc(&f.content_type),
+                    size = esc(&human_size(f.size)),
+                    download = download,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+
+    let count = match files.len() {
+        1 => "1 file".to_string(),
+        n => format!("{n} files"),
+    };
+    let html = SHARE_FOLDER_HTML
+        .replace("{{CSS}}", APP_CSS)
+        .replace("{{SHIELD}}", SHIELD_SVG)
+        .replace("{{HEADING}}", &esc(&folder.name))
+        .replace("{{COUNT}}", &esc(&count))
+        .replace("{{FILES}}", &rows);
+    (StatusCode::OK, Html(html)).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -547,13 +1009,26 @@ pub async fn revoke_share(
 // Folders (albums): create / rename / delete (owner-only), and move a file
 // ---------------------------------------------------------------------------
 
-/// New-folder form: a display name. CSRF-checked.
+/// New-folder form: a display name + the parent level (empty = a root folder). CSRF-checked.
 #[derive(Debug, Deserialize)]
 pub struct FolderCreateForm {
     #[serde(default)]
     pub csrf_token: String,
     #[serde(default)]
     pub name: String,
+    /// The folder currently being viewed; the new folder is created as its child. Blank = root.
+    #[serde(default)]
+    pub parent_id: String,
+}
+
+/// Folder-delete form: CSRF + an optional `cascade` flag. Without it the delete succeeds only when
+/// the folder is empty; with `cascade=1` the whole subtree (subfolders + files) is removed.
+#[derive(Debug, Deserialize)]
+pub struct FolderDeleteForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub cascade: String,
 }
 
 /// Rename-folder form: the new display name. CSRF-checked.
@@ -589,11 +1064,27 @@ pub async fn create_folder(
     let actor = auth::identity(&headers);
     let name = clean_folder_name(&form.name)?;
 
+    // The parent (current level) must be one of the owner's folders, else the folder is a root.
+    let parent_id: Option<String> = match form.parent_id.trim() {
+        "" => None,
+        pid => {
+            if state.store.get_folder(pid, &actor.subject).await?.is_none() {
+                return Err(AppError::NotFound("No such folder.".to_string()));
+            }
+            Some(pid.to_string())
+        }
+    };
+
     let mut rec = FolderRec {
         id: String::new(),
         owner_sub: actor.subject.clone(),
+        parent_id,
         name,
         created_at: now_secs(),
+        // A fresh folder has no public share link until the owner creates one.
+        share_token: None,
+        expires_at: None,
+        share_password_hash: None,
     };
     // Reserve a unique folder id, retrying on the rare collision.
     let mut created = false;
@@ -642,9 +1133,121 @@ pub async fn rename_folder(
     Ok(redirect_found(&format!("/?folder={id}")))
 }
 
-/// `POST /folders/{id}/delete` — delete an owner's folder (its files are UNFILED, never deleted),
-/// then 302 to the flat drive. CSRF-checked, owner-scoped.
+/// `POST /folders/{id}/delete` — delete an owner's folder, then 302 to its parent level. Without
+/// `cascade` the delete succeeds only when the folder is EMPTY (no subfolders, no files) — a
+/// non-empty folder is refused with a 400 pointing at the cascade option. With `cascade=1` the
+/// whole subtree (descendant folders + their files + version blobs) is removed. CSRF-checked,
+/// owner-scoped.
 pub async fn delete_folder(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<FolderDeleteForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let actor = auth::identity(&headers);
+    // Capture the parent BEFORE deleting so we can land the redirect at the right level.
+    let folder = state
+        .store
+        .get_folder(&id, &actor.subject)
+        .await?
+        .ok_or_else(|| AppError::NotFound("No such folder.".to_string()))?;
+    let up = match &folder.parent_id {
+        Some(pid) => format!("/?folder={pid}"),
+        None => "/".to_string(),
+    };
+
+    let cascade = matches!(form.cascade.trim(), "1" | "true" | "on" | "yes");
+    if cascade {
+        // Remove the subtree; drop every freed blob (and its derived thumbnail) best-effort.
+        let keys = state.store.delete_folder_cascade(&id, &actor.subject).await?;
+        for key in &keys {
+            let _ = state.blobs.delete(key).await;
+            let _ = state.blobs.delete(&thumb_object_key(key)).await;
+        }
+        tracing::info!(id, owner = actor.subject, blobs = keys.len(), "folder cascade-deleted");
+        state.audit.emit(AuditEvent::warning(
+            "folder.delete.cascade",
+            &actor.subject,
+            &id,
+            "folder subtree",
+        ));
+        return Ok(redirect_found(&up));
+    }
+
+    match state.store.delete_folder_if_empty(&id, &actor.subject).await? {
+        FolderDelete::Deleted => {
+            tracing::info!(id, owner = actor.subject, "empty folder deleted");
+            state
+                .audit
+                .emit(AuditEvent::notice("folder.delete", &actor.subject, &id, "folder"));
+            Ok(redirect_found(&up))
+        }
+        FolderDelete::NotEmpty => Err(AppError::BadRequest(
+            "This folder isn't empty. Move or delete its contents first, or use \"Delete \
+             everything\" to remove the folder and everything inside it."
+                .to_string(),
+        )),
+        FolderDelete::NotFound => Err(AppError::NotFound("No such folder.".to_string())),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Folder share links: configure / revoke (owner-only)
+// ---------------------------------------------------------------------------
+
+/// `POST /folders/{id}/share` — (re)enable / update a folder's PUBLIC share link: set its expiry +
+/// optional password, minting a fresh token when the link had been revoked. CSRF-checked,
+/// owner-scoped, then 302 back to the folder. Mirrors [`configure_share`] for files.
+pub async fn configure_folder_share(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<ShareConfigForm>,
+) -> Result<Response, AppError> {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let actor = auth::identity(&headers);
+    let folder = state
+        .store
+        .get_folder(&id, &actor.subject)
+        .await?
+        .ok_or_else(|| AppError::NotFound("No such folder.".to_string()))?;
+
+    let expires_at = parse_expiry(&form.expiry, now_secs());
+    let password = form.password.trim();
+    let password_hash = if password.is_empty() {
+        None
+    } else {
+        let capped: String = password.chars().take(MAX_PASSWORD_CHARS).collect();
+        Some(auth::hash_share_password(&capped))
+    };
+    let token = folder
+        .share_token
+        .clone()
+        .unwrap_or_else(|| random_alnum(SHARE_TOKEN_LEN));
+
+    state
+        .store
+        .configure_folder_share(&id, &actor.subject, Some(token), expires_at, password_hash)
+        .await?;
+    tracing::info!(id, owner = actor.subject, "folder share link configured");
+    state
+        .audit
+        .emit(AuditEvent::notice("folder.share.update", &actor.subject, &id, "folder"));
+    Ok(redirect_found(&format!("/?folder={id}")))
+}
+
+/// `POST /folders/{id}/revoke` — revoke a folder's public share link (clears token + expiry +
+/// password). CSRF-checked, owner-scoped, then 302 back to the folder.
+pub async fn revoke_folder_share(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
@@ -656,14 +1259,18 @@ pub async fn delete_folder(
         ));
     }
     let actor = auth::identity(&headers);
-    if !state.store.delete_folder(&id, &actor.subject).await? {
+    if !state
+        .store
+        .configure_folder_share(&id, &actor.subject, None, None, None)
+        .await?
+    {
         return Err(AppError::NotFound("No such folder.".to_string()));
     }
-    tracing::info!(id, owner = actor.subject, "folder deleted");
+    tracing::info!(id, owner = actor.subject, "folder share link revoked");
     state
         .audit
-        .emit(AuditEvent::notice("folder.delete", &actor.subject, &id, "folder"));
-    Ok(redirect_found("/"))
+        .emit(AuditEvent::notice("folder.share.revoke", &actor.subject, &id, "folder"));
+    Ok(redirect_found(&format!("/?folder={id}")))
 }
 
 /// `POST /f/{id}/move` — move an owned file into a folder (or back to the root when the target is
@@ -745,8 +1352,9 @@ async fn serve_shared(state: &AppState, rec: &FileRec) -> Result<Response, AppEr
 }
 
 /// Render the public share-link password prompt (`status` = 200 on first ask, 401 after a wrong
-/// password). `error` is an optional inline message.
-fn render_share_prompt(token: &str, status: StatusCode, error: Option<&str>) -> Response {
+/// password). `action` is the form POST target (`/s/{token}` for a file, `/s/folder/{token}` for a
+/// folder). `error` is an optional inline message.
+fn render_share_prompt(action: &str, status: StatusCode, error: Option<&str>) -> Response {
     let error_html = match error {
         Some(msg) => format!("<p class=\"form-error\">{}</p>", esc(msg)),
         None => String::new(),
@@ -755,7 +1363,7 @@ fn render_share_prompt(token: &str, status: StatusCode, error: Option<&str>) -> 
         .replace("{{CSS}}", APP_CSS)
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{ERROR}}", &error_html)
-        .replace("{{TOKEN}}", &esc(token));
+        .replace("{{ACTION}}", &esc(action));
     (status, Html(html)).into_response()
 }
 
@@ -921,8 +1529,105 @@ fn ext_label(name: &str) -> String {
         .unwrap_or_else(|| "FILE".to_string())
 }
 
+/// The direct child folders of `parent` (`None` = the root level), owner list already name-ordered
+/// by [`crate::store::Store::list_folders`] so this preserves that order.
+fn folder_children<'a>(folders: &'a [FolderRec], parent: Option<&str>) -> Vec<&'a FolderRec> {
+    folders
+        .iter()
+        .filter(|f| f.parent_id.as_deref() == parent)
+        .collect()
+}
+
+/// The breadcrumb chain root→…→`folder` (inclusive), walking `parent_id` up. Depth-guarded so a
+/// (never-created) cycle cannot loop. Returned root-first for rendering.
+fn folder_chain(folders: &[FolderRec], folder: &FolderRec) -> Vec<FolderRec> {
+    let mut chain = vec![folder.clone()];
+    let mut cursor = folder.parent_id.clone();
+    let mut guard = 0;
+    while let Some(pid) = cursor {
+        if guard >= MAX_TREE_DEPTH {
+            break;
+        }
+        guard += 1;
+        match folders.iter().find(|f| f.id == pid) {
+            Some(p) => {
+                cursor = p.parent_id.clone();
+                chain.push(p.clone());
+            }
+            None => break,
+        }
+    }
+    chain.reverse();
+    chain
+}
+
+/// Render the folder breadcrumb: `All files › … › current`, each ancestor a link, the current node
+/// plain text. Owner-scoped; every name escaped.
+fn render_breadcrumb(chain: &[FolderRec]) -> String {
+    let mut out = String::from("<nav class=\"breadcrumb\" aria-label=\"Folder path\">");
+    if chain.is_empty() {
+        out.push_str("<span class=\"breadcrumb__here\">All files</span>");
+    } else {
+        out.push_str("<a class=\"breadcrumb__crumb\" href=\"/\">All files</a>");
+        for (i, f) in chain.iter().enumerate() {
+            out.push_str("<span class=\"breadcrumb__sep\" aria-hidden=\"true\">/</span>");
+            if i + 1 == chain.len() {
+                out.push_str(&format!(
+                    "<span class=\"breadcrumb__here\">{}</span>",
+                    esc(&f.name)
+                ));
+            } else {
+                out.push_str(&format!(
+                    "<a class=\"breadcrumb__crumb\" href=\"/?folder={id}\">{name}</a>",
+                    id = esc(&f.id),
+                    name = esc(&f.name),
+                ));
+            }
+        }
+    }
+    out.push_str("</nav>");
+    out
+}
+
+/// Render the subfolder tiles for the current level (child folders + an "Up" tile when inside a
+/// folder), prepended to the file grid. Each tile navigates into `/?folder={id}`.
+fn render_folder_tiles(children: &[&FolderRec], up_href: Option<&str>) -> String {
+    let mut out = String::new();
+    if let Some(href) = up_href {
+        out.push_str(&format!(
+            "<li class=\"file-card file-card--folder file-card--up\">\
+               <a class=\"file-card__link\" href=\"{href}\">\
+                 <span class=\"thumb thumb--folder\">{FOLDER_UP_SVG}</span>\
+               </a>\
+               <div class=\"file-card__body\"><a class=\"file-card__name\" href=\"{href}\">Up one level</a></div>\
+             </li>",
+            href = esc(href),
+            FOLDER_UP_SVG = FOLDER_UP_SVG,
+        ));
+    }
+    for f in children {
+        let href = format!("/?folder={}", f.id);
+        out.push_str(&format!(
+            "<li class=\"file-card file-card--folder\">\
+               <a class=\"file-card__link\" href=\"{href}\">\
+                 <span class=\"thumb thumb--folder\">{FOLDER_SVG}</span>\
+               </a>\
+               <div class=\"file-card__body\">\
+                 <a class=\"file-card__name\" href=\"{href}\" title=\"{name}\">{name}</a>\
+                 <div class=\"file-card__meta\"><span>Folder</span></div>\
+               </div>\
+             </li>",
+            href = esc(&href),
+            name = esc(&f.name),
+            FOLDER_SVG = FOLDER_SVG,
+        ));
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_gallery(
+    config: &Config,
     who: &Identity,
     csrf: &str,
     files: &[FileRec],
@@ -937,7 +1642,7 @@ fn render_gallery(
         1 => "1 file".to_string(),
         n => format!("{n} files"),
     };
-    // The content heading names the active folder, or "All files" for the flat view.
+    // The content heading names the active folder, or "All files" for the root.
     let heading = match active {
         Some(f) => f.name.clone(),
         None => "All files".to_string(),
@@ -946,7 +1651,6 @@ fn render_gallery(
     let folder_qs = active
         .map(|f| format!("&folder={}", f.id))
         .unwrap_or_default();
-    // A "Load older" link only when a full page came back (there may be older files to page into).
     let pager = match next {
         Some((ts, id)) => format!(
             "<nav class=\"gallery-pager\"><a class=\"btn btn-ghost\" href=\"/?before={ts}_{id}{folder_qs}\">Load older</a></nav>",
@@ -956,16 +1660,42 @@ fn render_gallery(
         ),
         None => String::new(),
     };
+
+    // Tree context: breadcrumb, the current level's child folders, and the "Up" target.
+    let chain = active.map(|a| folder_chain(folders, a)).unwrap_or_default();
+    let breadcrumb = render_breadcrumb(&chain);
+    let children = folder_children(folders, active.map(|a| a.id.as_str()));
+    let up_href = active.map(|a| match &a.parent_id {
+        Some(pid) => format!("/?folder={pid}"),
+        None => "/".to_string(),
+    });
+    let tiles = render_folder_tiles(&children, up_href.as_deref());
+    let file_cards = render_cards(files);
+    // The empty placeholder shows only when the whole level is empty (no subfolders, no files).
+    let cards = if tiles.is_empty() && file_cards.is_empty() {
+        let msg = if active.is_none() {
+            "Your drive is empty. Drop a file above to get started."
+        } else {
+            "This folder is empty. Drop a file above or create a subfolder."
+        };
+        format!("<li class=\"file-card file-card--empty\">{msg}</li>")
+    } else {
+        format!("{tiles}{file_cards}")
+    };
+    let upload_folder = active.map(|a| a.id.clone()).unwrap_or_default();
+
     GALLERY_HTML
         .replace("{{CSS}}", APP_CSS)
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Drive", Some(&who.email)))
         .replace("{{USAGE}}", &render_usage_meter(used, quota))
         .replace("{{CSRF}}", &esc(csrf))
-        .replace("{{SIDEBAR}}", &render_sidebar(csrf, folders, active))
+        .replace("{{UPLOAD_FOLDER}}", &esc(&upload_folder))
+        .replace("{{SIDEBAR}}", &render_sidebar(config, csrf, active))
+        .replace("{{BREADCRUMB}}", &breadcrumb)
         .replace("{{HEADING}}", &esc(&heading))
         .replace("{{COUNT}}", &esc(&count))
-        .replace("{{CARDS}}", &render_cards(files))
+        .replace("{{CARDS}}", &cards)
         .replace("{{PAGER}}", &pager)
 }
 
@@ -1010,34 +1740,28 @@ fn render_usage_meter(used: i64, quota: Option<i64>) -> String {
     }
 }
 
-/// Render the folder sidebar/switcher: an "All files" entry, one link per folder (the active one
-/// highlighted), a "New folder" form, and — when a folder is active — its rename + delete controls.
-/// Every form is CSRF-protected and owner-scoped.
-fn render_sidebar(csrf: &str, folders: &[FolderRec], active: Option<&FolderRec>) -> String {
-    let all_sel = if active.is_none() {
-        " folder-item--active"
-    } else {
-        ""
-    };
-    let mut items = format!(
-        "<li><a class=\"folder-item{all_sel}\" href=\"/\">All files</a></li>",
-        all_sel = all_sel,
+/// Render the folder management rail: a "New folder" form (creating INTO the current level), and —
+/// when a folder is active — its rename, empty/cascade delete, and public folder-share controls.
+/// Every form is CSRF-protected and owner-scoped. Navigation itself (breadcrumb + child tiles +
+/// "Up") lives in the main grid; this rail is the per-folder actions.
+fn render_sidebar(config: &Config, csrf: &str, active: Option<&FolderRec>) -> String {
+    // The new-folder form carries the current level as the hidden parent (empty = a root folder).
+    let parent_id = active.map(|a| a.id.clone()).unwrap_or_default();
+    let new_form = format!(
+        "<form class=\"folder-form\" method=\"post\" action=\"/folders\">\
+           <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+           <input type=\"hidden\" name=\"parent_id\" value=\"{parent}\">\
+           <label for=\"newFolder\">New folder here</label>\
+           <div class=\"share-row\">\
+             <input id=\"newFolder\" type=\"text\" name=\"name\" placeholder=\"Folder name\" maxlength=\"255\" required>\
+             <button class=\"btn btn-secondary btn-sm\" type=\"submit\">Create</button>\
+           </div>\
+         </form>",
+        csrf = esc(csrf),
+        parent = esc(&parent_id),
     );
-    for f in folders {
-        let sel = if active.map(|a| a.id.as_str()) == Some(f.id.as_str()) {
-            " folder-item--active"
-        } else {
-            ""
-        };
-        items.push_str(&format!(
-            "<li><a class=\"folder-item{sel}\" href=\"/?folder={id}\">{name}</a></li>",
-            sel = sel,
-            id = esc(&f.id),
-            name = esc(&f.name),
-        ));
-    }
 
-    // Rename + delete controls, shown only when viewing a specific folder.
+    // Rename + delete + folder-share controls, shown only when viewing a specific folder.
     let manage = match active {
         Some(f) => format!(
             "<form class=\"folder-form\" method=\"post\" action=\"/folders/{id}/rename\">\
@@ -1048,43 +1772,106 @@ fn render_sidebar(csrf: &str, folders: &[FolderRec], active: Option<&FolderRec>)
                  <button class=\"btn btn-secondary btn-sm\" type=\"submit\">Save</button>\
                </div>\
              </form>\
+             {share}\
              <form class=\"folder-form\" method=\"post\" action=\"/folders/{id}/delete\" \
-               onsubmit=\"return confirm('Delete this folder? Its files are kept and moved back to All files.');\">\
+               onsubmit=\"return confirm('Delete this folder? It must be empty.');\">\
                <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
-               <button class=\"btn btn-danger btn-sm\" type=\"submit\">Delete folder</button>\
+               <button class=\"btn btn-danger btn-sm\" type=\"submit\">Delete (if empty)</button>\
+             </form>\
+             <form class=\"folder-form\" method=\"post\" action=\"/folders/{id}/delete\" \
+               onsubmit=\"return confirm('Delete this folder AND everything inside it (subfolders and files)? This cannot be undone.');\">\
+               <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+               <input type=\"hidden\" name=\"cascade\" value=\"1\">\
+               <button class=\"btn btn-danger btn-sm\" type=\"submit\">Delete everything</button>\
              </form>",
             id = esc(&f.id),
             csrf = esc(csrf),
             name = esc(&f.name),
+            share = render_folder_share_section(config, f, csrf),
         ),
         None => String::new(),
     };
 
     format!(
         "<aside class=\"folder-rail\">\
-           <div class=\"section-head\"><h2>Folders</h2></div>\
-           <ul class=\"folder-list\">{items}</ul>\
-           <form class=\"folder-form\" method=\"post\" action=\"/folders\">\
-             <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
-             <label for=\"newFolder\">New folder</label>\
-             <div class=\"share-row\">\
-               <input id=\"newFolder\" type=\"text\" name=\"name\" placeholder=\"Folder name\" maxlength=\"255\" required>\
-               <button class=\"btn btn-secondary btn-sm\" type=\"submit\">Create</button>\
-             </div>\
-           </form>\
+           <div class=\"section-head\"><h2>Folder actions</h2></div>\
+           {new_form}\
            {manage}\
          </aside>",
-        items = items,
-        csrf = esc(csrf),
+        new_form = new_form,
         manage = manage,
     )
 }
 
-fn render_cards(files: &[FileRec]) -> String {
-    if files.is_empty() {
-        return "<li class=\"file-card file-card--empty\">Your drive is empty. Drop a file above to get started.</li>"
-            .to_string();
+/// Build the public folder-share control for the rail (shown while viewing a folder). An active
+/// link shows its `/s/folder/{token}` URL + expiry/password state + update + revoke; a folder with no
+/// link shows a "create folder link" form. Mirrors [`render_share_section`] for files; CSRF-scoped.
+fn render_folder_share_section(config: &Config, folder: &FolderRec, csrf: &str) -> String {
+    let controls = format!(
+        "<div class=\"field\">\
+           <label for=\"folderExpiry\">Link expires</label>\
+           <select id=\"folderExpiry\" name=\"expiry\">{options}</select>\
+         </div>\
+         <div class=\"field\">\
+           <label for=\"folderPassword\">Password (optional)</label>\
+           <input id=\"folderPassword\" type=\"password\" name=\"password\" autocomplete=\"off\" \
+             placeholder=\"Leave blank for no password\">\
+         </div>",
+        options = expiry_options("never"),
+    );
+    match &folder.share_token {
+        Some(token) => {
+            let share_url = format!("{}/s/folder/{}", config.public_base, token);
+            let expiry_status = match folder.expires_at {
+                Some(exp) => format!("Expires {}", esc(&fmt_ts(exp))),
+                None => "Never expires".to_string(),
+            };
+            let pw_status = if folder.share_has_password() {
+                "Password-protected"
+            } else {
+                "No password"
+            };
+            format!(
+                "<div class=\"field\">\
+                   <label for=\"folderShareUrl\">Folder share link (no sign-in)</label>\
+                   <div class=\"share-row\">\
+                     <input id=\"folderShareUrl\" type=\"text\" readonly value=\"{url}\">\
+                   </div>\
+                   <p class=\"muted\">{expiry_status} · {pw_status}</p>\
+                 </div>\
+                 <form class=\"folder-form\" method=\"post\" action=\"/folders/{id}/share\">\
+                   <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+                   {controls}\
+                   <button class=\"btn btn-secondary btn-sm\" type=\"submit\">Update folder link</button>\
+                 </form>\
+                 <form class=\"folder-form\" method=\"post\" action=\"/folders/{id}/revoke\" \
+                   onsubmit=\"return confirm('Revoke this folder share link?');\">\
+                   <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+                   <button class=\"btn btn-danger btn-sm\" type=\"submit\">Revoke folder link</button>\
+                 </form>",
+                url = esc(&share_url),
+                expiry_status = expiry_status,
+                pw_status = pw_status,
+                id = esc(&folder.id),
+                csrf = esc(csrf),
+                controls = controls,
+            )
+        }
+        None => format!(
+            "<form class=\"folder-form\" method=\"post\" action=\"/folders/{id}/share\">\
+               <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+               <label>Share this folder</label>\
+               {controls}\
+               <button class=\"btn btn-secondary btn-sm\" type=\"submit\">Create folder link</button>\
+             </form>",
+            id = esc(&folder.id),
+            csrf = esc(csrf),
+            controls = controls,
+        ),
     }
+}
+
+fn render_cards(files: &[FileRec]) -> String {
     files
         .iter()
         .map(|f| {
@@ -1114,28 +1901,107 @@ fn render_cards(files: &[FileRec]) -> String {
         .join("")
 }
 
+/// Which inline preview a file gets on its detail page.
+enum Preview {
+    Image,
+    Text,
+    Pdf,
+    None,
+}
+
+/// Classify a file for inline preview from its resolved content type (+ name for extension hints).
+fn preview_kind(rec: &FileRec) -> Preview {
+    if rec.is_image() {
+        Preview::Image
+    } else if rec.content_type == "application/pdf" {
+        Preview::Pdf
+    } else if is_text_preview(&rec.content_type, &rec.name) {
+        Preview::Text
+    } else {
+        Preview::None
+    }
+}
+
+/// True when a file should preview as escaped text/markdown: any `text/*`, a couple of textual
+/// application types, or a known text-ish extension (covers files uploaded as octet-stream).
+fn is_text_preview(content_type: &str, name: &str) -> bool {
+    if content_type.starts_with("text/")
+        || content_type == "application/json"
+        || content_type == "application/xml"
+    {
+        return true;
+    }
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+    matches!(
+        ext.as_deref(),
+        Some("txt" | "md" | "markdown" | "json" | "xml" | "csv" | "log" | "toml" | "yaml" | "yml")
+    )
+}
+
+/// Build the inline preview block for the detail page. Images render inline (click to open full
+/// size — a tiny CSS/JS lightbox, no library); text/markdown is fetched, escaped and shown in a
+/// `<pre>` (this crate ships no markdown renderer, so the safe escaped fallback is used); PDFs are
+/// embedded in a sandboxed `<iframe>` of the inline-served bytes; everything else shows the type
+/// icon + a download prompt.
+async fn build_preview(state: &AppState, rec: &FileRec) -> String {
+    match preview_kind(rec) {
+        Preview::Image => format!(
+            "<a class=\"lightbox-trigger\" href=\"/f/{id}/raw\" title=\"Open full size\">\
+               <img class=\"preview-img\" src=\"/f/{id}/raw\" alt=\"{alt}\"></a>",
+            id = esc(&rec.id),
+            alt = esc(&rec.name),
+        ),
+        Preview::Pdf => format!(
+            "<iframe class=\"preview-pdf\" src=\"/f/{id}/preview-raw\" sandbox \
+               title=\"{alt}\"></iframe>",
+            id = esc(&rec.id),
+            alt = esc(&rec.name),
+        ),
+        Preview::Text => match state.blobs.get(&rec.object_key).await {
+            Ok(bytes) => render_text_preview(&bytes),
+            Err(_) => preview_none(rec),
+        },
+        Preview::None => preview_none(rec),
+    }
+}
+
+/// Render a text/markdown preview: the leading [`MAX_TEXT_PREVIEW_BYTES`] as ESCAPED text in a
+/// `<pre>` (never interpreted as HTML), with a truncation note when the file is larger.
+fn render_text_preview(bytes: &[u8]) -> String {
+    let truncated = bytes.len() > MAX_TEXT_PREVIEW_BYTES;
+    let slice = &bytes[..bytes.len().min(MAX_TEXT_PREVIEW_BYTES)];
+    let text = String::from_utf8_lossy(slice);
+    let note = if truncated {
+        "<p class=\"muted preview-text__note\">Preview truncated — download the file for the full contents.</p>"
+    } else {
+        ""
+    };
+    format!(
+        "<div class=\"preview-text\"><pre class=\"preview-text__pre\">{body}</pre>{note}</div>",
+        body = esc(&text),
+        note = note,
+    )
+}
+
+/// The non-previewable fallback: the document glyph + extension label + a download prompt.
+fn preview_none(rec: &FileRec) -> String {
+    format!(
+        "<div class=\"preview-file\">{glyph}<span class=\"thumb__ext\">{ext}</span>\
+           <p class=\"muted\">No inline preview for this file type.</p></div>",
+        glyph = FILE_SVG,
+        ext = esc(&ext_label(&rec.name)),
+    )
+}
+
 fn render_detail(
     config: &Config,
     rec: &FileRec,
     viewer: &Identity,
     csrf: &str,
     folders: &[FolderRec],
+    preview: &str,
+    versions: &[VersionRec],
 ) -> String {
-    let preview = if rec.is_image() {
-        format!(
-            "<img class=\"preview-img\" src=\"/f/{id}/raw\" alt=\"{alt}\">",
-            id = esc(&rec.id),
-            alt = esc(&rec.name),
-        )
-    } else {
-        format!(
-            "<div class=\"preview-file\">{glyph}<span class=\"thumb__ext\">{ext}</span>\
-               <p class=\"muted\">No inline preview for this file type.</p></div>",
-            glyph = FILE_SVG,
-            ext = esc(&ext_label(&rec.name)),
-        )
-    };
-
     let meta_list = format!(
         "<dl class=\"meta-list\">\
            <div><dt>Type</dt><dd>{ctype}</dd></div>\
@@ -1151,6 +2017,7 @@ fn render_detail(
 
     let share = render_share_section(config, rec, csrf);
     let move_section = render_move_section(rec, csrf, folders);
+    let versions_section = render_versions(rec, versions, csrf);
 
     let sub = format!(
         "{ctype} · {size} · {date}",
@@ -1175,12 +2042,101 @@ fn render_detail(
         .replace("{{USERBOX}}", &userbox("Drive", Some(&viewer.email)))
         .replace("{{NAME}}", &esc(&rec.name))
         .replace("{{SUB}}", &esc(&sub))
-        .replace("{{PREVIEW}}", &preview)
+        .replace("{{PREVIEW}}", preview)
         .replace("{{META_LIST}}", &meta_list)
         .replace("{{MOVE}}", &move_section)
         .replace("{{SHARE}}", &share)
+        .replace("{{VERSIONS}}", &versions_section)
         .replace("{{ID}}", &esc(&rec.id))
         .replace("{{DELETE}}", &delete)
+}
+
+/// Render the version history block for the detail page: each retained snapshot with its date,
+/// size and type, a download link, and a CSRF-protected "Restore" form. Empty history shows a
+/// muted note. Every value is server-formatted + escaped.
+fn render_versions(rec: &FileRec, versions: &[VersionRec], csrf: &str) -> String {
+    if versions.is_empty() {
+        return "<div class=\"field\"><label>Versions</label>\
+                <p class=\"muted\">No earlier versions. Re-uploading a file with the same name in \
+                this folder keeps the previous copy here.</p></div>"
+            .to_string();
+    }
+    let rows = versions
+        .iter()
+        .map(|v| {
+            format!(
+                "<tr>\
+                   <td>{date}</td>\
+                   <td>{size}</td>\
+                   <td class=\"mono\">{ctype}</td>\
+                   <td class=\"version-actions\">\
+                     <a class=\"btn btn-secondary btn-sm\" href=\"/f/{id}/versions/{vid}/raw\">Download</a>\
+                     <form method=\"post\" action=\"/f/{id}/versions/{vid}/restore\" \
+                       onsubmit=\"return confirm('Restore this version? The current file becomes a version.');\">\
+                       <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+                       <button class=\"btn btn-secondary btn-sm\" type=\"submit\">Restore</button>\
+                     </form>\
+                   </td>\
+                 </tr>",
+                date = esc(&fmt_ts(v.created_at)),
+                size = esc(&human_size(v.size)),
+                ctype = esc(&v.content_type),
+                id = esc(&rec.id),
+                vid = esc(&v.id),
+                csrf = esc(csrf),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        "<div class=\"field\">\
+           <label>Versions <span class=\"count-badge\">{count}</span></label>\
+           <table class=\"data version-table\">\
+             <thead><tr><th>Saved</th><th>Size</th><th>Type</th><th></th></tr></thead>\
+             <tbody>{rows}</tbody>\
+           </table>\
+           <p class=\"muted\">Versions count toward your storage quota.</p>\
+         </div>",
+        count = versions.len(),
+        rows = rows,
+    )
+}
+
+/// Serve a retained version's blob as a download (always an attachment; `nosniff`), named after the
+/// current file. A version is never served inline — only the current blob previews.
+fn serve_version_download(rec: &FileRec, bytes: Vec<u8>) -> Response {
+    let filename = safe_filename(&rec.name);
+    (
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+/// Serve a PDF INLINE for the sandboxed detail embed: `application/pdf` + `nosniff` (so a file
+/// lying about its type is never run as HTML) + a `sandbox` CSP (no scripts, no plugins-as-script).
+fn serve_pdf_inline(rec: &FileRec, bytes: Vec<u8>) -> Response {
+    let filename = safe_filename(&rec.name);
+    (
+        [
+            (header::CONTENT_TYPE, "application/pdf".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("inline; filename=\"{filename}\""),
+            ),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            (header::CONTENT_SECURITY_POLICY, "sandbox".to_string()),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 /// Build the "Move to folder" control for the detail page: a `<select>` of the owner's folders
