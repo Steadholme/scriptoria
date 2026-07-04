@@ -41,6 +41,7 @@ fn file(id: &str, owner: &str, token: &str, created_at: i64) -> FileRec {
         share_password_hash: None,
         folder_id: None,
         trashed_at: 0,
+        view_count: 0,
     }
 }
 
@@ -91,6 +92,7 @@ async fn pg_store_full_integration() {
     assert_eq!(got.bucket, "aperture");
     assert_eq!(got.object_key, "aaaaaaaaaa");
     assert_eq!(got.share_token.as_deref(), Some("tok-aaaa"));
+    assert_eq!(got.view_count, 0);
 
     // --- id collision -> create returns false (ON CONFLICT DO NOTHING) ------
     assert!(!store
@@ -109,6 +111,15 @@ async fn pg_store_full_integration() {
         "aaaaaaaaaa"
     );
     assert!(store.get_by_token("nope").await.unwrap().is_none());
+
+    // --- public landing-page view counter is atomic and missing ids are no-op.
+    store.bump_view_count("aaaaaaaaaa").await.unwrap();
+    store.bump_view_count("aaaaaaaaaa").await.unwrap();
+    store.bump_view_count("missing").await.unwrap();
+    assert_eq!(
+        store.get("aaaaaaaaaa").await.unwrap().unwrap().view_count,
+        2
+    );
 
     // --- share-link lifecycle: set expiry + password, then revoke ----------
     assert!(store

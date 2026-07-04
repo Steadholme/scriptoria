@@ -139,6 +139,7 @@ pub fn app(state: AppState) -> Router {
             "/s/{token}",
             get(handlers::files::share).post(handlers::files::share_unlock),
         )
+        .route("/s/{token}/view", get(handlers::files::share_landing))
         .route(
             "/s/folder/{token}",
             get(handlers::files::share_folder).post(handlers::files::share_folder_unlock),

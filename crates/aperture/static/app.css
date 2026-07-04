@@ -631,3 +631,55 @@ body.page { max-width:none; margin:0; padding:0; }
 .dropzone__progress { margin-top:12px; height:6px; background:var(--surface-3); border-radius:var(--r-pill); overflow:hidden; }
 .dropzone__bar { height:100%; width:0; background:var(--accent); border-radius:var(--r-pill); transition:width 120ms linear; }
 @media (max-width:720px){ .card-menu__btn { opacity:1; } .card-menu__pop { width:200px; } }
+
+/* ---- public share landing (imgur-style showcase) ------------------------ */
+/* Logged-out shop window: one narrow centered column, media as the hero, minimal chrome.
+ * The body already paints the canvas (same convention as .page-console above). */
+.page-share-landing { background: transparent; }
+.share-landing { max-width: 720px; padding: 36px 20px 72px; text-align: center; }
+.share-landing__media {
+  display: flex; align-items: center; justify-content: center;
+  min-height: 240px; padding: 18px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--r);
+  box-shadow: var(--sh-sm); overflow: hidden;
+}
+.share-landing__media-img {
+  display: block; max-width: 100%; max-height: 64vh; height: auto;
+  border-radius: var(--r-sm); box-shadow: var(--sh-md); object-fit: contain;
+}
+.share-landing__media > svg { width: 180px; height: auto; max-width: 70%; border-radius: var(--r-sm); box-shadow: var(--sh-xs); }
+.share-landing__title { margin: 22px 0 8px; font-size: 22px; font-weight: 650; letter-spacing: -.02em; word-break: break-all; }
+.share-landing__meta { margin: 0 0 22px; font-size: 12.5px; color: var(--ink-3); }
+.share-landing__meta .mono { font-size: 12px; }
+.share-landing__views {
+  display: inline-flex; align-items: center; height: 22px; padding: 0 10px; margin-left: 2px;
+  border-radius: var(--r-pill); background: var(--accent-soft); color: var(--accent-ink);
+  font-size: 11.5px; font-weight: 600; letter-spacing: .01em; font-variant-numeric: tabular-nums;
+}
+.share-landing__actions { display: flex; justify-content: center; gap: 10px; flex-wrap: wrap; margin: 0 0 28px; }
+
+/* ---- embed widget (share landing + owner detail share this box) --------- */
+.embed-box {
+  display: flex; flex-direction: column; gap: 8px; margin-top: 24px; text-align: left;
+  padding: 16px 18px; background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r); box-shadow: var(--sh-xs);
+}
+.embed-box > label { font-size: 13px; font-weight: 600; color: var(--ink); margin-bottom: 2px; }
+.embed-box__row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
+.embed-box__label {
+  flex: 0 0 84px; font-family: var(--mono); font-size: 10.5px; font-weight: 600;
+  letter-spacing: .05em; text-transform: uppercase; color: var(--ink-3);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.embed-box__row .embed-box__input {
+  flex: 1 1 160px; width: auto; min-width: 0; max-width: 100%;
+  font-family: var(--mono); font-size: 12px; color: var(--ink-2);
+  padding: 7px 10px; background: var(--surface-2); border-radius: var(--r-xs);
+}
+.embed-box__row .copy-btn { flex: 0 0 auto; min-width: 66px; }
+.embed-box__stats { margin: 4px 0 0; font-size: 12px; }
+@media (max-width:560px){
+  .share-landing { padding: 24px 14px 56px; }
+  .share-landing__media { min-height: 180px; padding: 12px; }
+  .embed-box__label { flex-basis: 100%; }
+}

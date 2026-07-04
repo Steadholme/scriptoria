@@ -324,6 +324,134 @@ async fn share_password_prompts_then_serves() {
 }
 
 #[tokio::test]
+async fn share_landing_for_image_unfurls_and_counts_views() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let (id, _) = upload_png(&app, "alice").await;
+    let token = store.get(&id).await.unwrap().unwrap().share_token.unwrap();
+
+    let first = send(&app, get(&format!("/s/{token}/view"), None)).await;
+    assert_eq!(first.status, StatusCode::OK);
+    let first_html = first.text();
+    assert!(first_html.contains("shot.png"));
+    assert!(first_html.contains("og:image"));
+    assert!(first_html.contains("twitter:card\" content=\"summary_large_image"));
+    assert!(first_html.contains(&format!("content=\"https://drive.w33d.xyz/s/{token}\"")));
+    assert!(first_html.contains(&format!("href=\"/s/{token}\"")));
+    assert!(first_html.contains("Markdown"));
+    assert!(first_html.contains("BBCode"));
+    assert!(first_html.contains("1 views"));
+    assert!(first_html.contains("Opened 1 times"));
+
+    let second = send(&app, get(&format!("/s/{token}/view"), None)).await;
+    assert_eq!(second.status, StatusCode::OK);
+    assert!(second.text().contains("2 views"));
+    assert_eq!(
+        store
+            .get_by_token(&token)
+            .await
+            .unwrap()
+            .unwrap()
+            .view_count,
+        2
+    );
+
+    let direct = send(&app, get(&format!("/s/{token}"), None)).await;
+    assert_eq!(direct.status, StatusCode::OK);
+    assert_eq!(direct.body, png_bytes());
+    assert_eq!(
+        store
+            .get_by_token(&token)
+            .await
+            .unwrap()
+            .unwrap()
+            .view_count,
+        2
+    );
+}
+
+#[tokio::test]
+async fn share_landing_respects_expiry_and_password_privacy() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let (id, csrf) = upload_png(&app, "alice").await;
+    let token = store.get(&id).await.unwrap().unwrap().share_token.unwrap();
+
+    let set_password = send(
+        &app,
+        post_form(
+            &format!("/f/{id}/share"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&expiry=never&password=hunter2"),
+        ),
+    )
+    .await;
+    assert_eq!(set_password.status, StatusCode::FOUND);
+
+    let prompt = send(&app, get(&format!("/s/{token}/view"), None)).await;
+    assert_eq!(prompt.status, StatusCode::OK);
+    let prompt_html = prompt.text();
+    assert!(prompt_html.contains("Password required"));
+    assert!(prompt_html.contains(&format!("action=\"/s/{token}\"")));
+    assert!(!prompt_html.contains("og:image"));
+    assert!(!prompt_html.contains("Embed &amp; links"));
+    assert_eq!(
+        store
+            .get_by_token(&token)
+            .await
+            .unwrap()
+            .unwrap()
+            .view_count,
+        0
+    );
+
+    store
+        .configure_share(&id, "alice", Some(token.clone()), Some(1), None)
+        .await
+        .unwrap();
+    let gone = send(&app, get(&format!("/s/{token}/view"), None)).await;
+    assert_eq!(gone.status, StatusCode::GONE);
+}
+
+#[tokio::test]
+async fn share_landing_for_non_image_uses_summary_card_without_image_embeds() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let home = send(&app, get("/", Some("alice"))).await;
+    let csrf = home.csrf_cookie().expect("csrf cookie");
+    let created = send(
+        &app,
+        upload_req(
+            &csrf,
+            &csrf,
+            "alice",
+            "note.txt",
+            "text/plain",
+            b"hello world",
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::FOUND);
+    let id = created.location().trim_start_matches("/f/").to_string();
+    let token = store.get(&id).await.unwrap().unwrap().share_token.unwrap();
+
+    let page = send(&app, get(&format!("/s/{token}/view"), None)).await;
+    assert_eq!(page.status, StatusCode::OK);
+    let html = page.text();
+    assert!(html.contains("note.txt"));
+    assert!(html.contains("twitter:card\" content=\"summary\""));
+    assert!(!html.contains("og:image"));
+    assert!(html.contains("Direct"));
+    assert!(html.contains("Share page"));
+    assert!(!html.contains("Markdown"));
+    assert!(!html.contains("BBCode"));
+}
+
+#[tokio::test]
 async fn share_revoke_clears_the_token() {
     let state = build_dev_state();
     let store: Arc<dyn Store> = state.store.clone();
@@ -470,6 +598,8 @@ async fn upload_detail_raw_share_delete_lifecycle() {
     assert!(detail.text().contains("screenshot.png"));
     assert!(detail.text().contains(&format!("/f/{id}/raw")));
     assert!(detail.text().contains(&format!("/s/{token}")));
+    assert!(detail.text().contains("Embed &amp; links"));
+    assert!(detail.text().contains(&format!("/s/{token}/view")));
 
     // GET /f/{id}/raw streams the bytes inline as image/png.
     let raw = send(&app, get(&format!("/f/{id}/raw"), Some("alice"))).await;

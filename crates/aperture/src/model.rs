@@ -58,6 +58,9 @@ pub struct FileRec {
     /// Soft-delete marker, epoch seconds. `0` means live; a positive value means the file is in the
     /// owner's trash. Trashed files stay in storage (and quota usage) until purged.
     pub trashed_at: i64,
+    /// Public landing-page open count. Only `/s/{token}/view` increments this; direct blob fetches
+    /// remain byte-for-byte compatible and do not count views.
+    pub view_count: i64,
 }
 
 /// A single per-file comment. Bodies are display-only and always escaped at render time.
@@ -203,6 +206,7 @@ mod tests {
             share_password_hash: None,
             folder_id: None,
             trashed_at: 0,
+            view_count: 0,
         }
     }
 

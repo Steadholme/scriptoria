@@ -54,6 +54,7 @@ const MAX_TREE_DEPTH: usize = 64;
 
 const GALLERY_HTML: &str = include_str!("../../templates/gallery.html");
 const DETAIL_HTML: &str = include_str!("../../templates/detail.html");
+const SHARE_LANDING_HTML: &str = include_str!("../../templates/share_landing.html");
 const SHARE_PW_HTML: &str = include_str!("../../templates/share_password.html");
 const SHARE_FOLDER_HTML: &str = include_str!("../../templates/share_folder.html");
 const UPLOAD_INBOX_HTML: &str = include_str!("../../templates/upload_inbox.html");
@@ -331,6 +332,7 @@ pub async fn upload(
         // A fresh upload lands at the level it was uploaded into (root when unset).
         folder_id: target,
         trashed_at: 0,
+        view_count: 0,
     };
 
     // Reserve a unique row (id + share token) BEFORE writing the blob, retrying on the rare
@@ -764,7 +766,10 @@ pub async fn rename(
         return Err(AppError::BadRequest("A file name is required.".to_string()));
     }
 
-    state.store.rename_file(&rec.id, &actor.subject, &name).await?;
+    state
+        .store
+        .rename_file(&rec.id, &actor.subject, &name)
+        .await?;
     tracing::info!(id = rec.id, owner = actor.subject, "file renamed");
     state.audit.emit(AuditEvent::notice(
         "file.rename",
@@ -1012,6 +1017,27 @@ pub async fn share_unlock(
     }
 }
 
+/// `GET /s/{token}/view` — render the public share landing page used for unfurls and human opens.
+/// Password-protected links do not reveal metadata here; the prompt posts to `/s/{token}`, the
+/// existing unlock route that serves the bytes after a correct password.
+pub async fn share_landing(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> Result<Response, AppError> {
+    let mut rec = load_shared(&state, &token).await?;
+    if rec.share_has_password() {
+        return Ok(render_share_prompt(
+            &format!("/s/{token}"),
+            StatusCode::OK,
+            None,
+        ));
+    }
+    if state.store.bump_view_count(&rec.id).await.is_ok() {
+        rec.view_count += 1;
+    }
+    Ok(render_share_landing(&state.config, &rec, &token))
+}
+
 // ---------------------------------------------------------------------------
 // GET/POST /s/folder/{token} + /s/folder/{token}/f/{fid} — public folder share (NO SSO)
 // ---------------------------------------------------------------------------
@@ -1243,6 +1269,7 @@ pub async fn upload_inbox_submit(
         share_password_hash: None,
         folder_id: Some(folder.id.clone()),
         trashed_at: 0,
+        view_count: 0,
     };
     let mut reserved = false;
     for _ in 0..6 {
@@ -2032,6 +2059,63 @@ fn render_share_prompt(action: &str, status: StatusCode, error: Option<&str>) ->
         .replace("{{ERROR}}", &error_html)
         .replace("{{ACTION}}", &esc(action));
     (status, Html(html)).into_response()
+}
+
+fn render_share_landing(config: &Config, rec: &FileRec, token: &str) -> Response {
+    let direct_url = format!("{}/s/{}", config.public_base, token);
+    let page_url = format!("{}/s/{}/view", config.public_base, token);
+    let description = format!(
+        "{} · {} · {} views",
+        rec.content_type,
+        human_size(rec.size),
+        rec.view_count
+    );
+    let twitter_card = if rec.is_image() {
+        "summary_large_image"
+    } else {
+        "summary"
+    };
+    let mut og_meta = format!(
+        "<meta property=\"og:title\" content=\"{title}\">\
+         <meta property=\"og:description\" content=\"{description}\">\
+         <meta property=\"og:url\" content=\"{page_url}\">\
+         <meta name=\"twitter:card\" content=\"{twitter_card}\">\
+         <meta name=\"twitter:title\" content=\"{title}\">\
+         <meta name=\"twitter:description\" content=\"{description}\">",
+        title = esc(&rec.name),
+        description = esc(&description),
+        page_url = esc(&page_url),
+        twitter_card = twitter_card,
+    );
+    if rec.is_image() {
+        og_meta.push_str(&format!(
+            "<meta property=\"og:image\" content=\"{direct_url}\">\
+             <meta name=\"twitter:image\" content=\"{direct_url}\">",
+            direct_url = esc(&direct_url),
+        ));
+    }
+
+    let preview = if rec.is_image() {
+        format!(
+            "<img class=\"share-landing__media-img\" src=\"/s/{token}\" alt=\"{name}\">",
+            token = esc(token),
+            name = esc(&rec.name),
+        )
+    } else {
+        render_type_thumb(&rec.content_type, &rec.name)
+    };
+
+    let html = SHARE_LANDING_HTML
+        .replace("{{CSS}}", APP_CSS)
+        .replace("{{NAME}}", &esc(&rec.name))
+        .replace("{{OG_META}}", &og_meta)
+        .replace("{{PREVIEW}}", &preview)
+        .replace("{{TYPE}}", &esc(&rec.content_type))
+        .replace("{{SIZE}}", &esc(&human_size(rec.size)))
+        .replace("{{VIEWS}}", &rec.view_count.to_string())
+        .replace("{{DOWNLOAD_URL}}", &format!("/s/{}", esc(token)))
+        .replace("{{EMBED}}", &render_embed_codes(config, rec));
+    Html(html).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -2890,6 +2974,7 @@ fn render_detail(
     );
 
     let share = render_share_section(config, rec, csrf);
+    let embed = render_embed_codes(config, rec);
     let move_section = render_move_section(rec, csrf, folders);
     let versions_section = render_versions(rec, versions, csrf);
     let comments_section = render_comments(rec, comments, csrf);
@@ -2921,6 +3006,7 @@ fn render_detail(
         .replace("{{META_LIST}}", &meta_list)
         .replace("{{MOVE}}", &move_section)
         .replace("{{SHARE}}", &share)
+        .replace("{{EMBED}}", &embed)
         .replace("{{VERSIONS}}", &versions_section)
         .replace("{{COMMENTS}}", &comments_section)
         .replace("{{ID}}", &esc(&rec.id))
@@ -3110,6 +3196,56 @@ fn render_move_section(rec: &FileRec, csrf: &str, folders: &[FolderRec]) -> Stri
         id = esc(&rec.id),
         csrf = esc(csrf),
         options = options,
+    )
+}
+
+fn render_embed_code_row(label: &str, value: &str) -> String {
+    format!(
+        "<div class=\"embed-box__row\">\
+           <span class=\"embed-box__label\">{label}</span>\
+           <input class=\"embed-box__input\" type=\"text\" readonly value=\"{value}\">\
+           <button class=\"btn btn-secondary btn-sm copy-btn\" type=\"button\" \
+             data-copy=\".embed-box__input\" data-label=\"Copy\">Copy</button>\
+         </div>",
+        label = esc(label),
+        value = esc(value),
+    )
+}
+
+fn render_embed_codes(config: &Config, rec: &FileRec) -> String {
+    let Some(token) = rec.share_token.as_deref() else {
+        return String::new();
+    };
+
+    let direct = format!("{}/s/{}", config.public_base, token);
+    let page = format!("{}/s/{}/view", config.public_base, token);
+    let mut rows = vec![
+        render_embed_code_row("Direct", &direct),
+        render_embed_code_row("Share page", &page),
+    ];
+    if rec.is_image() {
+        rows.push(render_embed_code_row(
+            "Markdown",
+            &format!("![{}]({})", rec.name, direct),
+        ));
+        rows.push(render_embed_code_row(
+            "HTML",
+            &format!("<img src=\"{}\" alt=\"{}\">", direct, rec.name),
+        ));
+        rows.push(render_embed_code_row(
+            "BBCode",
+            &format!("[img]{}[/img]", direct),
+        ));
+    }
+
+    format!(
+        "<div class=\"embed-box\">\
+           <label>Embed &amp; links</label>\
+           {rows}\
+           <p class=\"muted embed-box__stats\">Opened {views} times</p>\
+         </div>",
+        rows = rows.join(""),
+        views = rec.view_count,
     )
 }
 

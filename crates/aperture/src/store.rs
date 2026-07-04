@@ -48,6 +48,10 @@ pub trait Store: Send + Sync {
     /// Fetch a file by its public share token (the unauthenticated `/s/{token}` path).
     async fn get_by_token(&self, token: &str) -> Result<Option<FileRec>, StoreError>;
 
+    /// Best-effort public landing-page view counter. Missing ids are a no-op so handlers can call
+    /// it after a share-token lookup without turning analytics failures into public 500s.
+    async fn bump_view_count(&self, id: &str) -> Result<(), StoreError>;
+
     /// An owner's files, newest-first, one keyset page at a time.
     ///
     /// `folder` selects the tree level: `None` is the ROOT view (only files whose `folder_id` IS
@@ -82,8 +86,7 @@ pub trait Store: Send + Sync {
     async fn restore_file(&self, id: &str, owner_sub: &str) -> Result<bool, StoreError>;
 
     /// Rename an owner's live (non-trashed) file. Returns `true` when a row was updated.
-    async fn rename_file(&self, id: &str, owner_sub: &str, name: &str)
-        -> Result<bool, StoreError>;
+    async fn rename_file(&self, id: &str, owner_sub: &str, name: &str) -> Result<bool, StoreError>;
 
     /// An owner's trashed files, newest-trash-first.
     async fn list_trashed_by_owner(&self, owner_sub: &str) -> Result<Vec<FileRec>, StoreError>;
@@ -335,6 +338,14 @@ impl Store for InMemoryStore {
             .cloned())
     }
 
+    async fn bump_view_count(&self, id: &str) -> Result<(), StoreError> {
+        let mut files = self.files.lock().expect("files lock poisoned");
+        if let Some(f) = files.iter_mut().find(|f| f.id == id && f.trashed_at == 0) {
+            f.view_count += 1;
+        }
+        Ok(())
+    }
+
     async fn list_by_owner(
         &self,
         owner_sub: &str,
@@ -410,12 +421,7 @@ impl Store for InMemoryStore {
         }
     }
 
-    async fn rename_file(
-        &self,
-        id: &str,
-        owner_sub: &str,
-        name: &str,
-    ) -> Result<bool, StoreError> {
+    async fn rename_file(&self, id: &str, owner_sub: &str, name: &str) -> Result<bool, StoreError> {
         let mut files = self.files.lock().expect("files lock poisoned");
         match files
             .iter_mut()
@@ -984,7 +990,7 @@ use sqlx::Row;
 
 /// Column list shared by every SELECT, so the row decoder stays in lock-step with the query.
 const COLS: &str = "id, owner_sub, name, content_type, size, bucket, object_key, share_token, \
-     created_at, expires_at, share_password_hash, folder_id, trashed_at";
+     created_at, expires_at, share_password_hash, folder_id, trashed_at, view_count";
 
 /// Column list shared by every folder SELECT.
 const FOLDER_COLS: &str =
@@ -1065,6 +1071,11 @@ impl PgStore {
         // Soft-delete marker. Live rows are `0`; trashed rows keep their blob and continue counting
         // toward usage until purged. Additive + idempotent; existing rows become live.
         sqlx::query("ALTER TABLE files ADD COLUMN IF NOT EXISTS trashed_at BIGINT DEFAULT 0")
+            .execute(&self.pool)
+            .await?;
+        // Public landing-page opens. Direct `/s/{token}` blob fetches intentionally do not update
+        // this counter, preserving hotlink/backward-compatible byte behavior.
+        sqlx::query("ALTER TABLE files ADD COLUMN IF NOT EXISTS view_count BIGINT DEFAULT 0")
             .execute(&self.pool)
             .await?;
         sqlx::query(
@@ -1202,6 +1213,7 @@ impl PgStore {
             share_password_hash: row.try_get("share_password_hash")?,
             folder_id: row.try_get("folder_id")?,
             trashed_at: row.try_get("trashed_at")?,
+            view_count: row.try_get("view_count")?,
         })
     }
 
@@ -1246,8 +1258,8 @@ impl PgStore {
         let result = sqlx::query(
             "INSERT INTO files \
                  (id, owner_sub, name, content_type, size, bucket, object_key, share_token, \
-                  created_at, expires_at, share_password_hash, folder_id, trashed_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+                  created_at, expires_at, share_password_hash, folder_id, trashed_at, view_count) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
              ON CONFLICT DO NOTHING",
         )
         .bind(&file.id)
@@ -1263,6 +1275,7 @@ impl PgStore {
         .bind(&file.share_password_hash)
         .bind(&file.folder_id)
         .bind(file.trashed_at)
+        .bind(file.view_count)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
@@ -1306,6 +1319,16 @@ impl PgStore {
         .fetch_optional(&self.pool)
         .await?;
         row.as_ref().map(Self::file_from_row).transpose()
+    }
+
+    async fn bump_view_count_async(&self, id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE files SET view_count = view_count + 1 WHERE id = $1 AND trashed_at = 0",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn list_by_owner_async(
@@ -2043,6 +2066,12 @@ impl Store for PgStore {
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
+    async fn bump_view_count(&self, id: &str) -> Result<(), StoreError> {
+        self.bump_view_count_async(id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
     async fn list_by_owner(
         &self,
         owner_sub: &str,
@@ -2078,12 +2107,7 @@ impl Store for PgStore {
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
-    async fn rename_file(
-        &self,
-        id: &str,
-        owner_sub: &str,
-        name: &str,
-    ) -> Result<bool, StoreError> {
+    async fn rename_file(&self, id: &str, owner_sub: &str, name: &str) -> Result<bool, StoreError> {
         self.rename_file_async(id, owner_sub, name)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
@@ -2376,6 +2400,7 @@ mod tests {
             share_password_hash: None,
             folder_id: None,
             trashed_at: 0,
+            view_count: 0,
         }
     }
 
@@ -2490,6 +2515,18 @@ mod tests {
         assert!(s.get("a").await.unwrap().is_some());
         assert!(s.delete("a", "u").await.unwrap());
         assert!(s.get("a").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn bump_view_count_increments_and_missing_id_is_noop() {
+        let s = InMemoryStore::new();
+        s.create(&file("a", "u", "tok-a", 1)).await.unwrap();
+
+        s.bump_view_count("a").await.unwrap();
+        s.bump_view_count("a").await.unwrap();
+        s.bump_view_count("missing").await.unwrap();
+
+        assert_eq!(s.get("a").await.unwrap().unwrap().view_count, 2);
     }
 
     #[tokio::test]
