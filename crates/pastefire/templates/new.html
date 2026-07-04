@@ -14,7 +14,7 @@
       <span class="appbar__name"><b>Paste</b><span>paste.w33d.xyz</span></span>
     </a>
     <nav class="appbar__nav" aria-label="Pastefire">
-      <a class="appnav is-active" href="/"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="M12 5v14"/></svg>New paste</a>
+      <a class="appnav is-active" href="/" aria-current="page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="M12 5v14"/></svg>New paste</a>
     </nav>
     <span class="appbar__spacer"></span>
     <div class="appbar__right">{{USERBOX}}</div>
@@ -23,95 +23,136 @@
   <main class="console">
     <div class="console__head">
       <h1>New paste</h1>
-      <p class="sub">Share a snippet across the estate. Author and identity come from your single sign-on session.</p>
+      <p class="sub">Share code and text. Burn, protect, expire.</p>
     </div>
-
     <div class="layout">
-      <section class="card">
-        <div class="card__head"><h2>Compose</h2></div>
+      <section class="card compose">
         <div class="card__body">
           {{ERROR}}
-          <form method="post" action="/">
+          <form method="post" action="/" id="composeForm">
             <input type="hidden" name="csrf_token" value="{{CSRF}}">
-            <div class="field-row">
-              <div class="field field--grow">
-                <label for="title">Title</label>
-                <input type="text" id="title" name="title" maxlength="200" value="{{TITLE}}" placeholder="Optional — e.g. nginx reverse proxy config">
+            <input class="compose__title" type="text" name="title" id="title" maxlength="200"
+                   placeholder="Untitled paste — optional title" value="{{TITLE_VALUE}}" autocomplete="off">
+            <div class="editor">
+              <div class="editor__tabs" id="fileTabs" hidden>
+                <button type="button" class="editor__addtab" id="addFileBtn" aria-label="Add file">+ Add file</button>
               </div>
-              <div class="field">
-                <label for="language">Language</label>
-                <select id="language" name="language">{{LANGUAGE_OPTIONS}}</select>
-              </div>
-              <div class="field">
-                <label for="expiry">Expiry</label>
-                <select id="expiry" name="expiry">{{EXPIRY_OPTIONS}}</select>
-              </div>
+              <div class="editor__files" id="fileEditor">{{FILE_ROWS}}</div>
             </div>
-            <div class="field">
-              <label class="check">
-                <input type="checkbox" id="burn" name="burn" value="on"{{BURN_CHECKED}}>
-                <span>Burn after read — delete on the first view by anyone other than you</span>
-              </label>
-            </div>
-            <div class="field">
-              <label for="password">Password <span class="field-hint">optional</span></label>
-              <input type="password" id="password" name="password" autocomplete="new-password" placeholder="Leave blank for no password — anyone but you must enter it to view">
-            </div>
-            <div class="field">
-              <label>Files</label>
-              <div class="file-editor" id="fileEditor">{{FILE_ROWS}}</div>
-              <button class="btn btn-ghost btn-sm" type="button" id="addFileBtn">+ Add file</button>
-            </div>
-            <div class="actions">
-              <button class="btn btn-primary" type="submit">Create paste</button>
+            <div class="compose__bar">
+              <select class="select select--bar" name="language" id="language" aria-label="Language">{{LANGUAGE_OPTIONS}}</select>
+              <select class="select select--bar" name="expiry" id="expiry" aria-label="Expiry">{{EXPIRY_OPTIONS}}</select>
+              <details class="opts"{{OPTS_OPEN}}>
+                <summary class="opts__summary">Options</summary>
+                <div class="opts__pop">
+                  <label class="check check--chip"><input type="checkbox" name="burn" value="on"{{BURN_CHECKED}}><span>Burn after read</span></label>
+                  <div class="field"><label for="password">Password <span class="field-hint">optional</span></label>
+                    <input class="input" type="password" name="password" id="password" autocomplete="new-password"></div>
+                </div>
+              </details>
+              <span class="compose__spacer"></span>
+              <button type="submit" class="btn btn-primary" title="Ctrl+Enter">Create paste</button>
             </div>
           </form>
 
           <template id="fileRowTemplate">
-            <div class="file-row" data-file-row>
-              <div class="file-row__head">
-                <div class="field field--grow">
-                  <label>Filename <span class="field-hint">optional</span></label>
-                  <input type="text" name="file_name" maxlength="128" value="" placeholder="e.g. main.rs">
-                </div>
-                <button class="btn btn-ghost btn-sm" type="button" data-file-remove>Remove</button>
+            <div class="editor__file" data-file-row>
+              <div class="editor__filehead">
+                <input class="editor__filename" type="text" name="file_name" maxlength="128" value=""
+                       placeholder="Filename including extension (optional)" autocomplete="off">
+                <button class="btn btn-ghost btn-sm editor__remove" type="button" data-file-remove>Remove</button>
               </div>
-              <textarea name="file_content" class="code-input" spellcheck="false" autocomplete="off" placeholder="Paste this file's content here…"></textarea>
+              <textarea name="file_content" class="code-input" spellcheck="false" autocomplete="off"
+                        placeholder="Paste your content here…"></textarea>
             </div>
           </template>
         </div>
       </section>
-
-      <section class="card">
-        <div class="card__head"><h2>My recent pastes</h2></div>
-        <div class="card__body">
-          <ul class="paste-list">
-            {{RECENT}}
-          </ul>
-          {{LOAD_OLDER}}
-        </div>
-      </section>
+      <aside class="rail">
+        <section class="card"><div class="card__head"><h2>My recent pastes</h2></div>
+          <div class="card__body card__body--list"><ul class="paste-list">{{RECENT}}</ul>{{LOAD_OLDER}}</div>
+        </section>
+      </aside>
     </div>
   </main>
 
   <script>
-    // Multi-file compose: add/remove file rows. The row markup is cloned from a static
-    // <template> (no user/remote strings interpolated), so this never injects untrusted HTML.
+    document.documentElement.classList.add('js');
     (function () {
+      var form = document.getElementById('composeForm');
       var editor = document.getElementById('fileEditor');
+      var tabs = document.getElementById('fileTabs');
       var addBtn = document.getElementById('addFileBtn');
       var tpl = document.getElementById('fileRowTemplate');
-      if (!editor || !addBtn || !tpl) { return; }
+      if (!form || !editor || !tabs || !addBtn || !tpl) { return; }
+
+      function rows() {
+        return Array.prototype.slice.call(editor.querySelectorAll('[data-file-row]'));
+      }
+      function tabLabel(row, index) {
+        var input = row.querySelector('input[name="file_name"]');
+        var value = input && input.value.trim();
+        return value || 'File ' + (index + 1);
+      }
+      function syncLabels() {
+        rows().forEach(function (row, index) {
+          if (row._tab) { row._tab.textContent = tabLabel(row, index); }
+        });
+      }
+      function activate(row) {
+        rows().forEach(function (candidate) {
+          var active = candidate === row;
+          candidate.classList.toggle('is-active', active);
+          if (candidate._tab) { candidate._tab.classList.toggle('is-active', active); }
+        });
+      }
+      function wireRow(row) {
+        if (!row || row._tab) { return; }
+        var tab = document.createElement('button');
+        tab.type = 'button';
+        tab.className = 'editor__tab';
+        row._tab = tab;
+        tabs.insertBefore(tab, addBtn);
+        tab.addEventListener('click', function () { activate(row); });
+        var name = row.querySelector('input[name="file_name"]');
+        if (name) { name.addEventListener('input', syncLabels); }
+      }
+
+      rows().forEach(wireRow);
+      syncLabels();
+      if (rows()[0]) { activate(rows()[0]); }
+      tabs.hidden = false;
+
       addBtn.addEventListener('click', function () {
-        editor.appendChild(tpl.content.cloneNode(true));
+        var fragment = tpl.content.cloneNode(true);
+        var row = fragment.querySelector('[data-file-row]');
+        editor.appendChild(fragment);
+        wireRow(row);
+        syncLabels();
+        activate(row);
+        var name = row && row.querySelector('input[name="file_name"]');
+        if (name) { name.focus(); }
       });
+
       editor.addEventListener('click', function (ev) {
         var btn = ev.target.closest('[data-file-remove]');
         if (!btn) { return; }
-        var rows = editor.querySelectorAll('[data-file-row]');
-        if (rows.length <= 1) { return; } // always keep at least one row
+        var all = rows();
+        if (all.length <= 1) { return; }
         var row = btn.closest('[data-file-row]');
+        var index = all.indexOf(row);
+        if (row && row._tab) { row._tab.remove(); }
         if (row) { row.remove(); }
+        var remaining = rows();
+        syncLabels();
+        activate(remaining[Math.min(index, remaining.length - 1)]);
+      });
+
+      form.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) {
+          ev.preventDefault();
+          form.requestSubmit();
+        }
       });
     })();
   </script>

@@ -139,6 +139,34 @@ pub fn fmt_ts(secs: i64) -> String {
     }
 }
 
+/// Format a byte count for compact file metadata in code block headers.
+pub fn fmt_size(bytes: usize) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / KB)
+    } else {
+        format!("{:.1} MB", bytes as f64 / MB)
+    }
+}
+
+/// Format a positive future duration for compact expiry badges.
+pub fn fmt_dur_short(secs: i64) -> String {
+    if secs <= 0 {
+        "now".to_string()
+    } else if secs < 60 {
+        "in <1m".to_string()
+    } else if secs < 3600 {
+        format!("in {}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("in {}h", secs / 3600)
+    } else {
+        format!("in {}d", secs / 86_400)
+    }
+}
+
 /// The app-bar's right cluster: the "All apps" waffle to the apex portal and the avatar user-menu
 /// (Account / All apps / the preserved cross-subdomain gateway Sign-out). Shared by every page so
 /// the chrome stays identical. Legacy `allapps`/`userchip` hooks are retained on the new elements.

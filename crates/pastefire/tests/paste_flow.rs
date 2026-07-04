@@ -57,7 +57,9 @@ async fn send(app: &axum::Router, req: Request<Body>) -> Resp {
     let res = app.clone().oneshot(req).await.unwrap();
     let status = res.status();
     let headers = res.headers().clone();
-    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
     Resp {
         status,
         headers,
@@ -68,12 +70,19 @@ async fn send(app: &axum::Router, req: Request<Body>) -> Resp {
 fn get(path: &str, subject: Option<&str>) -> Request<Body> {
     let mut b = Request::builder().method("GET").uri(path);
     if let Some(s) = subject {
-        b = b.header("x-auth-subject", s).header("x-auth-email", format!("{s}@w33d.xyz"));
+        b = b
+            .header("x-auth-subject", s)
+            .header("x-auth-email", format!("{s}@w33d.xyz"));
     }
     b.body(Body::empty()).unwrap()
 }
 
-fn post_form(path: &str, fields: &[(&str, &str)], cookie: &str, subject: Option<&str>) -> Request<Body> {
+fn post_form(
+    path: &str,
+    fields: &[(&str, &str)],
+    cookie: &str,
+    subject: Option<&str>,
+) -> Request<Body> {
     let body = fields
         .iter()
         .map(|(k, v)| format!("{}={}", k, enc(v)))
@@ -85,7 +94,9 @@ fn post_form(path: &str, fields: &[(&str, &str)], cookie: &str, subject: Option<
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header(header::COOKIE, format!("__Host-csrf={cookie}"));
     if let Some(s) = subject {
-        b = b.header("x-auth-subject", s).header("x-auth-email", format!("{s}@w33d.xyz"));
+        b = b
+            .header("x-auth-subject", s)
+            .header("x-auth-email", format!("{s}@w33d.xyz"));
     }
     b.body(Body::from(body)).unwrap()
 }
@@ -150,7 +161,12 @@ async fn create_view_raw_delete_lifecycle() {
     let csrf2 = view.csrf_cookie().expect("csrf on view page");
     let del = send(
         &app,
-        post_form(&format!("/delete/{id}"), &[("csrf_token", &csrf2)], &csrf2, Some("alice")),
+        post_form(
+            &format!("/delete/{id}"),
+            &[("csrf_token", &csrf2)],
+            &csrf2,
+            Some("alice"),
+        ),
     )
     .await;
     assert_eq!(del.status, StatusCode::FOUND);
@@ -199,7 +215,11 @@ async fn csrf_is_required_on_create() {
         &app,
         post_form(
             "/",
-            &[("csrf_token", "totally-wrong"), ("body", "hi"), ("expiry", "never")],
+            &[
+                ("csrf_token", "totally-wrong"),
+                ("body", "hi"),
+                ("expiry", "never"),
+            ],
             "the-cookie-value",
             Some("alice"),
         ),
@@ -319,7 +339,9 @@ async fn view_renders_line_gutter_with_anchors() {
     assert!(view.body.contains("<div class=\"ln\" id=\"L1\">"));
     assert!(view.body.contains("<div class=\"ln\" id=\"L3\">"));
     assert!(view.body.contains("<a class=\"ln-no\" href=\"#L2\">2</a>"));
-    assert!(view.body.contains("<span class=\"ln-code\">line two</span>"));
+    assert!(view
+        .body
+        .contains("<span class=\"ln-code\">line two</span>"));
     // No phantom fourth line for a body without a trailing newline.
     assert!(!view.body.contains("id=\"L4\""));
 }
@@ -383,15 +405,31 @@ async fn similar_pastes_panel_links_related_snippet() {
             Some("alice"),
         )
     };
-    let a = send(&app, mk("nginx one", "server listen ssl proxy_pass upstream backend")).await;
-    let _b = send(&app, mk("nginx two", "server listen ssl proxy_pass upstream backend cache")).await;
-    let _c = send(&app, mk("totally other", "lorem ipsum dolor sit amet consectetur")).await;
+    let a = send(
+        &app,
+        mk("nginx one", "server listen ssl proxy_pass upstream backend"),
+    )
+    .await;
+    let _b = send(
+        &app,
+        mk(
+            "nginx two",
+            "server listen ssl proxy_pass upstream backend cache",
+        ),
+    )
+    .await;
+    let _c = send(
+        &app,
+        mk("totally other", "lorem ipsum dolor sit amet consectetur"),
+    )
+    .await;
 
     let view = send(&app, get(&a.location(), Some("alice"))).await;
     assert_eq!(view.status, StatusCode::OK);
     assert!(view.body.contains("Similar pastes"));
     assert!(view.body.contains("nginx two"));
-    assert!(view.body.contains("% match"));
+    assert!(view.body.contains("class=\"paste-item__num\">"));
+    assert!(view.body.contains("%</span>"));
     // The unrelated paste must not be surfaced.
     assert!(!view.body.contains("totally other"));
 }
@@ -420,6 +458,7 @@ async fn burn_after_read_survives_author_then_burns_for_recipient() {
     )
     .await;
     let loc = created.location();
+    let id = loc.trim_start_matches("/p/").to_string();
 
     // The author can open it repeatedly (to copy the link) without consuming it.
     let owner1 = send(&app, get(&loc, Some("alice"))).await;
@@ -433,6 +472,7 @@ async fn burn_after_read_survives_author_then_burns_for_recipient() {
     assert_eq!(recipient.status, StatusCode::OK);
     assert!(recipient.body.contains("launch-codes-1234"));
     assert!(recipient.body.contains("burn-after-read"));
+    assert!(!recipient.body.contains(&format!("/raw/{id}")));
 
     // Now it is gone for everyone — including the author.
     let gone_recipient = send(&app, get(&loc, Some("bob"))).await;
@@ -511,7 +551,10 @@ async fn recent_list_paginates_backward_with_load_older_link() {
     assert_eq!(page1.status, StatusCode::OK);
     assert!(page1.body.contains("/p/p5aaaaaa"));
     assert!(page1.body.contains("/p/p4aaaaaa"));
-    assert!(!page1.body.contains("/p/p3aaaaaa"), "third-newest must not be on page 1");
+    assert!(
+        !page1.body.contains("/p/p3aaaaaa"),
+        "third-newest must not be on page 1"
+    );
     assert!(page1.body.contains("Load older"));
     assert!(page1.body.contains("/?before=103_p4aaaaaa&amp;limit=2"));
 
@@ -520,14 +563,20 @@ async fn recent_list_paginates_backward_with_load_older_link() {
     assert_eq!(page2.status, StatusCode::OK);
     assert!(page2.body.contains("/p/p3aaaaaa"));
     assert!(page2.body.contains("/p/p2aaaaaa"));
-    assert!(!page2.body.contains("/p/p4aaaaaa"), "cursor excludes the row it was cut from");
+    assert!(
+        !page2.body.contains("/p/p4aaaaaa"),
+        "cursor excludes the row it was cut from"
+    );
     assert!(page2.body.contains("/?before=101_p2aaaaaa&amp;limit=2"));
 
     // Final page: only p1 remains — a short page, so NO "Load older" link.
     let page3 = send(&app, get("/?before=101_p2aaaaaa&limit=2", Some("alice"))).await;
     assert_eq!(page3.status, StatusCode::OK);
     assert!(page3.body.contains("/p/p1aaaaaa"));
-    assert!(!page3.body.contains("Load older"), "end of list has no older link");
+    assert!(
+        !page3.body.contains("Load older"),
+        "end of list has no older link"
+    );
 }
 
 #[tokio::test]
@@ -583,11 +632,16 @@ async fn multi_file_create_view_and_raw() {
     // The view renders each file with its own header + numbered lines.
     let view = send(&app, get(&format!("/p/{id}"), Some("alice"))).await;
     assert_eq!(view.status, StatusCode::OK);
-    assert!(view.body.contains("<div class=\"file-block\">"), "multi-file view uses per-file blocks");
-    assert!(view.body.contains("<span>alpha.txt</span>"));
-    assert!(view.body.contains("<span>bravo.txt</span>"));
-    assert!(view.body.contains("1 of 2"));
-    assert!(view.body.contains("2 of 2"));
+    assert!(
+        view.body.contains("<div class=\"file-block\">"),
+        "multi-file view uses per-file blocks"
+    );
+    assert!(view
+        .body
+        .contains("<span class=\"file-block__fname\">alpha.txt</span>"));
+    assert!(view
+        .body
+        .contains("<span class=\"file-block__fname\">bravo.txt</span>"));
     assert!(view.body.contains("alpha file body"));
     assert!(view.body.contains("bravo file body"));
 
@@ -597,12 +651,22 @@ async fn multi_file_create_view_and_raw() {
     assert!(raw.body.contains("alpha file body"));
     assert!(raw.body.contains("bravo file body"));
     assert!(raw.body.contains("alpha.txt"));
+
+    // ?file= serves one positioned file without changing the legacy no-query raw response.
+    let raw_alpha = send(&app, get(&format!("/raw/{id}?file=0"), Some("alice"))).await;
+    assert_eq!(raw_alpha.status, StatusCode::OK);
+    assert_eq!(raw_alpha.body, "alpha file body");
+    let raw_bravo = send(&app, get(&format!("/raw/{id}?file=1"), Some("alice"))).await;
+    assert_eq!(raw_bravo.status, StatusCode::OK);
+    assert_eq!(raw_bravo.body, "bravo file body");
+    let raw_missing = send(&app, get(&format!("/raw/{id}?file=2"), Some("alice"))).await;
+    assert_eq!(raw_missing.status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
-async fn single_file_paste_has_no_file_headers() {
+async fn single_file_paste_uses_file_block() {
     // Backward compatibility: a one-file paste (via the legacy `body` field OR a single file row)
-    // renders exactly one unlabeled code block — no per-file header.
+    // still stores and serves raw bytes the same way, but the view now uses the unified file shell.
     let app = app(build_dev_state());
     let (id, _) = create_paste(
         &app,
@@ -618,7 +682,13 @@ async fn single_file_paste_has_no_file_headers() {
     let view = send(&app, get(&format!("/p/{id}"), Some("alice"))).await;
     assert_eq!(view.status, StatusCode::OK);
     assert!(view.body.contains("only one file here"));
-    assert!(!view.body.contains("<div class=\"file-block\">"), "single-file paste has no per-file header");
+    assert!(
+        view.body.contains("<div class=\"file-block\">"),
+        "single-file paste uses unified file block"
+    );
+    assert!(view
+        .body
+        .contains("<span class=\"file-block__fname\">just one</span>"));
 }
 
 #[tokio::test]
@@ -663,7 +733,12 @@ async fn fork_copies_all_files() {
     let csrf = view.csrf_cookie().unwrap();
     let forked = send(
         &app,
-        post_form(&format!("/fork/{id}"), &[("csrf_token", &csrf)], &csrf, Some("bob")),
+        post_form(
+            &format!("/fork/{id}"),
+            &[("csrf_token", &csrf)],
+            &csrf,
+            Some("bob"),
+        ),
     )
     .await;
     assert_eq!(forked.status, StatusCode::FOUND);
@@ -671,11 +746,17 @@ async fn fork_copies_all_files() {
     assert_ne!(fork_id, id);
 
     let fview = send(&app, get(&format!("/p/{fork_id}"), Some("bob"))).await;
-    assert!(fview.body.contains("<span>one.txt</span>"));
-    assert!(fview.body.contains("<span>two.txt</span>"));
+    assert!(fview
+        .body
+        .contains("<span class=\"file-block__fname\">one.txt</span>"));
+    assert!(fview
+        .body
+        .contains("<span class=\"file-block__fname\">two.txt</span>"));
     assert!(fview.body.contains("content of file one"));
     assert!(fview.body.contains("content of file two"));
-    assert!(fview.body.contains(&format!("Forked from <a href=\"/p/{id}\">")));
+    assert!(fview
+        .body
+        .contains(&format!("Forked from <a href=\"/p/{id}\">")));
 }
 
 #[tokio::test]
@@ -693,7 +774,7 @@ async fn edit_single_into_multi_file_snapshots_revision() {
     )
     .await;
     let view = send(&app, get(&format!("/p/{id}"), Some("alice"))).await;
-    assert!(!view.body.contains("<div class=\"file-block\">"));
+    assert!(view.body.contains("<div class=\"file-block\">"));
     let ecsrf = view.csrf_cookie().unwrap();
 
     // Edit into two named files.
@@ -719,8 +800,12 @@ async fn edit_single_into_multi_file_snapshots_revision() {
 
     // The current view is now multi-file; the pre-edit content is archived as revision 1.
     let v2 = send(&app, get(&format!("/p/{id}"), Some("alice"))).await;
-    assert!(v2.body.contains("<span>first.txt</span>"));
-    assert!(v2.body.contains("<span>second.txt</span>"));
+    assert!(v2
+        .body
+        .contains("<span class=\"file-block__fname\">first.txt</span>"));
+    assert!(v2
+        .body
+        .contains("<span class=\"file-block__fname\">second.txt</span>"));
     assert!(v2.body.contains(&format!("/p/{id}/history")));
     let rev = send(&app, get(&format!("/p/{id}/rev/1"), Some("alice"))).await;
     assert!(rev.body.contains("originally one file"));
@@ -757,10 +842,10 @@ async fn edit_appends_revision_and_updates_current() {
     )
     .await;
 
-    // The owner view offers an Edit control; a brand-new paste has no History link yet.
+    // The owner view offers Edit and the History tab even before any revision exists.
     let view = send(&app, get(&format!("/p/{id}"), Some("alice"))).await;
     assert!(view.body.contains(&format!("/edit/{id}")));
-    assert!(!view.body.contains(&format!("/p/{id}/history")));
+    assert!(view.body.contains(&format!("/p/{id}/history")));
 
     // A non-owner cannot open the edit form.
     let forbid = send(&app, get(&format!("/edit/{id}"), Some("bob"))).await;
@@ -824,7 +909,10 @@ async fn edit_appends_revision_and_updates_current() {
     .await;
     assert_eq!(noop.status, StatusCode::FOUND);
     let hist2 = send(&app, get(&format!("/p/{id}/history"), Some("alice"))).await;
-    assert!(!hist2.body.contains(&format!("/p/{id}/rev/2")), "no spurious revision 2");
+    assert!(
+        !hist2.body.contains(&format!("/p/{id}/rev/2")),
+        "no spurious revision 2"
+    );
 }
 
 #[tokio::test]
@@ -848,7 +936,12 @@ async fn fork_credits_source_and_is_owned_by_forker() {
     let csrf = view.csrf_cookie().unwrap();
     let forked = send(
         &app,
-        post_form(&format!("/fork/{id}"), &[("csrf_token", &csrf)], &csrf, Some("bob")),
+        post_form(
+            &format!("/fork/{id}"),
+            &[("csrf_token", &csrf)],
+            &csrf,
+            Some("bob"),
+        ),
     )
     .await;
     assert_eq!(forked.status, StatusCode::FOUND);
@@ -860,7 +953,9 @@ async fn fork_credits_source_and_is_owned_by_forker() {
     assert_eq!(fview.status, StatusCode::OK);
     // `fn` is wrapped in a highlight span; the identifier is rendered verbatim.
     assert!(fview.body.contains("shared()"));
-    assert!(fview.body.contains(&format!("Forked from <a href=\"/p/{id}\">")));
+    assert!(fview
+        .body
+        .contains(&format!("Forked from <a href=\"/p/{id}\">")));
     assert!(fview.body.contains(&format!("/delete/{fork_id}")));
 
     // The original is untouched and still owned by Alice.
@@ -888,6 +983,8 @@ async fn password_protected_paste_prompts_and_unlocks() {
     let owner = send(&app, get(&format!("/p/{id}"), Some("alice"))).await;
     assert_eq!(owner.status, StatusCode::OK);
     assert!(owner.body.contains("SECRET-TOKEN-42"));
+    assert!(owner.body.contains(&format!("/raw/{id}")));
+    assert!(owner.body.contains(&format!("/fork/{id}")));
 
     // A non-owner is prompted, and the body is NOT in the prompt page.
     let bob = send(&app, get(&format!("/p/{id}"), Some("bob"))).await;
@@ -928,6 +1025,9 @@ async fn password_protected_paste_prompts_and_unlocks() {
     .await;
     assert_eq!(ok.status, StatusCode::OK);
     assert!(ok.body.contains("SECRET-TOKEN-42"));
+    assert!(!ok.body.contains(&format!("/raw/{id}")));
+    assert!(!ok.body.contains(&format!("/fork/{id}")));
+    assert!(!ok.body.contains(&format!("/p/{id}/history")));
 }
 
 #[tokio::test]
@@ -951,7 +1051,12 @@ async fn cannot_fork_a_protected_paste_as_non_owner() {
     let csrf = page.csrf_cookie().unwrap();
     let denied = send(
         &app,
-        post_form(&format!("/fork/{id}"), &[("csrf_token", &csrf)], &csrf, Some("bob")),
+        post_form(
+            &format!("/fork/{id}"),
+            &[("csrf_token", &csrf)],
+            &csrf,
+            Some("bob"),
+        ),
     )
     .await;
     assert_eq!(denied.status, StatusCode::FORBIDDEN);
@@ -985,7 +1090,12 @@ async fn cannot_delete_another_users_paste() {
     let csrf = page.csrf_cookie().unwrap();
     let del = send(
         &app,
-        post_form("/delete/ownedbyA", &[("csrf_token", &csrf)], &csrf, Some("bob")),
+        post_form(
+            "/delete/ownedbyA",
+            &[("csrf_token", &csrf)],
+            &csrf,
+            Some("bob"),
+        ),
     )
     .await;
     assert_eq!(del.status, StatusCode::FORBIDDEN);

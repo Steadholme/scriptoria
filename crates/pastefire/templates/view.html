@@ -22,33 +22,24 @@
 
   <main class="console">
     <div class="console__head console__head--row">
-      <div>
+      <div class="console__lead">
         <h1>{{TITLE}}</h1>
         <p class="sub">{{META}}</p>
         {{SOURCE}}
+        <div class="badges">{{BADGES}}</div>
       </div>
-      <a class="btn btn-ghost btn-sm" href="/">New paste</a>
+      <div class="console__actions">{{ACTIONS}}</div>
     </div>
-
     {{BURN_NOTICE}}
-
-    <section class="card">
-      <div class="card__head">
-        <span class="lang-badge lang-badge--lg">{{LANG_LABEL}}</span>
-        <div class="code-tools">
-          <button class="btn btn-secondary btn-sm" id="copyBtn" type="button" data-label="Copy">Copy</button>
-          {{TOOLS}}
-        </div>
+    <div class="layout layout--view{{LAYOUT_MOD}}">
+      <div class="layout__main">
+        {{TABS}}
+        <section class="card card--code"><div class="card__body card__body--code"><div id="code">{{BODY}}</div></div></section>
       </div>
-      <div class="card__body card__body--code">
-        <div id="code">{{BODY}}</div>
-      </div>
-    </section>
-
-    {{SIMILAR}}
+      {{SIMILAR}}
+    </div>
+    <div class="toast-host" id="hf-toasts" aria-live="polite"></div>
   </main>
-
-  <div class="toast-host" id="hf-toasts" aria-live="polite" aria-atomic="false"></div>
 
   <script>
     // Minimal toast helper (textContent only — never innerHTML for messages).
@@ -77,26 +68,7 @@
       navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(false); });
     }
 
-    // Whole-paste copy button in the card header.
-    (function () {
-      var btn = document.getElementById('copyBtn');
-      var code = document.getElementById('code');
-      if (!btn || !code) { return; }
-      if (!navigator.clipboard) { btn.disabled = true; return; }
-      btn.addEventListener('click', function () {
-        copyLines(code, function (ok) {
-          if (ok) {
-            btn.textContent = 'Copied';
-            setTimeout(function () { btn.textContent = btn.getAttribute('data-label'); }, 1200);
-            hfToast('Copied to clipboard', 'ok');
-          } else {
-            hfToast('Copy failed — select and copy manually', 'err');
-          }
-        });
-      });
-    })();
-
-    // Per-file copy buttons in each multi-file block header.
+    // Per-file copy buttons in each file block header.
     (function () {
       var buttons = document.querySelectorAll('.file-copy[data-copy="file"]');
       if (!buttons.length) { return; }

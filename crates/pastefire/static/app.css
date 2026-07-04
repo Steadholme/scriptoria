@@ -388,43 +388,73 @@ body.page { max-width:none; margin:0; padding:0; }
  * surfaces, hairline borders, soft accent tints, small radii.
  * ================================================================== */
 
-/* head row: title block + a trailing action (e.g. "New paste") */
-.console__head--row { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+/* head row: title block + a trailing action cluster (view page) */
+.console__head--row { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
+.console__actions { display:flex; align-items:center; gap:8px; flex-shrink:0; }
 
-/* compose: a row of fields — title grows, language/expiry stay fixed */
-.field-row { display: flex; gap: 16px; flex-wrap: wrap; }
-.field--grow { flex: 1 1 240px; min-width: 0; }
+/* ---- Compose: document title -------------------------------------------- */
+/* element-qualified: must outrank the legacy-compat input[type=text] rule above */
+input.compose__title { display:block; width:100%; font:600 16px/1.4 var(--font); color:var(--ink); background:transparent; border:0; border-bottom:1px solid transparent; border-radius:0; padding:2px 2px 10px; margin-bottom:12px; }
+input.compose__title:focus { outline:none; border-bottom-color:var(--border-2); box-shadow:none; }
+input.compose__title::placeholder { color:var(--ink-4); }
 
-/* burn-after-read checkbox row */
-.check { display: flex; align-items: flex-start; gap: 10px; font-size: 13px; font-weight: 500; color: var(--ink-2); cursor: pointer; }
-.check input[type=checkbox] { width: auto; margin-top: 2px; accent-color: var(--accent); flex: 0 0 auto; }
-.check span { line-height: 1.5; }
+/* ---- Editor box: gist-style file tabs + stacked file panels -------------- */
+.editor { border:1px solid var(--border); border-radius:var(--r-sm); background:var(--surface); overflow:clip; }
+.editor__tabs { display:flex; align-items:stretch; height:36px; background:var(--surface-2); border-bottom:1px solid var(--border); overflow-x:auto; }
+.editor__tabs[hidden] { display:none; } /* pre-JS the tab strip stays hidden (author display:flex must not defeat [hidden]) */
+.editor__tab { font:500 12.5px/1 var(--mono); color:var(--ink-2); background:transparent; border:0; border-right:1px solid var(--hairline); padding:0 14px; cursor:pointer; white-space:nowrap; max-width:220px; overflow:hidden; text-overflow:ellipsis; }
+.editor__tab:hover { color:var(--ink); background:var(--surface-3); }
+.editor__tab.is-active { background:var(--surface); color:var(--ink); box-shadow:inset 0 2px 0 var(--accent); }
+.editor__addtab { font:600 12px/1 var(--font); color:var(--ink-3); background:transparent; border:0; padding:0 12px; cursor:pointer; margin-left:auto; white-space:nowrap; }
+.editor__addtab:hover { color:var(--accent); }
+.editor__file + .editor__file { border-top:1px solid var(--border); }
+.js .editor__file:not(.is-active) { display:none; }
+.editor__filehead { display:flex; align-items:center; gap:8px; min-height:40px; padding:6px 8px 6px 12px; background:var(--surface-2); border-bottom:1px solid var(--border); }
+input.editor__filename { font:500 12.5px/1 var(--mono); flex:1 1 auto; max-width:320px; height:28px; padding:0 8px; border:1px solid var(--border); border-radius:var(--r-xs); background:var(--surface); color:var(--ink); }
+input.editor__filename:focus { border-color:var(--accent); box-shadow:0 0 0 4px var(--ring); outline:none; }
+.editor__remove { margin-left:auto; }
 
-/* monospace compose surface */
-.code-input { font-family: var(--mono); font-size: 13px; line-height: 1.6; min-height: 320px; tab-size: 2; }
+/* monospace compose surface — borderless inside the editor frame */
+.code-input { font-family:var(--mono); font-size:13px; line-height:1.65; tab-size:2; width:100%; min-height:clamp(320px, 55vh, 720px); padding:14px 16px; border:0; border-radius:0; background:var(--surface); resize:vertical; display:block; }
+.code-input:focus { box-shadow:none; } /* the editor box is the frame; global :focus-visible still applies */
 
-/* recent / similar paste lists */
-.paste-list { list-style: none; margin: 0; padding: 6px; }
-.paste-item { display: flex; flex-direction: column; gap: 7px; padding: 12px 14px; border-radius: var(--radius-sm); transition: background .1s; }
-.paste-item:hover { background: var(--surface-2); }
-.paste-item + .paste-item { border-top: 1px solid var(--border); }
-.paste-item__title { font-weight: 550; font-size: 13.5px; color: var(--ink); }
-.paste-item__title:hover { color: var(--accent); }
-.paste-item__meta { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; color: var(--ink-3); font-size: 12px; }
-.paste-item--empty { color: var(--ink-3); font-size: 13px; padding: 28px 14px; text-align: center; justify-content: center; }
-.paste-item--empty:hover { background: transparent; }
+/* ---- Compose bar + options popover --------------------------------------- */
+.compose__bar { display:flex; align-items:center; gap:10px; margin-top:14px; flex-wrap:wrap; }
+.compose__spacer { flex:1; }
+.select--bar { height:32px; font-size:13px; padding:0 30px 0 10px; width:auto; min-width:130px; }
+.opts { position:relative; }
+.opts__summary { list-style:none; cursor:pointer; display:inline-flex; align-items:center; height:32px; padding:0 12px; font:600 13px/1 var(--font); color:var(--ink-2); border:1px solid var(--border); border-radius:var(--r-xs); background:var(--surface); user-select:none; -webkit-user-select:none; }
+.opts__summary::-webkit-details-marker { display:none; }
+.opts__summary::after { content:"▾"; margin-left:6px; font-size:10px; color:var(--ink-3); }
+.opts__summary:hover { border-color:var(--border-2); }
+.opts[open] .opts__summary { color:var(--ink); border-color:var(--accent); }
+.opts__pop { position:absolute; bottom:calc(100% + 8px); left:0; z-index:30; min-width:280px; padding:14px; background:var(--surface); border:1px solid var(--border); border-radius:var(--r); box-shadow:var(--sh-pop); display:grid; gap:12px; }
+.check--chip { display:inline-flex; align-items:center; gap:8px; padding:7px 10px; border:1px solid var(--border); border-radius:var(--r-xs); cursor:pointer; font-size:13px; color:var(--ink-2); }
+.check--chip:has(input:checked) { background:var(--warn-soft); border-color:var(--warn); color:var(--warn-ink); }
+
+/* ---- View tabs: shared .tabs/.tab kit, tightened above the code card ----- */
+.tabs--view { margin-bottom:12px; }
+
+/* ---- Badge row (lang / expiry<24h warn / burn down / password info) ------ */
+.badges { display:flex; align-items:center; flex-wrap:wrap; gap:6px; margin-top:8px; }
 
 /* language badge — soft accent-tint pill */
 .lang-badge { display: inline-flex; align-items: center; font-size: 11px; font-weight: 550; padding: 2px 8px; border-radius: 999px; letter-spacing: 0; background: var(--accent-soft); color: var(--accent-2); border: 1px solid var(--accent-border); }
-.lang-badge--lg { font-size: 12px; padding: 4px 10px; }
 
-/* view: the code tool cluster + owner-only delete sit inline */
-.code-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
-.delete-form, .inline-form { display: inline-flex; margin: 0; }
-
-/* "Forked from …" credit + optional-field hint */
+/* "Forked from …" credit + optional-field hint + inline POST controls */
 .sub--credit { margin-top: 4px; font-size: 12px; }
 .field-hint { color: var(--ink-3); font-weight: 400; font-size: 12px; }
+.delete-form, .inline-form { display: inline-flex; margin: 0; }
+
+/* ---- File block (view page): sticky file head + Copy/Raw/Download -------- */
+.card--code { overflow:clip; } /* clip (not hidden) keeps the sticky head working */
+.file-block + .file-block { border-top: 1px solid var(--border); }
+.file-block__head { position:sticky; top:56px; z-index:5; display:flex; align-items:center; gap:10px; min-height:40px; padding:6px 10px 6px 16px; background:var(--surface-2); border-bottom:1px solid var(--border); user-select:none; -webkit-user-select:none; } /* top:56px = sticky appbar height; keep in sync */
+.file-block__head svg { width: 15px; height: 15px; color: var(--ink-3); flex: 0 0 auto; }
+.file-block__fname { font:600 12.5px/1.4 var(--mono); color:var(--ink); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.file-block__meta { font-size:12px; color:var(--ink-3); font-variant-numeric:tabular-nums; white-space:nowrap; }
+.file-block__tools { margin-left:auto; display:flex; align-items:center; gap:6px; flex-wrap:wrap; justify-content:flex-end; }
+.file-copy { white-space:nowrap; }
 
 /* code body — flush within the card, scrollable, monospace */
 .card__body--code { padding: 0; }
@@ -434,30 +464,33 @@ body.page { max-width:none; margin:0; padding:0; }
 /* numbered line gutter + per-line anchors (rendered by highlight::render_lines) */
 .code-lines { padding: 12px 0; counter-reset: none; }
 .ln { display: flex; align-items: baseline; padding: 0 20px; }
-.ln:target, .ln--hl { background: var(--accent-soft); }
-.ln-no { flex: 0 0 auto; width: 3.2em; margin-right: 16px; text-align: right; color: var(--ink-3); font-variant-numeric: tabular-nums; user-select: none; -webkit-user-select: none; }
+.ln:target, .ln--hl { background: var(--warn-soft); box-shadow: inset 3px 0 0 var(--warn); }
+.ln-no { flex: 0 0 auto; width: 3.2em; padding-right: 10px; margin-right: 14px; text-align: right; color: var(--ink-4); font-variant-numeric: tabular-nums; user-select: none; -webkit-user-select: none; border-right: 1px solid var(--hairline); }
 .ln-no:hover { color: var(--accent); }
 .ln-code { flex: 1 1 auto; white-space: pre; min-height: 1.6em; }
-
-/* multi-file pastes — one titled block per file, stacked (single-file pastes render one
-   unlabeled block, exactly as before) */
-.file-block + .file-block { border-top: 1px solid var(--border); }
-.file-block__head { display: flex; align-items: center; gap: 8px; padding: 10px 20px; font-family: var(--mono); font-size: 12.5px; font-weight: 600; color: var(--ink-2); background: var(--surface-2); border-bottom: 1px solid var(--border); }
-.file-block__head svg { width: 15px; height: 15px; color: var(--ink-3); flex: 0 0 auto; }
-.file-block__count { margin-left: auto; font-weight: 500; color: var(--ink-3); }
-
-/* multi-file compose editor — repeatable filename + content rows */
-.file-editor { display: flex; flex-direction: column; gap: 14px; margin-bottom: 12px; }
-.file-row { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px 16px; background: var(--surface-2); }
-.file-row__head { display: flex; align-items: flex-end; gap: 12px; margin-bottom: 10px; }
-.file-row__head .field { margin-bottom: 0; }
-.file-row .code-input { min-height: 160px; }
 
 /* syntax-highlight tokens (emitted by highlight.rs) */
 .tok-kw  { color: var(--accent-2); font-weight: 550; }
 .tok-str { color: var(--ok-ink); }
 .tok-num { color: var(--warn-ink); }
 .tok-com { color: var(--ink-3); font-style: italic; }
+
+/* ---- Paste list — dense rows (recent / similar / history) ---------------- */
+.card__body--list { padding:8px 8px 10px; } /* the list card sheds the big body inset */
+.paste-list { list-style:none; margin:0; padding:0; }
+.paste-item { margin:0; padding:0; }
+.paste-item + .paste-item { border-top:1px solid var(--hairline); }
+.paste-item__row { display:grid; grid-template-columns:minmax(0,1fr) auto auto; align-items:center; gap:8px; padding:8px 10px; border-radius:var(--r-xs); text-decoration:none; transition:background var(--dur) var(--ease); }
+.paste-item__row:hover { background:var(--surface-2); text-decoration:none; }
+.paste-item__title { font:550 13px/1.4 var(--font); color:var(--ink); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.paste-item__row:hover .paste-item__title { color:var(--accent); }
+.paste-item__num { font-size:11.5px; color:var(--ink-3); font-variant-numeric:tabular-nums; white-space:nowrap; }
+.paste-item--empty { padding:24px 12px; text-align:center; color:var(--ink-3); font-size:13px; }
+
+/* ---- View layout: main column + optional similar rail -------------------- */
+.layout--view { display:block; }
+.layout--view.has-rail { display:grid; grid-template-columns:minmax(0,1fr) 320px; gap:20px; align-items:start; }
+.layout__main { min-width:0; } /* code-pre scrolls inside; the body never scrolls sideways */
 
 /* inline alerts (validation errors / burn notices) */
 .alert { padding: 12px 16px; border-radius: var(--radius-sm); font-size: 13.5px; border: 1px solid var(--border); background: var(--surface-2); margin-bottom: 18px; }
@@ -487,8 +520,11 @@ body.page { max-width:none; margin:0; padding:0; }
 .is-busy { opacity:.55; pointer-events:none; }
 .is-pending { opacity:.6; }
 
-/* pastefire — per-file copy affordance in each multi-file block header. The
-   name grows; the tools cluster (language pill + "n of N" + Copy) sits right. */
-.file-block__tools { margin-left:auto; display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; }
-.file-block__tools .file-block__count { margin-left:0; }
-.file-copy { white-space:nowrap; }
+/* ---- Responsive addenda — pastefire layer only (shared breakpoints above) - */
+@media (max-width:900px){
+  .layout--view.has-rail { grid-template-columns:1fr; } /* similar rail drops below the code */
+}
+@media (max-width:720px){
+  .file-block__head { padding-left:12px; }
+  .compose__bar { gap:8px; }
+}

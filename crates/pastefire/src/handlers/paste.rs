@@ -18,8 +18,8 @@ use crate::auth::{self, Identity};
 use crate::config::{clamp_page, DEFAULT_PAGE, MAX_BODY_BYTES, MAX_TITLE_CHARS};
 use crate::error::AppError;
 use crate::handlers::{
-    esc, expiry_options, fmt_ts, language_label, language_options, parse_expiry, userbox, APP_CSS,
-    LANGUAGES, SHIELD_SVG,
+    esc, expiry_options, fmt_dur_short, fmt_size, fmt_ts, language_label, language_options,
+    parse_expiry, userbox, APP_CSS, LANGUAGES, SHIELD_SVG,
 };
 use crate::model::{Paste, PasteFile, PasteRevision};
 use crate::{highlight, now_secs, random_alnum, similar, AppState};
@@ -89,7 +89,16 @@ pub async fn new_form(
     let load_older = render_load_older(&recent, limit, q.limit);
 
     let html = render_new(
-        &who, &csrf, &recent, &load_older, None, "", "plaintext", "never", false, &[],
+        &who,
+        &csrf,
+        &recent,
+        &load_older,
+        None,
+        "",
+        "plaintext",
+        "never",
+        false,
+        &[],
     );
     html_with_csrf(StatusCode::OK, html, &csrf)
 }
@@ -192,7 +201,12 @@ pub async fn create(
         state.store.set_files(&paste.id, &rows).await?;
     }
 
-    tracing::info!(id = paste.id, author = who.subject, files = files.len(), "paste created");
+    tracing::info!(
+        id = paste.id,
+        author = who.subject,
+        files = files.len(),
+        "paste created"
+    );
 
     // Tamper-evident trail: record the create AFTER the store insert succeeded. `detail` is
     // value-free metadata (never the body) — only whether the paste self-destructs on read.
@@ -255,7 +269,16 @@ pub async fn view(
 
     let highlight_lines = q.lines.as_deref().and_then(parse_lines);
     let csrf = auth::new_csrf_token();
-    let html = render_paste_view(&state, &paste, &viewer, is_owner, &csrf, highlight_lines, now).await;
+    let html = render_paste_view(
+        &state,
+        &paste,
+        &viewer,
+        is_owner,
+        &csrf,
+        highlight_lines,
+        now,
+    )
+    .await;
 
     // Burn-after-read: this recipient's read consumes the paste (see [`maybe_burn`]).
     maybe_burn(&state, &paste, &viewer, is_owner).await;
@@ -270,7 +293,9 @@ async fn load_live(state: &AppState, id: &str, now: i64) -> Result<Paste, AppErr
         Some(_) => Err(AppError::NotFound(
             "This paste has expired and is no longer available.".to_string(),
         )),
-        None => Err(AppError::NotFound("No paste exists at that link.".to_string())),
+        None => Err(AppError::NotFound(
+            "No paste exists at that link.".to_string(),
+        )),
     }
 }
 
@@ -283,7 +308,11 @@ async fn maybe_burn(state: &AppState, paste: &Paste, viewer: &Identity, is_owner
     if let Err(e) = state.store.delete(&paste.id, &paste.author_sub).await {
         tracing::warn!(id = paste.id, error = %e, "burn-after-read purge failed");
     } else {
-        tracing::info!(id = paste.id, viewer = viewer.subject, "paste burned after read");
+        tracing::info!(
+            id = paste.id,
+            viewer = viewer.subject,
+            "paste burned after read"
+        );
     }
 }
 
@@ -330,6 +359,12 @@ async fn similar_pastes(state: &AppState, paste: &Paste, now: i64) -> Vec<(f64, 
 // GET /raw/{id} — the raw body as text/plain
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Deserialize)]
+pub struct RawQuery {
+    #[serde(default)]
+    pub file: Option<usize>,
+}
+
 /// `GET /raw/{id}` — serve the body verbatim as `text/plain` (with `nosniff`, so a browser
 /// never reinterprets it as HTML). Honors expiry. A raw read by a non-author also consumes a
 /// burn-after-read paste (so a recipient cannot bypass the burn by fetching `/raw`).
@@ -337,6 +372,7 @@ pub async fn raw(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Query(q): Query<RawQuery>,
 ) -> Result<Response, AppError> {
     let viewer = auth::identity(&headers);
     let now = now_secs();
@@ -351,12 +387,29 @@ pub async fn raw(
                         .to_string(),
                 ));
             }
-            let body = p.body.clone();
+            let body = if let Some(position) = q.file {
+                let files = state.store.list_files(&p.id).await.unwrap_or_default();
+                if files.is_empty() {
+                    return Err(AppError::NotFound(
+                        "No such file in this paste.".to_string(),
+                    ));
+                }
+                files
+                    .get(position)
+                    .map(|f| f.content.clone())
+                    .ok_or_else(|| AppError::NotFound("No such file in this paste.".to_string()))?
+            } else {
+                p.body.clone()
+            };
             if p.burn_after_read && p.author_sub != viewer.subject {
                 if let Err(e) = state.store.delete(&p.id, &p.author_sub).await {
                     tracing::warn!(id = p.id, error = %e, "burn-after-read purge (raw) failed");
                 } else {
-                    tracing::info!(id = p.id, viewer = viewer.subject, "paste burned after raw read");
+                    tracing::info!(
+                        id = p.id,
+                        viewer = viewer.subject,
+                        "paste burned after raw read"
+                    );
                 }
             }
             Ok((
@@ -369,7 +422,9 @@ pub async fn raw(
                 .into_response())
         }
         Some(_) => Err(AppError::NotFound("This paste has expired.".to_string())),
-        None => Err(AppError::NotFound("No paste exists at that link.".to_string())),
+        None => Err(AppError::NotFound(
+            "No paste exists at that link.".to_string(),
+        )),
     }
 }
 
@@ -419,7 +474,9 @@ pub async fn delete(
         Some(_) => Err(AppError::Forbidden(
             "You can only delete your own pastes.".to_string(),
         )),
-        None => Err(AppError::NotFound("No paste exists at that link.".to_string())),
+        None => Err(AppError::NotFound(
+            "No paste exists at that link.".to_string(),
+        )),
     }
 }
 
@@ -461,7 +518,12 @@ pub async fn unlock(
 
     if !auth::verify_password(&form.password, hash) {
         let csrf = auth::new_csrf_token();
-        let html = render_unlock(&viewer, &paste.id, &csrf, Some("Incorrect password. Try again."));
+        let html = render_unlock(
+            &viewer,
+            &paste.id,
+            &csrf,
+            Some("Incorrect password. Try again."),
+        );
         return Ok(html_with_csrf(StatusCode::BAD_REQUEST, html, &csrf));
     }
 
@@ -494,7 +556,15 @@ pub async fn edit_form(
     }
     let files = load_file_inputs(&state, &paste).await;
     let csrf = auth::new_csrf_token();
-    let html = render_edit(&who, &paste.id, None, &paste.title, &paste.language, &files, &csrf);
+    let html = render_edit(
+        &who,
+        &paste.id,
+        None,
+        &paste.title,
+        &paste.language,
+        &files,
+        &csrf,
+    );
     Ok(html_with_csrf(StatusCode::OK, html, &csrf))
 }
 
@@ -523,13 +593,25 @@ pub async fn edit(
         ));
     }
 
-    let new_title: String = field(&pairs, "title").trim().chars().take(MAX_TITLE_CHARS).collect();
+    let new_title: String = field(&pairs, "title")
+        .trim()
+        .chars()
+        .take(MAX_TITLE_CHARS)
+        .collect();
     let new_language = normalize_language(field(&pairs, "language"));
     let files = collect_files_or_legacy(&pairs);
 
     if let Some(msg) = files_problem(&files) {
         let csrf = auth::new_csrf_token();
-        let html = render_edit(&who, &paste.id, Some(msg), &new_title, &new_language, &files, &csrf);
+        let html = render_edit(
+            &who,
+            &paste.id,
+            Some(msg),
+            &new_title,
+            &new_language,
+            &files,
+            &csrf,
+        );
         return Ok(html_with_csrf(StatusCode::BAD_REQUEST, html, &csrf));
     }
 
@@ -570,8 +652,17 @@ pub async fn edit(
         state.store.set_files(&paste.id, &[]).await?;
     }
 
-    tracing::info!(id = paste.id, author = who.subject, revision = next, "paste edited");
-    let actor = if who.email.is_empty() { &who.subject } else { &who.email };
+    tracing::info!(
+        id = paste.id,
+        author = who.subject,
+        revision = next,
+        "paste edited"
+    );
+    let actor = if who.email.is_empty() {
+        &who.subject
+    } else {
+        &who.email
+    };
     state.audit.emit(AuditEvent::info(
         "paste.edit",
         actor,
@@ -665,8 +756,17 @@ pub async fn fork(
         state.store.set_files(&paste.id, &rows).await?;
     }
 
-    tracing::info!(id = paste.id, source = source.id, author = who.subject, "paste forked");
-    let actor = if who.email.is_empty() { &who.subject } else { &who.email };
+    tracing::info!(
+        id = paste.id,
+        source = source.id,
+        author = who.subject,
+        "paste forked"
+    );
+    let actor = if who.email.is_empty() {
+        &who.subject
+    } else {
+        &who.email
+    };
     state
         .audit
         .emit(AuditEvent::info("paste.fork", actor, &paste.id, &source.id));
@@ -870,7 +970,13 @@ fn combined_body(files: &[FileInput]) -> String {
     files
         .iter()
         .enumerate()
-        .map(|(i, f)| format!("===== {} =====\n{}", display_filename(&f.filename, i), f.content))
+        .map(|(i, f)| {
+            format!(
+                "===== {} =====\n{}",
+                display_filename(&f.filename, i),
+                f.content
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n\n")
 }
@@ -1014,50 +1120,54 @@ fn render_new(
         None => String::new(),
     };
     let burn_checked = if burn { " checked" } else { "" };
+    let opts_open = if burn { " open" } else { "" };
     NEW_HTML
         .replace("{{CSS}}", APP_CSS)
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("New paste", Some(&who.email)))
-        .replace("{{ERROR}}", &error_block)
-        .replace("{{TITLE}}", &esc(title))
+        .replace("{{CSRF}}", &esc(csrf))
         .replace("{{LANGUAGE_OPTIONS}}", &language_options(language))
         .replace("{{EXPIRY_OPTIONS}}", &expiry_options(expiry))
+        .replace("{{OPTS_OPEN}}", opts_open)
         .replace("{{BURN_CHECKED}}", burn_checked)
-        .replace("{{FILE_ROWS}}", &render_file_rows(files))
-        .replace("{{CSRF}}", &esc(csrf))
+        .replace("{{TITLE_VALUE}}", &esc(title))
+        .replace("{{ERROR}}", &error_block)
+        .replace("{{FILE_ROWS}}", &render_file_rows(files, true))
         .replace("{{RECENT}}", &render_recent(recent))
         .replace("{{LOAD_OLDER}}", load_older)
 }
 
-/// Render the compose/edit file rows (one `<div class="file-row">` per file), always emitting at
+/// Render the compose/edit file rows (one `<div class="editor__file">` per file), always emitting at
 /// least one row so a fresh form starts with a single empty file. Every user string is escaped.
-fn render_file_rows(files: &[FileInput]) -> String {
+fn render_file_rows(files: &[FileInput], autofocus_first: bool) -> String {
     if files.is_empty() {
-        return render_file_row("", "");
+        return render_file_row("", "", autofocus_first);
     }
     files
         .iter()
-        .map(|f| render_file_row(&f.filename, &f.content))
+        .enumerate()
+        .map(|(i, f)| render_file_row(&f.filename, &f.content, autofocus_first && i == 0))
         .collect::<Vec<_>>()
         .join("")
 }
 
 /// A single compose/edit file row: a filename input + a content textarea (matching the static
 /// `<template>` the add-file JS clones), with both values HTML-escaped.
-fn render_file_row(filename: &str, content: &str) -> String {
+fn render_file_row(filename: &str, content: &str, autofocus: bool) -> String {
+    let maybe_autofocus = if autofocus { " autofocus" } else { "" };
     format!(
-        "<div class=\"file-row\" data-file-row>\
-           <div class=\"file-row__head\">\
-             <div class=\"field field--grow\">\
-               <label>Filename <span class=\"field-hint\">optional</span></label>\
-               <input type=\"text\" name=\"file_name\" maxlength=\"128\" value=\"{name}\" placeholder=\"e.g. main.rs\">\
-             </div>\
-             <button class=\"btn btn-ghost btn-sm\" type=\"button\" data-file-remove>Remove</button>\
+        "<div class=\"editor__file\" data-file-row>\
+           <div class=\"editor__filehead\">\
+             <input class=\"editor__filename\" type=\"text\" name=\"file_name\" maxlength=\"128\" value=\"{name}\" \
+                    placeholder=\"Filename including extension (optional)\" autocomplete=\"off\">\
+             <button class=\"btn btn-ghost btn-sm editor__remove\" type=\"button\" data-file-remove>Remove</button>\
            </div>\
-           <textarea name=\"file_content\" class=\"code-input\" spellcheck=\"false\" autocomplete=\"off\" placeholder=\"Paste this file's content here…\">{content}</textarea>\
+           <textarea name=\"file_content\" class=\"code-input\" spellcheck=\"false\" autocomplete=\"off\"{autofocus} \
+                     placeholder=\"Paste your content here…\">{content}</textarea>\
          </div>",
         name = esc(filename),
         content = esc(content),
+        autofocus = maybe_autofocus,
     )
 }
 
@@ -1075,24 +1185,19 @@ fn render_recent(recent: &[Paste]) -> String {
             } else {
                 p.title.clone()
             };
-            let expiry = match p.expires_at {
-                Some(exp) => format!("expires {}", fmt_ts(exp)),
-                None => "never expires".to_string(),
-            };
+            let created = fmt_ts(p.created_at).chars().take(10).collect::<String>();
             format!(
                 "<li class=\"paste-item\">\
-                   <a class=\"paste-item__title\" href=\"/p/{id}\">{title}</a>\
-                   <span class=\"paste-item__meta\">\
+                   <a class=\"paste-item__row\" href=\"/p/{id}\">\
+                     <span class=\"paste-item__title\">{title}</span>\
                      <span class=\"lang-badge\">{lang}</span>\
-                     <span>{created}</span>\
-                     <span>{expiry}</span>\
-                   </span>\
+                     <span class=\"paste-item__num\">{created}</span>\
+                   </a>\
                  </li>",
                 id = esc(&p.id),
                 title = esc(&title),
                 lang = esc(&language_label(&p.language)),
-                created = esc(&fmt_ts(p.created_at)),
-                expiry = esc(&expiry),
+                created = esc(&created),
             )
         })
         .collect::<Vec<_>>()
@@ -1146,64 +1251,130 @@ async fn render_paste_view(
         .await
         .unwrap_or_default()
         .len();
-    // Multi-file pastes render each file as its own titled, line-numbered block; a
-    // legacy/single-content paste (no `paste_files` rows) renders one unlabeled block exactly
-    // as before, and the `?lines=` line-range highlight still applies to it.
     let files = state.store.list_files(&paste.id).await.unwrap_or_default();
-    let body_html = render_body_html(paste, &files, highlight_lines);
+    let accessible = is_owner || paste.password_hash.is_none();
+    let allow_raw = accessible && (!paste.burn_after_read || is_owner);
+    let body_html = render_body_html(
+        &paste.id,
+        &paste.title,
+        &paste.language,
+        &paste.body,
+        &files,
+        highlight_lines,
+        allow_raw,
+    );
     let burned = paste.burn_after_read && !is_owner;
     render_view_html(
         paste,
         viewer,
         is_owner,
+        accessible,
         burned,
         &similar,
         csrf,
         &body_html,
         revision_count,
+        now,
     )
 }
 
-/// Render a paste's code area: one titled block per file for a multi-file paste, or a single
-/// unlabeled `code-pre code-lines` block for a legacy/single-content paste (byte-identical to the
-/// old view — the `?lines=` highlight only applies in the single-file case).
+/// Render a paste's code area: single-content and multi-file pastes share the same file-block
+/// shell, while `?lines=` keeps its legacy single-file behavior.
 fn render_body_html(
-    paste: &Paste,
+    paste_id: &str,
+    title: &str,
+    language: &str,
+    body: &str,
     files: &[PasteFile],
     highlight_lines: Option<(usize, usize)>,
+    allow_raw: bool,
 ) -> String {
     if files.is_empty() {
-        return format!(
-            "<div class=\"code-pre code-lines\">{}</div>",
-            highlight::render_lines(&paste.language, &paste.body, highlight_lines)
+        let filename = if title.trim().is_empty() {
+            "paste".to_string()
+        } else {
+            title.to_string()
+        };
+        let download_name = if title.trim().is_empty() {
+            format!("paste-{paste_id}.txt")
+        } else {
+            title.to_string()
+        };
+        return render_file_block(
+            &filename,
+            language,
+            body,
+            highlight_lines,
+            &format!("/raw/{paste_id}"),
+            &download_name,
+            allow_raw,
         );
     }
-    let count = files.len();
     files
         .iter()
         .enumerate()
         .map(|(i, f)| {
-            format!(
-                "<div class=\"file-block\">\
-                   <div class=\"file-block__head\">{icon}<span>{name}</span>\
-                     <span class=\"file-block__tools\">\
-                       <span class=\"lang-badge\">{lang}</span>\
-                       <span class=\"file-block__count\">{n} of {count}</span>\
-                       <button class=\"btn btn-subtle btn-sm file-copy\" type=\"button\" \
-                         data-copy=\"file\" data-label=\"Copy\" aria-label=\"Copy this file\">Copy</button>\
-                     </span></div>\
-                   <div class=\"code-pre code-lines\">{lines}</div>\
-                 </div>",
-                icon = FILE_ICON_SVG,
-                name = esc(&display_filename(&f.filename, i)),
-                lang = esc(&language_label(&paste.language)),
-                n = i + 1,
-                count = count,
-                lines = highlight::render_lines(&paste.language, &f.content, None),
+            let raw_href = format!("/raw/{paste_id}?file={i}");
+            render_file_block(
+                &display_filename(&f.filename, i),
+                language,
+                &f.content,
+                None,
+                &raw_href,
+                &download_filename(paste_id, &f.filename),
+                allow_raw,
             )
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn render_file_block(
+    filename: &str,
+    language: &str,
+    content: &str,
+    highlight_lines: Option<(usize, usize)>,
+    raw_href: &str,
+    download_name: &str,
+    allow_raw: bool,
+) -> String {
+    let line_count = content.lines().count();
+    let line_word = if line_count == 1 { "line" } else { "lines" };
+    let mut tools = "<button type=\"button\" class=\"btn btn-ghost btn-sm file-copy\" \
+                     data-copy=\"file\" data-label=\"Copy\">Copy</button>"
+        .to_string();
+    if allow_raw {
+        tools.push_str(&format!(
+            "<a class=\"btn btn-ghost btn-sm\" href=\"{raw_href}\">Raw</a>\
+             <a class=\"btn btn-ghost btn-sm\" href=\"{raw_href}\" download=\"{download}\">Download</a>",
+            raw_href = esc(raw_href),
+            download = esc(download_name),
+        ));
+    }
+    format!(
+        "<div class=\"file-block\">\
+           <div class=\"file-block__head\">{icon}<span class=\"file-block__fname\">{filename}</span>\
+             <span class=\"file-block__meta\">{line_count} {line_word} · {size}</span>\
+             <span class=\"file-block__tools\">{tools}</span>\
+           </div>\
+           <div class=\"code-pre code-lines\">{lines}</div>\
+         </div>",
+        icon = FILE_ICON_SVG,
+        filename = esc(filename),
+        line_count = line_count,
+        line_word = line_word,
+        size = esc(&fmt_size(content.len())),
+        tools = tools,
+        lines = highlight::render_lines(language, content, highlight_lines),
+    )
+}
+
+fn download_filename(paste_id: &str, filename: &str) -> String {
+    if filename.trim().is_empty() {
+        format!("paste-{paste_id}.txt")
+    } else {
+        filename.to_string()
+    }
 }
 
 /// A file's display name, or the `File {n}` placeholder when it has no name.
@@ -1215,22 +1386,47 @@ fn display_filename(filename: &str, index: usize) -> String {
     }
 }
 
-/// The per-paste action buttons (`{{TOOLS}}`). Raw/history/fork honor the password gate; edit and
-/// delete are owner-only. Each POST control carries the double-submit CSRF token.
-fn view_tools(paste: &Paste, is_owner: bool, csrf: &str, revision_count: usize) -> String {
+fn view_tabs(paste_id: &str, revision_count: Option<usize>, history_active: bool) -> String {
+    let id = esc(paste_id);
+    let code_class = if history_active {
+        "tab"
+    } else {
+        "tab is-active"
+    };
+    let code_current = if history_active {
+        ""
+    } else {
+        " aria-current=\"page\""
+    };
+    let history_class = if history_active {
+        "tab is-active"
+    } else {
+        "tab"
+    };
+    let history_current = if history_active {
+        " aria-current=\"page\""
+    } else {
+        ""
+    };
+    let history_label = match revision_count {
+        Some(n) if n > 0 => format!("History ({n})"),
+        _ => "History".to_string(),
+    };
+    format!(
+        "<nav class=\"tabs tabs--view\" aria-label=\"Paste views\">\
+           <a class=\"{code_class}\"{code_current} href=\"/p/{id}\">Code</a>\
+           <a class=\"{history_class}\"{history_current} href=\"/p/{id}/history\">{history_label}</a>\
+         </nav>",
+        history_label = esc(&history_label),
+    )
+}
+
+/// The page-level action buttons (`{{ACTIONS}}`). Fork honors the password gate; edit and delete
+/// are owner-only. Each POST control carries the double-submit CSRF token.
+fn page_actions(paste: &Paste, is_owner: bool, csrf: &str) -> String {
     let id = esc(&paste.id);
     let accessible = is_owner || paste.password_hash.is_none();
     let mut out = String::new();
-    if accessible {
-        out.push_str(&format!(
-            "<a class=\"btn btn-ghost btn-sm\" href=\"/raw/{id}\">View raw</a>"
-        ));
-    }
-    if revision_count > 0 && accessible {
-        out.push_str(&format!(
-            "<a class=\"btn btn-ghost btn-sm\" href=\"/p/{id}/history\">History</a>"
-        ));
-    }
     if accessible {
         out.push_str(&format!(
             "<form class=\"inline-form\" method=\"post\" action=\"/fork/{id}\">\
@@ -1256,6 +1452,32 @@ fn view_tools(paste: &Paste, is_owner: bool, csrf: &str, revision_count: usize) 
     out
 }
 
+fn render_badges(paste: &Paste, now: i64) -> String {
+    let mut out = format!(
+        "<span class=\"lang-badge\">{}</span>",
+        esc(&language_label(&paste.language))
+    );
+    if let Some(expires_at) = paste.expires_at {
+        let remaining = expires_at - now;
+        let class = if remaining < 86_400 {
+            "pill pill-warn"
+        } else {
+            "pill"
+        };
+        out.push_str(&format!(
+            "<span class=\"{class}\">Expires {}</span>",
+            esc(&fmt_dur_short(remaining))
+        ));
+    }
+    if paste.burn_after_read {
+        out.push_str("<span class=\"pill pill-down\">Burn after read</span>");
+    }
+    if paste.password_hash.is_some() {
+        out.push_str("<span class=\"pill pill-info\">Password protected</span>");
+    }
+    out
+}
+
 /// The "Forked from …" credit line (`{{SOURCE}}`), or empty for an original paste.
 fn source_credit(paste: &Paste) -> String {
     match &paste.source_id {
@@ -1272,33 +1494,18 @@ fn render_view_html(
     paste: &Paste,
     viewer: &Identity,
     is_owner: bool,
+    accessible: bool,
     burned: bool,
     similar: &[(f64, Paste)],
     csrf: &str,
     body_html: &str,
     revision_count: usize,
+    now: i64,
 ) -> String {
-    let expiry = match paste.expires_at {
-        Some(exp) => format!("Expires {}", fmt_ts(exp)),
-        None => "Never expires".to_string(),
-    };
-    let burn_meta = if paste.burn_after_read {
-        " · Burn after read"
-    } else {
-        ""
-    };
-    let lock_meta = if paste.password_hash.is_some() {
-        " · Password-protected"
-    } else {
-        ""
-    };
     let meta = format!(
-        "Created {created} by {author} · {expiry}{burn}{lock}",
+        "Created {created} by {author}",
         created = esc(&fmt_ts(paste.created_at)),
         author = esc(&paste.author_email),
-        expiry = esc(&expiry),
-        burn = burn_meta,
-        lock = lock_meta,
     );
 
     // A one-time notice shown to the recipient whose read just consumed a burn paste.
@@ -1306,28 +1513,36 @@ fn render_view_html(
         "<div class=\"alert alert-warn\" role=\"alert\">This was a burn-after-read paste. \
          It has now been deleted and this link will no longer work.</div>"
             .to_string()
-    } else if paste.burn_after_read {
-        "<div class=\"alert alert-warn\" role=\"alert\">Burn after read — this paste will be \
-         deleted the first time someone other than you opens it.</div>"
-            .to_string()
     } else {
         String::new()
     };
 
-    let tools = view_tools(paste, is_owner, csrf, revision_count);
+    let similar_html = render_similar(similar);
+    let layout_mod = if similar_html.is_empty() {
+        ""
+    } else {
+        " has-rail"
+    };
+    let tabs = if accessible {
+        view_tabs(&paste.id, Some(revision_count), false)
+    } else {
+        String::new()
+    };
+    let actions = page_actions(paste, is_owner, csrf);
     // `body_html` is pre-rendered by [`render_body_html`] (every character already HTML-escaped
     // by `highlight::render_lines`), so this is never less safe than a plain `esc(body)`.
     fill_view(
         &viewer.email,
         &title_or_untitled(&paste.title),
-        &language_label(&paste.language),
         &meta,
         &burn_notice,
         &source_credit(paste),
-        &paste.id,
-        &tools,
+        &tabs,
+        &render_badges(paste, now),
+        &actions,
         body_html,
-        &render_similar(similar),
+        &similar_html,
+        layout_mod,
     )
 }
 
@@ -1337,26 +1552,28 @@ fn render_view_html(
 fn fill_view(
     viewer_email: &str,
     title: &str,
-    lang_label: &str,
     meta: &str,
     banner: &str,
     source: &str,
-    id: &str,
-    tools: &str,
+    tabs: &str,
+    badges: &str,
+    actions: &str,
     body_html: &str,
     similar: &str,
+    layout_mod: &str,
 ) -> String {
     VIEW_HTML
         .replace("{{CSS}}", APP_CSS)
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("View paste", Some(viewer_email)))
+        .replace("{{TABS}}", tabs)
+        .replace("{{BADGES}}", badges)
+        .replace("{{ACTIONS}}", actions)
+        .replace("{{LAYOUT_MOD}}", layout_mod)
         .replace("{{TITLE}}", &esc(title))
-        .replace("{{LANG_LABEL}}", &esc(lang_label))
         .replace("{{META}}", meta)
         .replace("{{BURN_NOTICE}}", banner)
         .replace("{{SOURCE}}", source)
-        .replace("{{ID}}", &esc(id))
-        .replace("{{TOOLS}}", tools)
         .replace("{{BODY}}", body_html)
         .replace("{{SIMILAR}}", similar)
 }
@@ -1374,25 +1591,29 @@ fn render_revision(viewer: &Identity, paste_id: &str, rev: &PasteRevision) -> St
         n = rev.revision,
         id = esc(paste_id),
     );
-    let tools = format!(
-        "<a class=\"btn btn-ghost btn-sm\" href=\"/p/{id}\">Current version</a>\
-         <a class=\"btn btn-ghost btn-sm\" href=\"/p/{id}/history\">History</a>",
-        id = esc(paste_id),
-    );
-    let body_html = format!(
-        "<div class=\"code-pre code-lines\">{}</div>",
-        highlight::render_lines(&rev.language, &rev.body, None)
+    let body_html = render_body_html(
+        paste_id,
+        &rev.title,
+        &rev.language,
+        &rev.body,
+        &[],
+        None,
+        false,
     );
     fill_view(
         &viewer.email,
         &title_or_untitled(&rev.title),
-        &language_label(&rev.language),
         &meta,
         &banner,
         "",
-        paste_id,
-        &tools,
+        &view_tabs(paste_id, None, true),
+        &format!(
+            "<span class=\"lang-badge\">{}</span>",
+            esc(&language_label(&rev.language))
+        ),
+        "",
         &body_html,
+        "",
         "",
     )
 }
@@ -1425,11 +1646,11 @@ fn render_edit(
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Edit paste", Some(&who.email)))
         .replace("{{ID}}", &esc(id))
-        .replace("{{ERROR}}", &error_block(error))
         .replace("{{CSRF}}", &esc(csrf))
-        .replace("{{TITLE}}", &esc(title))
         .replace("{{LANGUAGE_OPTIONS}}", &language_options(language))
-        .replace("{{FILE_ROWS}}", &render_file_rows(files))
+        .replace("{{ERROR}}", &error_block(error))
+        .replace("{{TITLE_VALUE}}", &esc(title))
+        .replace("{{FILE_ROWS}}", &render_file_rows(files, false))
 }
 
 /// Render the revision-history page: the current version plus every archived revision, newest
@@ -1438,8 +1659,15 @@ fn render_history(viewer: &Identity, paste: &Paste, revisions: &[PasteRevision])
     HISTORY_HTML
         .replace("{{CSS}}", APP_CSS)
         .replace("{{SHIELD}}", SHIELD_SVG)
-        .replace("{{USERBOX}}", &userbox("Paste history", Some(&viewer.email)))
+        .replace(
+            "{{USERBOX}}",
+            &userbox("Paste history", Some(&viewer.email)),
+        )
         .replace("{{ID}}", &esc(&paste.id))
+        .replace(
+            "{{TABS}}",
+            &view_tabs(&paste.id, Some(revisions.len()), true),
+        )
         .replace("{{TITLE}}", &esc(&title_or_untitled(&paste.title)))
         .replace("{{REVISIONS}}", &render_history_items(paste, revisions))
 }
@@ -1450,11 +1678,11 @@ fn render_history_items(paste: &Paste, revisions: &[PasteRevision]) -> String {
     let id = esc(&paste.id);
     let mut out = format!(
         "<li class=\"paste-item\">\
-           <a class=\"paste-item__title\" href=\"/p/{id}\">Current version</a>\
-           <span class=\"paste-item__meta\">\
+           <a class=\"paste-item__row\" href=\"/p/{id}\">\
+             <span class=\"paste-item__title\">Current version</span>\
              <span class=\"lang-badge\">{lang}</span>\
-             <span>created {created}</span>\
-           </span>\
+             <span class=\"paste-item__num\">created {created}</span>\
+           </a>\
          </li>",
         lang = esc(&language_label(&paste.language)),
         created = esc(&fmt_ts(paste.created_at)),
@@ -1469,11 +1697,11 @@ fn render_history_items(paste: &Paste, revisions: &[PasteRevision]) -> String {
     for rev in revisions.iter().rev() {
         out.push_str(&format!(
             "<li class=\"paste-item\">\
-               <a class=\"paste-item__title\" href=\"/p/{id}/rev/{n}\">Revision {n}</a>\
-               <span class=\"paste-item__meta\">\
+               <a class=\"paste-item__row\" href=\"/p/{id}/rev/{n}\">\
+                 <span class=\"paste-item__title\">Revision {n}</span>\
                  <span class=\"lang-badge\">{lang}</span>\
-                 <span>archived {ts}</span>\
-               </span>\
+                 <span class=\"paste-item__num\">archived {ts}</span>\
+               </a>\
              </li>",
             n = rev.revision,
             lang = esc(&language_label(&rev.language)),
@@ -1497,15 +1725,15 @@ fn render_similar(similar: &[(f64, Paste)]) -> String {
             } else {
                 p.title.clone()
             };
-            // Score rendered as a 0–100% match for a human-readable signal.
+            // Score rendered as a 0–100% value for a human-readable signal.
             let pct = (score * 100.0).round() as i64;
             format!(
                 "<li class=\"paste-item\">\
-                   <a class=\"paste-item__title\" href=\"/p/{id}\">{title}</a>\
-                   <span class=\"paste-item__meta\">\
+                   <a class=\"paste-item__row\" href=\"/p/{id}\">\
+                     <span class=\"paste-item__title\">{title}</span>\
                      <span class=\"lang-badge\">{lang}</span>\
-                     <span>{pct}% match</span>\
-                   </span>\
+                     <span class=\"paste-item__num\">{pct}%</span>\
+                   </a>\
                  </li>",
                 id = esc(&p.id),
                 title = esc(&title),
@@ -1516,10 +1744,10 @@ fn render_similar(similar: &[(f64, Paste)]) -> String {
         .collect::<Vec<_>>()
         .join("");
     format!(
-        "<section class=\"card\">\
+        "<aside class=\"rail\"><section class=\"card\">\
            <div class=\"card__head\"><h2>Similar pastes</h2></div>\
-           <div class=\"card__body\"><ul class=\"paste-list\">{items}</ul></div>\
-         </section>"
+           <div class=\"card__body card__body--list\"><ul class=\"paste-list\">{items}</ul></div>\
+         </section></aside>"
     )
 }
 
