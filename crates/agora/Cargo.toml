@@ -14,6 +14,9 @@ name = "agora"
 path = "src/main.rs"
 
 [dependencies]
+# Odyssey canonical design system (vendored path-dep): its APP_CSS (font+tokens+components)
+# is prepended to this crate's service.css so every surface shares one design language.
+odyssey = { path = "../odyssey" }
 # HTTP framework (shared with keystone/keyward/beacon): State/Path/Query/Form extractors,
 # typed responses. The `form` + `query` features are on by default.
 axum = "0.8"

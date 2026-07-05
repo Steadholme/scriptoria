@@ -8,8 +8,23 @@
 use crate::auth;
 use axum::http::HeaderMap;
 
-/// Embedded design-system CSS (brand tokens shared across the HOLDFAST estate).
-const APP_CSS: &str = include_str!("../static/app.css");
+/// Lattice-only CSS layered after Odyssey's canonical font, tokens, and components.
+const SERVICE_CSS: &str = include_str!("../static/service.css");
+
+static APP_CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Embedded design-system CSS inlined into every page's `<style>`: Odyssey's canonical
+/// CSS (font + tokens + components) followed by Lattice's service surface CSS.
+fn app_css() -> &'static str {
+    APP_CSS
+        .get_or_init(|| {
+            let mut css = String::with_capacity(odyssey::APP_CSS.len() + SERVICE_CSS.len());
+            css.push_str(odyssey::APP_CSS);
+            css.push_str(SERVICE_CSS);
+            css
+        })
+        .as_str()
+}
 /// Page shell with `{{...}}` slots.
 const LAYOUT: &str = include_str!("../templates/layout.html");
 
@@ -31,7 +46,7 @@ pub fn layout(page_title: &str, headers: &HeaderMap, content: &str) -> String {
         "home"
     };
     LAYOUT
-        .replace("{{STYLE}}", APP_CSS)
+        .replace("{{STYLE}}", app_css())
         .replace("{{PAGE_TITLE}}", &esc(page_title))
         .replace("{{APPBAR}}", &app_bar(active, email.as_deref()))
         .replace("{{CONTENT}}", content)

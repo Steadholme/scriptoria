@@ -1,0 +1,311 @@
+/* Agora (Forum) service surface, layered AFTER Odyssey canonical CSS.
+   The base kit (font + tokens + reset + shared components: app-bar, card, btn,
+   pill, field, stat, table, tabs, empty, toast, layout, pagehead …) now comes
+   from odyssey::APP_CSS. This file keeps only Agora's own domain chrome and the
+   legacy-compat gap-fillers its templates/tests still reference. */
+
+/* --- Token bridge --------------------------------------------------------
+   Define only the helper token canonical doesn't provide. Every shared token
+   (--accent/--bg/--surface/--ink/--sh-*/--r*/--sp-*/--ok-border … ) is left to
+   canonical so it wins and future kit changes propagate. */
+:root { --accent-border: var(--accent-soft-2); }
+
+/* --- App-bar dropdown logout form (canonical has .menuitem, not the form) - */
+.menuitem-form { margin:0; } .menuitem-form .menuitem { width:100%; border:0; background:transparent; font-family:inherit; cursor:pointer; text-align:left; }
+
+/* ============================================================================
+   Legacy-compat layer — keeps every EXISTING class name & bare-element markup
+   working on the v2 tokens (no template/test breaks). Additive only: v2
+   component classes above own the shared look; these fill the gaps.
+   ============================================================================ */
+/* bare form controls (templates use element selectors, not .input) inherit the v2 field look */
+input[type=text], input[type=search], input[type=password], input[type=number], input[type=email],
+input[type=url], input[type=datetime-local], input[type=date], textarea, select {
+  width:100%; font-family:inherit; font-size:14px; color:var(--ink);
+  background:var(--surface); border:1px solid var(--border-2); border-radius:var(--r-sm);
+  padding:10px 12px; outline:none; transition:border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+textarea { resize:vertical; min-height:88px; line-height:1.6; }
+select { appearance:none; padding-right:36px;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23727a8a' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='m6 9 6 6 6-6'/></svg>");
+  background-repeat:no-repeat; background-position:right 12px center; }
+input:focus, textarea:focus, select:focus { border-color:var(--accent); box-shadow:0 0 0 4px var(--ring); outline:none; }
+input::placeholder, textarea::placeholder { color:var(--ink-4); }
+.actions { display:flex; gap:10px; align-items:center; margin-top:4px; flex-wrap:wrap; }
+
+/* bare tables (admin lists etc.) inherit the v2 data-table look */
+table { width:100%; border-collapse:collapse; font-size:13.5px; }
+thead th { text-align:left; font-size:11px; font-weight:650; letter-spacing:.06em; text-transform:uppercase; color:var(--ink-3); background:var(--surface-2); padding:11px 16px; border-bottom:1px solid var(--border); }
+tbody td { padding:12px 16px; border-bottom:1px solid var(--hairline); color:var(--ink-2); }
+tbody tr:last-child td { border-bottom:0; }
+tbody tr:hover { background:var(--surface-2); }
+
+/* button aliases */
+.btn-secondary { background:var(--surface); color:var(--ink); border-color:var(--border); box-shadow:var(--sh-xs); }
+.btn-secondary:hover { background:var(--surface-2); border-color:var(--border-2); color:var(--ink); text-decoration:none; }
+.btn-link { background:transparent; color:var(--accent-ink); padding:0 8px; height:auto; border:0; }
+.btn-link:hover { color:var(--accent-ink); text-decoration:underline; }
+.card__head { justify-content:space-between; }
+
+/* legacy tag/badge → pill vocabulary */
+.tag, .badge { display:inline-flex; align-items:center; gap:5px; font-size:11.5px; font-weight:600; padding:2px 9px; border-radius:var(--r-pill); background:var(--accent-soft); color:var(--accent-ink); }
+.tag-ok, .badge-ok { background:var(--ok-soft); color:var(--ok-ink); }
+.tag-warn, .badge-warn { background:var(--warn-soft); color:var(--warn-ink); }
+.tag-down, .badge-down { background:var(--down-soft); color:var(--down-ink); }
+.ver { font-family:var(--mono); font-size:11.5px; }
+
+/* legacy layout containers */
+.console { max-width:1120px; margin:0 auto; padding:40px 28px 72px; }
+.console--narrow { max-width:760px; }
+.console__head { margin:0 0 26px; }
+.console__head .eyebrow { margin:0 0 10px; font-size:11.5px; font-weight:650; letter-spacing:.08em; text-transform:uppercase; color:var(--accent-ink); }
+.console__head h1 { margin:0; font-size:26px; font-weight:650; letter-spacing:-.025em; }
+.console__head .sub { margin:9px 0 0; color:var(--ink-2); font-size:14.5px; max-width:680px; line-height:1.6; }
+.layout { display:grid; grid-template-columns:1fr 340px; gap:24px; align-items:start; }
+.reading, .rail { min-width:0; }
+.spacer { margin-left:auto; }
+.mask { color:var(--ink-3); letter-spacing:2px; font-family:var(--mono); }
+.hint { font-size:13px; color:var(--ink-2); line-height:1.6; }
+.hint--muted { color:var(--ink-3); margin:16px 0 0; }
+
+/* legacy lists */
+.secret-list, .list { list-style:none; margin:0; padding:8px; }
+.secret-list > li, .list > li { display:flex; align-items:center; gap:14px; padding:13px 14px; border-radius:var(--r-sm); transition:background var(--dur) var(--ease); }
+.secret-list > li:hover, .list > li:hover { background:var(--surface-2); }
+.secret-list > li + li, .list > li + li { border-top:1px solid var(--hairline); }
+.secret-list .path, .list .title { font-family:var(--mono); font-size:13.5px; font-weight:500; color:var(--ink); }
+.list__meta { color:var(--ink-3); font-size:12.5px; }
+
+/* legacy notices + code + rules */
+.code, pre { font-family:var(--mono); font-size:12.5px; background:var(--surface-2); border:1px solid var(--border); border-radius:var(--r-sm); padding:14px 16px; overflow:auto; line-height:1.55; }
+.notice { padding:12px 16px; border-radius:var(--r-sm); font-size:13.5px; border:1px solid var(--border); background:var(--surface-2); }
+.notice-ok { background:var(--ok-soft); border-color:var(--ok-border); color:var(--ok-ink); }
+.notice-warn { background:var(--warn-soft); border-color:var(--warn-border); color:var(--warn-ink); }
+.notice-down { background:var(--down-soft); border-color:var(--down-border); color:var(--down-ink); }
+hr { border:none; border-top:1px solid var(--border); margin:20px 0; }
+
+/* legacy empty-state block */
+.empty-state { text-align:center; padding:56px 24px; border:1px dashed var(--border-2); border-radius:var(--r); background:var(--surface); }
+.empty-state h1, .empty-state h2 { font-size:17px; font-weight:650; color:var(--ink); margin:0 0 6px; }
+.empty-state p { font-size:14px; color:var(--ink-3); margin:0 auto 18px; max-width:44ch; line-height:1.6; }
+.empty-state__code { font-size:34px; font-weight:700; color:var(--accent-ink); letter-spacing:-.02em; }
+
+/* inkwell search-result + tag chips (legacy shared additions; harmless where unused) */
+.tag-list { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
+.tag-list .tag { text-decoration:none; }
+.tag-list .tag:hover { background:var(--accent-soft-2); }
+mark { background:var(--warn-soft); color:var(--warn-ink); padding:0 2px; border-radius:3px; }
+.search-results { margin-top:22px; }
+.search-results__head { display:flex; align-items:baseline; gap:10px; margin-bottom:14px; }
+.search-results__list { list-style:none; padding:0; margin:0; display:flex; flex-direction:column; gap:16px; }
+.search-result { padding-bottom:14px; border-bottom:1px solid var(--border); }
+.search-result:last-child { border-bottom:0; padding-bottom:0; }
+.search-result__title { font-weight:650; color:var(--accent-ink); text-decoration:none; font-size:15px; }
+.search-result__title:hover { text-decoration:underline; }
+.search-result__date { margin-left:8px; font-size:12.5px; color:var(--ink-3); }
+.search-result__excerpt { margin:6px 0 0; color:var(--ink-2); font-size:13.5px; line-height:1.55; }
+
+/* agora/lattice full-width body shells must NOT inherit the v2 .page content max-width */
+body.page { max-width:none; margin:0; padding:0; }
+
+/* ---- Responsive --------------------------------------------------------- */
+@media (max-width:900px){ .grid--4{grid-template-columns:repeat(2,1fr);} .grid--3{grid-template-columns:1fr 1fr;} .layout{grid-template-columns:1fr;} }
+@media (max-width:720px){
+  .appbar__nav, .usermenu__name { display:none; }
+  .grid--2,.grid--3,.grid--4 { grid-template-columns:1fr; }
+  .pagehead { flex-direction:column; align-items:flex-start; }
+  .page { padding:20px 14px 48px; }
+}
+@media (prefers-reduced-motion:reduce){ * { transition:none !important; animation:none !important; } }
+
+/* ==========================================================================
+   Agora — forum components layered on the HOLDFAST Okta-Odyssey kit.
+   Only the classes the base kit lacks (forum chrome: app-bar lead, breadcrumb,
+   category grid, thread lists, posts + markdown, compose forms, the local
+   similar/summary text-intelligence cards). Pure Odyssey tokens — flat
+   surfaces, hairline borders, soft accent tints, small radii, medium headings.
+   ========================================================================== */
+
+/* page shell: column with a pinned footer */
+.page { display: flex; flex-direction: column; min-height: 100vh; }
+
+/* app-bar lead (brand + service title); kit owns .topbar/.brand/.allapps/.userchip */
+.topbar__lead { display: flex; align-items: center; gap: 14px; min-width: 0; }
+.topbar__sep { width: 1px; height: 22px; background: var(--border); flex: none; }
+.brand--sm .brand__glyph { width: 24px; height: 24px; }
+.brand--sm .brand__word { font-size: 14px; letter-spacing: .02em; }
+
+/* content wrapper + footer */
+.wrap { max-width: 920px; width: 100%; margin: 0 auto; padding: 40px 28px 72px; flex: 1 0 auto; }
+.site-foot { flex: none; padding: 28px; text-align: center; color: var(--ink-3); font-size: 12.5px; border-top: 1px solid var(--border); }
+
+/* breadcrumb */
+.crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 13px; color: var(--ink-3); margin-bottom: 20px; }
+.crumbs a { color: var(--ink-2); }
+.crumbs a:hover { color: var(--accent); }
+.crumbs__sep { color: var(--border-2); }
+
+/* page head */
+.page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 28px; }
+.page-head h1 { margin: 0; font-size: 28px; font-weight: 600; letter-spacing: -.025em; }
+.page-head .muted { margin: 8px 0 0; }
+
+/* sections */
+.section { margin-bottom: 32px; }
+.section__title { margin: 0 0 12px; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-3); }
+
+/* category grid */
+.cat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 16px; }
+.cat-card { display: flex; flex-direction: column; gap: 6px; padding: 18px 20px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--sh-xs); transition: border-color .12s, box-shadow .12s; }
+.cat-card:hover { border-color: var(--border-2); box-shadow: var(--sh-md); color: inherit; }
+.cat-card__name { font-size: 15px; font-weight: 600; color: var(--ink); }
+.cat-card__meta { font-size: 13px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+
+/* thread list */
+.thread-list { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--sh-xs); overflow: hidden; }
+.thread-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 0 0 12px; }
+.thread-controls label { font-size: 13px; font-weight: 550; color: var(--ink-2); }
+.thread-controls select { width: auto; min-width: 120px; height: 32px; font-size: 13px; }
+.thread-filter { display: inline-flex; align-items: center; gap: 7px; }
+.thread-filter input { width: 16px; height: 16px; accent-color: var(--accent); }
+.thread-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 18px; border-bottom: 1px solid var(--border); color: var(--ink); }
+.thread-row:last-child { border-bottom: 0; }
+.thread-row:hover { background: var(--surface-2); color: inherit; }
+.thread-row__main { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.thread-row__title { font-weight: 600; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.thread-row__sub { font-size: 13px; color: var(--ink-3); }
+.thread-row__cat { color: var(--accent-2); font-weight: 600; }
+.thread-row__time { flex: none; font-size: 12.5px; color: var(--ink-3); white-space: nowrap; font-variant-numeric: tabular-nums; }
+
+/* thread head */
+.thread-head { margin-bottom: 20px; }
+.thread-head h1 { margin: 0 0 8px; font-size: 28px; font-weight: 600; letter-spacing: -.025em; }
+.subscription-form { margin-top: 12px; display: inline-block; }
+.mentions__title { display: flex; align-items: center; gap: 8px; }
+.mention-badge { margin-left: 0; }
+
+/* posts */
+.posts { display: flex; flex-direction: column; gap: 16px; margin-bottom: 32px; }
+.pagination { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 32px; }
+.post { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--sh-xs); padding: 18px 22px; }
+.post.is-op { border-color: var(--accent-border); background: var(--accent-soft); }
+.post__meta { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; font-size: 13px; color: var(--ink-3); }
+.post__author { font-weight: 600; color: var(--ink); }
+.post__dot { color: var(--border-2); }
+.post__time { color: var(--ink-3); }
+
+/* OP badge — kit owns .badge (accent-soft); this only handles placement */
+.badge-op { margin-left: auto; }
+.summary .badge-op { margin-left: 0; }
+/* accepted-answer badge: reuse the "ok" tokens; sits after the OP badge (which took margin-left) */
+.badge-accepted { background: var(--ok-soft); color: var(--ok-ink); border-color: var(--ok-border); }
+.post__meta .badge-op + .badge-accepted { margin-left: 8px; }
+.post__meta .badge-accepted:first-of-type { margin-left: auto; }
+/* the accepted reply gets a soft "ok" frame so it reads as resolved at a glance */
+.post.is-accepted { border-color: var(--ok-border); background: var(--ok-soft); }
+
+/* reaction row: a compact button per allowed kind, glyph + live count. The viewer's own active
+   reaction is filled with the accent tint. */
+.reactions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+.reaction {
+  display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+  font-size: 12.5px; font-weight: 550; padding: 4px 10px; border-radius: 999px;
+  background: var(--surface); color: var(--ink-2); border: 1px solid var(--border);
+  transition: border-color .12s, background .12s, color .12s;
+}
+.reaction:hover { border-color: var(--border-2); }
+.reaction.is-mine { background: var(--accent-soft); color: var(--accent-2); border-color: var(--accent-border); }
+.reaction__glyph { font-size: 13.5px; line-height: 1; }
+.reaction__count { font-variant-numeric: tabular-nums; }
+
+/* author edit/delete controls (thread head + per-reply). The delete form sits inline so its
+   button lines up beside the edit link. */
+.owner-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.thread-head .owner-actions { margin-top: 12px; }
+.post__actions { margin-top: 14px; }
+.inline-form { display: inline; margin: 0; }
+
+/* card padding variant used by reply/compose/summary cards */
+.card.pad { padding: 22px; }
+
+/* compose forms */
+.form { display: flex; flex-direction: column; gap: 8px; }
+.form label { margin-top: 14px; font-size: 13px; font-weight: 550; color: var(--ink-2); }
+.form label:first-of-type { margin-top: 0; }
+.form__actions { display: flex; gap: 10px; margin-top: 16px; }
+
+/* compose-time similar threads (local dedupe) */
+.similar { margin-top: 14px; padding: 14px 16px; background: var(--accent-soft); border: 1px solid var(--accent-border); border-radius: var(--radius-sm); }
+.similar__head { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--accent-2); margin-bottom: 8px; }
+.similar__list { margin: 0; padding-left: 18px; }
+.similar__list li { margin: 4px 0; font-size: 13px; }
+.similar__list a { color: var(--accent-2); font-weight: 550; }
+
+/* per-thread extractive summary */
+.summary { margin-bottom: 20px; }
+.summary .section__title { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.summary__note { margin: 0 0 12px; font-size: 13px; }
+.summary__list { margin: 0; padding-left: 18px; color: var(--ink); }
+.summary__list li { margin: 8px 0; line-height: 1.6; }
+
+/* empty states — kit owns .empty; these are the card-centred variants */
+.empty-card { text-align: center; }
+.empty-title { margin: 0 0 8px; font-size: 20px; font-weight: 600; }
+
+/* markdown body (sanitised post HTML) */
+.markdown { color: var(--ink); font-size: 15px; line-height: 1.7; word-break: break-word; }
+.markdown > :first-child { margin-top: 0; }
+.markdown > :last-child { margin-bottom: 0; }
+.markdown p { margin: 0 0 12px; }
+.markdown h1, .markdown h2, .markdown h3, .markdown h4 { margin: 20px 0 12px; line-height: 1.35; font-weight: 600; }
+.markdown h1 { font-size: 20px; }
+.markdown h2 { font-size: 17px; }
+.markdown h3 { font-size: 15px; }
+.markdown ul, .markdown ol { margin: 0 0 12px; padding-left: 22px; }
+.markdown li { margin: 4px 0; }
+.markdown a { color: var(--accent-2); text-decoration: underline; }
+.markdown a:hover { color: var(--accent); }
+.markdown blockquote { margin: 0 0 12px; padding: 8px 16px; border-left: 3px solid var(--border-2); color: var(--ink-2); background: var(--surface-2); border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
+.quote-preview { margin: 4px 0 8px; }
+.quote-preview blockquote, .post-quote { font-size: 13.5px; }
+.quote-preview__by, .post-quote__by { margin: 0 0 4px; font-weight: 600; color: var(--ink); }
+.markdown pre { background: var(--surface-2); color: var(--ink); border: 1px solid var(--border); padding: 14px 16px; border-radius: var(--radius-sm); overflow-x: auto; font-size: 12.5px; line-height: 1.55; }
+.markdown pre code { background: transparent; border: 0; padding: 0; color: inherit; }
+.markdown code { background: var(--surface-2); border: 1px solid var(--border); padding: 1px 6px; border-radius: 5px; font-size: .92em; font-family: var(--mono); color: var(--ink); }
+.markdown img { max-width: 100%; height: auto; border-radius: var(--radius-sm); }
+.markdown table { border-collapse: collapse; width: 100%; margin: 0 0 12px; font-size: 13px; }
+.markdown th, .markdown td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+.markdown hr { border: 0; border-top: 1px solid var(--border); margin: 20px 0; }
+
+/* Admin panel rows: each management action (rename/reorder/delete, ban, thread toolbar) sits on
+   one wrapping line. Reuses the existing card/inline-form/button vocabulary. */
+.admin-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+.admin-row:last-child { border-bottom: 0; }
+.admin-toolbar { flex-wrap: wrap; gap: 8px; }
+
+@media (max-width: 640px) {
+  .page-head { align-items: flex-start; }
+}
+
+/* ============================================================================
+   Odyssey v2 — progressive-enhancement layer (ADDITIVE; redefines no selector
+   above). Toast host + optimistic busy/pending states used by the JS layer.
+   All motion rides the shared --dur/--ease tokens and is neutralised by the
+   global prefers-reduced-motion rule already declared above.
+   ============================================================================ */
+.toast-host { position:fixed; z-index:80; left:50%; bottom:22px; transform:translateX(-50%);
+  display:flex; flex-direction:column; gap:9px; align-items:center; width:auto; max-width:92vw; pointer-events:none; }
+.toast-host .toast { pointer-events:auto; opacity:0; transform:translateY(8px);
+  transition:opacity var(--dur) var(--ease), transform var(--dur) var(--ease); max-width:100%; }
+.toast-host .toast.is-in { opacity:1; transform:translateY(0); }
+.toast--err { background:var(--down); }
+.toast--err svg { color:#fecaca; }
+.is-busy { opacity:.55; pointer-events:none; }
+.is-pending { opacity:.6; }
+
+/* agora — instant sort tabs row + subscribed filter alignment. Tabs reuse the
+   shared .tabs/.tab kit; this only lays out the control row. */
+.thread-controls { display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin-bottom:16px; }
+.sort-tabs { margin-bottom:0; }
+.thread-filter { margin-left:auto; }
+@media (max-width:720px){ .thread-filter { margin-left:0; } }

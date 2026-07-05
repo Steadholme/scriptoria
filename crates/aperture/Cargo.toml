@@ -14,6 +14,8 @@ name = "aperture"
 path = "src/main.rs"
 
 [dependencies]
+# Odyssey canonical design system (vendored path-dep): its APP_CSS is prepended to service.css.
+odyssey = { path = "../odyssey" }
 # HTTP framework (shared with the rest of the estate). `multipart` enables the streaming
 # file-upload extractor used by POST /upload.
 axum = { version = "0.8", features = ["multipart"] }

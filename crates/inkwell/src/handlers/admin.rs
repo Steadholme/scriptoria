@@ -20,7 +20,7 @@ use crate::audit::AuditEvent;
 use crate::auth;
 use crate::config::MAX_PAGE;
 use crate::error::AppError;
-use crate::handlers::{esc, topbar, APP_CSS};
+use crate::handlers::{esc, topbar, app_css};
 use crate::store::{Post, Settings};
 use crate::{now_secs, AppState};
 
@@ -73,7 +73,7 @@ pub async fn index(
     }
 
     let page = ADMIN_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{TOPBAR}}", &topbar("Admin", &email))
         .replace("{{CSRF}}", &esc(&csrf))
         .replace("{{SETTINGS_TITLE}}", &esc(&settings.title))

@@ -10,6 +10,7 @@ dependencies = [
  "axum",
  "hex",
  "hmac",
+ "odyssey",
  "pulldown-cmark 0.13.4",
  "rand 0.8.6",
  "serde",
@@ -47,6 +48,7 @@ dependencies = [
  "bytes",
  "hmac",
  "object_store",
+ "odyssey",
  "rand 0.8.6",
  "serde",
  "serde_json",
@@ -334,6 +336,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hex",
  "hmac",
+ "odyssey",
  "pulldown-cmark 0.13.4",
  "serde",
  "serde_json",
@@ -897,6 +900,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hex",
  "hmac",
+ "odyssey",
  "pulldown-cmark 0.13.4",
  "serde",
  "serde_json",
@@ -950,6 +954,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hex",
  "hmac",
+ "odyssey",
  "pulldown-cmark 0.12.2",
  "serde",
  "serde_json",
@@ -1124,6 +1129,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "odyssey"
+version = "0.1.0"
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1171,6 +1180,7 @@ dependencies = [
  "async-trait",
  "axum",
  "hmac",
+ "odyssey",
  "rand 0.8.6",
  "serde",
  "serde_json",

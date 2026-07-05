@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::audit::AuditEvent;
 use crate::auth;
 use crate::error::AppError;
-use crate::handlers::{esc, fmt_date, tag_chips, topbar, APP_CSS};
+use crate::handlers::{esc, fmt_date, tag_chips, topbar, app_css};
 use crate::markdown;
 use crate::store::{Post, PostCursor};
 use crate::{now_nanos, now_secs, unique_slug, AppState};
@@ -122,7 +122,7 @@ pub async fn index(
     };
 
     let body = LIST_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{TOPBAR}}", &topbar(&settings.title, &email))
         .replace("{{BLOG_TITLE}}", &esc(&settings.title))
         .replace("{{TAGLINE}}", &esc(&settings.tagline))
@@ -199,7 +199,7 @@ pub async fn tag_index(
 
     let heading = format!("#{label}");
     let body = LIST_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{TOPBAR}}", &topbar(&heading, &email))
         .replace("{{BLOG_TITLE}}", &esc(&heading))
         .replace("{{TAGLINE}}", &esc(&format!("Posts tagged “{label}”")))
@@ -309,7 +309,7 @@ pub async fn view(
     let related = render_related(&related_posts);
 
     let page = POST_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{TOPBAR}}", &topbar("Reading", &email))
         .replace("{{TITLE_TEXT}}", &esc(&post.title))
         .replace("{{TITLE}}", &esc(&post.title))
@@ -822,7 +822,7 @@ fn render_editor(v: EditorView<'_>) -> String {
     };
 
     EDITOR_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{TOPBAR}}", &topbar(v.heading, v.email))
         .replace("{{HEADING}}", &esc(v.heading))
         .replace("{{SUBHEAD}}", &esc(v.subhead))

@@ -21,7 +21,7 @@ use crate::config::{clamp_page, effective_quota, Config};
 use crate::error::AppError;
 use crate::handlers::{
     esc, expiry_options, fmt_ts, human_size, parse_expiry, resolve_content_type, safe_filename,
-    userbox, APP_CSS, FILE_SVG, SHIELD_SVG,
+    userbox, app_css, FILE_SVG, SHIELD_SVG,
 };
 use crate::model::{FileComment, FileRec, FolderRec, VersionRec};
 use crate::store::{FolderDelete, MAX_VERSIONS_PER_FILE};
@@ -1350,7 +1350,7 @@ fn render_upload_inbox(
         None => String::new(),
     };
     UPLOAD_INBOX_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{HEADING}}", &esc(&folder.name))
         .replace("{{STATUS}}", &status_html)
@@ -1493,7 +1493,7 @@ fn render_folder_index(
         n => format!("{n} files"),
     };
     let html = SHARE_FOLDER_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{HEADING}}", &esc(&folder.name))
         .replace("{{COUNT}}", &esc(&count))
@@ -2054,7 +2054,7 @@ fn render_share_prompt(action: &str, status: StatusCode, error: Option<&str>) ->
         None => String::new(),
     };
     let html = SHARE_PW_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{ERROR}}", &error_html)
         .replace("{{ACTION}}", &esc(action));
@@ -2106,7 +2106,7 @@ fn render_share_landing(config: &Config, rec: &FileRec, token: &str) -> Response
     };
 
     let html = SHARE_LANDING_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{NAME}}", &esc(&rec.name))
         .replace("{{OG_META}}", &og_meta)
         .replace("{{PREVIEW}}", &preview)
@@ -2473,7 +2473,7 @@ fn render_gallery(
     let upload = render_upload_form(csrf, &upload_folder);
 
     GALLERY_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Drive", Some(&who.email)))
         .replace("{{USAGE}}", &render_usage_meter(used, quota))
@@ -2530,7 +2530,7 @@ fn render_trash_gallery(
     let breadcrumb =
         "<nav class=\"breadcrumb\" aria-label=\"Folder path\"><a class=\"breadcrumb__crumb\" href=\"/\">All files</a><span class=\"breadcrumb__sep\" aria-hidden=\"true\">/</span><span class=\"breadcrumb__here\">Trash</span></nav>";
     GALLERY_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Drive", Some(&who.email)))
         .replace("{{USAGE}}", &render_usage_meter(used, quota))
@@ -2997,7 +2997,7 @@ fn render_detail(
     );
 
     DETAIL_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Drive", Some(&viewer.email)))
         .replace("{{NAME}}", &esc(&rec.name))

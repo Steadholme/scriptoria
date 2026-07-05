@@ -19,7 +19,7 @@ use crate::config::{clamp_page, DEFAULT_PAGE, MAX_BODY_BYTES, MAX_TITLE_CHARS};
 use crate::error::AppError;
 use crate::handlers::{
     esc, expiry_options, fmt_dur_short, fmt_size, fmt_ts, language_label, language_options,
-    parse_expiry, userbox, APP_CSS, LANGUAGES, SHIELD_SVG,
+    parse_expiry, userbox, app_css, LANGUAGES, SHIELD_SVG,
 };
 use crate::model::{Paste, PasteFile, PasteRevision};
 use crate::{highlight, now_secs, random_alnum, similar, AppState};
@@ -1122,7 +1122,7 @@ fn render_new(
     let burn_checked = if burn { " checked" } else { "" };
     let opts_open = if burn { " open" } else { "" };
     NEW_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("New paste", Some(&who.email)))
         .replace("{{CSRF}}", &esc(csrf))
@@ -1563,7 +1563,7 @@ fn fill_view(
     layout_mod: &str,
 ) -> String {
     VIEW_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("View paste", Some(viewer_email)))
         .replace("{{TABS}}", tabs)
@@ -1622,7 +1622,7 @@ fn render_revision(viewer: &Identity, paste_id: &str, rev: &PasteRevision) -> St
 /// the unlock form.
 fn render_unlock(viewer: &Identity, id: &str, csrf: &str, error: Option<&str>) -> String {
     UNLOCK_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Locked paste", Some(&viewer.email)))
         .replace("{{ERROR}}", &error_block(error))
@@ -1642,7 +1642,7 @@ fn render_edit(
     csrf: &str,
 ) -> String {
     EDIT_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Edit paste", Some(&who.email)))
         .replace("{{ID}}", &esc(id))
@@ -1657,7 +1657,7 @@ fn render_edit(
 /// first, each linking to that version.
 fn render_history(viewer: &Identity, paste: &Paste, revisions: &[PasteRevision]) -> String {
     HISTORY_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace(
             "{{USERBOX}}",

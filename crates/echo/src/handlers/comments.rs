@@ -20,7 +20,7 @@ use crate::config::{
     REACTION_KINDS, RECENT_LIMIT,
 };
 use crate::error::AppError;
-use crate::handlers::{esc, fmt_datetime, topbar, APP_CSS};
+use crate::handlers::{esc, fmt_datetime, topbar, app_css};
 use crate::markdown;
 use crate::store::{Comment, CommentCursor, CommentReport, CommentVote, Reaction, Sort, Thread};
 use crate::{now_nanos, now_secs, rand_suffix, AppState};
@@ -212,7 +212,7 @@ pub async fn dashboard(
     }
 
     let body = DASHBOARD_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{TOPBAR}}", &topbar("Dashboard", &email))
         .replace("{{THREADS}}", &threads_table)
         .replace("{{THREADS_MORE}}", &threads_more)
@@ -294,7 +294,7 @@ pub async fn thread_view(
     );
 
     let body = THREAD_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{TOPBAR}}", &topbar("Thread", &email))
         .replace("{{TITLE_TEXT}}", &esc(&title))
         .replace("{{TITLE}}", &esc(&title))
@@ -344,7 +344,7 @@ pub async fn embed_view(
     let composer = render_composer(&csrf, &key, "", &return_to, thread_url(&page.thread));
 
     let body = EMBED_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{SORT}}", &sort_html)
         .replace("{{COMMENTS}}", &comments_html)
         .replace("{{MORE}}", &more_html)

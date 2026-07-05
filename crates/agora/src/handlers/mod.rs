@@ -11,9 +11,25 @@ pub mod health;
 pub mod insight;
 
 use axum::http::HeaderMap;
+use std::sync::OnceLock;
 
-/// Embedded design system, inlined into each rendered page's `<style>`.
-pub const APP_CSS: &str = include_str!("../../static/app.css");
+/// Agora-only CSS layered after Odyssey's canonical font, tokens, and components.
+pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
+
+static APP_CSS: OnceLock<String> = OnceLock::new();
+
+/// Embedded design system, inlined into each rendered page's `<style>`:
+/// Odyssey's canonical CSS followed by Agora's service surface CSS.
+pub fn app_css() -> &'static str {
+    APP_CSS
+        .get_or_init(|| {
+            let mut css = String::with_capacity(odyssey::APP_CSS.len() + SERVICE_CSS.len());
+            css.push_str(odyssey::APP_CSS);
+            css.push_str(SERVICE_CSS);
+            css
+        })
+        .as_str()
+}
 /// Page shell with `{{STYLE}}`/`{{SHIELD}}`/`{{TITLE}}`/`{{USERBOX}}`/`{{CONTENT}}` slots.
 pub const SHELL: &str = include_str!("../../templates/shell.html");
 
@@ -37,7 +53,7 @@ pub fn esc(s: &str) -> String {
 pub fn render_page(title: &str, email_display: &str, content: &str) -> String {
     let active = if title == "New thread" { "new" } else { "home" };
     SHELL
-        .replace("{{STYLE}}", APP_CSS)
+        .replace("{{STYLE}}", app_css())
         .replace("{{APPBAR}}", &app_bar(active, email_display))
         .replace("{{TITLE}}", &esc(title))
         .replace("{{CONTENT}}", content)

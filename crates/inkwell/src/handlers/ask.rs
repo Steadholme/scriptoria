@@ -19,7 +19,7 @@ use serde::Deserialize;
 
 use crate::auth;
 use crate::error::AppError;
-use crate::handlers::{esc, fmt_date, topbar, APP_CSS};
+use crate::handlers::{esc, fmt_date, topbar, app_css};
 use crate::index::{self, Scored};
 use crate::AppState;
 
@@ -101,7 +101,7 @@ pub async fn ask(
 /// Render the full console page around its parts.
 fn render_console(email: &str, csrf: &str, question: &str, answer_html: &str) -> String {
     ASK_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{TOPBAR}}", &topbar("Ask", email))
         .replace("{{CSRF}}", &esc(csrf))
         .replace("{{QUESTION}}", &esc(question))

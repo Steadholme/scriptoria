@@ -14,6 +14,8 @@ name = "inkwell"
 path = "src/main.rs"
 
 [dependencies]
+# Odyssey canonical design system (vendored path-dep): its APP_CSS is prepended to service.css.
+odyssey = { path = "../odyssey" }
 # HTTP framework (shared with keystone/keyward/beacon): Form/State/Path extractors, typed responses.
 axum = "0.8"
 # Async runtime axum runs on. The Store trait is async: handlers `.await` it directly and

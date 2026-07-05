@@ -16,8 +16,23 @@ pub mod search;
 
 use axum::http::StatusCode;
 
-/// Embedded design system, inlined into each rendered page's `<style>`.
-pub const APP_CSS: &str = include_str!("../../static/app.css");
+/// Inkwell-only CSS layered after Odyssey's canonical font, tokens, and components.
+pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
+
+static APP_CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Embedded design system, inlined into each rendered page's `<style>`:
+/// Odyssey's canonical CSS followed by Inkwell's service surface CSS.
+pub fn app_css() -> &'static str {
+    APP_CSS
+        .get_or_init(|| {
+            let mut css = String::with_capacity(odyssey::APP_CSS.len() + SERVICE_CSS.len());
+            css.push_str(odyssey::APP_CSS);
+            css.push_str(SERVICE_CSS);
+            css
+        })
+        .as_str()
+}
 
 /// Cross-subdomain gateway logout (Inkwell lives at blog.w33d.xyz; the IdP is at id.w33d.xyz).
 pub const LOGOUT_URL: &str = "https://sso.w33d.xyz/_gw/auth/logout";
@@ -199,7 +214,7 @@ pub fn error_page(status: StatusCode, message: &str) -> String {
   </div>
 </main>
 </body></html>"#,
-        css = APP_CSS,
+        css = app_css(),
         topbar = topbar("Inkwell", "—"),
         code = code,
         reason = esc(reason),

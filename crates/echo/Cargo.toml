@@ -14,6 +14,8 @@ name = "echo"
 path = "src/main.rs"
 
 [dependencies]
+# Odyssey canonical design system (vendored path-dep): its APP_CSS is prepended to service.css.
+odyssey = { path = "../odyssey" }
 # HTTP framework (shared with keystone/inkwell/sanctum): Form/State/Path extractors, typed
 # responses, server-rendered HTML.
 axum = "0.8"

@@ -19,7 +19,7 @@ use axum::response::{Html, IntoResponse, Response};
 use serde::Deserialize;
 
 use crate::auth;
-use crate::handlers::{esc, fmt_date, topbar, APP_CSS};
+use crate::handlers::{esc, fmt_date, topbar, app_css};
 use crate::index::{self, Scored};
 use crate::AppState;
 
@@ -74,7 +74,7 @@ pub async fn search_page(
     };
 
     let page = SEARCH_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{TOPBAR}}", &topbar("Search", &email))
         .replace("{{QUERY}}", &esc(&query))
         .replace("{{RESULTS}}", &results_html);
