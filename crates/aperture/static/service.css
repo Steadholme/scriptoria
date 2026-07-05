@@ -418,3 +418,24 @@ body.page { max-width:none; margin:0; padding:0; }
   .share-landing__media { min-height: 180px; padding: 12px; }
   .embed-box__label { flex-basis: 100%; }
 }
+
+/* ---- narrow-screen hardening for Aperture domain layouts ----------------- */
+/* Additive only: the .drive-layout sidebar (@720), .layout detail split (@900),
+ * and .gallery-grid (auto-fill, @640) already collapse above. This tightens the
+ * remaining domain chrome — the .console shell padding, the tall media preview,
+ * the section-head control row, and the detail share/split action rows. */
+@media (max-width: 900px) {
+  .console { padding: 32px 20px 60px; }
+  .card__body--media { min-height: 260px; }
+}
+@media (max-width: 640px) {
+  .console { padding: 22px 14px 48px; }
+  .console__head h1 { font-size: 22px; }
+  .card__body--media { min-height: 190px; padding: 12px; }
+  .section-head { flex-wrap: wrap; }
+  .view-toggle { margin-left: 0; }
+  .share-row { flex-direction: column; align-items: stretch; }
+  .actions--split { flex-direction: column; align-items: stretch; gap: 10px; }
+  .actions--split .delete-form { width: 100%; }
+  .actions--split .btn { width: 100%; }
+}
