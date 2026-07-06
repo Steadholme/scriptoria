@@ -13,6 +13,7 @@
 //! Endpoints:
 //! - `GET /healthz` — liveness (public; the container HEALTHCHECK).
 //! - `GET /` — the page index (all pages).
+//! - `GET /recent` — cross-page recent changes feed (all revisions, newest-first).
 //! - `GET /new?title=…` — convenience redirect to the editor for a slugified new page.
 //! - `GET /w/{slug}` — render a page's markdown; if missing, offer to create it.
 //! - `GET /edit/{slug}` / `POST /edit/{slug}` — edit; a save appends a revision + updates the page.
@@ -57,6 +58,7 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(handlers::health::healthz))
         .route("/", get(handlers::pages::index))
+        .route("/recent", get(handlers::pages::recent))
         .route("/new", get(handlers::pages::new_page))
         .route("/w/{slug}", get(handlers::pages::view))
         .route(

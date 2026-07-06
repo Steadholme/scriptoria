@@ -26,7 +26,7 @@ use crate::graph::{self, PagePanel};
 use crate::markdown;
 use crate::render::{esc, fmt_ts, layout};
 use crate::slug::{humanize, slugify};
-use crate::store::{Page, Revision, SaveInput};
+use crate::store::{Page, RecentEntry, Revision, SaveInput};
 use crate::{now_ms, AppState};
 
 /// Query for `GET /new` — the title the operator typed into the "new page" box.
@@ -43,6 +43,16 @@ pub struct NewQuery {
 /// the page size and is clamped into `1..=MAX_PAGE`.
 #[derive(Debug, Deserialize)]
 pub struct IndexQuery {
+    #[serde(default)]
+    pub before: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// Query for `GET /recent` — keyset pagination over all revisions. `before=<ts>_<rev_id>` is the
+/// cursor taken from the previous page's last row (absent = the newest revision).
+#[derive(Debug, Deserialize)]
+pub struct RecentQuery {
     #[serde(default)]
     pub before: Option<String>,
     #[serde(default)]
@@ -217,6 +227,91 @@ fn render_index(pages: &[Page], next: Option<&(i64, String)>) -> String {
     format!(
         "{head}<section class=\"card\">{list}</section>{older}\
          <p class=\"site-foot\">HOLDFAST Lattice · server-rendered wiki · Markdown with <code>[[wiki-links]]</code> · <a href=\"/coherence\">Coherence report</a></p>"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// GET /recent  — cross-page recent changes
+// ---------------------------------------------------------------------------
+
+pub async fn recent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<RecentQuery>,
+) -> Result<Html<String>, AppError> {
+    let before = q.before.as_deref().and_then(parse_before);
+    let limit = clamp_page_limit(q.limit.unwrap_or(DEFAULT_PAGE));
+    let entries = state.store.recent_revisions(before, limit).await?;
+    let next = if entries.len() as i64 == limit {
+        entries.last().map(|e| (e.rev.ts, e.rev.id.clone()))
+    } else {
+        None
+    };
+    let content = render_recent(&entries, next.as_ref());
+    Ok(Html(layout("Recent changes", &headers, &content)))
+}
+
+fn render_recent(entries: &[RecentEntry], next: Option<&(i64, String)>) -> String {
+    let count = entries.len();
+    let head = format!(
+        "<div class=\"page-head\">\
+           <div>\
+             <h1>Recent changes</h1>\
+             <p class=\"muted\">{count} change{plural}</p>\
+           </div>\
+           <a class=\"btn btn-secondary btn-sm\" href=\"/\">Back to the index</a>\
+         </div>",
+        count = count,
+        plural = if count == 1 { "" } else { "s" },
+    );
+
+    let rows = if entries.is_empty() {
+        "<tr><td class=\"empty\" colspan=\"5\">No changes yet.</td></tr>".to_string()
+    } else {
+        entries
+            .iter()
+            .map(|entry| {
+                let badge = if entry.rev.ts == entry.page_created_at {
+                    "created"
+                } else {
+                    "edited"
+                };
+                format!(
+                    "<tr class=\"recent-row\">\
+                       <td class=\"c-title\"><a href=\"/w/{slug}\">{title}</a> <span class=\"badge\">{badge}</span></td>\
+                       <td class=\"h-editor\">{editor}</td>\
+                       <td class=\"h-when\"><time>{when}</time></td>\
+                       <td class=\"h-size\">{chars}</td>\
+                       <td class=\"h-act\"><a class=\"btn btn-secondary btn-sm\" href=\"/history/{slug}\">History</a></td>\
+                     </tr>",
+                    slug = esc(&entry.rev.slug),
+                    title = esc(&entry.title),
+                    badge = badge,
+                    editor = esc(&entry.rev.editor_email),
+                    when = esc(&fmt_ts(entry.rev.ts)),
+                    chars = entry.rev.body_md.chars().count(),
+                )
+            })
+            .collect::<String>()
+    };
+
+    let older = match next {
+        Some((ts, id)) => format!(
+            "<nav class=\"pager\"><a class=\"btn btn-secondary\" rel=\"next\" href=\"/recent?before={ts}_{id}&limit={limit}\">Load older</a></nav>",
+            ts = ts,
+            id = esc(id),
+            limit = entries.len(),
+        ),
+        None => String::new(),
+    };
+
+    format!(
+        "{head}<section class=\"card\">\
+           <table class=\"history\">\
+             <thead><tr><th>Page</th><th>Editor</th><th>When (UTC)</th><th>Size</th><th>History</th></tr></thead>\
+             <tbody>{rows}</tbody>\
+           </table>\
+         </section>{older}"
     )
 }
 

@@ -5,6 +5,8 @@
 //! CSRF-protected create/edit cycle (editor identity taken from the gateway header), the
 //! revision history, slug canonicalization, raw-HTML sanitization, and `[[wiki-link]]` markup.
 
+use std::time::Duration;
+
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use tower::ServiceExt;
@@ -116,6 +118,121 @@ async fn full_create_edit_history_flow() {
     // Both editors appear in the history list.
     assert!(body.contains("alice@holdfast.local"));
     assert!(body.contains("bob@holdfast.local"));
+}
+
+#[tokio::test]
+async fn recent_feed_lists_cross_page_edits_newest_first() {
+    let state = build_dev_state();
+    save_page_http(
+        &state,
+        "alpha",
+        "Alpha",
+        "alpha created",
+        "alice@holdfast.local",
+    )
+    .await;
+    pause_for_distinct_ts().await;
+    save_page_http(&state, "beta", "Beta", "beta created", "bob@holdfast.local").await;
+    pause_for_distinct_ts().await;
+    save_page_http(
+        &state,
+        "alpha",
+        "Alpha",
+        "alpha edited",
+        "carol@holdfast.local",
+    )
+    .await;
+
+    let (status, headers, body) = call(&state, get("/recent")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(set_cookie(&headers).is_none(), "recent feed is read-only");
+    assert!(body.contains("Recent changes"));
+    assert!(body.contains("alice@holdfast.local"));
+    assert!(body.contains("bob@holdfast.local"));
+    assert!(body.contains("carol@holdfast.local"));
+    assert!(body.contains(r#"href="/w/alpha""#));
+    assert!(body.contains(r#"href="/w/beta""#));
+    assert!(body.contains(r#"href="/history/alpha""#));
+    assert!(body.contains(">created</span>"));
+    assert!(body.contains(">edited</span>"));
+
+    let carol = body.find("carol@holdfast.local").unwrap();
+    let alice = body.find("alice@holdfast.local").unwrap();
+    assert!(
+        carol < alice,
+        "newest alpha edit appears before its creation"
+    );
+}
+
+#[tokio::test]
+async fn recent_feed_escapes_untrusted_title() {
+    let state = build_dev_state();
+    save_page_http(
+        &state,
+        "unsafe-title",
+        "<b>x</b>",
+        "body",
+        "alice@holdfast.local",
+    )
+    .await;
+
+    let (status, _headers, body) = call(&state, get("/recent")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains("<b>x</b>"), "raw title must not render");
+    assert!(body.contains("&lt;b&gt;"), "title is HTML-escaped");
+}
+
+#[tokio::test]
+async fn recent_feed_keyset_paginates() {
+    let state = build_dev_state();
+    save_page_http(
+        &state,
+        "alpha",
+        "Alpha",
+        "alpha created",
+        "alice@holdfast.local",
+    )
+    .await;
+    pause_for_distinct_ts().await;
+    save_page_http(&state, "beta", "Beta", "beta created", "bob@holdfast.local").await;
+    pause_for_distinct_ts().await;
+    save_page_http(
+        &state,
+        "alpha",
+        "Alpha",
+        "alpha edited",
+        "carol@holdfast.local",
+    )
+    .await;
+
+    let (status, _headers, body) = call(&state, get("/recent?limit=2")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.matches("class=\"recent-row\"").count(), 2);
+    assert!(body.contains("Load older"));
+    assert!(body.contains(r#"href="/recent?before="#));
+    assert!(body.contains("limit=2"));
+}
+
+#[tokio::test]
+async fn recent_feed_never_leaks_body() {
+    let state = build_dev_state();
+    let sentinel = "recent_body_sentinel_9d4598b2";
+    save_page_http(
+        &state,
+        "secret",
+        "Secret",
+        &format!("visible title only\n{sentinel}"),
+        "alice@holdfast.local",
+    )
+    .await;
+
+    let (status, _headers, body) = call(&state, get("/recent")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(">Secret</a>"));
+    assert!(
+        !body.contains(sentinel),
+        "recent feed must not emit revision body_md"
+    );
 }
 
 #[tokio::test]
@@ -797,6 +914,10 @@ async fn call(state: &AppState, req: Request<Body>) -> (StatusCode, axum::http::
 
 fn get(uri: &str) -> Request<Body> {
     Request::builder().uri(uri).body(Body::empty()).unwrap()
+}
+
+async fn pause_for_distinct_ts() {
+    tokio::time::sleep(Duration::from_millis(2)).await;
 }
 
 fn post_form(

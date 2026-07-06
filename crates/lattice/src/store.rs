@@ -52,6 +52,14 @@ pub struct Revision {
     pub ts: i64,
 }
 
+/// One revision joined to the page metadata needed by the cross-page recent feed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecentEntry {
+    pub rev: Revision,
+    pub title: String,
+    pub page_created_at: i64,
+}
+
 /// What a save needs from the caller. `editor_email` comes from the gateway identity, NEVER
 /// from a client-supplied field. `now` and `revision_id` are passed in so the store stays free
 /// of clock/RNG concerns (and tests are deterministic).
@@ -113,6 +121,14 @@ pub trait Store: Send + Sync {
     /// the revision the editor was opened against with this — a mismatch means someone else saved
     /// in between. Reuses the revisions table; `None` for a page with no history yet.
     async fn head_revision(&self, slug: &str) -> Result<Option<Revision>, StoreError>;
+
+    /// Cross-page revision feed, newest-first by `(ts DESC, id DESC)`. `before` is the exclusive
+    /// keyset cursor from the previous page's last revision.
+    async fn recent_revisions(
+        &self,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<RecentEntry>, StoreError>;
 }
 
 // --------------------------------------------------------------------------------------
@@ -282,6 +298,31 @@ impl Store for InMemoryStore {
             .max_by(|a, b| a.ts.cmp(&b.ts))
             .cloned())
     }
+
+    async fn recent_revisions(
+        &self,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<RecentEntry>, StoreError> {
+        let limit = clamp_page_limit(limit) as usize;
+        let data = self.data.lock().expect("lattice store lock poisoned");
+        let mut revs: Vec<Revision> = data.revisions.clone();
+        revs.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| b.id.cmp(&a.id)));
+        if let Some((b_ts, b_id)) = before {
+            revs.retain(|r| r.ts < b_ts || (r.ts == b_ts && r.id < b_id));
+        }
+        revs.truncate(limit);
+        Ok(revs
+            .into_iter()
+            .filter_map(|r| {
+                data.pages.get(&r.slug).map(|p| RecentEntry {
+                    title: p.title.clone(),
+                    page_created_at: p.created_at,
+                    rev: r,
+                })
+            })
+            .collect())
+    }
 }
 
 fn normalize_parent_id(parent_id: Option<String>) -> Option<String> {
@@ -434,6 +475,9 @@ impl PgStore {
         .execute(&self.pool)
         .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_revisions_slug_ts ON revisions (slug, ts)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_revisions_ts_id ON revisions (ts, id)")
             .execute(&self.pool)
             .await?;
         sqlx::query(
@@ -746,6 +790,47 @@ impl PgStore {
         rows.iter().map(Self::revision_from_row).collect()
     }
 
+    async fn recent_revisions_async(
+        &self,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<RecentEntry>, sqlx::Error> {
+        let limit = clamp_page_limit(limit);
+        let rows =
+            match before {
+                None => sqlx::query(
+                    "SELECT r.id, r.slug, r.body_md, r.editor_email, r.ts, p.title, p.created_at \
+                 FROM revisions r \
+                 JOIN pages p ON p.slug = r.slug \
+                 ORDER BY r.ts DESC, r.id DESC LIMIT $1",
+                )
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?,
+                Some((b_ts, b_id)) => sqlx::query(
+                    "SELECT r.id, r.slug, r.body_md, r.editor_email, r.ts, p.title, p.created_at \
+                 FROM revisions r \
+                 JOIN pages p ON p.slug = r.slug \
+                 WHERE (r.ts < $1 OR (r.ts = $1 AND r.id < $2)) \
+                 ORDER BY r.ts DESC, r.id DESC LIMIT $3",
+                )
+                .bind(b_ts)
+                .bind(b_id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?,
+            };
+        rows.iter()
+            .map(|row| {
+                Ok(RecentEntry {
+                    rev: Self::revision_from_row(row)?,
+                    title: row.try_get("title")?,
+                    page_created_at: row.try_get("created_at")?,
+                })
+            })
+            .collect()
+    }
+
     async fn get_revision_async(
         &self,
         slug: &str,
@@ -838,6 +923,16 @@ impl Store for PgStore {
 
     async fn head_revision(&self, slug: &str) -> Result<Option<Revision>, StoreError> {
         self.head_revision_async(slug)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn recent_revisions(
+        &self,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<RecentEntry>, StoreError> {
+        self.recent_revisions_async(before, limit)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
     }

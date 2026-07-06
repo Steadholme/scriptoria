@@ -38,7 +38,9 @@ const LOGOUT_URL: &str = "https://sso.w33d.xyz/_gw/auth/logout";
 /// the handler.
 pub fn layout(page_title: &str, headers: &HeaderMap, content: &str) -> String {
     let email = auth::signed_in_email(headers);
-    let active = if page_title == "Coherence" {
+    let active = if page_title == "Recent changes" {
+        "recent"
+    } else if page_title == "Coherence" {
         "coherence"
     } else if page_title.starts_with("Create") {
         "new"
@@ -63,13 +65,19 @@ fn app_bar(active: &str, email: Option<&str>) -> String {
         concat!(
             r#"<nav class="appbar__nav" aria-label="Lattice">"#,
             r#"<a class="appnav{a_home}" href="/"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 22V12h6v10"/></svg>Home</a>"#,
+            r#"<a class="appnav{a_recent}" href="/recent"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 8v5l3 2"/><circle cx="12" cy="12" r="10"/></svg>Recent changes</a>"#,
             r#"<a class="appnav{a_new}" href="/new"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="M12 5v14"/></svg>New page</a>"#,
             r#"<a class="appnav{a_coh}" href="/coherence"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>Coherence</a>"#,
             r#"</nav>"#,
         ),
         a_home = if active == "home" { " is-active" } else { "" },
+        a_recent = if active == "recent" { " is-active" } else { "" },
         a_new = if active == "new" { " is-active" } else { "" },
-        a_coh = if active == "coherence" { " is-active" } else { "" },
+        a_coh = if active == "coherence" {
+            " is-active"
+        } else {
+            ""
+        },
     );
     format!(
         r#"<header class="appbar">
