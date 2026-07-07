@@ -48,6 +48,17 @@ pub fn esc(s: &str) -> String {
         .replace('\'', "&#x27;")
 }
 
+pub(crate) fn ag_tone(s: &str) -> usize {
+    s.bytes().map(usize::from).sum::<usize>() % 5 + 1
+}
+
+pub(crate) fn ag_initial(s: &str) -> String {
+    s.chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().collect())
+        .unwrap_or_else(|| "U".to_string())
+}
+
 /// Render a full page: fill the shell with the inlined CSS, the (raw) title, the Odyssey v2
 /// app-bar (brand tile + forum nav + avatar user-menu), and the already-built content HTML.
 pub fn render_page(title: &str, email_display: &str, content: &str) -> String {
@@ -79,7 +90,7 @@ pub fn app_bar(active: &str, email_display: &str) -> String {
     format!(
         r#"<header class="appbar">
   <a class="appbar__brand" href="/" aria-label="HOLDFAST Agora home">
-    <span class="app-tile" aria-hidden="true">{icon}</span>
+    <span class="app-tile" aria-hidden="true" style="--app:var(--brand);--app-soft:var(--brand-soft)">{icon}</span>
     <span class="appbar__name"><b>Forum</b><span>forum.w33d.xyz</span></span>
   </a>
   {nav}
@@ -213,6 +224,20 @@ mod tests {
     #[test]
     fn escapes_html_metacharacters() {
         assert_eq!(esc("<b>&\"'"), "&lt;b&gt;&amp;&quot;&#x27;");
+    }
+
+    #[test]
+    fn ag_tone_is_stable_and_bounded() {
+        assert_eq!(ag_tone("general"), ag_tone("general"));
+        assert!((1..=5).contains(&ag_tone("support")));
+        assert_eq!(ag_tone(""), 1);
+    }
+
+    #[test]
+    fn ag_initial_uses_first_alphanumeric_uppercase_or_fallback() {
+        assert_eq!(ag_initial("&x"), "X");
+        assert_eq!(ag_initial(""), "U");
+        assert_eq!(ag_initial("éclair"), "É");
     }
 
     #[test]

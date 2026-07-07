@@ -54,7 +54,7 @@ pub async fn dashboard(
     for c in &categories {
         let count = state.store.count_threads(&c.id).await?;
         cat_rows.push_str(&format!(
-            r#"<div class="admin-row">
+            r#"<div class="admin-row ag-admin--cat">
   <form class="inline-form" method="post" action="/admin/categories/{id}/rename">
     <input type="hidden" name="csrf" value="{csrf}">
     <input type="text" name="name" maxlength="{maxn}" value="{name}" required>
@@ -81,12 +81,12 @@ pub async fn dashboard(
     }
 
     let create_cat = format!(
-        r#"<form class="form inline-form" method="post" action="/admin/categories">
+        r#"<div class="ag-admin-new"><form class="form inline-form" method="post" action="/admin/categories">
   <input type="hidden" name="csrf" value="{csrf}">
   <input type="text" name="id" maxlength="{maxid}" placeholder="slug-id" required>
   <input type="text" name="name" maxlength="{maxn}" placeholder="Display name" required>
   <button class="btn btn-primary btn-sm" type="submit">Add category</button>
-</form>"#,
+</form></div>"#,
         csrf = esc(&csrf),
         maxid = MAX_CATEGORY_ID,
         maxn = MAX_NAME,
@@ -96,7 +96,7 @@ pub async fn dashboard(
     let mut thread_rows = String::new();
     for t in &threads {
         thread_rows.push_str(&format!(
-            r#"<div class="admin-row">
+            r#"<div class="admin-row ag-admin--thread">
   <a class="thread-row__title" href="/t/{id}">{title}</a>
   {toolbar}
 </div>"#,
@@ -113,7 +113,7 @@ pub async fn dashboard(
     let mut ban_rows = String::new();
     for b in &bans {
         ban_rows.push_str(&format!(
-            r#"<div class="admin-row">
+            r#"<div class="admin-row ag-admin--ban">
   <span><code>{sub}</code>{reason} <span class="muted">· by {by} · {when}</span></span>
   <form class="inline-form" method="post" action="/admin/bans/{sub_enc}/delete">
     <input type="hidden" name="csrf" value="{csrf}">
@@ -136,12 +136,12 @@ pub async fn dashboard(
         ban_rows = r#"<div class="empty">No blocked authors.</div>"#.to_string();
     }
     let add_ban = format!(
-        r#"<form class="form inline-form" method="post" action="/admin/bans">
+        r#"<div class="ag-admin-new"><form class="form inline-form" method="post" action="/admin/bans">
   <input type="hidden" name="csrf" value="{csrf}">
   <input type="text" name="author_sub" maxlength="{maxsub}" placeholder="author subject id" required>
   <input type="text" name="reason" maxlength="{maxr}" placeholder="reason (optional)">
   <button class="btn btn-danger btn-sm" type="submit">Block author</button>
-</form>"#,
+</form></div>"#,
         csrf = esc(&csrf),
         maxsub = MAX_SUB,
         maxr = MAX_REASON,
@@ -150,18 +150,26 @@ pub async fn dashboard(
     let content = format!(
         r#"<nav class="crumbs"><a href="/">Home</a><span class="crumbs__sep">/</span><span>Admin</span></nav>
 <div class="page-head"><div><h1>Admin</h1><p class="muted">Moderate categories, threads, and authors.</p></div></div>
+<div class="stat-grid ag-admin-stats">
+  <div class="stat"><span class="stat__label">Categories</span><b class="stat__value">{cat_count}</b></div>
+  <div class="stat"><span class="stat__label">Recent threads</span><b class="stat__value">{thread_count}</b></div>
+  <div class="stat"><span class="stat__label">Blocked authors</span><b class="stat__value">{ban_count}</b></div>
+</div>
 <section class="section">
-  <h2 class="section__title">Categories</h2>
-  <div class="card pad">{cat_rows}{create_cat}</div>
+  <div class="ag-sect__head"><h2 class="section__title">Categories</h2><span class="ag-count">{cat_count}</span></div>
+  <div class="card ag-rows">{cat_rows}{create_cat}</div>
 </section>
 <section class="section">
-  <h2 class="section__title">Threads</h2>
-  <div class="card pad">{thread_rows}</div>
+  <div class="ag-sect__head"><h2 class="section__title">Threads</h2><span class="ag-count">{thread_count}</span></div>
+  <div class="card ag-rows">{thread_rows}</div>
 </section>
 <section class="section">
-  <h2 class="section__title">Blocked authors</h2>
-  <div class="card pad">{ban_rows}{add_ban}</div>
+  <div class="ag-sect__head"><h2 class="section__title">Blocked authors</h2><span class="ag-count">{ban_count}</span></div>
+  <div class="card ag-rows">{ban_rows}{add_ban}</div>
 </section>"#,
+        cat_count = categories.len(),
+        thread_count = threads.len(),
+        ban_count = bans.len(),
         cat_rows = cat_rows,
         create_cat = create_cat,
         thread_rows = thread_rows,
@@ -202,10 +210,14 @@ pub async fn create_category(
     }
     let name = form.name.trim();
     if name.is_empty() || name.chars().count() > MAX_NAME {
-        return Err(AppError::InvalidRequest("category name is required".to_string()));
+        return Err(AppError::InvalidRequest(
+            "category name is required".to_string(),
+        ));
     }
     if state.store.get_category(id).await?.is_some() {
-        return Err(AppError::InvalidRequest("a category with that id already exists".to_string()));
+        return Err(AppError::InvalidRequest(
+            "a category with that id already exists".to_string(),
+        ));
     }
 
     // Append to the end of the current ordering.
@@ -224,9 +236,12 @@ pub async fn create_category(
         sort_order: next_order,
     };
     state.store.create_category(&category).await?;
-    state
-        .audit
-        .emit(AuditEvent::notice("admin.category.create", &actor(&headers), &category.id, name));
+    state.audit.emit(AuditEvent::notice(
+        "admin.category.create",
+        &actor(&headers),
+        &category.id,
+        name,
+    ));
     Ok(redirect_to("/admin"))
 }
 
@@ -250,12 +265,17 @@ pub async fn rename_category(
     }
     let name = form.name.trim();
     if name.is_empty() || name.chars().count() > MAX_NAME {
-        return Err(AppError::InvalidRequest("category name is required".to_string()));
+        return Err(AppError::InvalidRequest(
+            "category name is required".to_string(),
+        ));
     }
     state.store.rename_category(&id, name).await?;
-    state
-        .audit
-        .emit(AuditEvent::notice("admin.category.rename", &actor(&headers), &id, name));
+    state.audit.emit(AuditEvent::notice(
+        "admin.category.rename",
+        &actor(&headers),
+        &id,
+        name,
+    ));
     Ok(redirect_to("/admin"))
 }
 
@@ -285,7 +305,11 @@ pub async fn reorder_category(
         "up" if pos > 0 => Some(pos - 1),
         "down" if pos + 1 < cats.len() => Some(pos + 1),
         "up" | "down" => None,
-        _ => return Err(AppError::InvalidRequest("reorder direction must be up or down".to_string())),
+        _ => {
+            return Err(AppError::InvalidRequest(
+                "reorder direction must be up or down".to_string(),
+            ))
+        }
     };
     if let Some(n) = neighbor {
         let (a, b) = (&cats[pos], &cats[n]);
@@ -297,9 +321,12 @@ pub async fn reorder_category(
         };
         state.store.set_category_order(&a.id, ao).await?;
         state.store.set_category_order(&b.id, bo).await?;
-        state
-            .audit
-            .emit(AuditEvent::notice("admin.category.reorder", &actor(&headers), &id, form.dir.trim()));
+        state.audit.emit(AuditEvent::notice(
+            "admin.category.reorder",
+            &actor(&headers),
+            &id,
+            form.dir.trim(),
+        ));
     }
     Ok(redirect_to("/admin"))
 }
@@ -327,9 +354,12 @@ pub async fn delete_category(
         ));
     }
     state.store.delete_category(&id).await?;
-    state
-        .audit
-        .emit(AuditEvent::notice("admin.category.delete", &actor(&headers), &id, "delete"));
+    state.audit.emit(AuditEvent::notice(
+        "admin.category.delete",
+        &actor(&headers),
+        &id,
+        "delete",
+    ));
     Ok(redirect_to("/admin"))
 }
 
@@ -406,9 +436,12 @@ pub async fn move_thread(
         return Err(AppError::InvalidRequest("unknown category".to_string()));
     }
     state.store.move_thread(&id, category_id).await?;
-    state
-        .audit
-        .emit(AuditEvent::notice("admin.thread.move", &actor(&headers), &id, category_id));
+    state.audit.emit(AuditEvent::notice(
+        "admin.thread.move",
+        &actor(&headers),
+        &id,
+        category_id,
+    ));
     Ok(redirect_to(&format!("/t/{id}")))
 }
 
@@ -423,9 +456,12 @@ pub async fn delete_thread(
         return Err(AppError::NotFound("thread not found".to_string()));
     }
     state.store.delete_thread(&id).await?;
-    state
-        .audit
-        .emit(AuditEvent::notice("admin.thread.delete", &actor(&headers), &id, "delete"));
+    state.audit.emit(AuditEvent::notice(
+        "admin.thread.delete",
+        &actor(&headers),
+        &id,
+        "delete",
+    ));
     Ok(redirect_to("/admin"))
 }
 
@@ -447,9 +483,12 @@ pub async fn delete_post(
         .ok_or_else(|| AppError::NotFound("post not found".to_string()))?;
     let thread_id = post.thread_id.clone();
     state.store.delete_post(&id).await?;
-    state
-        .audit
-        .emit(AuditEvent::notice("admin.post.delete", &actor(&headers), &id, &thread_id));
+    state.audit.emit(AuditEvent::notice(
+        "admin.post.delete",
+        &actor(&headers),
+        &id,
+        &thread_id,
+    ));
     Ok(redirect_to(&format!("/t/{thread_id}")))
 }
 
@@ -475,7 +514,9 @@ pub async fn add_ban(
     auth::verify_csrf(&headers, &form.csrf)?;
     let author_sub = form.author_sub.trim();
     if author_sub.is_empty() || author_sub.len() > MAX_SUB {
-        return Err(AppError::InvalidRequest("author subject id is required".to_string()));
+        return Err(AppError::InvalidRequest(
+            "author subject id is required".to_string(),
+        ));
     }
     let reason = form.reason.trim();
     if reason.chars().count() > MAX_REASON {
@@ -488,9 +529,12 @@ pub async fn add_ban(
         created_at: now_secs(),
     };
     state.store.add_ban(&ban).await?;
-    state
-        .audit
-        .emit(AuditEvent::notice("admin.author.ban", &actor(&headers), author_sub, reason));
+    state.audit.emit(AuditEvent::notice(
+        "admin.author.ban",
+        &actor(&headers),
+        author_sub,
+        reason,
+    ));
     Ok(redirect_to("/admin"))
 }
 
@@ -502,9 +546,12 @@ pub async fn remove_ban(
 ) -> Result<Response, AppError> {
     auth::verify_csrf(&headers, &form.csrf)?;
     state.store.remove_ban(&sub).await?;
-    state
-        .audit
-        .emit(AuditEvent::notice("admin.author.unban", &actor(&headers), &sub, "unban"));
+    state.audit.emit(AuditEvent::notice(
+        "admin.author.unban",
+        &actor(&headers),
+        &sub,
+        "unban",
+    ));
     Ok(redirect_to("/admin"))
 }
 

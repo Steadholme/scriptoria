@@ -18,7 +18,9 @@ use crate::audit::AuditEvent;
 use crate::auth;
 use crate::error::AppError;
 use crate::handlers::insight::thread_summary;
-use crate::handlers::{email_display, esc, fmt_ts, rel_time, render_page, replies_label};
+use crate::handlers::{
+    ag_initial, ag_tone, email_display, esc, fmt_ts, rel_time, render_page, replies_label,
+};
 use crate::model::{Post, ReactionCount, Thread};
 use crate::store::{ReplyAnchor, ThreadSort};
 use crate::{markdown, new_id, now_secs, AppState};
@@ -170,26 +172,31 @@ pub async fn home(
         .iter()
         .map(|c| (c.id.as_str(), c.name.as_str()))
         .collect();
+    let mut reply_counts = HashMap::new();
+    for t in &recent {
+        reply_counts.insert(t.id.clone(), state.store.count_posts(&t.id).await?);
+    }
 
     let mut cats_html = String::new();
     for c in &categories {
         let count = state.store.count_threads(&c.id).await?;
         cats_html.push_str(&format!(
-            r#"<a class="cat-card" href="/c/{id}">
-  <span class="cat-card__name">{name}</span>
-  <span class="cat-card__meta">{count} {tw}</span>
+            r#"<a class="ag-cat" href="/c/{id}">
+  <span class="ag-cat__dot ag-tone-{tone}" aria-hidden="true"></span>
+  <span class="ag-cat__name">{name}</span>
+  <span class="ag-cat__count">{count}</span>
 </a>"#,
             id = esc(&c.id),
+            tone = ag_tone(&c.id),
             name = esc(&c.name),
             count = count,
-            tw = if count == 1 { "thread" } else { "threads" },
         ));
     }
     if cats_html.is_empty() {
         cats_html = r#"<div class="empty">No categories yet.</div>"#.to_string();
     }
 
-    let recent_html = render_thread_rows(&recent, now, Some(&cat_names));
+    let recent_html = render_thread_rows(&recent, now, Some(&cat_names), Some(&reply_counts));
     let mentions_html = render_mentions_panel(&state, &headers).await?;
     let thread_controls = render_thread_list_controls("/", &q, viewer_sub.is_some());
 
@@ -199,18 +206,24 @@ pub async fn home(
     <h1>Forum</h1>
     <p class="muted">Discussions across the keep — sign-in is handled by Keystone SSO.</p>
   </div>
-  <a class="btn btn-primary" href="/new">New thread</a>
 </div>
-<section class="section">
-  <h2 class="section__title">Categories</h2>
-  <div class="cat-grid">{cats}</div>
-</section>
-{mentions}
-<section class="section">
-  <h2 class="section__title">{thread_title}</h2>
-  {controls}
-  <div class="thread-list">{recent}</div>
-</section>"#,
+<div class="ag-home">
+  <aside class="ag-rail">
+    <a class="btn btn-primary ag-cta" href="/new">New thread</a>
+    <nav class="ag-rail__nav" aria-label="Categories">
+      <a class="ag-cat is-active" href="/"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span class="ag-cat__name">All threads</span></a>
+      {cats}
+    </nav>
+    {mentions}
+  </aside>
+  <div class="ag-feed">
+    <section class="section">
+      <h2 class="section__title">{thread_title}</h2>
+      {controls}
+      <div class="thread-list">{recent}</div>
+    </section>
+  </div>
+</div>"#,
         cats = cats_html,
         mentions = mentions_html,
         thread_title = if q.subscribed_only() {
@@ -265,7 +278,7 @@ pub async fn category(
         r#"<nav class="crumbs"><a href="/">Home</a><span class="crumbs__sep">/</span><span>{name}</span></nav>"#,
         name = esc(&category.name),
     );
-    let list = render_thread_rows(&threads, now, None);
+    let list = render_thread_rows(&threads, now, None, None);
     let controls = render_thread_list_controls(
         &format!("/c/{}", esc(&category.id)),
         &q,
@@ -491,26 +504,40 @@ pub async fn thread(
 
     // A locked thread shows a notice instead of the reply form (admins still moderate above).
     let reply_form = if thread.locked {
-        r#"<section class="card pad"><p class="muted">This thread is locked — no new replies.</p></section>"#
+        r#"<section class="card pad"><p class="muted ag-locked"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="11" x="3" y="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>This thread is locked — no new replies.</p></section>"#
             .to_string()
     } else {
         let quote_fields = render_reply_quote_fields(quote_target.as_ref());
+        let composer_head = render_composer_head(
+            &headers,
+            &format!(
+                r#"<b>Reply</b><span>replying to &quot;{}&quot;</span>"#,
+                esc(&thread.title)
+            ),
+        );
         format!(
-            r#"<section id="reply" class="card pad">
-  <h2 class="section__title">Reply</h2>
-  <form class="form" method="post" action="/t/{tid}/reply">
+            r#"<section id="reply" class="card ag-composer ag-composer--reply">
+  <form class="ag-form" method="post" action="/t/{tid}/reply">
     <input type="hidden" name="csrf" value="{csrf}">
-    {quote}
-    <label for="reply-body">Your reply <span class="muted">(Markdown supported)</span></label>
-    <textarea id="reply-body" name="body" rows="5" placeholder="Write a reply…" required></textarea>
-    <div class="form__actions">
-      <button class="btn btn-primary" type="submit">Post reply</button>
+    {head}
+    <div class="ag-composer__fields">
+      {quote}
+      <div class="field">
+        <label class="label" for="reply-body">Your reply <span class="muted">(Markdown supported)</span></label>
+        <textarea id="reply-body" name="body" rows="6" placeholder="Write a reply…" required></textarea>
+      </div>
+    </div>
+    <div class="ag-composer__bar">
+      {hint}
+      <div class="ag-composer__actions"><button class="btn btn-primary" type="submit">Post reply</button></div>
     </div>
   </form>
 </section>"#,
             tid = esc(&thread.id),
             csrf = esc(&csrf),
+            head = composer_head,
             quote = quote_fields,
+            hint = markdown_hint(),
         )
     };
 
@@ -522,13 +549,36 @@ pub async fn thread(
     if thread.locked {
         badges.push_str(r#" <span class="badge badge-op">Locked</span>"#);
     }
+    let category_chip = category
+        .as_ref()
+        .map(|c| {
+            format!(
+                r#"<a class="ag-chip ag-tone-{tone}" href="/c/{cid}">{name}</a>"#,
+                tone = ag_tone(&c.id),
+                cid = esc(&c.id),
+                name = esc(&c.name),
+            )
+        })
+        .unwrap_or_default();
+    let head_tools = if thread_actions.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<div class="ag-head-tools">{thread_actions}</div>"#)
+    };
+    let head_side = if subscription_action.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<div class="ag-head-side">{subscription_action}</div>"#)
+    };
 
     let content = format!(
         r#"{crumbs}
-<div class="thread-head">
-  <h1>{title}{badges}</h1>
-  <p class="muted">Started by <strong>{author}</strong> · {when} · {replies}</p>
-  {actions}
+<div class="thread-head ag-thread-head">
+  <div>
+    <h1>{title}{badges}</h1>
+    <div class="ag-thread-meta">{category_chip}<span>Started by <strong>{author}</strong></span><time title="{created_abs}">{created_rel}</time><span>{replies}</span></div>
+    {actions}
+  </div>
   {subscription}
   {admin_actions}
 </div>
@@ -539,11 +589,13 @@ pub async fn thread(
         crumbs = crumbs,
         title = esc(&thread.title),
         badges = badges,
+        category_chip = category_chip,
         author = esc(&thread.author_email),
-        when = esc(&fmt_ts(thread.created_at)),
+        created_abs = esc(&fmt_ts(thread.created_at)),
+        created_rel = esc(&rel_time(thread.created_at, now)),
         replies = esc(&replies_label(post_count)),
-        actions = thread_actions,
-        subscription = subscription_action,
+        actions = head_tools,
+        subscription = head_side,
         admin_actions = admin_actions,
         summary = summary_html,
         posts = posts_html,
@@ -573,6 +625,7 @@ pub async fn new_form(
     let categories = state.store.list_categories().await?;
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
     let selected = q.cat.unwrap_or_default();
+    let (_, _, viewer_email) = composer_identity(&headers);
 
     let mut options = String::new();
     for c in &categories {
@@ -588,29 +641,49 @@ pub async fn new_form(
     let content = format!(
         r#"<nav class="crumbs"><a href="/">Home</a><span class="crumbs__sep">/</span><span>New thread</span></nav>
 <div class="page-head"><div><h1>New thread</h1></div></div>
-<section class="card pad">
-  <form class="form" method="post" action="/new">
+<section class="card ag-composer ag-composer--new">
+  <form class="ag-form" method="post" action="/new">
     <input type="hidden" name="csrf" value="{csrf}">
-    <label for="nt-cat">Category</label>
-    <select id="nt-cat" name="category" required>{options}</select>
-    <label for="nt-title">Title</label>
-    <input id="nt-title" type="text" name="title" maxlength="{maxt}" placeholder="A short, descriptive title" required>
-    <label for="nt-body">Body <span class="muted">(Markdown supported)</span></label>
-    <textarea id="nt-body" name="body" rows="10" placeholder="Write the first post…" required></textarea>
-    <div id="similar-box" class="similar" hidden>
-      <div class="similar__head">Similar existing threads — is one of these your topic?</div>
-      <ul id="similar-list" class="similar__list"></ul>
+    {head}
+    <div class="ag-composer__fields">
+      <div class="field">
+        <label class="label" for="nt-title">Title</label>
+        <input id="nt-title" class="input ag-title-input" type="text" name="title" maxlength="{maxt}" placeholder="A short, descriptive title" required>
+        <p class="hint">Up to 200 characters — make it easy to find</p>
+        <div id="similar-box" class="similar ag-similar" hidden>
+          <div class="similar__head">Similar existing threads — is one of these your topic?</div>
+          <ul id="similar-list" class="similar__list"></ul>
+        </div>
+      </div>
+      <div class="ag-meta-row">
+        <div class="field">
+          <label class="label" for="nt-cat">Category</label>
+          <select id="nt-cat" name="category" required>{options}</select>
+        </div>
+      </div>
+      <div class="field">
+        <label class="label" for="nt-body">Body <span class="muted">(Markdown supported)</span></label>
+        <textarea id="nt-body" name="body" rows="12" placeholder="Write the first post…" required></textarea>
+      </div>
     </div>
-    <div class="form__actions">
-      <button class="btn btn-primary" type="submit">Create thread</button>
+    <div class="ag-composer__bar">
+      {hint}
+      <div class="ag-composer__actions">
       <a class="btn btn-secondary" href="/">Cancel</a>
+      <button class="btn btn-primary" type="submit">Create thread</button>
+      </div>
     </div>
   </form>
 </section>
 {script}"#,
         csrf = esc(&csrf),
+        head = render_composer_head(
+            &headers,
+            &format!(r#"<b>{viewer_email}</b><span>posting a new thread</span>"#),
+        ),
         options = options,
         maxt = MAX_TITLE,
+        hint = markdown_hint(),
         script = SIMILAR_SCRIPT,
     );
 
@@ -880,6 +953,7 @@ pub async fn edit_thread_form(
         Some(&thread.title),
         op_body,
         &format!("/t/{}", esc(&thread.id)),
+        &headers,
     );
     let html = render_page("Edit thread", &email_display(&headers), &content);
     Ok(html_response(html, set_cookie))
@@ -1048,6 +1122,7 @@ pub async fn edit_reply_form(
         None,
         &post.body_md,
         &format!("/t/{}", esc(&tid)),
+        &headers,
     );
     let html = render_page("Edit reply", &email_display(&headers), &content);
     Ok(html_response(html, set_cookie))
@@ -1460,7 +1535,7 @@ async fn render_mentions_panel(state: &AppState, headers: &HeaderMap) -> Result<
     Ok(format!(
         r#"<section class="section mentions">
   <h2 class="section__title mentions__title">Mentions <span class="badge mention-badge">@{count}</span></h2>
-  <div class="thread-list">{rows}</div>
+  <div class="ag-mentions-list">{rows}</div>
 </section>"#,
         count = count,
         rows = rows,
@@ -1490,19 +1565,52 @@ fn render_subscription_form(thread_id: &str, csrf: &str, subscribed: bool) -> St
     )
 }
 
+fn composer_identity(headers: &HeaderMap) -> (usize, String, String) {
+    let email = auth::identity_email(headers).unwrap_or_default();
+    let subject = auth::identity_subject(headers);
+    let tone_key = subject
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(email.as_str());
+    let tone = if tone_key.trim().is_empty() {
+        1
+    } else {
+        ag_tone(tone_key)
+    };
+    let label = if email.trim().is_empty() {
+        "Not signed in".to_string()
+    } else {
+        email.clone()
+    };
+    (tone, esc(&ag_initial(&email)), esc(&label))
+}
+
+fn render_composer_head(headers: &HeaderMap, who_html: &str) -> String {
+    let (tone, initial, _) = composer_identity(headers);
+    format!(
+        r#"<div class="ag-composer__head"><span class="avatar ag-avatar ag-tone-{tone}" aria-hidden="true">{initial}</span><div class="ag-composer__who">{who}</div><span class="pill pill-neutral ag-composer__badge">Markdown</span></div>"#,
+        tone = tone,
+        initial = initial,
+        who = who_html,
+    )
+}
+
+fn markdown_hint() -> &'static str {
+    r#"<div class="ag-md-hint"><code>**bold**</code><code>_italic_</code><code>`code`</code><code>&gt; quote</code><span>@name to mention</span></div>"#
+}
+
 fn render_reply_quote_fields(quote: Option<&Post>) -> String {
     let Some(quote) = quote else {
         return String::new();
     };
     format!(
-        r#"<input type="hidden" name="quote_post_id" value="{pid}">
-    <div class="quote-preview">
-      <blockquote>
-        <p class="quote-preview__by">{author} wrote:</p>
-        <p>{body}</p>
-      </blockquote>
-    </div>"#,
+        r##"<input type="hidden" name="quote_post_id" value="{pid}">
+      <blockquote class="ag-composer__quote">
+        <p class="ag-composer__quote-by">Quoting {author}<a href="/t/{tid}#reply">Remove</a></p>
+        <p class="ag-composer__quote-body">{body}</p>
+      </blockquote>"##,
         pid = esc(&quote.id),
+        tid = esc(&quote.thread_id),
         author = esc(&quote.author_email),
         body = esc(&quote.body_md),
     )
@@ -1701,7 +1809,7 @@ pub(crate) fn render_admin_thread_toolbar(
         ));
     }
     format!(
-        r#"<div class="owner-actions admin-toolbar">
+        r#"<div class="owner-actions admin-toolbar ag-modbar">
   <form class="inline-form" method="post" action="/admin/threads/{tid}/lock">
     <input type="hidden" name="csrf" value="{csrf}">
     <button class="btn btn-secondary btn-sm" type="submit">{lock_label}</button>
@@ -1738,11 +1846,14 @@ fn render_edit_form(
     title_value: Option<&str>,
     body_value: &str,
     cancel_href: &str,
+    headers: &HeaderMap,
 ) -> String {
     let title_input = match title_value {
         Some(v) => format!(
-            r#"<label for="ed-title">Title</label>
-    <input id="ed-title" type="text" name="title" maxlength="{maxt}" required value="{value}">"#,
+            r#"<div class="field">
+      <label class="label" for="ed-title">Title</label>
+      <input id="ed-title" class="input ag-title-input" type="text" name="title" maxlength="{maxt}" required value="{value}">
+    </div>"#,
             maxt = MAX_TITLE,
             value = esc(v),
         ),
@@ -1751,23 +1862,33 @@ fn render_edit_form(
     format!(
         r#"<nav class="crumbs"><a href="/">Home</a><span class="crumbs__sep">/</span><span>{heading}</span></nav>
 <div class="page-head"><div><h1>{heading}</h1></div></div>
-<section class="card pad">
-  <form class="form" method="post" action="{action}">
+<section class="card ag-composer ag-composer--edit">
+  <form class="ag-form" method="post" action="{action}">
     <input type="hidden" name="csrf" value="{csrf}">
-    {title_input}
-    <label for="ed-body">Body <span class="muted">(Markdown supported)</span></label>
-    <textarea id="ed-body" name="body" rows="10" required>{body}</textarea>
-    <div class="form__actions">
-      <button class="btn btn-primary" type="submit">Save changes</button>
+    {head}
+    <div class="ag-composer__fields">
+      {title_input}
+      <div class="field">
+        <label class="label" for="ed-body">Body <span class="muted">(Markdown supported)</span></label>
+        <textarea id="ed-body" name="body" rows="10" required>{body}</textarea>
+      </div>
+    </div>
+    <div class="ag-composer__bar">
+      {hint}
+      <div class="ag-composer__actions">
       <a class="btn btn-secondary" href="{cancel}">Cancel</a>
+      <button class="btn btn-primary" type="submit">Save changes</button>
+      </div>
     </div>
   </form>
 </section>"#,
         heading = esc(heading),
         action = action,
         csrf = esc(csrf),
+        head = render_composer_head(headers, &format!(r#"<b>{}</b>"#, esc(heading))),
         title_input = title_input,
         body = esc(body_value),
+        hint = markdown_hint(),
         cancel = cancel_href,
     )
 }
@@ -1778,31 +1899,64 @@ fn render_thread_rows(
     threads: &[Thread],
     now: i64,
     cat_names: Option<&HashMap<&str, &str>>,
+    counts: Option<&HashMap<String, i64>>,
 ) -> String {
     if threads.is_empty() {
-        return r#"<div class="empty">No threads yet — start the conversation.</div>"#.to_string();
+        return r#"<div class="empty"><div class="empty__ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div><h3>No threads yet — start the conversation.</h3><p>Every thread supports Markdown, reactions and @mentions.</p><a class="btn btn-primary btn-sm" href="/new">New thread</a></div>"#.to_string();
     }
     let mut out = String::new();
     for t in threads {
         let cat_part = match cat_names {
             Some(map) => {
                 let name = map.get(t.category_id.as_str()).copied().unwrap_or("—");
-                format!("in <span class=\"thread-row__cat\">{}</span> · ", esc(name))
+                format!(
+                    r#"<span class="ag-chip ag-tone-{tone} thread-row__cat">{name}</span>"#,
+                    tone = ag_tone(&t.category_id),
+                    name = esc(name),
+                )
             }
             None => String::new(),
         };
+        let mut glyphs = String::new();
+        if t.pinned {
+            glyphs.push_str(r#"<svg class="ag-glyph ag-glyph--pin" role="img" aria-label="Pinned" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M5 17h14"/><path d="m7 9 5-5 5 5"/><path d="M8 14h8"/></svg>"#);
+        }
+        if t.locked {
+            glyphs.push_str(r#"<svg class="ag-glyph ag-glyph--lock" role="img" aria-label="Locked" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="11" x="3" y="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>"#);
+        }
+        if !t.accepted_post_id.is_empty() {
+            glyphs.push_str(r#"<svg class="ag-glyph ag-glyph--answered" role="img" aria-label="Answered" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="m9 11 3 3L22 4"/></svg>"#);
+        }
+        let replies = counts
+            .and_then(|map| map.get(&t.id))
+            .map(|count| {
+                format!(
+                    r#"<span class="ag-row__replies" title="{label}">{replies}</span>"#,
+                    label = esc(&replies_label(*count)),
+                    replies = (*count - 1).max(0),
+                )
+            })
+            .unwrap_or_default();
+        let pinned_class = if t.pinned { " ag-row--pinned" } else { "" };
         out.push_str(&format!(
-            r#"<a class="thread-row" href="/t/{id}">
+            r#"<a class="thread-row ag-row{pinned}" href="/t/{id}">
+  <span class="avatar ag-avatar ag-tone-{tone}" aria-hidden="true">{initial}</span>
   <span class="thread-row__main">
-    <span class="thread-row__title">{title}</span>
-    <span class="thread-row__sub">{cat}started by {author}</span>
+    <span class="thread-row__title">{glyphs}<span class="ag-title">{title}</span></span>
+    <span class="thread-row__sub">{cat}<span class="ag-row__by">started by {author}</span></span>
   </span>
-  <span class="thread-row__time">{when}</span>
+  <span class="ag-row__side">{replies}<span class="thread-row__time" title="{abs}">{when}</span></span>
 </a>"#,
             id = esc(&t.id),
+            pinned = pinned_class,
+            tone = ag_tone(&t.author_sub),
+            initial = esc(&ag_initial(&t.author_email)),
+            glyphs = glyphs,
             title = esc(&t.title),
             cat = cat_part,
             author = esc(&t.author_email),
+            replies = replies,
+            abs = esc(&fmt_ts(t.last_at)),
             when = esc(&rel_time(t.last_at, now)),
         ));
     }
@@ -1832,8 +1986,8 @@ fn render_summary(posts: &[Post]) -> String {
         .map(|s| format!("<li>{}</li>", esc(s)))
         .collect();
     format!(
-        r#"<section class="card pad summary">
-  <h2 class="section__title">Thread summary <span class="badge badge-op">Auto</span></h2>
+        r#"<section class="card pad summary ag-insight">
+  <h2 class="section__title"><svg class="ag-insight__glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 1.7 5.3L19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7L12 3z"/><path d="M19 15v4"/><path d="M21 17h-4"/></svg>Thread summary <span class="badge badge-op">Auto</span></h2>
   <p class="muted summary__note">Top sentences across this thread — generated locally, no AI service.</p>
   <ul class="summary__list">{items}</ul>
 </section>"#,
@@ -2082,19 +2236,23 @@ fn render_posts(
         let reactions_html = render_reactions(thread_id, &p.id, csrf, counts);
         let quote_html = render_quote_block(p, quoted_posts);
         out.push_str(&format!(
-            r#"<article id="post-{pid}" class="post{op}">
-  <header class="post__meta">
-    <span class="post__author">{author}</span>
-    <span class="post__dot">·</span>
-    <time class="post__time" title="{abs}">{ago}</time>
-    {tag}
-  </header>
-  <div class="markdown">{quote}{body}</div>
-  {reactions}
-  {controls}
-</article>"#,
+            r##"<article id="post-{pid}" class="post{op}">
+  <div class="ag-post-rail"><span class="avatar ag-avatar ag-tone-{tone}" aria-hidden="true">{initial}</span></div>
+  <div class="ag-post-main">
+    <header class="post__meta">
+      <span class="post__author">{author}</span>
+      <span class="post__dot">·</span>
+      <a class="ag-permalink" href="#post-{pid}"><time class="post__time" title="{abs}">{ago}</time></a>
+      {tag}
+    </header>
+    <div class="markdown">{quote}{body}</div>
+    <footer class="ag-post-foot">{reactions}{controls}</footer>
+  </div>
+</article>"##,
             pid = esc(&p.id),
             op = op,
+            tone = ag_tone(&p.author_sub),
+            initial = esc(&ag_initial(&p.author_email)),
             author = esc(&p.author_email),
             abs = esc(&fmt_ts(p.created_at)),
             ago = esc(&rel_time(p.created_at, now)),
