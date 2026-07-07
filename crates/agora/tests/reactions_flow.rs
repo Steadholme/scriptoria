@@ -36,6 +36,10 @@ async fn reaction_toggle_is_idempotent_and_per_user() {
     assert_eq!(s, StatusCode::SEE_OTHER);
 
     let (_s, _h, page) = send(&state, get_as(&loc, ALICE_SUB, ALICE_EMAIL)).await;
+    assert!(page.contains(r##"data-wire-target="#post-"##));
+    assert!(page.contains("odyssey-wire v1"));
+    assert!(page.contains("odyssey-spark v1"));
+    assert!(!page.contains("handleReact"));
     assert!(page.contains(r#"class="reaction is-mine""#), "alice sees her own reaction highlighted");
     assert!(page.contains(r#"<span class="reaction__count">1</span>"#), "count is 1");
 

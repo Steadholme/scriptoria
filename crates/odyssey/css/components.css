@@ -455,6 +455,9 @@ input[type="range"]:focus-visible { box-shadow:0 0 0 4px var(--ring); border-rad
 .toast--err { background:var(--down-ink); }
 .toast--err .toast__ico { color:var(--surface); background:color-mix(in srgb, var(--surface) 22%, transparent); }
 
+[hidden]{display:none!important;}
+[data-spark-cloak]{display:none!important;}
+
 /* ============ 13 · Modal / dialog(缺口补件)============ */
 .modal {
   position:fixed; inset:0; z-index:70; display:grid; place-items:center; padding:var(--sp-5);

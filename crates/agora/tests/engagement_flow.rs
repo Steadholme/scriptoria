@@ -87,6 +87,7 @@ async fn thread_subscription_toggle_and_filter() {
         thread_page.contains("Unsubscribe"),
         "subscribed thread shows the reverse action"
     );
+    assert!(thread_page.contains(r#"data-wire-target=".subscription-form""#));
 
     let (_s, _h, filtered) = send(
         &state,

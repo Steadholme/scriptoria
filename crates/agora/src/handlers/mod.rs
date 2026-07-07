@@ -17,6 +17,7 @@ use std::sync::OnceLock;
 pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
 
 static APP_CSS: OnceLock<String> = OnceLock::new();
+static DYNAMIC_JS: OnceLock<String> = OnceLock::new();
 
 /// Embedded design system, inlined into each rendered page's `<style>`:
 /// Odyssey's canonical CSS followed by Agora's service surface CSS.
@@ -30,7 +31,13 @@ pub fn app_css() -> &'static str {
         })
         .as_str()
 }
-/// Page shell with `{{STYLE}}`/`{{SHIELD}}`/`{{TITLE}}`/`{{USERBOX}}`/`{{CONTENT}}` slots.
+fn dynamic_js() -> &'static str {
+    DYNAMIC_JS
+        .get_or_init(|| odyssey::dynamic_scripts().0)
+        .as_str()
+}
+
+/// Page shell with `{{STYLE}}`/`{{DYNAMIC}}`/`{{APPBAR}}`/`{{TITLE}}`/`{{CONTENT}}` slots.
 pub const SHELL: &str = include_str!("../../templates/shell.html");
 
 /// The HOLDFAST shield glyph (small, for the app-bar brand lockup).
@@ -65,6 +72,7 @@ pub fn render_page(title: &str, email_display: &str, content: &str) -> String {
     let active = if title == "New thread" { "new" } else { "home" };
     SHELL
         .replace("{{STYLE}}", app_css())
+        .replace("{{DYNAMIC}}", dynamic_js())
         .replace("{{APPBAR}}", &app_bar(active, email_display))
         .replace("{{TITLE}}", &esc(title))
         .replace("{{CONTENT}}", content)

@@ -1554,7 +1554,7 @@ fn render_subscription_form(thread_id: &str, csrf: &str, subscribed: bool) -> St
         "btn btn-ghost btn-sm"
     };
     format!(
-        r#"<form class="inline-form subscription-form" method="post" action="/t/{tid}/subscribe">
+        r#"<form class="inline-form subscription-form" method="post" action="/t/{tid}/subscribe" data-wire data-wire-target=".subscription-form" data-wire-err="Could not update your subscription">
   <input type="hidden" name="csrf" value="{csrf}">
   <button class="{class}" type="submit">{label}</button>
 </form>"#,
@@ -2104,14 +2104,14 @@ fn render_reactions(
         let mine = hit.map(|c| c.mine).unwrap_or(false);
         let mine_class = if mine { " is-mine" } else { "" };
         buttons.push_str(&format!(
-            r#"<form class="inline-form" method="post" action="/t/{tid}/p/{pid}/react">
+            r##"<form class="inline-form" method="post" action="/t/{tid}/p/{pid}/react" data-wire data-wire-target="#post-{pid}" data-wire-err="Could not save your reaction">
     <input type="hidden" name="csrf" value="{csrf}">
     <input type="hidden" name="kind" value="{kind}">
     <button class="reaction{mine}" type="submit" aria-pressed="{pressed}" title="{kind} reaction">
       <span class="reaction__glyph" aria-hidden="true">{glyph}</span>
       <span class="reaction__count">{count}</span>
     </button>
-  </form>"#,
+  </form>"##,
             tid = esc(thread_id),
             pid = esc(post_id),
             csrf = esc(csrf),
