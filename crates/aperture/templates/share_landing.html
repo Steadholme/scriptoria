@@ -14,19 +14,17 @@
       <span class="app-tile" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="22" x2="2" y1="12" y2="12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><line x1="6" x2="6.01" y1="16" y2="16"/><line x1="10" x2="10.01" y1="16" y2="16"/></svg></span>
       <span class="appbar__name"><b>Drive</b><span>drive.w33d.xyz</span></span>
     </a>
-    <nav class="appbar__nav" aria-label="Aperture">
-      <a class="appnav is-active" href="/"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>Files</a>
-    </nav>
-    <span class="appbar__spacer"></span>
-  </header>
-
-  <main class="console share-landing">
-    <div class="share-landing__media">{{PREVIEW}}</div>
-    <h1 class="share-landing__title">{{NAME}}</h1>
-    <p class="share-landing__meta"><span class="mono">{{TYPE}}</span> &middot; {{SIZE}} &middot; <span class="share-landing__views">{{VIEWS}} views</span></p>
-    <div class="share-landing__actions">
-      <a class="btn btn-primary" href="{{DOWNLOAD_URL}}">Download</a>
-    </div>
+	    <span class="appbar__spacer"></span>
+	    <span class="ap-pubbar__tag"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-8 9-4.5-1.5-8-4-8-9V5l8-3 8 3v8Z"/><path d="m9 12 2 2 4-5"/></svg>Shared via Drive</span>
+	  </header>
+	
+	  <main class="console share-landing ap-share">
+	    <div class="share-landing__media ap-share__stage">{{PREVIEW}}</div>
+	    <h1 class="share-landing__title ap-share__name">{{NAME}}</h1>
+	    <p class="share-landing__meta ap-share__facts"><span class="ap-fact ap-fact--type mono">{{TYPE}}</span><span class="ap-fact">{{SIZE}}</span><span class="share-landing__views ap-fact ap-fact--views">{{VIEWS}} views</span></p>
+	    <div class="share-landing__actions">
+	      <a class="btn btn-primary btn-lg" href="{{DOWNLOAD_URL}}"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>Download</a>
+	    </div>
     {{EMBED}}
   </main>
 

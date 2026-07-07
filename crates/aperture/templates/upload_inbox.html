@@ -12,15 +12,18 @@
     <a class="appbar__brand" href="/" aria-label="HOLDFAST Aperture home">
       <span class="app-tile" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="22" x2="2" y1="12" y2="12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><line x1="6" x2="6.01" y1="16" y2="16"/><line x1="10" x2="10.01" y1="16" y2="16"/></svg></span>
       <span class="appbar__name"><b>Drive</b><span>drive.w33d.xyz</span></span>
-    </a>
-    <span class="appbar__spacer"></span>
-  </header>
-
-  <main class="console">
-    <div class="console__head">
-      <h1>{{HEADING}}</h1>
-      <p class="sub">Upload files into this request folder. Existing files are not listed.</p>
-    </div>
+	    </a>
+	    <span class="appbar__spacer"></span>
+	    <span class="ap-pubbar__tag"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-8 9-4.5-1.5-8-4-8-9V5l8-3 8 3v8Z"/><path d="m9 12 2 2 4-5"/></svg>Shared via Drive</span>
+	  </header>
+	
+	  <main class="console ap-inbox">
+	    <div class="console__head">
+	      <div class="ap-inbox__glyph" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg></div>
+	      <p class="ap-inbox__eyebrow">Files requested</p>
+	      <h1>{{HEADING}}</h1>
+	      <p class="sub">Upload files into this request folder. Existing files are not listed.</p>
+	    </div>
 
     {{STATUS}}
 
@@ -37,10 +40,11 @@
           <div class="dropzone__actions">
             <button class="btn btn-primary" type="submit">Upload</button>
           </div>
-        </form>
-      </div>
-    </section>
-  </main>
+	        </form>
+	      </div>
+	    </section>
+	    <p class="ap-inbox__trust">Uploads go straight to this folder — only its owner can see them.</p>
+	  </main>
 
   <script>
     (function () {

@@ -20,8 +20,8 @@ use crate::auth::{self, Identity};
 use crate::config::{clamp_page, effective_quota, Config};
 use crate::error::AppError;
 use crate::handlers::{
-    esc, expiry_options, fmt_ts, human_size, parse_expiry, resolve_content_type, safe_filename,
-    userbox, app_css, FILE_SVG, SHIELD_SVG,
+    app_css, dynamic_js, esc, expiry_options, fmt_ts, human_size, parse_expiry,
+    resolve_content_type, safe_filename, userbox, FILE_SVG, SHIELD_SVG,
 };
 use crate::model::{FileComment, FileRec, FolderRec, VersionRec};
 use crate::store::{FolderDelete, MAX_VERSIONS_PER_FILE};
@@ -148,7 +148,8 @@ pub async fn gallery(
             .list_trashed_by_owner(&who.subject)
             .await
             .unwrap_or_default();
-        let html = render_trash_gallery(&state.config, &who, &csrf, &trashed, used, quota);
+        let html =
+            render_trash_gallery(&state.config, &who, &csrf, &trashed, &folders, used, quota);
         return html_with_csrf(StatusCode::OK, html, &csrf);
     }
 
@@ -492,16 +493,16 @@ pub async fn detail(
     let preview = build_preview(&state, &rec).await;
     let versions = state.store.list_versions(&rec.id).await.unwrap_or_default();
     let comments = state.store.list_comments(&rec.id).await.unwrap_or_default();
-    let html = render_detail(
-        &state.config,
-        &rec,
-        &viewer,
-        &csrf,
-        &folders,
-        &preview,
-        &versions,
-        &comments,
-    );
+    let html = render_detail(DetailRender {
+        config: &state.config,
+        rec: &rec,
+        viewer: &viewer,
+        csrf: &csrf,
+        folders: &folders,
+        preview: &preview,
+        versions: &versions,
+        comments: &comments,
+    });
     Ok(html_with_csrf(StatusCode::OK, html, &csrf))
 }
 
@@ -1472,12 +1473,15 @@ fn render_folder_index(
                 };
                 format!(
                     "<li class=\"share-file\">\
+                       <span class=\"ap-filetile {tone}\" aria-hidden=\"true\">{ext}</span>\
                        <div class=\"share-file__info\">\
                          <span class=\"share-file__name\" title=\"{name}\">{name}</span>\
                          <span class=\"share-file__meta\">{ctype} · {size}</span>\
                        </div>\
                        {download}\
                      </li>",
+                    tone = ap_tone_class(&f.content_type),
+                    ext = esc(&ext_label(&f.name)),
                     name = esc(&f.name),
                     ctype = esc(&f.content_type),
                     size = esc(&human_size(f.size)),
@@ -2288,6 +2292,31 @@ fn thumb_palette(content_type: &str) -> (&'static str, &'static str) {
     }
 }
 
+fn ap_tone_class(content_type: &str) -> &'static str {
+    let ct = content_type;
+    if ct == "application/pdf" {
+        "ap-tone-doc"
+    } else if ct.starts_with("image/") {
+        "ap-tone-img"
+    } else if ct.starts_with("audio/") {
+        "ap-tone-aud"
+    } else if ct.starts_with("video/") {
+        "ap-tone-vid"
+    } else if ct.starts_with("text/") {
+        "ap-tone-txt"
+    } else if ct.contains("zip")
+        || ct.contains("tar")
+        || ct.contains("gzip")
+        || ct.contains("compress")
+        || ct.contains("x-7z")
+        || ct.contains("x-rar")
+    {
+        "ap-tone-zip"
+    } else {
+        "ap-tone-bin"
+    }
+}
+
 /// Wrap rendered HTML in a response that also (re)sets the CSRF cookie.
 pub(crate) fn html_with_csrf(status: StatusCode, html: String, csrf: &str) -> Response {
     (
@@ -2386,7 +2415,7 @@ fn render_folder_tiles(children: &[&FolderRec], up_href: Option<&str>) -> String
                <a class=\"file-card__link\" href=\"{href}\">\
                  <span class=\"thumb thumb--folder\">{FOLDER_UP_SVG}</span>\
                </a>\
-               <div class=\"file-card__body\"><a class=\"file-card__name\" href=\"{href}\">Up one level</a></div>\
+               <div class=\"file-card__body\"><a class=\"file-card__name\" href=\"{href}\">Up one level</a><span class=\"ap-folder-cue\" aria-hidden=\"true\">›</span></div>\
              </li>",
             href = esc(href),
             FOLDER_UP_SVG = FOLDER_UP_SVG,
@@ -2394,18 +2423,26 @@ fn render_folder_tiles(children: &[&FolderRec], up_href: Option<&str>) -> String
     }
     for f in children {
         let href = format!("/?folder={}", f.id);
+        let mut badges = String::new();
+        if f.share_token.is_some() {
+            badges.push_str("<span class=\"ap-badge ap-badge--link\" title=\"Folder link enabled\">Linked</span>");
+        }
+        if f.upload_token.is_some() {
+            badges.push_str("<span class=\"ap-badge ap-badge--views\" title=\"Upload request enabled\">Inbox</span>");
+        }
         out.push_str(&format!(
             "<li class=\"file-card file-card--folder\">\
                <a class=\"file-card__link\" href=\"{href}\">\
                  <span class=\"thumb thumb--folder\">{FOLDER_SVG}</span>\
                </a>\
                <div class=\"file-card__body\">\
-                 <a class=\"file-card__name\" href=\"{href}\" title=\"{name}\">{name}</a>\
-                 <div class=\"file-card__meta\"><span>Folder</span></div>\
+                 <div class=\"ap-name-row\"><a class=\"file-card__name\" href=\"{href}\" title=\"{name}\">{name}</a><span class=\"ap-folder-cue\" aria-hidden=\"true\">›</span></div>\
+                 <div class=\"file-card__meta\"><span>Folder</span><span class=\"ap-badges\">{badges}</span></div>\
                </div>\
              </li>",
             href = esc(&href),
             name = esc(&f.name),
+            badges = badges,
             FOLDER_SVG = FOLDER_SVG,
         ));
     }
@@ -2460,12 +2497,16 @@ fn render_gallery(
     let file_cards = render_cards(files, csrf);
     // The empty placeholder shows only when the whole level is empty (no subfolders, no files).
     let cards = if tiles.is_empty() && file_cards.is_empty() {
-        let msg = if active.is_none() {
-            "Your drive is empty. Drop a file above to get started."
+        let (title, class) = if active.is_none() {
+            ("Your drive is empty.", "")
         } else {
-            "This folder is empty. Drop a file above or create a subfolder."
+            ("This folder is empty.", "")
         };
-        format!("<li class=\"file-card file-card--empty\">{msg}</li>")
+        format!(
+            "<li class=\"file-card file-card--empty ap-empty{class}\"><div class=\"ap-empty__art\" aria-hidden=\"true\"></div><h3>{title}</h3><p>Drag a file anywhere or use Upload file.</p></li>",
+            class = class,
+            title = title,
+        )
     } else {
         format!("{tiles}{file_cards}")
     };
@@ -2474,11 +2515,15 @@ fn render_gallery(
 
     GALLERY_HTML
         .replace("{{CSS}}", app_css())
+        .replace("{{DYNAMIC}}", dynamic_js())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Drive", Some(&who.email)))
         .replace("{{USAGE}}", &render_usage_meter(used, quota))
         .replace("{{UPLOAD}}", &upload)
-        .replace("{{SIDEBAR}}", &render_sidebar(config, csrf, active))
+        .replace(
+            "{{SIDEBAR}}",
+            &render_sidebar(config, csrf, folders, active, false),
+        )
         .replace("{{BREADCRUMB}}", &breadcrumb)
         .replace("{{HEADING}}", &esc(&heading))
         .replace("{{COUNT}}", &esc(&count))
@@ -2488,19 +2533,21 @@ fn render_gallery(
 
 fn render_upload_form(csrf: &str, folder_id: &str) -> String {
     format!(
-        "<form id=\"uploadForm\" class=\"dropzone\" method=\"post\" action=\"/upload\" enctype=\"multipart/form-data\">\
+        "<form id=\"uploadForm\" class=\"dropzone ap-new\" method=\"post\" action=\"/upload\" enctype=\"multipart/form-data\">\
           <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
           <input type=\"hidden\" name=\"folder_id\" value=\"{folder}\">\
-          <input id=\"fileInput\" class=\"dropzone__input\" type=\"file\" name=\"file\" required>\
-          <label for=\"fileInput\" class=\"dropzone__label\">\
-            <span class=\"dropzone__icon\" aria-hidden=\"true\">&#8682;</span>\
-            <span class=\"dropzone__text\"><strong>Choose a file</strong> or drag &amp; drop it here</span>\
+          <div class=\"ap-new__pick\">\
+            <label for=\"fileInput\" class=\"btn btn-primary ap-new__btn\">\
+              <svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4\"/><path d=\"m17 8-5-5-5 5\"/><path d=\"M12 3v12\"/></svg>\
+              Upload file\
+            </label>\
+            <input id=\"fileInput\" class=\"dropzone__input\" type=\"file\" name=\"file\" required>\
             <span id=\"fileName\" class=\"dropzone__hint\">Nothing selected yet</span>\
-          </label>\
-          <div class=\"dropzone__actions\">\
-            <button class=\"btn btn-primary\" type=\"submit\">Upload</button>\
           </div>\
-          <div class=\"dropzone__progress\" id=\"uploadProgress\" role=\"progressbar\" aria-label=\"Upload progress\" aria-valuemin=\"0\" aria-valuemax=\"100\" hidden>\
+          <div class=\"dropzone__actions\">\
+            <button class=\"btn btn-secondary btn-sm\" type=\"submit\">Upload</button>\
+          </div>\
+          <div class=\"dropzone__progress ap-upload-progress\" id=\"uploadProgress\" role=\"progressbar\" aria-label=\"Upload progress\" aria-valuemin=\"0\" aria-valuemax=\"100\" hidden>\
             <div class=\"dropzone__bar\" id=\"uploadBar\"></div>\
           </div>\
         </form>",
@@ -2510,10 +2557,11 @@ fn render_upload_form(csrf: &str, folder_id: &str) -> String {
 }
 
 fn render_trash_gallery(
-    _config: &Config,
+    config: &Config,
     who: &Identity,
     csrf: &str,
     files: &[FileRec],
+    folders: &[FolderRec],
     used: i64,
     quota: Option<i64>,
 ) -> String {
@@ -2523,7 +2571,7 @@ fn render_trash_gallery(
         n => format!("{n} trashed files"),
     };
     let cards = if files.is_empty() {
-        "<li class=\"file-card file-card--empty\">Trash is empty.</li>".to_string()
+        "<li class=\"file-card file-card--empty ap-empty ap-empty--trash\"><div class=\"ap-empty__art\" aria-hidden=\"true\"></div><h3>Trash is empty.</h3><p>Deleted files stay here until purged.</p></li>".to_string()
     } else {
         render_trash_cards(files, csrf)
     };
@@ -2531,11 +2579,15 @@ fn render_trash_gallery(
         "<nav class=\"breadcrumb\" aria-label=\"Folder path\"><a class=\"breadcrumb__crumb\" href=\"/\">All files</a><span class=\"breadcrumb__sep\" aria-hidden=\"true\">/</span><span class=\"breadcrumb__here\">Trash</span></nav>";
     GALLERY_HTML
         .replace("{{CSS}}", app_css())
+        .replace("{{DYNAMIC}}", dynamic_js())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Drive", Some(&who.email)))
         .replace("{{USAGE}}", &render_usage_meter(used, quota))
         .replace("{{UPLOAD}}", "")
-        .replace("{{SIDEBAR}}", &render_trash_sidebar())
+        .replace(
+            "{{SIDEBAR}}",
+            &render_sidebar(config, csrf, folders, None, true),
+        )
         .replace("{{BREADCRUMB}}", breadcrumb)
         .replace("{{HEADING}}", "Trash")
         .replace("{{COUNT}}", &esc(&count))
@@ -2543,28 +2595,20 @@ fn render_trash_gallery(
         .replace("{{PAGER}}", "")
 }
 
-fn render_trash_sidebar() -> String {
-    "<aside class=\"folder-rail\">\
-       <div class=\"section-head\"><h2>Drive</h2></div>\
-       <a class=\"folder-item\" href=\"/\">All files</a>\
-       <a class=\"folder-item folder-item--active\" href=\"/?view=trash\">Trash</a>\
-       <p class=\"muted trash-note\">Trashed files stay in storage and count toward quota until deleted forever.</p>\
-     </aside>"
-        .to_string()
-}
-
 fn render_trash_cards(files: &[FileRec], csrf: &str) -> String {
     files
         .iter()
         .map(|f| {
+            let tone = ap_tone_class(&f.content_type);
+            let deleted = fmt_ts(f.trashed_at);
             format!(
-                "<li class=\"file-card file-card--trash\">\
-                   <div class=\"thumb thumb--file\">{glyph}<span class=\"thumb__ext\">{ext}</span></div>\
+                "<li class=\"file-card file-card--trash\" id=\"file-{id}\">\
+                   <div class=\"thumb thumb--file {tone}\">{glyph}<span class=\"thumb__ext {tone}\">{ext}</span></div>\
                    <div class=\"file-card__body\">\
                      <span class=\"file-card__name\" title=\"{name}\">{name}</span>\
-                     <div class=\"file-card__meta\"><span>{size}</span><span>Deleted {deleted}</span></div>\
+                     <div class=\"file-card__meta\"><span>{size}</span><span>Deleted <time class=\"ap-date\" data-spark-reltime data-ts=\"{deleted_ts}\" title=\"{deleted}\">{deleted}</time></span></div>\
                      <div class=\"trash-actions\">\
-                       <form method=\"post\" action=\"/trash/{id}/restore\">\
+                       <form method=\"post\" action=\"/trash/{id}/restore\" data-wire data-wire-target=\"#file-{id}\" data-wire-swap=\"delete\" data-wire-optimistic data-wire-ok=\"Restored\" data-wire-err=\"Action failed — please retry\">\
                          <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
                          <button class=\"btn btn-secondary btn-sm\" type=\"submit\">Restore</button>\
                        </form>\
@@ -2578,11 +2622,13 @@ fn render_trash_cards(files: &[FileRec], csrf: &str) -> String {
                  </li>",
                 glyph = FILE_SVG,
                 ext = esc(&ext_label(&f.name)),
+                tone = tone,
                 id = esc(&f.id),
                 csrf = esc(csrf),
                 name = esc(&f.name),
                 size = esc(&human_size(f.size)),
-                deleted = esc(&fmt_ts(f.trashed_at)),
+                deleted = esc(&deleted),
+                deleted_ts = f.trashed_at,
             )
         })
         .collect::<Vec<_>>()
@@ -2634,7 +2680,13 @@ fn render_usage_meter(used: i64, quota: Option<i64>) -> String {
 /// when a folder is active — its rename, empty/cascade delete, and public folder-share controls.
 /// Every form is CSRF-protected and owner-scoped. Navigation itself (breadcrumb + child tiles +
 /// "Up") lives in the main grid; this rail is the per-folder actions.
-fn render_sidebar(config: &Config, csrf: &str, active: Option<&FolderRec>) -> String {
+fn render_sidebar(
+    config: &Config,
+    csrf: &str,
+    folders: &[FolderRec],
+    active: Option<&FolderRec>,
+    trash_active: bool,
+) -> String {
     // The new-folder form carries the current level as the hidden parent (empty = a root folder).
     let parent_id = active.map(|a| a.id.clone()).unwrap_or_default();
     let new_form = format!(
@@ -2649,6 +2701,10 @@ fn render_sidebar(config: &Config, csrf: &str, active: Option<&FolderRec>) -> St
          </form>",
         csrf = esc(csrf),
         parent = esc(&parent_id),
+    );
+    let new_folder = format!(
+        "<details class=\"ap-fold ap-new-folder\"><summary>New folder</summary>{new_form}</details>",
+        new_form = new_form,
     );
 
     // Rename + delete + folder-share controls, shown only when viewing a specific folder.
@@ -2683,18 +2739,102 @@ fn render_sidebar(config: &Config, csrf: &str, active: Option<&FolderRec>) -> St
         ),
         None => String::new(),
     };
+    let settings = if manage.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<details class=\"ap-fold ap-rail__settings\"><summary>Folder settings</summary>{manage}</details>",
+            manage = manage,
+        )
+    };
+    let chain = active.map(|a| folder_chain(folders, a)).unwrap_or_default();
+    let tree = render_folder_tree(folders, active.map(|a| a.id.as_str()), &chain);
+    let all_active = if active.is_none() && !trash_active {
+        " is-active"
+    } else {
+        ""
+    };
+    let trash_active_class = if trash_active { " is-active" } else { "" };
+    let foot = if trash_active {
+        "<p class=\"ap-rail__foot trash-note\">Trashed files stay in storage and count toward quota until deleted forever.</p>"
+    } else {
+        ""
+    };
 
     format!(
-        "<aside class=\"folder-rail\">\
-           <div class=\"section-head\"><h2>Folder actions</h2></div>\
-           <a class=\"folder-item\" href=\"/\">All files</a>\
-           <a class=\"folder-item\" href=\"/?view=trash\">Trash</a>\
-           {new_form}\
-           {manage}\
-         </aside>",
-        new_form = new_form,
-        manage = manage,
+        "{new_folder}\
+         <nav class=\"ap-tree\" aria-label=\"Drive folders\">\
+           <a class=\"ap-tree__row{all_active}\" href=\"/\">\
+             <svg class=\"ap-tree__ico\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z\"/></svg>\
+             <span class=\"ap-tree__name\">All files</span>\
+           </a>\
+           {tree}\
+           <div class=\"ap-rail__rule\" aria-hidden=\"true\"></div>\
+           <a class=\"ap-tree__row{trash_active_class}\" href=\"/?view=trash\">\
+             <svg class=\"ap-tree__ico\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M3 6h18\"/><path d=\"M8 6V4h8v2\"/><path d=\"m19 6-1 14H6L5 6\"/></svg>\
+             <span class=\"ap-tree__name\">Trash</span>\
+           </a>\
+         </nav>\
+         {settings}\
+         {foot}",
+        new_folder = new_folder,
+        all_active = all_active,
+        tree = tree,
+        trash_active_class = trash_active_class,
+        settings = settings,
+        foot = foot,
     )
+}
+
+fn render_folder_tree(
+    folders: &[FolderRec],
+    active_id: Option<&str>,
+    chain: &[FolderRec],
+) -> String {
+    render_folder_tree_level(folders, None, active_id, chain, 0)
+}
+
+fn render_folder_tree_level(
+    folders: &[FolderRec],
+    parent: Option<&str>,
+    active_id: Option<&str>,
+    chain: &[FolderRec],
+    depth: usize,
+) -> String {
+    if depth >= MAX_TREE_DEPTH {
+        return String::new();
+    }
+    let children = folder_children(folders, parent);
+    if children.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("<ul>");
+    for f in children {
+        let active = active_id == Some(f.id.as_str());
+        let expanded = chain.iter().any(|c| c.id == f.id);
+        let class = if active { " is-active" } else { "" };
+        out.push_str(&format!(
+            "<li><a class=\"ap-tree__row{class}\" href=\"/?folder={id}\" title=\"{name}\">\
+               <svg class=\"ap-tree__ico\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M4 5h5l2 2.5h9a1 1 0 0 1 1 1V18a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Z\"/></svg>\
+               <span class=\"ap-tree__name\">{name}</span>\
+             </a>",
+            class = class,
+            id = esc(&f.id),
+            name = esc(&f.name),
+        ));
+        if expanded {
+            out.push_str(&render_folder_tree_level(
+                folders,
+                Some(&f.id),
+                active_id,
+                chain,
+                depth + 1,
+            ));
+        }
+        out.push_str("</li>");
+    }
+    out.push_str("</ul>");
+    out
 }
 
 /// Build the public folder-share control for the rail (shown while viewing a folder). An active
@@ -2806,6 +2946,9 @@ fn render_cards(files: &[FileRec], csrf: &str) -> String {
     files
         .iter()
         .map(|f| {
+            let tone = ap_tone_class(&f.content_type);
+            let date = fmt_ts(f.created_at);
+            let badges = render_card_badges(f);
             // Every card loads its thumbnail through the derived-thumbnail route: an image resolves
             // to its full bytes (302), a non-image to a cached, mime-keyed type icon. One uniform
             // `<img>` path replaces the old image-vs-generic-icon branch.
@@ -2828,7 +2971,7 @@ fn render_cards(files: &[FileRec], csrf: &str) -> String {
                        <input class=\"rename-form__input\" type=\"text\" name=\"name\" value=\"{name}\" maxlength=\"255\" required aria-label=\"New file name\">\
                        <button class=\"btn btn-primary btn-sm\" type=\"submit\">Rename</button>\
                      </form>\
-                     <form class=\"card-menu__form trash-form\" method=\"post\" action=\"/delete/{id}\">\
+                     <form class=\"card-menu__form trash-form\" method=\"post\" action=\"/delete/{id}\" data-wire data-wire-target=\"#file-{id}\" data-wire-swap=\"delete\" data-wire-optimistic data-wire-ok=\"Moved to trash\" data-wire-err=\"Action failed — please retry\">\
                        <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
                        <button class=\"btn btn-danger btn-sm\" type=\"submit\">Move to trash</button>\
                      </form>\
@@ -2839,23 +2982,74 @@ fn render_cards(files: &[FileRec], csrf: &str) -> String {
                 name = esc(&f.name),
             );
             format!(
-                "<li class=\"file-card\" data-file-id=\"{id}\">\
+                "<li class=\"file-card\" id=\"file-{id}\" data-file-id=\"{id}\">\
                    <a class=\"file-card__link\" href=\"/f/{id}\">{thumb}</a>\
                    <div class=\"file-card__body\">\
-                     <a class=\"file-card__name\" href=\"/f/{id}\" title=\"{name}\" data-file-name>{name}</a>\
-                     <div class=\"file-card__meta\"><span>{size}</span><span>{date}</span></div>\
+                     <div class=\"ap-name-row\"><span class=\"ap-glyph {tone}\" aria-hidden=\"true\">{ext}</span><a class=\"file-card__name\" href=\"/f/{id}\" title=\"{name}\" data-file-name>{name}</a></div>\
+                     <div class=\"file-card__meta\">{badges}<span class=\"ap-size\">{size}</span><time class=\"ap-date\" data-spark-reltime data-ts=\"{created_ts}\" title=\"{date}\">{date}</time></div>\
                      {menu}\
                    </div>\
                  </li>",
                 id = esc(&f.id),
                 name = esc(&f.name),
+                tone = tone,
+                ext = esc(&ext_label(&f.name)),
+                badges = badges,
                 size = esc(&human_size(f.size)),
-                date = esc(&fmt_ts(f.created_at)),
+                date = esc(&date),
+                created_ts = f.created_at,
                 menu = menu,
             )
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn render_card_badges(f: &FileRec) -> String {
+    let mut badges = String::from("<span class=\"ap-badges\">");
+    if f.share_token.is_some() {
+        badges.push_str(
+            "<span class=\"ap-badge ap-badge--link\" title=\"Share link enabled\">\
+               <svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71\"/><path d=\"M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71\"/></svg>\
+               Linked\
+             </span>",
+        );
+    }
+    if f.share_has_password() {
+        badges.push_str(
+            "<span class=\"ap-badge ap-badge--lock\" title=\"Password required\">\
+               <svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"3\" y=\"11\" width=\"18\" height=\"11\" rx=\"2\"/><path d=\"M7 11V7a5 5 0 0 1 10 0v4\"/></svg>\
+               Locked\
+             </span>",
+        );
+    }
+    if let Some(exp) = f.expires_at {
+        let date = fmt_ts(exp);
+        let expired = if f.share_expired(now_secs()) {
+            " ap-badge--expired"
+        } else {
+            ""
+        };
+        badges.push_str(&format!(
+            "<span class=\"ap-badge ap-badge--exp{expired}\" title=\"Expires {date}\">\
+               <svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><circle cx=\"12\" cy=\"12\" r=\"10\"/><path d=\"M12 6v6l4 2\"/></svg>\
+               Expires\
+             </span>",
+            expired = expired,
+            date = esc(&date),
+        ));
+    }
+    if f.share_token.is_some() && f.view_count > 0 {
+        badges.push_str(&format!(
+            "<span class=\"ap-badge ap-badge--views\" title=\"Opened {views} times\">\
+               <svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z\"/><circle cx=\"12\" cy=\"12\" r=\"3\"/></svg>\
+               {views}\
+             </span>",
+            views = f.view_count,
+        ));
+    }
+    badges.push_str("</span>");
+    badges
 }
 
 /// Which inline preview a file gets on its detail page.
@@ -2942,49 +3136,94 @@ fn render_text_preview(bytes: &[u8]) -> String {
 
 /// The non-previewable fallback: the document glyph + extension label + a download prompt.
 fn preview_none(rec: &FileRec) -> String {
+    let tone = ap_tone_class(&rec.content_type);
     format!(
-        "<div class=\"preview-file\">{glyph}<span class=\"thumb__ext\">{ext}</span>\
-           <p class=\"muted\">No inline preview for this file type.</p></div>",
-        glyph = FILE_SVG,
+        "<div class=\"preview-file ap-stage__none\">\
+           <span class=\"letter-tile ap-type-tile {tone}\" aria-hidden=\"true\">{ext}</span>\
+           <span class=\"mono\">{ctype}</span>\
+           <p class=\"muted\">No inline preview for this file type.</p>\
+           <a class=\"btn btn-secondary\" href=\"/f/{id}/raw\">Download</a>\
+         </div>",
+        tone = tone,
         ext = esc(&ext_label(&rec.name)),
+        ctype = esc(&rec.content_type),
+        id = esc(&rec.id),
     )
 }
 
-fn render_detail(
-    config: &Config,
-    rec: &FileRec,
-    viewer: &Identity,
-    csrf: &str,
-    folders: &[FolderRec],
-    preview: &str,
-    versions: &[VersionRec],
-    comments: &[FileComment],
-) -> String {
+struct DetailRender<'a> {
+    config: &'a Config,
+    rec: &'a FileRec,
+    viewer: &'a Identity,
+    csrf: &'a str,
+    folders: &'a [FolderRec],
+    preview: &'a str,
+    versions: &'a [VersionRec],
+    comments: &'a [FileComment],
+}
+
+fn render_detail(ctx: DetailRender<'_>) -> String {
+    let DetailRender {
+        config,
+        rec,
+        viewer,
+        csrf,
+        folders,
+        preview,
+        versions,
+        comments,
+    } = ctx;
+    let uploaded = fmt_ts(rec.created_at);
     let meta_list = format!(
         "<dl class=\"meta-list\">\
            <div><dt>Type</dt><dd>{ctype}</dd></div>\
            <div><dt>Size</dt><dd>{size}</dd></div>\
-           <div><dt>Uploaded</dt><dd>{date}</dd></div>\
+           <div><dt>Uploaded</dt><dd><time data-spark-reltime data-ts=\"{created_ts}\" title=\"{date}\">{date}</time></dd></div>\
            <div><dt>Storage</dt><dd>{bucket}</dd></div>\
          </dl>",
         ctype = esc(&rec.content_type),
         size = esc(&human_size(rec.size)),
-        date = esc(&fmt_ts(rec.created_at)),
+        date = esc(&uploaded),
+        created_ts = rec.created_at,
         bucket = esc(&rec.bucket),
     );
 
     let share = render_share_section(config, rec, csrf);
-    let embed = render_embed_codes(config, rec);
+    let embed_codes = render_embed_codes(config, rec);
+    let embed = if embed_codes.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<details class=\"ap-fold\"><summary>Embed &amp; links</summary><div class=\"ap-fold__body\">{embed_codes}</div></details>",
+            embed_codes = embed_codes,
+        )
+    };
     let move_section = render_move_section(rec, csrf, folders);
     let versions_section = render_versions(rec, versions, csrf);
-    let comments_section = render_comments(rec, comments, csrf);
+    let comments_section = render_comments(rec, comments, csrf, viewer);
 
-    let sub = format!(
-        "{ctype} · {size} · {date}",
-        ctype = rec.content_type,
-        size = human_size(rec.size),
-        date = fmt_ts(rec.created_at),
+    let tone = ap_tone_class(&rec.content_type);
+    let type_tile = format!(
+        "<span class=\"letter-tile ap-type-tile {tone}\" aria-hidden=\"true\">{ext}</span>",
+        tone = tone,
+        ext = esc(&ext_label(&rec.name)),
     );
+    let facts = format!(
+        "<p class=\"ap-facts\">\
+           <span class=\"ap-fact ap-fact--type mono\">{ctype}</span>\
+           <span class=\"ap-fact\">{size}</span>\
+           <span class=\"ap-fact\"><time data-spark-reltime data-ts=\"{created_ts}\" title=\"{date}\">{date}</time></span>\
+         </p>",
+        ctype = esc(&rec.content_type),
+        size = esc(&human_size(rec.size)),
+        created_ts = rec.created_at,
+        date = esc(&uploaded),
+    );
+    let stage_mod = match preview_kind(rec) {
+        Preview::Image => "ap-stage--checker",
+        Preview::Text | Preview::Pdf => "ap-stage--doc",
+        Preview::None => "",
+    };
 
     let delete = format!(
         "<form class=\"delete-form\" method=\"post\" action=\"/delete/{id}\" \
@@ -2998,10 +3237,13 @@ fn render_detail(
 
     DETAIL_HTML
         .replace("{{CSS}}", app_css())
+        .replace("{{DYNAMIC}}", dynamic_js())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Drive", Some(&viewer.email)))
         .replace("{{NAME}}", &esc(&rec.name))
-        .replace("{{SUB}}", &esc(&sub))
+        .replace("{{TYPE_TILE}}", &type_tile)
+        .replace("{{FACTS}}", &facts)
+        .replace("{{STAGE_MOD}}", stage_mod)
         .replace("{{PREVIEW}}", preview)
         .replace("{{META_LIST}}", &meta_list)
         .replace("{{MOVE}}", &move_section)
@@ -3013,28 +3255,42 @@ fn render_detail(
         .replace("{{DELETE}}", &delete)
 }
 
-fn render_comments(rec: &FileRec, comments: &[FileComment], csrf: &str) -> String {
+fn render_comments(
+    rec: &FileRec,
+    comments: &[FileComment],
+    csrf: &str,
+    viewer: &Identity,
+) -> String {
     let rows = if comments.is_empty() {
         "<p class=\"muted\">No comments yet.</p>".to_string()
     } else {
         comments
             .iter()
             .map(|c| {
+                let date = fmt_ts(c.created_at);
+                let tone = ap_avatar_tone(&c.author_sub);
+                let initial = ap_initial(&c.author_sub);
                 format!(
-                    "<li class=\"comment-item\">\
-                       <div class=\"comment-item__head\">\
-                         <span class=\"mono\">{author}</span>\
-                         <span class=\"muted\">{date}</span>\
+                    "<li class=\"comment-item ap-comment\">\
+                       <span class=\"letter-tile ap-comment__avatar ap-tone-{tone}\" aria-hidden=\"true\">{initial}</span>\
+                       <div>\
+                         <div class=\"comment-item__head ap-comment__head\">\
+                           <span class=\"mono\">{author}</span>\
+                           <time class=\"muted\" data-spark-reltime data-ts=\"{created_ts}\" title=\"{date}\">{date}</time>\
+                         </div>\
+                         <div class=\"comment-item__body ap-comment__body\">{body}</div>\
+                         <form class=\"comment-item__delete ap-comment__delete\" method=\"post\" action=\"/f/{fid}/comments/{cid}/delete\" \
+                           onsubmit=\"return confirm('Delete this comment?');\">\
+                           <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+                           <button class=\"btn btn-ghost btn-sm\" type=\"submit\">Delete</button>\
+                         </form>\
                        </div>\
-                       <div class=\"comment-item__body\">{body}</div>\
-                       <form class=\"comment-item__delete\" method=\"post\" action=\"/f/{fid}/comments/{cid}/delete\" \
-                         onsubmit=\"return confirm('Delete this comment?');\">\
-                         <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
-                         <button class=\"btn btn-danger btn-sm\" type=\"submit\">Delete</button>\
-                       </form>\
                      </li>",
+                    tone = tone,
+                    initial = initial,
                     author = esc(&c.author_sub),
-                    date = esc(&fmt_ts(c.created_at)),
+                    date = esc(&date),
+                    created_ts = c.created_at,
                     body = render_comment_body(&c.body),
                     fid = esc(&rec.id),
                     cid = esc(&c.id),
@@ -3044,15 +3300,20 @@ fn render_comments(rec: &FileRec, comments: &[FileComment], csrf: &str) -> Strin
             .collect::<Vec<_>>()
             .join("")
     };
+    let viewer_initial = ap_initial(&viewer.subject);
+    let viewer_tone = ap_avatar_tone(&viewer.subject);
     format!(
         "<div class=\"field comments\">\
            <label>Comments <span class=\"count-badge\">{count}</span></label>\
            <ul class=\"comment-list\">{rows}</ul>\
-           <form class=\"comment-form\" method=\"post\" action=\"/f/{id}/comments\">\
-             <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
-             <textarea name=\"body\" rows=\"4\" maxlength=\"{max}\" placeholder=\"Add a comment\" required></textarea>\
-             <div class=\"actions\">\
-               <button class=\"btn btn-secondary\" type=\"submit\">Comment</button>\
+           <form class=\"comment-form ap-comment-form\" method=\"post\" action=\"/f/{id}/comments\">\
+             <span class=\"letter-tile ap-comment__avatar ap-tone-{viewer_tone}\" aria-hidden=\"true\">{viewer_initial}</span>\
+             <div>\
+               <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+               <textarea name=\"body\" rows=\"4\" maxlength=\"{max}\" placeholder=\"Add a comment\" required></textarea>\
+               <div class=\"actions\">\
+                 <button class=\"btn btn-secondary\" type=\"submit\">Comment</button>\
+               </div>\
              </div>\
            </form>\
          </div>",
@@ -3061,11 +3322,25 @@ fn render_comments(rec: &FileRec, comments: &[FileComment], csrf: &str) -> Strin
         id = esc(&rec.id),
         csrf = esc(csrf),
         max = MAX_COMMENT_CHARS,
+        viewer_tone = viewer_tone,
+        viewer_initial = viewer_initial,
     )
 }
 
 fn render_comment_body(body: &str) -> String {
     esc(body).replace('\n', "<br>")
+}
+
+fn ap_avatar_tone(s: &str) -> usize {
+    s.bytes().map(usize::from).sum::<usize>() % 5 + 1
+}
+
+fn ap_initial(s: &str) -> String {
+    esc(s)
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().collect())
+        .unwrap_or_else(|| "U".to_string())
 }
 
 /// Render the version history block for the detail page: each retained snapshot with its date,
@@ -3081,21 +3356,28 @@ fn render_versions(rec: &FileRec, versions: &[VersionRec], csrf: &str) -> String
     let rows = versions
         .iter()
         .map(|v| {
+            let date = fmt_ts(v.created_at);
             format!(
-                "<tr>\
-                   <td>{date}</td>\
-                   <td>{size}</td>\
-                   <td class=\"mono\">{ctype}</td>\
-                   <td class=\"version-actions\">\
+                "<li class=\"eventline__item\">\
+                   <span class=\"eventline__dot\" aria-hidden=\"true\"></span>\
+                   <div class=\"eventline__body\">\
+                     <time class=\"eventline__time\" data-spark-reltime data-ts=\"{created_ts}\" title=\"{date}\">{date}</time>\
+                     <div class=\"ap-facts\">\
+                       <span class=\"ap-fact\">{size}</span>\
+                       <span class=\"ap-fact mono\">{ctype}</span>\
+                     </div>\
+                   </div>\
+                   <div class=\"version-actions\">\
                      <a class=\"btn btn-secondary btn-sm\" href=\"/f/{id}/versions/{vid}/raw\">Download</a>\
                      <form method=\"post\" action=\"/f/{id}/versions/{vid}/restore\" \
                        onsubmit=\"return confirm('Restore this version? The current file becomes a version.');\">\
                        <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
                        <button class=\"btn btn-secondary btn-sm\" type=\"submit\">Restore</button>\
                      </form>\
-                   </td>\
-                 </tr>",
-                date = esc(&fmt_ts(v.created_at)),
+                   </div>\
+                 </li>",
+                date = esc(&date),
+                created_ts = v.created_at,
                 size = esc(&human_size(v.size)),
                 ctype = esc(&v.content_type),
                 id = esc(&rec.id),
@@ -3108,10 +3390,7 @@ fn render_versions(rec: &FileRec, versions: &[VersionRec], csrf: &str) -> String
     format!(
         "<div class=\"field\">\
            <label>Versions <span class=\"count-badge\">{count}</span></label>\
-           <table class=\"data version-table\">\
-             <thead><tr><th>Saved</th><th>Size</th><th>Type</th><th></th></tr></thead>\
-             <tbody>{rows}</tbody>\
-           </table>\
+           <ol class=\"eventline ap-versions version-table\">{rows}</ol>\
            <p class=\"muted\">Versions count toward your storage quota.</p>\
          </div>",
         count = versions.len(),
@@ -3271,7 +3550,14 @@ fn render_share_section(config: &Config, rec: &FileRec, csrf: &str) -> String {
         Some(token) => {
             let share_url = format!("{}/s/{}", config.public_base, token);
             let expiry_status = match rec.expires_at {
-                Some(exp) => format!("Expires {}", esc(&fmt_ts(exp))),
+                Some(exp) => {
+                    let date = fmt_ts(exp);
+                    format!(
+                        "Expires <time data-spark-reltime data-ts=\"{exp}\" title=\"{date}\">{date}</time>",
+                        exp = exp,
+                        date = esc(&date),
+                    )
+                }
                 None => "Never expires".to_string(),
             };
             let pw_status = if rec.share_has_password() {
@@ -3280,26 +3566,32 @@ fn render_share_section(config: &Config, rec: &FileRec, csrf: &str) -> String {
                 "No password"
             };
             format!(
-                "<div class=\"field\">\
-                   <label for=\"shareUrl\">Share link (no sign-in required)</label>\
-                   <div class=\"share-row\">\
-                     <input id=\"shareUrl\" type=\"text\" readonly value=\"{url}\">\
-                     <button class=\"btn btn-secondary btn-sm\" id=\"copyBtn\" type=\"button\" data-label=\"Copy\">Copy</button>\
-                   </div>\
-                   <p class=\"muted\">{expiry_status} · {pw_status}</p>\
+                "<div class=\"ap-share-status\">\
+                   <span class=\"ap-badge ap-badge--link\">Public link live</span>\
+                   <span class=\"ap-badge ap-badge--exp\">{expiry_status}</span>\
+                   <span class=\"ap-badge ap-badge--lock\">{pw_status}</span>\
                  </div>\
-                 <form class=\"share-form\" method=\"post\" action=\"/f/{id}/share\">\
-                   <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
-                   {controls}\
-                   <div class=\"actions actions--split\">\
-                     <button class=\"btn btn-secondary\" type=\"submit\">Update share settings</button>\
+                 <div class=\"field\">\
+                   <label for=\"shareUrl\">Share link (no sign-in required)</label>\
+                   <div class=\"share-row embed-box__row\">\
+                     <input id=\"shareUrl\" class=\"embed-box__input\" type=\"text\" readonly value=\"{url}\">\
+                     <button class=\"btn btn-secondary btn-sm copy-btn\" id=\"copyBtn\" type=\"button\" data-copy=\".embed-box__input\" data-label=\"Copy\">Copy</button>\
                    </div>\
-                 </form>\
-                 <form class=\"revoke-form\" method=\"post\" action=\"/f/{id}/revoke\" \
-                   onsubmit=\"return confirm('Revoke this share link? The current link will stop working.');\">\
-                   <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
-                   <button class=\"btn btn-danger btn-sm\" type=\"submit\">Revoke share link</button>\
-                 </form>",
+                 </div>\
+                 <details class=\"ap-fold\"><summary>Link settings</summary><div class=\"ap-fold__body\">\
+                   <form class=\"share-form\" method=\"post\" action=\"/f/{id}/share\">\
+                     <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+                     {controls}\
+                     <div class=\"actions actions--split\">\
+                       <button class=\"btn btn-secondary\" type=\"submit\">Update share settings</button>\
+                     </div>\
+                   </form>\
+                   <form class=\"revoke-form\" method=\"post\" action=\"/f/{id}/revoke\" \
+                     onsubmit=\"return confirm('Revoke this share link? The current link will stop working.');\">\
+                     <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+                     <button class=\"btn btn-danger btn-sm\" type=\"submit\">Revoke share link</button>\
+                   </form>\
+                 </div></details>",
                 url = esc(&share_url),
                 expiry_status = expiry_status,
                 pw_status = pw_status,
@@ -3309,7 +3601,8 @@ fn render_share_section(config: &Config, rec: &FileRec, csrf: &str) -> String {
             )
         }
         None => format!(
-            "<div class=\"field\">\
+            "<div class=\"ap-share-status\"><span class=\"ap-badge ap-badge--link\">Private</span></div>\
+             <div class=\"field\">\
                <label>Share link</label>\
                <p class=\"muted\">This file is private — there is no active share link.</p>\
              </div>\

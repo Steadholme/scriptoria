@@ -21,67 +21,68 @@
   </header>
 
   <main class="console">
-    <div class="console__head console__head--row">
-      <div>
-        <h1 class="detail-title">{{NAME}}</h1>
-        <p class="sub">{{SUB}}</p>
-      </div>
-      <a class="btn btn-ghost btn-sm" href="/">Back to drive</a>
-    </div>
-
-    <div class="layout">
-      <section class="card">
-        <div class="card__body card__body--media">{{PREVIEW}}</div>
-      </section>
-
-      <div id="lightbox" class="lightbox" hidden aria-hidden="true">
-        <img id="lightboxImg" class="lightbox__img" alt="">
-      </div>
-
-      <section class="card">
-        <div class="card__head"><h2>Details</h2></div>
-        <div class="card__body">
-          {{META_LIST}}
-
-          {{MOVE}}
-
-          {{SHARE}}
-
-          {{EMBED}}
-
-          {{VERSIONS}}
-
-          {{COMMENTS}}
-
-          <div class="actions actions--split">
-            <a class="btn btn-primary" href="/f/{{ID}}/raw">Download</a>
-            {{DELETE}}
-          </div>
-        </div>
-      </section>
-    </div>
-  </main>
-
-  <script>
-    (function () {
-      var btn = document.getElementById('copyBtn');
-      var url = document.getElementById('shareUrl');
-      if (!btn || !url) { return; }
-      btn.addEventListener('click', function () {
-        url.select();
-        var done = function () {
-          btn.textContent = 'Copied';
-          setTimeout(function () { btn.textContent = btn.getAttribute('data-label'); }, 1200);
-        };
-        if (navigator.clipboard) {
-          navigator.clipboard.writeText(url.value).then(done, function () { try { document.execCommand('copy'); done(); } catch (e) {} });
-        } else {
-          try { document.execCommand('copy'); done(); } catch (e) {}
-        }
-      });
-    })();
-
-    (function () {
+	    <div class="console__head console__head--row ap-filehead">
+	      <div class="ap-filehead__lockup">
+	        {{TYPE_TILE}}
+	        <div>
+	          <h1 class="detail-title">{{NAME}}</h1>
+	          {{FACTS}}
+	        </div>
+	      </div>
+	      <a class="btn btn-ghost btn-sm" href="/">Back to drive</a>
+	    </div>
+	
+	    <div class="ap-detail">
+	      <section class="ap-stage {{STAGE_MOD}}">
+	        <div class="ap-stage__body">{{PREVIEW}}</div>
+	      </section>
+	
+	      <div class="ap-rail ap-detail__rail">
+	        <section class="ap-panel">
+	          <div class="ap-panel__head"><h2>Sharing</h2></div>
+	          <div class="ap-panel__body">
+	          {{SHARE}}
+	
+	          {{EMBED}}
+	          </div>
+	        </section>
+	
+	        <section class="ap-panel">
+	          <div class="ap-panel__head"><h2>Details</h2></div>
+	          <div class="ap-panel__body">
+	          {{META_LIST}}
+	
+	          {{MOVE}}
+	          </div>
+	        </section>
+	
+	        <section class="ap-panel ap-panel--sub">
+	          	          <div class="ap-panel__body">
+	          {{VERSIONS}}
+	          </div>
+	        </section>
+	
+	        <section class="ap-panel ap-panel--sub">
+	          	          <div class="ap-panel__body">
+	          {{COMMENTS}}
+	          </div>
+	        </section>
+	
+	        <div class="actions actions--split ap-actionbar">
+	          <a class="btn btn-primary" href="/f/{{ID}}/raw">Download</a>
+	          {{DELETE}}
+	        </div>
+	      </div>
+	    </div>
+	
+	    <div id="lightbox" class="lightbox" hidden aria-hidden="true">
+	      <img id="lightboxImg" class="lightbox__img" alt="">
+	    </div>
+	  </main>
+	
+	  {{DYNAMIC}}
+	  <script>
+	    (function () {
       var buttons = document.querySelectorAll('.copy-btn');
       Array.prototype.forEach.call(buttons, function (btn) {
         btn.addEventListener('click', function () {

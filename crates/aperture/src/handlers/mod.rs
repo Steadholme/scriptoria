@@ -16,11 +16,13 @@ pub mod health;
 
 use axum::http::StatusCode;
 use axum::response::Html;
+use std::sync::OnceLock;
 
 /// Aperture-only CSS layered after Odyssey's canonical font, tokens, and components.
 pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
 
-static APP_CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static APP_CSS: OnceLock<String> = OnceLock::new();
+static DYNAMIC_JS: OnceLock<String> = OnceLock::new();
 
 /// Embedded design system, inlined into each rendered page's `<style>`:
 /// Odyssey's canonical CSS followed by Aperture's service surface CSS.
@@ -32,6 +34,12 @@ pub fn app_css() -> &'static str {
             css.push_str(SERVICE_CSS);
             css
         })
+        .as_str()
+}
+
+pub fn dynamic_js() -> &'static str {
+    DYNAMIC_JS
+        .get_or_init(|| odyssey::dynamic_scripts().0)
         .as_str()
 }
 
@@ -343,8 +351,14 @@ mod tests {
     fn sanitize_content_type_rejects_garbage() {
         assert_eq!(sanitize_content_type("image/png"), "image/png");
         assert_eq!(sanitize_content_type("IMAGE/PNG"), "image/png");
-        assert_eq!(sanitize_content_type("text/html; charset=utf-8"), "text/html");
-        assert_eq!(sanitize_content_type("no-slash"), "application/octet-stream");
+        assert_eq!(
+            sanitize_content_type("text/html; charset=utf-8"),
+            "text/html"
+        );
+        assert_eq!(
+            sanitize_content_type("no-slash"),
+            "application/octet-stream"
+        );
         assert_eq!(
             sanitize_content_type("evil\r\nSet-Cookie: x"),
             "application/octet-stream"
