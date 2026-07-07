@@ -1,34 +1,16 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
-  <title>Search · Inkwell</title>
-  <style>{{CSS}}</style>
-</head>
-<body class="page-console">
-{{TOPBAR}}
 <main class="console console--narrow">
-  <div class="console__head">
+  <div class="console__head ink-pubhead">
     <h1>Search</h1>
     <p class="sub">Full-text search across every published post &mdash; matching words are highlighted.</p>
   </div>
-  <section class="card">
-    <div class="card__body">
-      <form class="editor" method="get" action="/search">
-        <div class="field">
-          <label for="q">Query</label>
-          <input type="text" id="q" name="q" maxlength="200" placeholder="Search posts&hellip;" value="{{QUERY}}" autofocus>
-        </div>
-        <div class="editor__actions">
-          <button class="btn btn-primary" type="submit">Search</button>
-          <a class="btn btn-ghost" href="/">Back to the blog</a>
-        </div>
-      </form>
+  <form class="ink-search" method="get" action="/search">
+    <div class="ink-search__box">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+      <label class="sr-only" for="q">Search</label>
+      <input type="text" id="q" name="q" maxlength="200" placeholder="Search posts&hellip;" value="{{QUERY}}" autofocus>
     </div>
-  </section>
+    <button class="btn btn-primary" type="submit">Search</button>
+  </form>
+  <p class="ink-search__hint"><a href="/">Back to the blog</a></p>
   {{RESULTS}}
 </main>
-</body>
-</html>

@@ -1,35 +1,21 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
-  <title>Ask the blog · Inkwell</title>
-  <style>{{CSS}}</style>
-</head>
-<body class="page-console">
-{{TOPBAR}}
 <main class="console console--narrow">
-  <div class="console__head">
+  <div class="console__head ink-pubhead">
+    <p class="eyebrow">Ask</p>
     <h1>Ask the blog</h1>
     <p class="sub">Ask a question and get an answer drawn straight from the published posts, with links to the sources.</p>
   </div>
-  <section class="card">
-    <div class="card__body">
-      <form class="editor" method="post" action="/api/ask">
-        <input type="hidden" name="csrf_token" value="{{CSRF}}">
-        <div class="field">
-          <label for="question">Question</label>
-          <textarea id="question" name="question" class="editor__body" placeholder="What have I written about&hellip;?" required>{{QUESTION}}</textarea>
-        </div>
-        <div class="editor__actions">
-          <button class="btn btn-primary" type="submit">Ask</button>
-          <a class="btn btn-ghost" href="/">Back to the blog</a>
-        </div>
-      </form>
+  <form class="editor ink-ask" method="post" action="/api/ask">
+    <input type="hidden" name="csrf_token" value="{{CSRF}}">
+    <div class="field">
+      <label for="question">Question</label>
+      <textarea id="question" name="question" class="editor__body" placeholder="What have I written about&hellip;?" required>{{QUESTION}}</textarea>
     </div>
-  </section>
+    <div class="ink-ask__foot">
+      <span class="ink-ask__hint">Answers come only from your published posts.</span>
+      <span class="spacer"></span>
+      <a class="btn btn-ghost" href="/">Back to the blog</a>
+      <button class="btn btn-primary" type="submit">Ask</button>
+    </div>
+  </form>
   {{ANSWER}}
 </main>
-</body>
-</html>

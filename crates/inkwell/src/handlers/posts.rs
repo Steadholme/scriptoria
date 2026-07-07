@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::audit::AuditEvent;
 use crate::auth;
 use crate::error::AppError;
-use crate::handlers::{esc, fmt_date, tag_chips, topbar, app_css};
+use crate::handlers::{esc, fmt_date, page_shell, tag_chips};
 use crate::markdown;
 use crate::store::{Post, PostCursor};
 use crate::{now_nanos, now_secs, unique_slug, AppState};
@@ -81,6 +81,7 @@ pub async fn index(
 ) -> Response {
     let viewer = auth::author_sub(&headers);
     let email = auth::display_email(&headers);
+    let is_admin = auth::is_admin(&headers);
 
     // Site settings drive the title/tagline in the head + masthead and the default page size.
     let settings = state.store.get_settings().await;
@@ -103,8 +104,14 @@ pub async fn index(
         None
     };
 
+    let (hero, list_posts): (String, &[Post]) = if q.before.is_none() && !posts.is_empty() {
+        (render_hero(&posts[0], viewer.as_deref(), now), &posts[1..])
+    } else {
+        (String::new(), &posts[..])
+    };
+
     let mut cards = String::new();
-    for p in &posts {
+    for p in list_posts {
         cards.push_str(&render_card(p, viewer.as_deref(), now));
     }
     if posts.is_empty() && next_cursor.is_none() {
@@ -121,14 +128,24 @@ pub async fn index(
         None => String::new(),
     };
 
-    let body = LIST_HTML
-        .replace("{{CSS}}", app_css())
-        .replace("{{TOPBAR}}", &topbar(&settings.title, &email))
+    let fragment = LIST_HTML
         .replace("{{BLOG_TITLE}}", &esc(&settings.title))
         .replace("{{TAGLINE}}", &esc(&settings.tagline))
+        .replace("{{HERO}}", &hero)
+        .replace("{{PAGE_CLASS}}", "")
+        .replace("{{MH_EYEBROW}}", "Publication")
         .replace("{{POSTS}}", &cards)
         .replace("{{PAGER}}", &pager);
-    Html(body).into_response()
+    let page = page_shell(
+        &format!("{} · HOLDFAST", settings.title),
+        "page-reading",
+        true,
+        &settings.title,
+        &email,
+        is_admin,
+        &fragment,
+    );
+    Html(page).into_response()
 }
 
 /// `GET /tag/{slug}` — one keyset page of posts carrying the tag `slug`, newest-first. Reuses the
@@ -144,6 +161,7 @@ pub async fn tag_index(
 ) -> Response {
     let viewer = auth::author_sub(&headers);
     let email = auth::display_email(&headers);
+    let is_admin = auth::is_admin(&headers);
     let settings = state.store.get_settings().await;
 
     let before = q.before.as_deref().and_then(parse_before);
@@ -197,15 +215,25 @@ pub async fn tag_index(
         None => String::new(),
     };
 
-    let heading = format!("#{label}");
-    let body = LIST_HTML
-        .replace("{{CSS}}", app_css())
-        .replace("{{TOPBAR}}", &topbar(&heading, &email))
+    let heading = label.clone();
+    let fragment = LIST_HTML
         .replace("{{BLOG_TITLE}}", &esc(&heading))
         .replace("{{TAGLINE}}", &esc(&format!("Posts tagged “{label}”")))
+        .replace("{{HERO}}", "")
+        .replace("{{PAGE_CLASS}}", " ink-tagview")
+        .replace("{{MH_EYEBROW}}", "Tagged")
         .replace("{{POSTS}}", &cards)
         .replace("{{PAGER}}", &pager);
-    Html(body).into_response()
+    let page = page_shell(
+        &format!("{heading} · HOLDFAST"),
+        "page-reading",
+        true,
+        &heading,
+        &email,
+        is_admin,
+        &fragment,
+    );
+    Html(page).into_response()
 }
 
 /// Parse a `?before=<created_at>_<id>` keyset cursor into `(created_at, id)`. `created_at` is a
@@ -257,6 +285,7 @@ pub async fn view(
 ) -> Result<Response, AppError> {
     let viewer = auth::author_sub(&headers);
     let email = auth::display_email(&headers);
+    let is_admin = auth::is_admin(&headers);
 
     let now = now_secs();
     let post = state
@@ -270,16 +299,12 @@ pub async fn view(
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
 
     let meta = format!(
-        "{date} · {author}{draft}",
-        date = fmt_date(post.created_at),
-        author = post.author_email,
-        draft = if !post.published {
-            " · Draft"
-        } else if post.is_scheduled_at(now) {
-            " · Scheduled"
-        } else {
-            ""
-        },
+        r#"<div class="ink-byline"><span class="ink-avatar ink-avatar--lg">{initial}</span><div class="ink-byline__col"><span class="ink-byline__author">{author}</span><span class="ink-byline__meta">{date} · {mins} min read{state}</span></div></div>"#,
+        initial = esc(&author_initial(&post.author_email)),
+        author = esc(&post.author_email),
+        date = esc(&fmt_date(post.created_at)),
+        mins = read_minutes(&post.body_md),
+        state = state_badge(&post, now),
     );
 
     let actions = if is_owner {
@@ -308,20 +333,26 @@ pub async fn view(
         .await;
     let related = render_related(&related_posts);
 
-    let page = POST_HTML
-        .replace("{{CSS}}", app_css())
-        .replace("{{TOPBAR}}", &topbar("Reading", &email))
-        .replace("{{TITLE_TEXT}}", &esc(&post.title))
+    let fragment = POST_HTML
         .replace("{{TITLE}}", &esc(&post.title))
         .replace(
             "{{COVER}}",
             &render_cover(&post.cover_url, "article__cover", &post.title),
         )
-        .replace("{{META}}", &esc(&meta))
+        .replace("{{META}}", &meta)
         .replace("{{TAGS}}", &tag_chips(&post.tags))
         .replace("{{ACTIONS}}", &actions)
         .replace("{{BODY}}", &body_html)
         .replace("{{RELATED}}", &related);
+    let page = page_shell(
+        &format!("{} · Inkwell", post.title),
+        "page-reading",
+        true,
+        "Reading",
+        &email,
+        is_admin,
+        &fragment,
+    );
 
     Ok(html_with_cookie(page, set_cookie))
 }
@@ -333,9 +364,12 @@ pub async fn view(
 /// `GET /new` — the compose form.
 pub async fn new_form(State(_state): State<AppState>, headers: HeaderMap) -> Response {
     let email = auth::display_email(&headers);
+    let is_admin = auth::is_admin(&headers);
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
     let page = render_editor(EditorView {
         email: &email,
+        is_admin,
+        state_label: "published",
         heading: "New post",
         subhead: "Compose a post in Markdown. You are the author.",
         action: "/new",
@@ -456,6 +490,7 @@ pub async fn edit_form(
     Path(slug): Path<String>,
 ) -> Result<Response, AppError> {
     let (sub, email) = auth::require_author(&headers)?;
+    let is_admin = auth::is_admin(&headers);
     let post = state
         .store
         .get_post(&slug)
@@ -468,9 +503,12 @@ pub async fn edit_form(
         ));
     }
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
+    let state_label = publication_detail(&post, now_secs());
 
     let page = render_editor(EditorView {
         email: &email,
+        is_admin,
+        state_label,
         heading: "Edit post",
         subhead: "Update the title, body, or publication state.",
         action: &format!("/edit/{}", esc(&post.slug)),
@@ -739,46 +777,124 @@ fn render_related(posts: &[Post]) -> String {
     )
 }
 
-/// One index card: title link, meta line, excerpt, and (own posts only) a draft badge + edit
-/// link. Every interpolated field is HTML-escaped.
-fn render_card(post: &Post, viewer_sub: Option<&str>, now: i64) -> String {
-    let is_owner = viewer_sub == Some(post.author_sub.as_str());
-    let state_badge = if !post.published {
+fn read_minutes(body_md: &str) -> u64 {
+    (body_md.split_whitespace().count() as u64)
+        .div_ceil(200)
+        .max(1)
+}
+
+fn author_initial(email: &str) -> String {
+    if email.is_empty() || email == "—" {
+        return String::new();
+    }
+    email
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_default()
+}
+
+fn hero_letter(title: &str) -> String {
+    title
+        .chars()
+        .find(|c| !c.is_whitespace())
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "I".to_string())
+}
+
+fn state_badge(post: &Post, now: i64) -> &'static str {
+    if !post.published {
         r#"<span class="badge badge-draft">Draft</span>"#
     } else if post.is_scheduled_at(now) {
         r#"<span class="badge badge-warn">Scheduled</span>"#
     } else {
         ""
-    };
-    // Admin-set featured flag: a small badge on the (published) index card.
-    let featured_badge = if post.featured {
+    }
+}
+
+fn featured_badge(post: &Post) -> &'static str {
+    if post.featured {
         r#"<span class="badge badge-featured">Featured</span>"#
     } else {
         ""
-    };
-    let owner_link = if is_owner {
+    }
+}
+
+fn pin_badge(post: &Post) -> &'static str {
+    if post.pinned {
+        r#"<span class="badge ink-pin">Pinned</span>"#
+    } else {
+        ""
+    }
+}
+
+fn owner_link(post: &Post, viewer_sub: Option<&str>) -> String {
+    if viewer_sub == Some(post.author_sub.as_str()) {
         format!(
             r#" · <a class="card__edit" href="/edit/{slug}">Edit</a>"#,
             slug = esc(&post.slug)
         )
     } else {
         String::new()
+    }
+}
+
+fn render_hero(post: &Post, viewer_sub: Option<&str>, now: i64) -> String {
+    let cover = if post.cover_url.is_empty() {
+        format!(
+            r#"<div class="ink-hero__fallback" aria-hidden="true"><span>{letter}</span></div>"#,
+            letter = esc(&hero_letter(&post.title)),
+        )
+    } else {
+        render_cover(&post.cover_url, "card-post__cover", &post.title)
     };
+    format!(
+        r#"<article class="ink-hero">
+  {cover}
+  <div class="ink-hero__pills">{pin}{featured}{badge}</div>
+  <h2 class="ink-hero__title"><a href="/p/{slug}">{title}</a></h2>
+  <p class="ink-hero__excerpt">{excerpt}</p>
+  <div class="ink-byline"><span class="ink-avatar">{initial}</span><span>{author}</span><span>·</span><span>{date}</span><span>·</span><span>{mins} min read</span>{owner}</div>
+  {tags}
+</article>"#,
+        cover = cover,
+        pin = pin_badge(post),
+        featured = featured_badge(post),
+        badge = state_badge(post, now),
+        slug = esc(&post.slug),
+        title = esc(&post.title),
+        excerpt = esc(&markdown::excerpt(&post.body_md, 280)),
+        initial = esc(&author_initial(&post.author_email)),
+        author = esc(&post.author_email),
+        date = esc(&fmt_date(post.created_at)),
+        mins = read_minutes(&post.body_md),
+        owner = owner_link(post, viewer_sub),
+        tags = tag_chips(&post.tags),
+    )
+}
+
+/// One index card: title link, meta line, excerpt, and (own posts only) a draft badge + edit
+/// link. Every interpolated field is HTML-escaped.
+fn render_card(post: &Post, viewer_sub: Option<&str>, now: i64) -> String {
+    let owner_link = owner_link(post, viewer_sub);
     format!(
         r#"<article class="card-post">
   {cover}
-  <h2 class="card-post__title"><a href="/p/{slug}">{title}</a>{featured}{badge}</h2>
-  <div class="card-post__meta">{date} · {author}{owner}</div>
+  <h2 class="card-post__title"><a href="/p/{slug}">{title}</a>{featured}{badge}{pin}</h2>
+  <div class="card-post__meta"><span class="ink-avatar">{initial}</span>{author} · {date} · {mins} min read{owner}</div>
   <p class="card-post__excerpt">{excerpt}</p>
   {tags}
 </article>"#,
         cover = render_cover(&post.cover_url, "card-post__cover", &post.title),
         slug = esc(&post.slug),
         title = esc(&post.title),
-        featured = featured_badge,
-        badge = state_badge,
-        date = esc(&fmt_date(post.created_at)),
+        featured = featured_badge(post),
+        badge = state_badge(post, now),
+        pin = pin_badge(post),
+        initial = esc(&author_initial(&post.author_email)),
         author = esc(&post.author_email),
+        date = esc(&fmt_date(post.created_at)),
+        mins = read_minutes(&post.body_md),
         owner = owner_link,
         excerpt = esc(&markdown::excerpt(&post.body_md, 200)),
         tags = tag_chips(&post.tags),
@@ -788,6 +904,8 @@ fn render_card(post: &Post, viewer_sub: Option<&str>, now: i64) -> String {
 /// Inputs for rendering the compose/edit form (one shared template).
 struct EditorView<'a> {
     email: &'a str,
+    is_admin: bool,
+    state_label: &'a str,
     heading: &'a str,
     subhead: &'a str,
     action: &'a str,
@@ -806,6 +924,11 @@ struct EditorView<'a> {
 }
 
 fn render_editor(v: EditorView<'_>) -> String {
+    let state_pill_html = match v.state_label {
+        "draft" => r#"<span class="pill">Draft</span>"#,
+        "scheduled" => r#"<span class="pill pill--warn">Scheduled</span>"#,
+        _ => r#"<span class="pill pill--ok">Published</span>"#,
+    };
     let delete_block = match v.delete_slug {
         Some(slug) => format!(
             r#"<div class="danger-zone">
@@ -821,9 +944,7 @@ fn render_editor(v: EditorView<'_>) -> String {
         None => String::new(),
     };
 
-    EDITOR_HTML
-        .replace("{{CSS}}", app_css())
-        .replace("{{TOPBAR}}", &topbar(v.heading, v.email))
+    let fragment = EDITOR_HTML
         .replace("{{HEADING}}", &esc(v.heading))
         .replace("{{SUBHEAD}}", &esc(v.subhead))
         .replace("{{ACTION}}", v.action)
@@ -838,9 +959,19 @@ fn render_editor(v: EditorView<'_>) -> String {
             if v.published { "checked" } else { "" },
         )
         .replace("{{PINNED_CHECKED}}", if v.pinned { "checked" } else { "" })
+        .replace("{{STATE_PILL}}", state_pill_html)
         .replace("{{SUBMIT_LABEL}}", &esc(v.submit_label))
         .replace("{{CANCEL_HREF}}", v.cancel_href)
-        .replace("{{DELETE}}", &delete_block)
+        .replace("{{DELETE}}", &delete_block);
+    page_shell(
+        &format!("{} · Inkwell", v.heading),
+        "page-console",
+        false,
+        v.heading,
+        v.email,
+        v.is_admin,
+        &fragment,
+    )
 }
 
 /// A 303 redirect (post/redirect/get).

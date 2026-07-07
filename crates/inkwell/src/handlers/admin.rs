@@ -20,7 +20,7 @@ use crate::audit::AuditEvent;
 use crate::auth;
 use crate::config::MAX_PAGE;
 use crate::error::AppError;
-use crate::handlers::{esc, topbar, app_css};
+use crate::handlers::{esc, page_shell};
 use crate::store::{Post, Settings};
 use crate::{now_secs, AppState};
 
@@ -72,14 +72,21 @@ pub async fn index(
         rows.push_str(r#"<tr><td colspan="7" class="admin-table__empty">No posts yet.</td></tr>"#);
     }
 
-    let page = ADMIN_HTML
-        .replace("{{CSS}}", app_css())
-        .replace("{{TOPBAR}}", &topbar("Admin", &email))
+    let fragment = ADMIN_HTML
         .replace("{{CSRF}}", &esc(&csrf))
         .replace("{{SETTINGS_TITLE}}", &esc(&settings.title))
         .replace("{{SETTINGS_TAGLINE}}", &esc(&settings.tagline))
         .replace("{{SETTINGS_PPP}}", &settings.posts_per_page.to_string())
         .replace("{{ROWS}}", &rows);
+    let page = page_shell(
+        "Admin · Inkwell",
+        "page-console",
+        false,
+        "Admin",
+        &email,
+        true,
+        &fragment,
+    );
 
     Ok(html_with_cookie(page, set_cookie))
 }

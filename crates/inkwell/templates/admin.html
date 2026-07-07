@@ -1,14 +1,3 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
-  <title>Admin · Inkwell</title>
-  <style>{{CSS}}</style>
-</head>
-<body class="page-console">
-{{TOPBAR}}
 <main class="console">
   <div class="console__head">
     <h1>Admin</h1>
@@ -18,13 +7,13 @@
   <section class="card">
     <div class="card__body">
       <h2>Site settings</h2>
-      <form class="editor" method="post" action="/admin/settings">
+      <form class="editor ink-form" method="post" action="/admin/settings">
         <input type="hidden" name="csrf_token" value="{{CSRF}}">
-        <div class="field">
+        <div class="field field--wide">
           <label for="title">Blog title</label>
           <input type="text" id="title" name="title" maxlength="200" value="{{SETTINGS_TITLE}}">
         </div>
-        <div class="field">
+        <div class="field field--wide">
           <label for="tagline">Tagline</label>
           <input type="text" id="tagline" name="tagline" maxlength="300" value="{{SETTINGS_TAGLINE}}">
         </div>
@@ -74,5 +63,3 @@
     </div>
   </section>
 </main>
-</body>
-</html>

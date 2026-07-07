@@ -57,11 +57,16 @@ pub const APP_ICON: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="curr
 /// the avatar user-menu (Account / All apps / the preserved gateway Sign-out) on the right.
 /// `page_title` selects the active nav item; `email` is the gateway-injected address (empty or the
 /// neutral `—` placeholder on public, no-session reading pages → a minimal, no-identity avatar).
-pub fn topbar(page_title: &str, email: &str) -> String {
+pub fn topbar(page_title: &str, email: &str, is_admin: bool) -> String {
     let active = match page_title {
         "Search" => "search",
         "Ask" => "ask",
         _ => "posts",
+    };
+    let admin_nav = if is_admin {
+        r#"<a class="appnav" href="/admin">Admin</a>"#
+    } else {
+        ""
     };
     let nav = format!(
         concat!(
@@ -69,16 +74,18 @@ pub fn topbar(page_title: &str, email: &str) -> String {
             r#"<a class="appnav{a_posts}" href="/"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 22V12h6v10"/></svg>Posts</a>"#,
             r#"<a class="appnav{a_search}" href="/search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>Search</a>"#,
             r#"<a class="appnav{a_ask}" href="/ask"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/></svg>Ask</a>"#,
+            r#"{admin_nav}"#,
             r#"</nav>"#,
         ),
         a_posts = if active == "posts" { " is-active" } else { "" },
         a_search = if active == "search" { " is-active" } else { "" },
         a_ask = if active == "ask" { " is-active" } else { "" },
+        admin_nav = admin_nav,
     );
     format!(
         r#"<header class="appbar">
   <a class="appbar__brand" href="/" aria-label="HOLDFAST Inkwell home">
-    <span class="app-tile" aria-hidden="true">{icon}</span>
+    <span class="app-tile" style="--app:var(--brand);--app-soft:var(--brand-soft)" aria-hidden="true">{icon}</span>
     <span class="appbar__name"><b>Blog</b><span>blog.w33d.xyz</span></span>
   </a>
   {nav}
@@ -88,6 +95,35 @@ pub fn topbar(page_title: &str, email: &str) -> String {
         icon = APP_ICON,
         nav = nav,
         right = user_menu(email),
+    )
+}
+
+pub fn page_shell(
+    head_title: &str,
+    body_class: &str,
+    rss: bool,
+    nav_title: &str,
+    email: &str,
+    is_admin: bool,
+    fragment: &str,
+) -> String {
+    let rss_link = if rss {
+        r#"<link rel="alternate" type="application/rss+xml" title="Inkwell · HOLDFAST" href="/feed.xml">"#
+    } else {
+        ""
+    };
+    format!(
+        r#"<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>{title}</title>{rss_link}<style>{css}</style></head><body class="{body_class}">
+{topbar}{fragment}</body></html>"#,
+        title = esc(head_title),
+        rss_link = rss_link,
+        css = app_css(),
+        body_class = body_class,
+        topbar = topbar(nav_title, email, is_admin),
+        fragment = fragment,
     )
 }
 
@@ -109,10 +145,7 @@ pub fn user_menu(email: &str) -> String {
     let (avatar_inner, name_html, head_name, head_sub) = if has_id {
         (
             esc(&initials),
-            format!(
-                "<span class=\"usermenu__name\">{}</span>",
-                esc(email)
-            ),
+            format!("<span class=\"usermenu__name\">{}</span>", esc(email)),
             esc(email),
             "Signed in".to_string(),
         )
@@ -197,27 +230,26 @@ fn month_abbr(m: time::Month) -> &'static str {
 pub fn error_page(status: StatusCode, message: &str) -> String {
     let code = status.as_u16();
     let reason = status.canonical_reason().unwrap_or("Error");
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="light">
-<title>{code} {reason} · Inkwell</title><style>{css}</style></head>
-<body class="page-reading">
-{topbar}
-<main class="reader">
+    let fragment = format!(
+        r#"<main class="reader">
   <div class="error-card">
     <div class="error-card__code">{code}</div>
     <h1 class="error-card__title">{reason}</h1>
     <p class="error-card__msg">{msg}</p>
     <a class="btn btn-primary" href="/">Back to the blog</a>
   </div>
-</main>
-</body></html>"#,
-        css = app_css(),
-        topbar = topbar("Inkwell", "—"),
+</main>"#,
         code = code,
         reason = esc(reason),
         msg = esc(message),
+    );
+    page_shell(
+        &format!("{code} {reason} · Inkwell"),
+        "page-reading",
+        false,
+        "Inkwell",
+        "—",
+        false,
+        &fragment,
     )
 }

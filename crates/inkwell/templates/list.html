@@ -1,31 +1,20 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
-  <title>{{BLOG_TITLE}} · HOLDFAST</title>
-  <link rel="alternate" type="application/rss+xml" title="Inkwell · HOLDFAST" href="/feed.xml">
-  <style>{{CSS}}</style>
-</head>
-<body class="page-reading">
-{{TOPBAR}}
-<main class="reader">
-  <div class="reader__head">
+<main class="reader{{PAGE_CLASS}}">
+  <header class="ink-masthead">
     <div>
-      <h1 class="reader__title">{{BLOG_TITLE}}</h1>
-      <p class="reader__sub">{{TAGLINE}}</p>
+      <p class="ink-masthead__eyebrow">{{MH_EYEBROW}}</p>
+      <h1 class="ink-masthead__title">{{BLOG_TITLE}}</h1>
+      <p class="ink-masthead__tagline">{{TAGLINE}}</p>
     </div>
     <div class="reader__actions">
-      <a class="btn btn-secondary" href="/search">Search</a>
-      <a class="btn btn-secondary" href="/ask">Ask the blog</a>
+      <a class="btn btn-ghost" href="/search">Search</a>
+      <a class="btn btn-ghost" href="/ask">Ask the blog</a>
       <a class="btn btn-primary" href="/new">New post</a>
+      <a class="ink-rss" href="/feed.xml">RSS</a>
     </div>
-  </div>
+  </header>
+  {{HERO}}
   <div class="post-list">
     {{POSTS}}
   </div>
   {{PAGER}}
 </main>
-</body>
-</html>

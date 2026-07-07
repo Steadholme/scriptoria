@@ -19,7 +19,7 @@ use serde::Deserialize;
 
 use crate::auth;
 use crate::error::AppError;
-use crate::handlers::{esc, fmt_date, topbar, app_css};
+use crate::handlers::{esc, fmt_date, page_shell};
 use crate::index::{self, Scored};
 use crate::AppState;
 
@@ -48,8 +48,9 @@ pub struct AskForm {
 /// `GET /ask` — the ask console: a question box + an empty answer area.
 pub async fn ask_page(State(_state): State<AppState>, headers: HeaderMap) -> Response {
     let email = auth::display_email(&headers);
+    let is_admin = auth::is_admin(&headers);
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
-    let page = render_console(&email, &csrf, "", &empty_answer());
+    let page = render_console(&email, is_admin, &csrf, "", &empty_answer());
     html_with_cookie(page, set_cookie)
 }
 
@@ -66,12 +67,20 @@ pub async fn ask(
     Form(form): Form<AskForm>,
 ) -> Result<Response, AppError> {
     let (_sub, email) = auth::require_author(&headers)?;
+    let is_admin = auth::is_admin(&headers);
     auth::verify_csrf(&headers, &form.csrf_token)?;
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
 
-    let question: String = form.question.trim().chars().take(MAX_QUESTION_CHARS).collect();
+    let question: String = form
+        .question
+        .trim()
+        .chars()
+        .take(MAX_QUESTION_CHARS)
+        .collect();
     if question.is_empty() {
-        return Err(AppError::InvalidRequest("a question is required".to_string()));
+        return Err(AppError::InvalidRequest(
+            "a question is required".to_string(),
+        ));
     }
 
     // Lazy initial index: if nothing is indexed yet, rebuild from the published posts first so the
@@ -89,8 +98,18 @@ pub async fn ask(
     } else {
         render_answer(&top)
     };
+    let echo = format!(
+        r#"<blockquote class="ink-echo"><span class="ink-echo__kicker">You asked</span>{}</blockquote>"#,
+        esc(&question)
+    );
 
-    let page = render_console(&email, &csrf, &question, &answer_html);
+    let page = render_console(
+        &email,
+        is_admin,
+        &csrf,
+        &question,
+        &format!("{echo}{answer_html}"),
+    );
     Ok(html_with_cookie(page, set_cookie))
 }
 
@@ -99,13 +118,26 @@ pub async fn ask(
 // ---------------------------------------------------------------------------
 
 /// Render the full console page around its parts.
-fn render_console(email: &str, csrf: &str, question: &str, answer_html: &str) -> String {
-    ASK_HTML
-        .replace("{{CSS}}", app_css())
-        .replace("{{TOPBAR}}", &topbar("Ask", email))
+fn render_console(
+    email: &str,
+    is_admin: bool,
+    csrf: &str,
+    question: &str,
+    answer_html: &str,
+) -> String {
+    let fragment = ASK_HTML
         .replace("{{CSRF}}", &esc(csrf))
         .replace("{{QUESTION}}", &esc(question))
-        .replace("{{ANSWER}}", answer_html)
+        .replace("{{ANSWER}}", answer_html);
+    page_shell(
+        "Ask the blog · Inkwell",
+        "page-console",
+        false,
+        "Ask",
+        email,
+        is_admin,
+        &fragment,
+    )
 }
 
 /// Render the extractive answer: the top passages stitched with `[n]` markers, then a linked list
@@ -153,6 +185,7 @@ fn empty_answer() -> String {
   <div class="empty-state">
     <h2>Ask anything you've published</h2>
     <p>Inkwell searches your own posts and answers with the most relevant passages, linked to the originals.</p>
+    <p class="ink-ask__try muted">Try: “What have I written about deployment?” · “How does the gateway route requests?”</p>
   </div>
 </section>"#
         .to_string()
@@ -165,6 +198,7 @@ fn no_results_answer(question: &str) -> String {
   <div class="empty-state">
     <h2>No matching posts</h2>
     <p>Nothing in your published posts matched <strong>"{q}"</strong>. Try different words.</p>
+    <form class="ink-ask-redo" method="get" action="/search"><input type="hidden" name="q" value="{q}"><button class="btn btn-ghost" type="submit">Search the blog instead</button></form>
   </div>
 </section>"#,
         q = esc(question),

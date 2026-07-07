@@ -19,7 +19,7 @@ use axum::response::{Html, IntoResponse, Response};
 use serde::Deserialize;
 
 use crate::auth;
-use crate::handlers::{esc, fmt_date, topbar, app_css};
+use crate::handlers::{esc, fmt_date, page_shell};
 use crate::index::{self, Scored};
 use crate::AppState;
 
@@ -47,13 +47,13 @@ pub async fn search_page(
     Query(sq): Query<SearchQuery>,
 ) -> Response {
     let email = auth::display_email(&headers);
-    let query: String = sq
-        .q
-        .unwrap_or_default()
-        .trim()
-        .chars()
-        .take(MAX_QUERY_CHARS)
-        .collect();
+    let is_admin = auth::is_admin(&headers);
+    let query: String =
+        sq.q.unwrap_or_default()
+            .trim()
+            .chars()
+            .take(MAX_QUERY_CHARS)
+            .collect();
 
     let results_html = if query.is_empty() {
         empty_prompt()
@@ -73,11 +73,18 @@ pub async fn search_page(
         }
     };
 
-    let page = SEARCH_HTML
-        .replace("{{CSS}}", app_css())
-        .replace("{{TOPBAR}}", &topbar("Search", &email))
+    let fragment = SEARCH_HTML
         .replace("{{QUERY}}", &esc(&query))
         .replace("{{RESULTS}}", &results_html);
+    let page = page_shell(
+        "Search · Inkwell",
+        "page-console",
+        false,
+        "Search",
+        &email,
+        is_admin,
+        &fragment,
+    );
     Html(page).into_response()
 }
 
@@ -221,7 +228,11 @@ mod tests {
     #[test]
     fn highlight_is_case_insensitive() {
         let out = highlight("Gateway GATEWAY gateway", &terms("gateway"));
-        assert_eq!(out.matches("<mark>").count(), 3, "all case variants highlighted");
+        assert_eq!(
+            out.matches("<mark>").count(),
+            3,
+            "all case variants highlighted"
+        );
     }
 
     #[test]
@@ -230,6 +241,9 @@ mod tests {
         let out = highlight("<script>gateway</script>", &terms("gateway"));
         assert!(!out.contains("<script>"), "raw markup escaped");
         assert!(out.contains("&lt;script&gt;"), "shown as escaped text");
-        assert!(out.contains("<mark>gateway</mark>"), "term still highlighted");
+        assert!(
+            out.contains("<mark>gateway</mark>"),
+            "term still highlighted"
+        );
     }
 }
