@@ -26,46 +26,38 @@
       <p class="sub">Share code and text. Burn, protect, expire.</p>
     </div>
     <div class="layout">
-      <section class="card compose">
+      <section class="card compose" data-spark>
         <div class="card__body">
           {{ERROR}}
           <form method="post" action="/" id="composeForm">
             <input type="hidden" name="csrf_token" value="{{CSRF}}">
-            <input class="compose__title" type="text" name="title" id="title" maxlength="200"
+            <input class="compose__title" type="text" name="title" id="title" maxlength="200" data-spark-charcount
                    placeholder="Untitled paste — optional title" value="{{TITLE_VALUE}}" autocomplete="off">
-            <div class="editor">
-              <div class="editor__tabs" id="fileTabs" hidden>
-                <button type="button" class="editor__addtab" id="addFileBtn" aria-label="Add file">+ Add file</button>
+            <div class="pf-files" id="fileEditor">{{FILE_ROWS}}</div>
+            <button type="button" class="btn btn-ghost pf-addfile" id="addFileBtn">+ Add file</button>
+            <fieldset class="pf-options">
+              <div class="pf-opt">
+                <label for="language">Language</label>
+                <select class="select select--bar" name="language" id="language" aria-label="Language">{{LANGUAGE_OPTIONS}}</select>
               </div>
-              <div class="editor__files" id="fileEditor">{{FILE_ROWS}}</div>
-            </div>
-            <div class="compose__bar">
-              <select class="select select--bar" name="language" id="language" aria-label="Language">{{LANGUAGE_OPTIONS}}</select>
-              <select class="select select--bar" name="expiry" id="expiry" aria-label="Expiry">{{EXPIRY_OPTIONS}}</select>
-              <details class="opts"{{OPTS_OPEN}}>
-                <summary class="opts__summary">Options</summary>
-                <div class="opts__pop">
-                  <label class="check check--chip"><input type="checkbox" name="burn" value="on"{{BURN_CHECKED}}><span>Burn after read</span></label>
-                  <div class="field"><label for="password">Password <span class="field-hint">optional</span></label>
-                    <input class="input" type="password" name="password" id="password" autocomplete="new-password"></div>
-                </div>
-              </details>
-              <span class="compose__spacer"></span>
+              <div class="pf-opt">
+                <label for="expiry">Expiry</label>
+                <select class="select select--bar" name="expiry" id="expiry" aria-label="Expiry">{{EXPIRY_OPTIONS}}</select>
+              </div>
+              <label class="pf-burn"><input type="checkbox" name="burn" value="on"{{BURN_CHECKED}}><span>Burn after read</span></label>
+              <span class="pf-burn__hint">Destroyed the moment it is first viewed — one reader, once.</span>
+              <div class="pf-opt pf-opt--wide">
+                <label for="password">Password <span class="field-hint">optional</span></label>
+                <input class="input" type="password" name="password" id="password" autocomplete="new-password">
+              </div>
+            </fieldset>
+            <div class="pf-actions">
+              <span class="pf-kbd">Ctrl + Enter</span>
               <button type="submit" class="btn btn-primary" title="Ctrl+Enter">Create paste</button>
             </div>
           </form>
 
-          <template id="fileRowTemplate">
-            <div class="editor__file" data-file-row>
-              <div class="editor__filehead">
-                <input class="editor__filename" type="text" name="file_name" maxlength="128" value=""
-                       placeholder="Filename including extension (optional)" autocomplete="off">
-                <button class="btn btn-ghost btn-sm editor__remove" type="button" data-file-remove>Remove</button>
-              </div>
-              <textarea name="file_content" class="code-input" spellcheck="false" autocomplete="off"
-                        placeholder="Paste your content here…"></textarea>
-            </div>
-          </template>
+          <template id="fileRowTemplate"><div class="pf-file" data-file-row><div class="pf-file__head"><input class="pf-file__name" type="text" name="file_name" maxlength="128" value="" placeholder="Filename including extension (optional)" autocomplete="off"><button class="btn btn-ghost btn-sm editor__remove" type="button" data-file-remove>Remove</button></div><textarea name="file_content" class="code-input pf-editor" spellcheck="false" autocomplete="off" placeholder="Paste your content here…"></textarea></div></template>
         </div>
       </section>
       <aside class="rail">
@@ -81,55 +73,18 @@
     (function () {
       var form = document.getElementById('composeForm');
       var editor = document.getElementById('fileEditor');
-      var tabs = document.getElementById('fileTabs');
       var addBtn = document.getElementById('addFileBtn');
       var tpl = document.getElementById('fileRowTemplate');
-      if (!form || !editor || !tabs || !addBtn || !tpl) { return; }
+      if (!form || !editor || !addBtn || !tpl) { return; }
 
       function rows() {
         return Array.prototype.slice.call(editor.querySelectorAll('[data-file-row]'));
       }
-      function tabLabel(row, index) {
-        var input = row.querySelector('input[name="file_name"]');
-        var value = input && input.value.trim();
-        return value || 'File ' + (index + 1);
-      }
-      function syncLabels() {
-        rows().forEach(function (row, index) {
-          if (row._tab) { row._tab.textContent = tabLabel(row, index); }
-        });
-      }
-      function activate(row) {
-        rows().forEach(function (candidate) {
-          var active = candidate === row;
-          candidate.classList.toggle('is-active', active);
-          if (candidate._tab) { candidate._tab.classList.toggle('is-active', active); }
-        });
-      }
-      function wireRow(row) {
-        if (!row || row._tab) { return; }
-        var tab = document.createElement('button');
-        tab.type = 'button';
-        tab.className = 'editor__tab';
-        row._tab = tab;
-        tabs.insertBefore(tab, addBtn);
-        tab.addEventListener('click', function () { activate(row); });
-        var name = row.querySelector('input[name="file_name"]');
-        if (name) { name.addEventListener('input', syncLabels); }
-      }
-
-      rows().forEach(wireRow);
-      syncLabels();
-      if (rows()[0]) { activate(rows()[0]); }
-      tabs.hidden = false;
 
       addBtn.addEventListener('click', function () {
         var fragment = tpl.content.cloneNode(true);
         var row = fragment.querySelector('[data-file-row]');
         editor.appendChild(fragment);
-        wireRow(row);
-        syncLabels();
-        activate(row);
         var name = row && row.querySelector('input[name="file_name"]');
         if (name) { name.focus(); }
       });
@@ -140,15 +95,15 @@
         var all = rows();
         if (all.length <= 1) { return; }
         var row = btn.closest('[data-file-row]');
-        var index = all.indexOf(row);
-        if (row && row._tab) { row._tab.remove(); }
         if (row) { row.remove(); }
-        var remaining = rows();
-        syncLabels();
-        activate(remaining[Math.min(index, remaining.length - 1)]);
       });
 
       form.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Tab' && !ev.shiftKey && !ev.ctrlKey && !ev.metaKey && ev.target.matches('textarea.pf-editor')) {
+          ev.preventDefault();
+          ev.target.setRangeText('  ', ev.target.selectionStart, ev.target.selectionEnd, 'end');
+          return;
+        }
         if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) {
           ev.preventDefault();
           form.requestSubmit();
@@ -156,5 +111,6 @@
       });
     })();
   </script>
+  {{DYNAMIC}}
 </body>
 </html>

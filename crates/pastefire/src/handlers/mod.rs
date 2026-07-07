@@ -13,11 +13,13 @@ pub mod paste;
 
 use axum::http::StatusCode;
 use axum::response::Html;
+use std::sync::OnceLock;
 
 /// Pastefire-only CSS layered after Odyssey's canonical font, tokens, and components.
 pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
 
-static APP_CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static APP_CSS: OnceLock<String> = OnceLock::new();
+static DYNAMIC_JS: OnceLock<String> = OnceLock::new();
 
 /// Embedded design system, inlined into each rendered page's `<style>`:
 /// Odyssey's canonical CSS followed by Pastefire's service surface CSS.
@@ -29,6 +31,12 @@ pub fn app_css() -> &'static str {
             css.push_str(SERVICE_CSS);
             css
         })
+        .as_str()
+}
+
+pub fn dynamic_js() -> &'static str {
+    DYNAMIC_JS
+        .get_or_init(|| odyssey::dynamic_scripts().0)
         .as_str()
 }
 
@@ -241,14 +249,34 @@ pub fn render_error(
     message: &str,
     email: Option<&str>,
 ) -> (StatusCode, Html<String>) {
+    let (tone, glyph) = error_tone_glyph(status);
     let body = ERROR_HTML
         .replace("{{CSS}}", app_css())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Pastefire", email))
         .replace("{{STATUS}}", &status.as_u16().to_string())
         .replace("{{HEADING}}", &esc(heading))
-        .replace("{{MESSAGE}}", &esc(message));
+        .replace("{{MESSAGE}}", &esc(message))
+        .replace("{{TONE}}", tone)
+        .replace("{{GLYPH}}", glyph);
     (status, Html(body))
+}
+
+fn error_tone_glyph(status: StatusCode) -> (&'static str, &'static str) {
+    match status {
+        StatusCode::NOT_FOUND => (
+            "missing",
+            r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18.5 5.5-13 13"/><path d="M10 6h8v8"/><path d="M14 18H6v-8"/></svg>"##,
+        ),
+        StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN => (
+            "blocked",
+            r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="M9.5 9.5 14.5 14.5"/><path d="m14.5 9.5-5 5"/></svg>"##,
+        ),
+        _ => (
+            "fault",
+            r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3 10 18H2L12 3Z"/><path d="M12 9v5"/><path d="M12 17h.01"/></svg>"##,
+        ),
+    }
 }
 
 /// Minimal HTML escaping for text/attribute interpolation.

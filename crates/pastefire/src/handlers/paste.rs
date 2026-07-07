@@ -18,8 +18,8 @@ use crate::auth::{self, Identity};
 use crate::config::{clamp_page, DEFAULT_PAGE, MAX_BODY_BYTES, MAX_TITLE_CHARS};
 use crate::error::AppError;
 use crate::handlers::{
-    esc, expiry_options, fmt_dur_short, fmt_size, fmt_ts, language_label, language_options,
-    parse_expiry, userbox, app_css, LANGUAGES, SHIELD_SVG,
+    app_css, dynamic_js, esc, expiry_options, fmt_dur_short, fmt_size, fmt_ts, language_label,
+    language_options, parse_expiry, userbox, LANGUAGES, SHIELD_SVG,
 };
 use crate::model::{Paste, PasteFile, PasteRevision};
 use crate::{highlight, now_secs, random_alnum, similar, AppState};
@@ -39,6 +39,12 @@ const MAX_FILENAME_CHARS: usize = 128;
 
 /// A small file glyph for the multi-file per-file header.
 const FILE_ICON_SVG: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>"##;
+
+const FLAME_SVG: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8.5 14.5A4.5 4.5 0 0 0 13 19a4 4 0 0 0 4-4c0-3-2-4.5-3-7-1.7 1-2.8 2.4-3 4-1.2-.7-1.8-1.8-1.8-3.4C7.7 10 6 12 6 14.5A6 6 0 0 0 12 21a6 6 0 0 0 6-6"/></svg>"##;
+
+const GIT_FORK_SVG: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="4" r="2"/><circle cx="18" cy="4" r="2"/><circle cx="12" cy="20" r="2"/><path d="M6 6v3a6 6 0 0 0 6 6v3"/><path d="M18 6v3a6 6 0 0 1-6 6"/></svg>"##;
+
+const HISTORY_SVG: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 3v6h6"/><path d="M12 7v5l3 2"/></svg>"##;
 
 /// One file's worth of submitted form input (a filename + its content), before it is assigned an
 /// id/position and persisted. A paste with a single [`FileInput`] is stored the legacy way (in
@@ -1135,9 +1141,10 @@ fn render_new(
         .replace("{{FILE_ROWS}}", &render_file_rows(files, true))
         .replace("{{RECENT}}", &render_recent(recent))
         .replace("{{LOAD_OLDER}}", load_older)
+        .replace("{{DYNAMIC}}", dynamic_js())
 }
 
-/// Render the compose/edit file rows (one `<div class="editor__file">` per file), always emitting at
+/// Render the compose/edit file rows (one `<div class="pf-file">` per file), always emitting at
 /// least one row so a fresh form starts with a single empty file. Every user string is escaped.
 fn render_file_rows(files: &[FileInput], autofocus_first: bool) -> String {
     if files.is_empty() {
@@ -1156,15 +1163,7 @@ fn render_file_rows(files: &[FileInput], autofocus_first: bool) -> String {
 fn render_file_row(filename: &str, content: &str, autofocus: bool) -> String {
     let maybe_autofocus = if autofocus { " autofocus" } else { "" };
     format!(
-        "<div class=\"editor__file\" data-file-row>\
-           <div class=\"editor__filehead\">\
-             <input class=\"editor__filename\" type=\"text\" name=\"file_name\" maxlength=\"128\" value=\"{name}\" \
-                    placeholder=\"Filename including extension (optional)\" autocomplete=\"off\">\
-             <button class=\"btn btn-ghost btn-sm editor__remove\" type=\"button\" data-file-remove>Remove</button>\
-           </div>\
-           <textarea name=\"file_content\" class=\"code-input\" spellcheck=\"false\" autocomplete=\"off\"{autofocus} \
-                     placeholder=\"Paste your content here…\">{content}</textarea>\
-         </div>",
+        "<div class=\"pf-file\" data-file-row><div class=\"pf-file__head\"><input class=\"pf-file__name\" type=\"text\" name=\"file_name\" maxlength=\"128\" value=\"{name}\" placeholder=\"Filename including extension (optional)\" autocomplete=\"off\"><button class=\"btn btn-ghost btn-sm editor__remove\" type=\"button\" data-file-remove>Remove</button></div><textarea name=\"file_content\" class=\"code-input pf-editor\" spellcheck=\"false\" autocomplete=\"off\"{autofocus} placeholder=\"Paste your content here…\">{content}</textarea></div>",
         name = esc(filename),
         content = esc(content),
         autofocus = maybe_autofocus,
@@ -1190,12 +1189,13 @@ fn render_recent(recent: &[Paste]) -> String {
                 "<li class=\"paste-item\">\
                    <a class=\"paste-item__row\" href=\"/p/{id}\">\
                      <span class=\"paste-item__title\">{title}</span>\
-                     <span class=\"lang-badge\">{lang}</span>\
+                     <span class=\"{lang_class}\">{lang}</span>\
                      <span class=\"paste-item__num\">{created}</span>\
                    </a>\
                  </li>",
                 id = esc(&p.id),
                 title = esc(&title),
+                lang_class = lang_badge_class(&p.language),
                 lang = esc(&language_label(&p.language)),
                 created = esc(&created),
             )
@@ -1340,7 +1340,10 @@ fn render_file_block(
 ) -> String {
     let line_count = content.lines().count();
     let line_word = if line_count == 1 { "line" } else { "lines" };
-    let mut tools = "<button type=\"button\" class=\"btn btn-ghost btn-sm file-copy\" \
+    let mut tools = "<button type=\"button\" class=\"btn btn-ghost btn-sm pf-wrap-btn\" \
+                     data-spark-click=\"toggle:wrap\" data-spark-attr=\"aria-pressed:wrap\" \
+                     aria-pressed=\"false\">Wrap</button>\
+                     <button type=\"button\" class=\"btn btn-ghost btn-sm file-copy\" \
                      data-copy=\"file\" data-label=\"Copy\">Copy</button>"
         .to_string();
     if allow_raw {
@@ -1431,9 +1434,10 @@ fn page_actions(paste: &Paste, is_owner: bool, csrf: &str) -> String {
         out.push_str(&format!(
             "<form class=\"inline-form\" method=\"post\" action=\"/fork/{id}\">\
                <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
-               <button class=\"btn btn-ghost btn-sm\" type=\"submit\">Fork</button>\
+               <button class=\"btn btn-ghost btn-sm\" type=\"submit\">{fork_icon}Fork</button>\
              </form>",
             csrf = esc(csrf),
+            fork_icon = GIT_FORK_SVG,
         ));
     }
     if is_owner {
@@ -1454,7 +1458,8 @@ fn page_actions(paste: &Paste, is_owner: bool, csrf: &str) -> String {
 
 fn render_badges(paste: &Paste, now: i64) -> String {
     let mut out = format!(
-        "<span class=\"lang-badge\">{}</span>",
+        "<span class=\"{}\">{}</span>",
+        lang_badge_class(&paste.language),
         esc(&language_label(&paste.language))
     );
     if let Some(expires_at) = paste.expires_at {
@@ -1465,8 +1470,9 @@ fn render_badges(paste: &Paste, now: i64) -> String {
             "pill"
         };
         out.push_str(&format!(
-            "<span class=\"{class}\">Expires {}</span>",
-            esc(&fmt_dur_short(remaining))
+            "<span class=\"{class} pf-exp\" data-pf-exp=\"{expires_at}\">Expires {}</span>",
+            esc(&fmt_dur_short(remaining)),
+            expires_at = esc(&expires_at.to_string()),
         ));
     }
     if paste.burn_after_read {
@@ -1482,8 +1488,9 @@ fn render_badges(paste: &Paste, now: i64) -> String {
 fn source_credit(paste: &Paste) -> String {
     match &paste.source_id {
         Some(src) => format!(
-            "<p class=\"sub sub--credit\">Forked from <a href=\"/p/{id}\">{id}</a></p>",
+            "<p class=\"pf-credit\">{fork_icon}Forked from <a href=\"/p/{id}\">{id}</a></p>",
             id = esc(src),
+            fork_icon = GIT_FORK_SVG,
         ),
         None => String::new(),
     }
@@ -1502,17 +1509,33 @@ fn render_view_html(
     revision_count: usize,
     now: i64,
 ) -> String {
+    let initial = paste
+        .author_email
+        .chars()
+        .next()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "U".to_string());
     let meta = format!(
-        "Created {created} by {author}",
+        "<span class=\"pf-meta__tile\" aria-hidden=\"true\">{initial}</span>\
+         <span>Created <span class=\"pf-meta__time\">{created}</span> by <b>{author}</b></span>",
+        initial = esc(&initial),
         created = esc(&fmt_ts(paste.created_at)),
         author = esc(&paste.author_email),
     );
 
     // A one-time notice shown to the recipient whose read just consumed a burn paste.
     let burn_notice = if burned {
-        "<div class=\"alert alert-warn\" role=\"alert\">This was a burn-after-read paste. \
-         It has now been deleted and this link will no longer work.</div>"
-            .to_string()
+        format!(
+            "<div class=\"alert alert-warn pf-burn pf-burn--consumed\" role=\"alert\">{flame}\
+             <span><b>Burn-after-read</b>This was a burn-after-read paste. It has now been deleted and this link will no longer work.</span></div>",
+            flame = FLAME_SVG,
+        )
+    } else if paste.burn_after_read {
+        format!(
+            "<div class=\"alert alert-warn pf-burn pf-burn--armed\" role=\"status\">{flame}\
+             <span><b>Burn after read is armed.</b> The first time someone other than you opens this paste, it is permanently deleted.</span></div>",
+            flame = FLAME_SVG,
+        )
     } else {
         String::new()
     };
@@ -1576,6 +1599,7 @@ fn fill_view(
         .replace("{{SOURCE}}", source)
         .replace("{{BODY}}", body_html)
         .replace("{{SIMILAR}}", similar)
+        .replace("{{DYNAMIC}}", dynamic_js())
 }
 
 /// Render a single archived revision, read-only, with a banner and minimal tools.
@@ -1586,10 +1610,12 @@ fn render_revision(viewer: &Identity, paste_id: &str, rev: &PasteRevision) -> St
         ts = esc(&fmt_ts(rev.created_at)),
     );
     let banner = format!(
-        "<div class=\"alert alert-warn\" role=\"alert\">You are viewing revision {n}, an archived \
-         version of this paste. <a href=\"/p/{id}\">View the current version</a>.</div>",
+        "<div class=\"pf-revbanner\" role=\"alert\">{history_icon}\
+         <span>You are viewing revision {n}, an archived version of this paste.</span>\
+         <span class=\"pf-revbanner__links\"><a href=\"/p/{id}\">View the current version</a> · <a href=\"/p/{id}/history\">All revisions</a></span></div>",
         n = rev.revision,
         id = esc(paste_id),
+        history_icon = HISTORY_SVG,
     );
     let body_html = render_body_html(
         paste_id,
@@ -1651,6 +1677,7 @@ fn render_edit(
         .replace("{{ERROR}}", &error_block(error))
         .replace("{{TITLE_VALUE}}", &esc(title))
         .replace("{{FILE_ROWS}}", &render_file_rows(files, false))
+        .replace("{{DYNAMIC}}", dynamic_js())
 }
 
 /// Render the revision-history page: the current version plus every archived revision, newest
@@ -1676,39 +1703,83 @@ fn render_history(viewer: &Identity, paste: &Paste, revisions: &[PasteRevision])
 /// first (or an "unedited" note when there are none).
 fn render_history_items(paste: &Paste, revisions: &[PasteRevision]) -> String {
     let id = esc(&paste.id);
+    let current_delta = revisions
+        .last()
+        .map(|rev| render_delta(paste.body.lines().count(), rev.body.lines().count()))
+        .unwrap_or_default();
     let mut out = format!(
-        "<li class=\"paste-item\">\
-           <a class=\"paste-item__row\" href=\"/p/{id}\">\
-             <span class=\"paste-item__title\">Current version</span>\
-             <span class=\"lang-badge\">{lang}</span>\
-             <span class=\"paste-item__num\">created {created}</span>\
+        "<li class=\"eventline__item\">\
+           <span class=\"eventline__dot pf-now\" aria-hidden=\"true\"></span>\
+           <a class=\"pf-hist__link\" href=\"/p/{id}\">\
+             <span class=\"pf-hist__row\">\
+               <span class=\"pf-hist__title\">Current version</span>\
+               <span class=\"{lang_class}\">{lang}</span>\
+               <span class=\"pf-hist__time\">created {created}</span>\
+             </span>\
+             <span class=\"pf-hist__meta\"><span class=\"pf-hist__size\">{lines} lines · {size}</span>{delta}</span>\
            </a>\
          </li>",
         lang = esc(&language_label(&paste.language)),
+        lang_class = lang_badge_class(&paste.language),
         created = esc(&fmt_ts(paste.created_at)),
+        lines = paste.body.lines().count(),
+        size = esc(&fmt_size(paste.body.len())),
+        delta = current_delta,
     );
     if revisions.is_empty() {
         out.push_str(
-            "<li class=\"paste-item paste-item--empty\">No earlier versions — this paste has not \
-             been edited.</li>",
+            "<li class=\"eventline__item pf-hist__empty\">No earlier versions — this paste has not been edited.</li>",
         );
         return out;
     }
     for rev in revisions.iter().rev() {
+        let delta = if rev.revision <= 1 {
+            String::new()
+        } else {
+            revisions
+                .iter()
+                .find(|prev| prev.revision == rev.revision - 1)
+                .map(|prev| render_delta(rev.body.lines().count(), prev.body.lines().count()))
+                .unwrap_or_default()
+        };
         out.push_str(&format!(
-            "<li class=\"paste-item\">\
-               <a class=\"paste-item__row\" href=\"/p/{id}/rev/{n}\">\
-                 <span class=\"paste-item__title\">Revision {n}</span>\
-                 <span class=\"lang-badge\">{lang}</span>\
-                 <span class=\"paste-item__num\">archived {ts}</span>\
+            "<li class=\"eventline__item\">\
+               <span class=\"eventline__dot\" aria-hidden=\"true\"></span>\
+               <a class=\"pf-hist__link\" href=\"/p/{id}/rev/{n}\">\
+                 <span class=\"pf-hist__row\">\
+                   <span class=\"pf-hist__title\">Revision {n}</span>\
+                   <span class=\"{lang_class}\">{lang}</span>\
+                   <span class=\"pf-hist__time\">archived {ts}</span>\
+                 </span>\
+                 <span class=\"pf-hist__meta\"><span class=\"pf-hist__size\">{lines} lines · {size}</span>{delta}</span>\
                </a>\
              </li>",
             n = rev.revision,
             lang = esc(&language_label(&rev.language)),
+            lang_class = lang_badge_class(&rev.language),
             ts = esc(&fmt_ts(rev.created_at)),
+            lines = rev.body.lines().count(),
+            size = esc(&fmt_size(rev.body.len())),
+            delta = delta,
         ));
     }
     out
+}
+
+fn render_delta(current_lines: usize, previous_lines: usize) -> String {
+    match current_lines.cmp(&previous_lines) {
+        std::cmp::Ordering::Greater => format!(
+            "<span class=\"pf-delta pf-delta--add\">+{} lines</span>",
+            current_lines - previous_lines
+        ),
+        std::cmp::Ordering::Less => format!(
+            "<span class=\"pf-delta pf-delta--del\">-{} lines</span>",
+            previous_lines - current_lines
+        ),
+        std::cmp::Ordering::Equal => {
+            "<span class=\"pf-delta pf-delta--same\">±0 lines</span>".to_string()
+        }
+    }
 }
 
 /// Render the "Similar pastes" panel, or an empty string when there are no scored matches (the
@@ -1731,12 +1802,13 @@ fn render_similar(similar: &[(f64, Paste)]) -> String {
                 "<li class=\"paste-item\">\
                    <a class=\"paste-item__row\" href=\"/p/{id}\">\
                      <span class=\"paste-item__title\">{title}</span>\
-                     <span class=\"lang-badge\">{lang}</span>\
+                     <span class=\"{lang_class}\">{lang}</span>\
                      <span class=\"paste-item__num\">{pct}%</span>\
                    </a>\
                  </li>",
                 id = esc(&p.id),
                 title = esc(&title),
+                lang_class = lang_badge_class(&p.language),
                 lang = esc(&language_label(&p.language)),
                 pct = pct,
             )
@@ -1749,6 +1821,10 @@ fn render_similar(similar: &[(f64, Paste)]) -> String {
            <div class=\"card__body card__body--list\"><ul class=\"paste-list\">{items}</ul></div>\
          </section></aside>"
     )
+}
+
+fn lang_badge_class(language: &str) -> String {
+    format!("lang-badge pf-tone-{}", odyssey::identity::tone(language))
 }
 
 #[cfg(test)]

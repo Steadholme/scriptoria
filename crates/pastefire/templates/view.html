@@ -24,7 +24,7 @@
     <div class="console__head console__head--row">
       <div class="console__lead">
         <h1>{{TITLE}}</h1>
-        <p class="sub">{{META}}</p>
+        <div class="pf-meta">{{META}}</div>
         {{SOURCE}}
         <div class="badges">{{BADGES}}</div>
       </div>
@@ -32,9 +32,9 @@
     </div>
     {{BURN_NOTICE}}
     <div class="layout layout--view{{LAYOUT_MOD}}">
-      <div class="layout__main">
+      <div class="layout__main" data-spark data-spark-persist="wrap">
         {{TABS}}
-        <section class="card card--code"><div class="card__body card__body--code"><div id="code">{{BODY}}</div></div></section>
+        <section class="card card--code"><div class="card__body card__body--code"><div id="code" data-spark-class="pf-wrap:wrap">{{BODY}}</div></div></section>
       </div>
       {{SIMILAR}}
     </div>
@@ -115,6 +115,48 @@
       window.addEventListener('hashchange', applyHash);
       applyHash();
     })();
+
+    (function () {
+      var badges = document.querySelectorAll('[data-pf-exp]');
+      if (!badges.length) { return; }
+      function textFor(exp) {
+        var left = exp - Math.floor(Date.now() / 1000);
+        if (left <= 0) { return 'Expires now'; }
+        if (left < 60) { return 'Expires in <1m'; }
+        if (left < 3600) { return 'Expires in ' + Math.floor(left / 60) + 'm'; }
+        if (left < 86400) { return 'Expires in ' + Math.floor(left / 3600) + 'h'; }
+        return 'Expires in ' + Math.floor(left / 86400) + 'd';
+      }
+      function tick() {
+        Array.prototype.forEach.call(badges, function (badge) {
+          var exp = parseInt(badge.getAttribute('data-pf-exp'), 10);
+          if (!isNaN(exp)) { badge.textContent = textFor(exp); }
+        });
+      }
+      tick();
+      window.setInterval(tick, 30000);
+    })();
+
+    (function () {
+      var key = 'pastefire:fork-source';
+      document.addEventListener('submit', function (ev) {
+        var form = ev.target.closest && ev.target.closest('form[action^="/fork/"]');
+        if (!form) { return; }
+        try { sessionStorage.setItem(key, form.getAttribute('action').replace(/^\/fork\//, '')); } catch (e) {}
+      });
+      var source = '';
+      try { source = sessionStorage.getItem(key) || ''; } catch (e) {}
+      if (!source) { return; }
+      var found = false;
+      Array.prototype.forEach.call(document.querySelectorAll('.pf-credit a'), function (a) {
+        if (a.getAttribute('href') === '/p/' + source) { found = true; }
+      });
+      if (found) {
+        hfToast('Forked — you now own this copy', 'ok');
+        try { sessionStorage.removeItem(key); } catch (e) {}
+      }
+    })();
   </script>
+  {{DYNAMIC}}
 </body>
 </html>

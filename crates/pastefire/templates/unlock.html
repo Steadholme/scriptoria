@@ -20,15 +20,13 @@
     <div class="appbar__right">{{USERBOX}}</div>
   </header>
 
-  <main class="console">
-    <div class="console__head">
-      <h1>Password required</h1>
-      <p class="sub">This paste is protected. Enter its password to view the contents.</p>
-    </div>
-
-    <section class="card">
-      <div class="card__head"><h2>Unlock</h2></div>
+  <main class="console pf-gate">
+    <section class="card pf-gate__card">
       <div class="card__body">
+        <div class="pf-gate__glyph" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></div>
+        <h1>Password required</h1>
+        <p class="sub">This paste is protected. Enter its password to view the contents.</p>
+        <span class="pf-gate__id">{{ID}}</span>
         {{ERROR}}
         <form method="post" action="/unlock/{{ID}}">
           <input type="hidden" name="csrf_token" value="{{CSRF}}">

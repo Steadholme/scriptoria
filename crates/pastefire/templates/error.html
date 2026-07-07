@@ -21,8 +21,9 @@
   </header>
 
   <main class="console">
-    <section class="card card--message">
+    <section class="card card--message pf-msg pf-msg--{{TONE}}">
       <div class="card__body">
+        <div class="pf-msg__glyph" aria-hidden="true">{{GLYPH}}</div>
         <div class="status-code">{{STATUS}}</div>
         <h1 class="message-heading">{{HEADING}}</h1>
         <p class="message-body">{{MESSAGE}}</p>
