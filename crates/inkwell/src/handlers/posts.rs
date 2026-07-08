@@ -136,6 +136,11 @@ pub async fn index(
         .replace("{{MH_EYEBROW}}", "Publication")
         .replace("{{POSTS}}", &cards)
         .replace("{{PAGER}}", &pager);
+    let theme = odyssey::resolve_theme(
+        headers
+            .get(axum::http::header::COOKIE)
+            .and_then(|v| v.to_str().ok()),
+    );
     let page = page_shell(
         &format!("{} · HOLDFAST", settings.title),
         "page-reading",
@@ -143,6 +148,7 @@ pub async fn index(
         &settings.title,
         &email,
         is_admin,
+        theme,
         &fragment,
     );
     Html(page).into_response()
@@ -224,6 +230,11 @@ pub async fn tag_index(
         .replace("{{MH_EYEBROW}}", "Tagged")
         .replace("{{POSTS}}", &cards)
         .replace("{{PAGER}}", &pager);
+    let theme = odyssey::resolve_theme(
+        headers
+            .get(axum::http::header::COOKIE)
+            .and_then(|v| v.to_str().ok()),
+    );
     let page = page_shell(
         &format!("{heading} · HOLDFAST"),
         "page-reading",
@@ -231,6 +242,7 @@ pub async fn tag_index(
         &heading,
         &email,
         is_admin,
+        theme,
         &fragment,
     );
     Html(page).into_response()
@@ -344,6 +356,11 @@ pub async fn view(
         .replace("{{ACTIONS}}", &actions)
         .replace("{{BODY}}", &body_html)
         .replace("{{RELATED}}", &related);
+    let theme = odyssey::resolve_theme(
+        headers
+            .get(axum::http::header::COOKIE)
+            .and_then(|v| v.to_str().ok()),
+    );
     let page = page_shell(
         &format!("{} · Inkwell", post.title),
         "page-reading",
@@ -351,6 +368,7 @@ pub async fn view(
         "Reading",
         &email,
         is_admin,
+        theme,
         &fragment,
     );
 
@@ -366,9 +384,15 @@ pub async fn new_form(State(_state): State<AppState>, headers: HeaderMap) -> Res
     let email = auth::display_email(&headers);
     let is_admin = auth::is_admin(&headers);
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
+    let theme = odyssey::resolve_theme(
+        headers
+            .get(axum::http::header::COOKIE)
+            .and_then(|v| v.to_str().ok()),
+    );
     let page = render_editor(EditorView {
         email: &email,
         is_admin,
+        theme,
         state_label: "published",
         heading: "New post",
         subhead: "Compose a post in Markdown. You are the author.",
@@ -504,10 +528,16 @@ pub async fn edit_form(
     }
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
     let state_label = publication_detail(&post, now_secs());
+    let theme = odyssey::resolve_theme(
+        headers
+            .get(axum::http::header::COOKIE)
+            .and_then(|v| v.to_str().ok()),
+    );
 
     let page = render_editor(EditorView {
         email: &email,
         is_admin,
+        theme,
         state_label,
         heading: "Edit post",
         subhead: "Update the title, body, or publication state.",
@@ -905,6 +935,7 @@ fn render_card(post: &Post, viewer_sub: Option<&str>, now: i64) -> String {
 struct EditorView<'a> {
     email: &'a str,
     is_admin: bool,
+    theme: &'a str,
     state_label: &'a str,
     heading: &'a str,
     subhead: &'a str,
@@ -970,6 +1001,7 @@ fn render_editor(v: EditorView<'_>) -> String {
         v.heading,
         v.email,
         v.is_admin,
+        v.theme,
         &fragment,
     )
 }

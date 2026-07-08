@@ -48,6 +48,11 @@ pub async fn search_page(
 ) -> Response {
     let email = auth::display_email(&headers);
     let is_admin = auth::is_admin(&headers);
+    let theme = odyssey::resolve_theme(
+        headers
+            .get(axum::http::header::COOKIE)
+            .and_then(|v| v.to_str().ok()),
+    );
     let query: String =
         sq.q.unwrap_or_default()
             .trim()
@@ -83,6 +88,7 @@ pub async fn search_page(
         "Search",
         &email,
         is_admin,
+        theme,
         &fragment,
     );
     Html(page).into_response()

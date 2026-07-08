@@ -57,7 +57,7 @@ pub const APP_ICON: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="curr
 /// the avatar user-menu (Account / All apps / the preserved gateway Sign-out) on the right.
 /// `page_title` selects the active nav item; `email` is the gateway-injected address (empty or the
 /// neutral `—` placeholder on public, no-session reading pages → a minimal, no-identity avatar).
-pub fn topbar(page_title: &str, email: &str, is_admin: bool) -> String {
+pub fn topbar(page_title: &str, email: &str, is_admin: bool, theme: &str) -> String {
     let active = match page_title {
         "Search" => "search",
         "Ask" => "ask",
@@ -90,11 +90,45 @@ pub fn topbar(page_title: &str, email: &str, is_admin: bool) -> String {
   </a>
   {nav}
   <span class="appbar__spacer"></span>
-  <div class="appbar__right">{right}</div>
+  <div class="appbar__right">{switcher}{right}</div>
 </header>"#,
         icon = APP_ICON,
         nav = nav,
+        switcher = theme_switcher(theme),
         right = user_menu(email),
+    )
+}
+
+/// The estate three-state theme switcher (light / dark / system) for the app-bar. Pure SSR
+/// `<a href>` links to the gateway `/_gw/theme` route — no JS, no new Inkwell route. `current` marks
+/// the resolved theme `.is-active`. `__Secure-theme` is a display-only preference living OUTSIDE the
+/// gateway HMAC, so it is never consulted for identity/authz — it only repaints. `.themeswitch` CSS
+/// ships in Odyssey's canonical bundle (do not add it to service.css).
+fn theme_switcher(current: &str) -> String {
+    let light_active = if current == "light" { " is-active" } else { "" };
+    let dark_active = if current == "dark" { " is-active" } else { "" };
+    let auto_active = if current == "auto" { " is-active" } else { "" };
+    let light_cur = if current == "light" {
+        r#" aria-current="true""#
+    } else {
+        ""
+    };
+    let dark_cur = if current == "dark" {
+        r#" aria-current="true""#
+    } else {
+        ""
+    };
+    let auto_cur = if current == "auto" {
+        r#" aria-current="true""#
+    } else {
+        ""
+    };
+    format!(
+        r##"<div class="themeswitch" role="group" aria-label="Theme">
+  <a class="themeswitch__opt{light_active}" href="/_gw/theme?to=light" title="Light" aria-label="Light"{light_cur}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></a>
+  <a class="themeswitch__opt{dark_active}" href="/_gw/theme?to=dark" title="Dark" aria-label="Dark"{dark_cur}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a6.5 6.5 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg></a>
+  <a class="themeswitch__opt{auto_active}" href="/_gw/theme?to=auto" title="System" aria-label="System"{auto_cur}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg></a>
+</div>"##
     )
 }
 
@@ -105,6 +139,7 @@ pub fn page_shell(
     nav_title: &str,
     email: &str,
     is_admin: bool,
+    theme: &str,
     fragment: &str,
 ) -> String {
     let rss_link = if rss {
@@ -113,16 +148,18 @@ pub fn page_shell(
         ""
     };
     format!(
-        r#"<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+        r#"<!DOCTYPE html><html lang="en"{theme_attr}><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="light">
+<meta name="color-scheme" content="{color_scheme}">
 <title>{title}</title>{rss_link}<style>{css}</style></head><body class="{body_class}">
 {topbar}{fragment}</body></html>"#,
+        theme_attr = odyssey::html_theme_attr(theme),
+        color_scheme = odyssey::color_scheme_meta(theme),
         title = esc(head_title),
         rss_link = rss_link,
         css = app_css(),
         body_class = body_class,
-        topbar = topbar(nav_title, email, is_admin),
+        topbar = topbar(nav_title, email, is_admin, theme),
         fragment = fragment,
     )
 }
@@ -250,6 +287,7 @@ pub fn error_page(status: StatusCode, message: &str) -> String {
         "Inkwell",
         "—",
         false,
+        "light",
         &fragment,
     )
 }

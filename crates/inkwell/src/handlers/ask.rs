@@ -49,8 +49,13 @@ pub struct AskForm {
 pub async fn ask_page(State(_state): State<AppState>, headers: HeaderMap) -> Response {
     let email = auth::display_email(&headers);
     let is_admin = auth::is_admin(&headers);
+    let theme = odyssey::resolve_theme(
+        headers
+            .get(axum::http::header::COOKIE)
+            .and_then(|v| v.to_str().ok()),
+    );
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
-    let page = render_console(&email, is_admin, &csrf, "", &empty_answer());
+    let page = render_console(&email, is_admin, theme, &csrf, "", &empty_answer());
     html_with_cookie(page, set_cookie)
 }
 
@@ -68,6 +73,11 @@ pub async fn ask(
 ) -> Result<Response, AppError> {
     let (_sub, email) = auth::require_author(&headers)?;
     let is_admin = auth::is_admin(&headers);
+    let theme = odyssey::resolve_theme(
+        headers
+            .get(axum::http::header::COOKIE)
+            .and_then(|v| v.to_str().ok()),
+    );
     auth::verify_csrf(&headers, &form.csrf_token)?;
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
 
@@ -106,6 +116,7 @@ pub async fn ask(
     let page = render_console(
         &email,
         is_admin,
+        theme,
         &csrf,
         &question,
         &format!("{echo}{answer_html}"),
@@ -121,6 +132,7 @@ pub async fn ask(
 fn render_console(
     email: &str,
     is_admin: bool,
+    theme: &str,
     csrf: &str,
     question: &str,
     answer_html: &str,
@@ -136,6 +148,7 @@ fn render_console(
         "Ask",
         email,
         is_admin,
+        theme,
         &fragment,
     )
 }

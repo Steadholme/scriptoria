@@ -57,6 +57,11 @@ pub async fn index(
 ) -> Result<Response, AppError> {
     auth::require_admin(&headers)?;
     let email = auth::display_email(&headers);
+    let theme = odyssey::resolve_theme(
+        headers
+            .get(axum::http::header::COOKIE)
+            .and_then(|v| v.to_str().ok()),
+    );
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
 
     let settings = state.store.get_settings().await;
@@ -85,6 +90,7 @@ pub async fn index(
         "Admin",
         &email,
         true,
+        theme,
         &fragment,
     );
 

@@ -1873,3 +1873,30 @@ body.page {
   .ink-search .btn { width:100%; }
   .ink-ask__foot { flex-wrap:wrap; }
 }
+
+/* S16 DARK RAMP ----------------------------------------------------------- */
+/* Odyssey's canonical dark ramp (tokens.css :root[data-theme="dark"]) already remaps every
+   --accent/--ink/--surface/--border token this service leans on, so no --accent* remap is needed
+   here. The one gap is Inkwell's own brand family: it is a teal defined at the BODY scope
+   (body.page-reading/.page-console), which — because custom properties inherit from the nearest
+   defining ancestor — shadows Odyssey's :root-level dark --brand. A :root[data-theme="dark"] remap
+   would therefore never reach page content; the remap must target the same body scope. Values only;
+   the LIGHT cascade is byte-identical (this block is dark-gated). --brand lifts to a teal that stays
+   legible on dark surfaces (carrying the color:var(--surface) white-label idiom for .btn-primary),
+   --brand-soft becomes a dark teal tint instead of the near-white light chip, and --brand-ink a
+   bright teal for chip/label text. Mirrors Odyssey's dual dark + prefers-dark(auto) structure. */
+:root[data-theme="dark"] body.page-reading,
+:root[data-theme="dark"] body.page-console {
+  --brand:#2dd4bf;
+  --brand-soft:color-mix(in srgb, #2dd4bf 14%, var(--surface));
+  --brand-ink:#5eead4;
+}
+
+@media (prefers-color-scheme:dark) {
+  :root[data-theme="auto"] body.page-reading,
+  :root[data-theme="auto"] body.page-console {
+    --brand:#2dd4bf;
+    --brand-soft:color-mix(in srgb, #2dd4bf 14%, var(--surface));
+    --brand-ink:#5eead4;
+  }
+}
