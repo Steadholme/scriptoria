@@ -317,6 +317,23 @@
 	        if (!e.detail || /view=trash/.test(e.detail.url || '')) { return; }
 	        recount();
 	      });
+
+	      // Sync the rail nav highlight to the swapped view (Trash / My Drive / folder) so
+	      // wire-navigation feels like Google Drive: content swaps, the active row follows,
+	      // no full-page reload. The rail lives OUTSIDE #ap-drive, so it needs this nudge.
+	      function syncNav(url) {
+	        var here;
+	        try { var u = new URL(url || location.href, location.href); here = u.pathname + u.search; }
+	        catch (_) { here = location.pathname + location.search; }
+	        var rows = document.querySelectorAll('.ap-nav__row');
+	        for (var i = 0; i < rows.length; i++) {
+	          var href = rows[i].getAttribute('href') || '';
+	          var match = href === here || (href === '/' && (here === '/' || here === ''));
+	          rows[i].classList.toggle('is-active', match);
+	        }
+	      }
+	      document.addEventListener('wire:after', function (e) { syncNav(e.detail && e.detail.url); });
+	      window.addEventListener('popstate', function () { syncNav(location.href); });
 	
 	      document.addEventListener('submit', function (e) {
 	        var form = e.target;
