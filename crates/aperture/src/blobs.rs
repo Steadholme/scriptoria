@@ -45,6 +45,14 @@ pub trait Blobs: Send + Sync {
     /// Fetch the whole object at `key`. `NotFound` when it does not exist.
     async fn get(&self, key: &str) -> Result<Vec<u8>, BlobError>;
 
+    /// Fetch an inclusive byte range from the object at `key`.
+    async fn get_range(
+        &self,
+        key: &str,
+        start: u64,
+        end_inclusive: u64,
+    ) -> Result<Vec<u8>, BlobError>;
+
     /// Remove the object at `key`. Deleting a missing object is a no-op (Ok).
     async fn delete(&self, key: &str) -> Result<(), BlobError>;
 }
@@ -87,6 +95,24 @@ impl Blobs for MemoryBlobs {
             .get(key)
             .cloned()
             .ok_or(BlobError::NotFound)
+    }
+
+    async fn get_range(
+        &self,
+        key: &str,
+        start: u64,
+        end_inclusive: u64,
+    ) -> Result<Vec<u8>, BlobError> {
+        let bytes = self.get(key).await?;
+        let start = start as usize;
+        if start >= bytes.len() {
+            return Ok(Vec::new());
+        }
+        let end = (end_inclusive as usize).min(bytes.len() - 1);
+        if end < start {
+            return Ok(Vec::new());
+        }
+        Ok(bytes[start..=end].to_vec())
     }
 
     async fn delete(&self, key: &str) -> Result<(), BlobError> {
@@ -160,6 +186,23 @@ impl Blobs for S3Blobs {
         let result = self.inner.get(&ObjPath::from(key)).await.map_err(map_err)?;
         let bytes = result.bytes().await.map_err(map_err)?;
         Ok(bytes.to_vec())
+    }
+
+    async fn get_range(
+        &self,
+        key: &str,
+        start: u64,
+        end_inclusive: u64,
+    ) -> Result<Vec<u8>, BlobError> {
+        let r = self
+            .inner
+            .get_range(
+                &ObjPath::from(key),
+                (start as usize)..(end_inclusive as usize + 1),
+            )
+            .await
+            .map_err(map_err)?;
+        Ok(r.to_vec())
     }
 
     async fn delete(&self, key: &str) -> Result<(), BlobError> {

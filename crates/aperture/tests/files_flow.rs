@@ -84,6 +84,19 @@ fn get(path: &str, subject: Option<&str>) -> Request<Body> {
     b.body(Body::empty()).unwrap()
 }
 
+fn get_range(path: &str, subject: Option<&str>, range: &str) -> Request<Body> {
+    let mut b = Request::builder()
+        .method("GET")
+        .uri(path)
+        .header(header::RANGE, range);
+    if let Some(s) = subject {
+        b = b
+            .header("x-auth-subject", s)
+            .header("x-auth-email", format!("{s}@w33d.xyz"));
+    }
+    b.body(Body::empty()).unwrap()
+}
+
 /// Build a `multipart/form-data` body carrying a `csrf_token` text field then a `file` field.
 fn multipart(csrf: &str, filename: &str, content_type: &str, data: &[u8]) -> Vec<u8> {
     let mut body: Vec<u8> = Vec::new();
@@ -225,11 +238,22 @@ fn post_public(uri: &str, body: String) -> Request<Body> {
 
 /// Upload a PNG as `subject` and return its `/f/{id}` id plus the fresh CSRF token.
 async fn upload_png(app: &axum::Router, subject: &str) -> (String, String) {
+    upload_file(app, subject, "shot.png", "image/png", &png_bytes()).await
+}
+
+/// Upload an arbitrary file as `subject` and return its `/f/{id}` id plus the fresh CSRF token.
+async fn upload_file(
+    app: &axum::Router,
+    subject: &str,
+    filename: &str,
+    ctype: &str,
+    data: &[u8],
+) -> (String, String) {
     let home = send(app, get("/", Some(subject))).await;
     let csrf = home.csrf_cookie().expect("csrf cookie");
     let created = send(
         app,
-        upload_req(&csrf, &csrf, subject, "shot.png", "image/png", &png_bytes()),
+        upload_req(&csrf, &csrf, subject, filename, ctype, data),
     )
     .await;
     let id = created.location().trim_start_matches("/f/").to_string();
@@ -752,6 +776,165 @@ async fn non_image_is_served_as_download() {
     assert!(raw
         .header(header::CONTENT_DISPOSITION)
         .contains("notes.pdf"));
+}
+
+#[tokio::test]
+async fn video_raw_supports_range_and_inline_playback() {
+    let app = app(build_dev_state());
+    let video = b"\x00\x00\x00\x18ftypmp42aperture-video".to_vec();
+    let size = video.len();
+    let (id, _) = upload_file(&app, "alice", "clip.mp4", "video/mp4", &video).await;
+
+    let full = send(&app, get(&format!("/f/{id}/raw"), Some("alice"))).await;
+    assert_eq!(full.status, StatusCode::OK);
+    assert_eq!(full.header(header::CONTENT_TYPE), "video/mp4");
+    assert!(full
+        .header(header::CONTENT_DISPOSITION)
+        .starts_with("inline"));
+    assert_eq!(full.header(header::X_CONTENT_TYPE_OPTIONS), "nosniff");
+    assert_eq!(full.header(header::ACCEPT_RANGES), "bytes");
+    assert_eq!(full.header(header::CONTENT_LENGTH), size.to_string());
+    assert_eq!(full.body, video);
+
+    let part = send(
+        &app,
+        get_range(&format!("/f/{id}/raw"), Some("alice"), "bytes=0-3"),
+    )
+    .await;
+    assert_eq!(part.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        part.header(header::CONTENT_RANGE),
+        format!("bytes 0-3/{size}")
+    );
+    assert_eq!(part.header(header::CONTENT_LENGTH), "4");
+    assert_eq!(part.header(header::ACCEPT_RANGES), "bytes");
+    assert_eq!(part.header(header::CONTENT_TYPE), "video/mp4");
+    assert!(part
+        .header(header::CONTENT_DISPOSITION)
+        .starts_with("inline"));
+    assert_eq!(part.header(header::X_CONTENT_TYPE_OPTIONS), "nosniff");
+    assert_eq!(part.body, video[0..4].to_vec());
+
+    let suffix = send(
+        &app,
+        get_range(&format!("/f/{id}/raw"), Some("alice"), "bytes=-2"),
+    )
+    .await;
+    assert_eq!(suffix.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        suffix.header(header::CONTENT_RANGE),
+        format!("bytes {}-{}/{size}", size - 2, size - 1)
+    );
+    assert_eq!(suffix.header(header::CONTENT_LENGTH), "2");
+    assert_eq!(suffix.body, video[size - 2..].to_vec());
+
+    let unsat = send(
+        &app,
+        get_range(
+            &format!("/f/{id}/raw"),
+            Some("alice"),
+            &format!("bytes={size}-"),
+        ),
+    )
+    .await;
+    assert_eq!(unsat.status, StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(
+        unsat.header(header::CONTENT_RANGE),
+        format!("bytes */{size}")
+    );
+    assert_eq!(unsat.header(header::ACCEPT_RANGES), "bytes");
+    assert_eq!(unsat.body, Vec::<u8>::new());
+}
+
+#[tokio::test]
+async fn non_media_download_supports_range_without_inline() {
+    let app = app(build_dev_state());
+    let zip = b"PK\x03\x04aperture-zip-bytes".to_vec();
+    let size = zip.len();
+    let (id, _) = upload_file(&app, "alice", "archive.zip", "application/zip", &zip).await;
+
+    let part = send(
+        &app,
+        get_range(&format!("/f/{id}/raw"), Some("alice"), "bytes=1-4"),
+    )
+    .await;
+    assert_eq!(part.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        part.header(header::CONTENT_TYPE),
+        "application/octet-stream"
+    );
+    assert!(part
+        .header(header::CONTENT_DISPOSITION)
+        .starts_with("attachment"));
+    assert!(part
+        .header(header::CONTENT_DISPOSITION)
+        .contains("archive.zip"));
+    assert_eq!(
+        part.header(header::CONTENT_RANGE),
+        format!("bytes 1-4/{size}")
+    );
+    assert_eq!(part.header(header::CONTENT_LENGTH), "4");
+    assert_eq!(part.header(header::ACCEPT_RANGES), "bytes");
+    assert_eq!(part.header(header::X_CONTENT_TYPE_OPTIONS), "nosniff");
+    assert_eq!(part.body, zip[1..5].to_vec());
+}
+
+#[tokio::test]
+async fn video_share_supports_range_after_public_gates() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let video = b"\x00\x00\x00\x18ftypmp42shared-video".to_vec();
+    let size = video.len();
+    let (id, csrf) = upload_file(&app, "alice", "shared.mp4", "video/mp4", &video).await;
+    let token = store.get(&id).await.unwrap().unwrap().share_token.unwrap();
+
+    let part = send(&app, get_range(&format!("/s/{token}"), None, "bytes=2-5")).await;
+    assert_eq!(part.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(part.header(header::CONTENT_TYPE), "video/mp4");
+    assert!(part
+        .header(header::CONTENT_DISPOSITION)
+        .starts_with("inline"));
+    assert_eq!(part.header(header::X_CONTENT_TYPE_OPTIONS), "nosniff");
+    assert_eq!(part.header(header::ACCEPT_RANGES), "bytes");
+    assert_eq!(
+        part.header(header::CONTENT_RANGE),
+        format!("bytes 2-5/{size}")
+    );
+    assert_eq!(part.header(header::CONTENT_LENGTH), "4");
+    assert_eq!(part.body, video[2..6].to_vec());
+
+    let set_password = send(
+        &app,
+        post_form(
+            &format!("/f/{id}/share"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&expiry=never&password=hunter2"),
+        ),
+    )
+    .await;
+    assert_eq!(set_password.status, StatusCode::FOUND);
+
+    let protected = send(&app, get_range(&format!("/s/{token}"), None, "bytes=0-3")).await;
+    assert_eq!(protected.status, StatusCode::OK);
+    assert!(protected.text().contains("Password required"));
+    assert_ne!(protected.body, video[0..4].to_vec());
+
+    let wrong = send(
+        &app,
+        post_public(&format!("/s/{token}"), "password=nope".to_string()),
+    )
+    .await;
+    assert_eq!(wrong.status, StatusCode::UNAUTHORIZED);
+    assert!(wrong.text().contains("Incorrect password"));
+
+    store
+        .configure_share(&id, "alice", Some(token.clone()), Some(1), None)
+        .await
+        .unwrap();
+    let gone = send(&app, get_range(&format!("/s/{token}"), None, "bytes=0-3")).await;
+    assert_eq!(gone.status, StatusCode::GONE);
 }
 
 #[tokio::test]

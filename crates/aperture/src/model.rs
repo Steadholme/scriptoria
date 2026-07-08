@@ -21,6 +21,11 @@ pub fn is_inline_image(content_type: &str) -> bool {
     INLINE_IMAGE_TYPES.contains(&content_type)
 }
 
+/// True when `content_type` is browser-native media that can be served inline and range-streamed.
+pub fn is_streamable_media(content_type: &str) -> bool {
+    content_type.starts_with("video/") || content_type.starts_with("audio/")
+}
+
 /// A single stored file. Field order/types mirror the `files` table exactly.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileRec {
@@ -152,6 +157,21 @@ impl FileRec {
         is_inline_image(&self.content_type)
     }
 
+    /// True when this file is browser-native video.
+    pub fn is_video(&self) -> bool {
+        self.content_type.starts_with("video/")
+    }
+
+    /// True when this file is browser-native audio.
+    pub fn is_audio(&self) -> bool {
+        self.content_type.starts_with("audio/")
+    }
+
+    /// True when this file is safe to serve inline as image/video/audio media.
+    pub fn is_media(&self) -> bool {
+        self.is_image() || self.is_video() || self.is_audio()
+    }
+
     /// True once `now` (epoch seconds) has reached the share-link expiry instant. A `None` expiry
     /// never expires. Mirrors pastefire's `Paste::is_expired` idiom.
     pub fn share_expired(&self, now: i64) -> bool {
@@ -189,6 +209,16 @@ mod tests {
         assert!(!is_inline_image("image/svg+xml"));
         assert!(!is_inline_image("text/html"));
         assert!(!is_inline_image("application/octet-stream"));
+    }
+
+    #[test]
+    fn streamable_media_is_video_or_audio_only() {
+        assert!(is_streamable_media("video/mp4"));
+        assert!(is_streamable_media("audio/mpeg"));
+        assert!(!is_streamable_media("image/png"));
+        assert!(!is_streamable_media("image/svg+xml"));
+        assert!(!is_streamable_media("text/html"));
+        assert!(!is_streamable_media("application/javascript"));
     }
 
     fn rec(expires_at: Option<i64>) -> FileRec {

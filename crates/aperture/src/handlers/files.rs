@@ -7,7 +7,8 @@
 //! cross-user access happens only through the unguessable share token. State-changing POSTs carry
 //! a double-submit CSRF token. Blob bytes are served as inline images only when magic-sniffed,
 //! otherwise as `attachment` downloads (+ `nosniff`), so an uploaded file can never execute as
-//! HTML in the drive's origin.
+//! HTML in the drive's origin. Owner raw downloads and public share fetches also honor HTTP Range
+//! so browser-native image/video/audio media can stream and seek without buffering the whole blob.
 
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -519,8 +520,7 @@ pub async fn raw(
 ) -> Result<Response, AppError> {
     let viewer = auth::identity(&headers);
     let rec = owned_file(&state, &id, &viewer).await?;
-    let bytes = state.blobs.get(&rec.object_key).await?;
-    Ok(serve_blob(&rec, bytes))
+    serve_file(&state, &rec, &headers).await
 }
 
 // ---------------------------------------------------------------------------
@@ -973,6 +973,7 @@ pub async fn delete_comment(
 /// renders a password prompt instead of the bytes. Inline for images, attachment otherwise.
 pub async fn share(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(token): Path<String>,
 ) -> Result<Response, AppError> {
     let rec = load_shared(&state, &token).await?;
@@ -984,7 +985,7 @@ pub async fn share(
             None,
         ));
     }
-    serve_shared(&state, &rec).await
+    serve_shared(&state, &rec, &headers).await
 }
 
 /// Submitted share-link password (the public unlock form). The route is unauthenticated and this
@@ -1000,6 +1001,7 @@ pub struct SharePasswordForm {
 /// serve the bytes. Wrong password re-renders the prompt (401). Same 404/410 lifecycle as the GET.
 pub async fn share_unlock(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(token): Path<String>,
     Form(form): Form<SharePasswordForm>,
 ) -> Result<Response, AppError> {
@@ -1007,9 +1009,9 @@ pub async fn share_unlock(
     match &rec.share_password_hash {
         // Correct password (or the link is no longer protected) -> serve.
         Some(hash) if auth::verify_share_password(hash, &form.password) => {
-            serve_shared(&state, &rec).await
+            serve_shared(&state, &rec, &headers).await
         }
-        None => serve_shared(&state, &rec).await,
+        None => serve_shared(&state, &rec, &headers).await,
         Some(_) => Ok(render_share_prompt(
             &format!("/s/{token}"),
             StatusCode::UNAUTHORIZED,
@@ -2036,8 +2038,12 @@ async fn load_shared(state: &AppState, token: &str) -> Result<FileRec, AppError>
 }
 
 /// Fetch the blob for a (validated) shared file, emit the public-share audit event, and serve it.
-async fn serve_shared(state: &AppState, rec: &FileRec) -> Result<Response, AppError> {
-    let bytes = state.blobs.get(&rec.object_key).await?;
+async fn serve_shared(
+    state: &AppState,
+    rec: &FileRec,
+    headers: &HeaderMap,
+) -> Result<Response, AppError> {
+    let response = serve_file(state, rec, headers).await?;
     // Public share fetch: no gateway identity on this route, so the affected file's owner is the
     // subject the event is attributed to.
     state.audit.emit(AuditEvent::info(
@@ -2046,7 +2052,7 @@ async fn serve_shared(state: &AppState, rec: &FileRec) -> Result<Response, AppEr
         &rec.id,
         if rec.is_image() { "image" } else { "file" },
     ));
-    Ok(serve_blob(rec, bytes))
+    Ok(response)
 }
 
 /// Render the public share-link password prompt (`status` = 200 on first ask, 401 after a wrong
@@ -2169,6 +2175,163 @@ async fn owned_trashed_file(
         ));
     }
     Ok(rec)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RangeSpec {
+    Full,
+    Partial { start: u64, end: u64 },
+    Unsatisfiable,
+}
+
+fn parse_range(range: Option<&str>, total: u64) -> RangeSpec {
+    let Some(raw) = range.map(str::trim) else {
+        return RangeSpec::Full;
+    };
+    let Some(spec) = raw.strip_prefix("bytes=") else {
+        return RangeSpec::Full;
+    };
+    if spec.is_empty() || spec.contains(',') {
+        return RangeSpec::Full;
+    }
+
+    if let Some(suffix) = spec.strip_prefix('-') {
+        let Ok(wanted) = suffix.parse::<u64>() else {
+            return RangeSpec::Full;
+        };
+        if wanted == 0 || total == 0 {
+            return RangeSpec::Unsatisfiable;
+        }
+        let len = wanted.min(total);
+        return RangeSpec::Partial {
+            start: total - len,
+            end: total - 1,
+        };
+    }
+
+    let Some((start_raw, end_raw)) = spec.split_once('-') else {
+        return RangeSpec::Full;
+    };
+    if start_raw.is_empty() {
+        return RangeSpec::Full;
+    }
+    let Ok(start) = start_raw.parse::<u64>() else {
+        return RangeSpec::Full;
+    };
+    let end = if end_raw.is_empty() {
+        total.saturating_sub(1)
+    } else {
+        let Ok(end) = end_raw.parse::<u64>() else {
+            return RangeSpec::Full;
+        };
+        end
+    };
+    if total == 0 || start >= total || start > end {
+        return RangeSpec::Unsatisfiable;
+    }
+    RangeSpec::Partial {
+        start,
+        end: end.min(total - 1),
+    }
+}
+
+fn blob_delivery_headers(rec: &FileRec) -> (String, String) {
+    let filename = safe_filename(&rec.name);
+    if rec.is_media() {
+        (
+            rec.content_type.clone(),
+            format!("inline; filename=\"{filename}\""),
+        )
+    } else {
+        (
+            "application/octet-stream".to_string(),
+            format!("attachment; filename=\"{filename}\""),
+        )
+    }
+}
+
+fn normalize_partial_bytes(bytes: Vec<u8>, start: u64, end: u64, total: u64) -> Vec<u8> {
+    let expected_len = (end - start + 1) as usize;
+    if bytes.len() == expected_len {
+        return bytes;
+    }
+
+    let total_len = total as usize;
+    let start_ix = start as usize;
+    let end_ix = end as usize + 1;
+    if bytes.len() == total_len && end_ix <= bytes.len() {
+        return bytes[start_ix..end_ix].to_vec();
+    }
+
+    if bytes.len() > expected_len {
+        let mut truncated = bytes;
+        truncated.truncate(expected_len);
+        return truncated;
+    }
+    bytes
+}
+
+/// Serve a current file blob with HTTP Range support. Image/video/audio are inline with their
+/// resolved content type; everything else remains an octet-stream attachment.
+async fn serve_file(
+    state: &AppState,
+    rec: &FileRec,
+    headers: &HeaderMap,
+) -> Result<Response, AppError> {
+    let total = rec.size.max(0) as u64;
+    let (ctype, disposition) = blob_delivery_headers(rec);
+    let range = parse_range(
+        headers.get(header::RANGE).and_then(|v| v.to_str().ok()),
+        total,
+    );
+
+    match range {
+        RangeSpec::Full => {
+            let bytes = state.blobs.get(&rec.object_key).await?;
+            Ok((
+                [
+                    (header::CONTENT_TYPE, ctype),
+                    (header::CONTENT_DISPOSITION, disposition),
+                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+                    (header::ACCEPT_RANGES, "bytes".to_string()),
+                    (header::CONTENT_LENGTH, total.to_string()),
+                ],
+                bytes,
+            )
+                .into_response())
+        }
+        RangeSpec::Partial { start, end } => {
+            let bytes = state.blobs.get_range(&rec.object_key, start, end).await?;
+            let bytes = normalize_partial_bytes(bytes, start, end, total);
+            Ok((
+                StatusCode::PARTIAL_CONTENT,
+                [
+                    (header::CONTENT_TYPE, ctype),
+                    (header::CONTENT_DISPOSITION, disposition),
+                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+                    (header::ACCEPT_RANGES, "bytes".to_string()),
+                    (
+                        header::CONTENT_RANGE,
+                        format!("bytes {start}-{end}/{total}"),
+                    ),
+                    (header::CONTENT_LENGTH, (end - start + 1).to_string()),
+                ],
+                bytes,
+            )
+                .into_response())
+        }
+        RangeSpec::Unsatisfiable => Ok((
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            [
+                (header::CONTENT_RANGE, format!("bytes */{total}")),
+                (header::ACCEPT_RANGES, "bytes".to_string()),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+                (header::CONTENT_LENGTH, "0".to_string()),
+            ],
+            Vec::<u8>::new(),
+        )
+            .into_response()),
+    }
 }
 
 /// Serve raw blob bytes: inline for sniffed images, attachment otherwise; always `nosniff`.
@@ -3635,6 +3798,33 @@ mod tests {
     #[test]
     fn thumb_object_key_is_namespaced() {
         assert_eq!(thumb_object_key("abc123"), "abc123.thumb");
+    }
+
+    #[test]
+    fn parse_range_handles_rfc_byte_forms() {
+        assert_eq!(parse_range(None, 10), RangeSpec::Full);
+        assert_eq!(parse_range(Some("items=0-3"), 10), RangeSpec::Full);
+        assert_eq!(parse_range(Some("bytes=0-3,5-6"), 10), RangeSpec::Full);
+        assert_eq!(parse_range(Some("bytes=x-y"), 10), RangeSpec::Full);
+        assert_eq!(
+            parse_range(Some("bytes=0-3"), 10),
+            RangeSpec::Partial { start: 0, end: 3 }
+        );
+        assert_eq!(
+            parse_range(Some("bytes=7-"), 10),
+            RangeSpec::Partial { start: 7, end: 9 }
+        );
+        assert_eq!(
+            parse_range(Some("bytes=-2"), 10),
+            RangeSpec::Partial { start: 8, end: 9 }
+        );
+        assert_eq!(
+            parse_range(Some("bytes=8-99"), 10),
+            RangeSpec::Partial { start: 8, end: 9 }
+        );
+        assert_eq!(parse_range(Some("bytes=10-"), 10), RangeSpec::Unsatisfiable);
+        assert_eq!(parse_range(Some("bytes=4-3"), 10), RangeSpec::Unsatisfiable);
+        assert_eq!(parse_range(Some("bytes=-0"), 10), RangeSpec::Unsatisfiable);
     }
 
     #[test]
