@@ -66,6 +66,14 @@ const FOLDER_SVG: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="curren
 /// "Up one level" glyph for the tile that navigates to the parent folder.
 const FOLDER_UP_SVG: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h5l2 2.5h9a1 1 0 0 1 1 1V18a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Z"/><path d="m12 16 0-5"/><path d="m9.5 13 2.5-2.5 2.5 2.5"/></svg>"##;
 
+/// Film-strip glyph for browser-native video cards.
+const VIDEO_SVG: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 5v14M17 5v14M3 9h4M3 15h4M17 9h4M17 15h4"/><path d="m11 10 4 2-4 2Z" fill="currentColor" stroke="none"/></svg>"##;
+
+/// Waveform glyph for browser-native audio cards.
+const AUDIO_SVG: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 13v-2M8 17V7M12 20V4M16 17V7M20 13v-2"/></svg>"##;
+
+const PLAY_SVG: &str = r##"<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M9 7.5v9l7-4.5-7-4.5Z"/></svg>"##;
+
 // ---------------------------------------------------------------------------
 // GET / — the signed-in user's drive (gallery grid + upload dropzone)
 // ---------------------------------------------------------------------------
@@ -2540,16 +2548,16 @@ fn folder_chain(folders: &[FolderRec], folder: &FolderRec) -> Vec<FolderRec> {
     chain
 }
 
-/// Render the folder breadcrumb: `All files › … › current`, each ancestor a link, the current node
+/// Render the folder breadcrumb: `My Drive › … › current`, each ancestor a link, the current node
 /// plain text. Owner-scoped; every name escaped.
 fn render_breadcrumb(chain: &[FolderRec]) -> String {
     let mut out = String::from("<nav class=\"breadcrumb\" aria-label=\"Folder path\">");
     if chain.is_empty() {
-        out.push_str("<span class=\"breadcrumb__here\">All files</span>");
+        out.push_str("<span class=\"breadcrumb__here\">My Drive</span>");
     } else {
-        out.push_str("<a class=\"breadcrumb__crumb\" href=\"/\">All files</a>");
+        out.push_str("<a class=\"breadcrumb__crumb\" href=\"/\">My Drive</a>");
         for (i, f) in chain.iter().enumerate() {
-            out.push_str("<span class=\"breadcrumb__sep\" aria-hidden=\"true\">/</span>");
+            out.push_str("<span class=\"breadcrumb__sep\" aria-hidden=\"true\">&rsaquo;</span>");
             if i + 1 == chain.len() {
                 out.push_str(&format!(
                     "<span class=\"breadcrumb__here\">{}</span>",
@@ -2574,11 +2582,15 @@ fn render_folder_tiles(children: &[&FolderRec], up_href: Option<&str>) -> String
     let mut out = String::new();
     if let Some(href) = up_href {
         out.push_str(&format!(
-            "<li class=\"file-card file-card--folder file-card--up\">\
+            "<li class=\"folder-tile file-card file-card--folder file-card--up\">\
                <a class=\"file-card__link\" href=\"{href}\">\
                  <span class=\"thumb thumb--folder\">{FOLDER_UP_SVG}</span>\
                </a>\
-               <div class=\"file-card__body\"><a class=\"file-card__name\" href=\"{href}\">Up one level</a><span class=\"ap-folder-cue\" aria-hidden=\"true\">›</span></div>\
+               <div class=\"file-card__body folder-tile__body\">\
+                 <a class=\"file-card__name\" href=\"{href}\">Up one level</a>\
+                 <span class=\"folder-tile__badge\">Parent</span>\
+                 <span class=\"ap-folder-cue\" aria-hidden=\"true\">›</span>\
+               </div>\
              </li>",
             href = esc(href),
             FOLDER_UP_SVG = FOLDER_UP_SVG,
@@ -2594,13 +2606,13 @@ fn render_folder_tiles(children: &[&FolderRec], up_href: Option<&str>) -> String
             badges.push_str("<span class=\"ap-badge ap-badge--views\" title=\"Upload request enabled\">Inbox</span>");
         }
         out.push_str(&format!(
-            "<li class=\"file-card file-card--folder\">\
+            "<li class=\"folder-tile file-card file-card--folder\">\
                <a class=\"file-card__link\" href=\"{href}\">\
                  <span class=\"thumb thumb--folder\">{FOLDER_SVG}</span>\
                </a>\
-               <div class=\"file-card__body\">\
+               <div class=\"file-card__body folder-tile__body\">\
                  <div class=\"ap-name-row\"><a class=\"file-card__name\" href=\"{href}\" title=\"{name}\">{name}</a><span class=\"ap-folder-cue\" aria-hidden=\"true\">›</span></div>\
-                 <div class=\"file-card__meta\"><span>Folder</span><span class=\"ap-badges\">{badges}</span></div>\
+                 <div class=\"file-card__meta\"><span class=\"folder-tile__badge\">Folder</span><span class=\"ap-badges\">{badges}</span></div>\
                </div>\
              </li>",
             href = esc(&href),
@@ -2629,11 +2641,6 @@ fn render_gallery(
         1 => "1 file".to_string(),
         n => format!("{n} files"),
     };
-    // The content heading names the active folder, or "All files" for the root.
-    let heading = match active {
-        Some(f) => f.name.clone(),
-        None => "All files".to_string(),
-    };
     // Preserve the active folder across the "Load older" pager (ids are alphanumeric => URL-safe).
     let folder_qs = active
         .map(|f| format!("&folder={}", f.id))
@@ -2658,8 +2665,21 @@ fn render_gallery(
     });
     let tiles = render_folder_tiles(&children, up_href.as_deref());
     let file_cards = render_cards(files, csrf);
+    let folder_section = if tiles.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<section class=\"drive-section drive-section--folders\" aria-labelledby=\"foldersLabel\">\
+               <div class=\"drive-section__head\">\
+                 <h2 class=\"drive-section__label\" id=\"foldersLabel\">Folders</h2>\
+               </div>\
+               <ul class=\"folder-grid\">{tiles}</ul>\
+             </section>",
+            tiles = tiles,
+        )
+    };
     // The empty placeholder shows only when the whole level is empty (no subfolders, no files).
-    let cards = if tiles.is_empty() && file_cards.is_empty() {
+    let cards = if folder_section.is_empty() && file_cards.is_empty() {
         let (title, class) = if active.is_none() {
             ("Your drive is empty.", "")
         } else {
@@ -2671,7 +2691,7 @@ fn render_gallery(
             title = title,
         )
     } else {
-        format!("{tiles}{file_cards}")
+        file_cards
     };
     let upload_folder = active.map(|a| a.id.clone()).unwrap_or_default();
     let upload = render_upload_form(csrf, &upload_folder);
@@ -2688,7 +2708,7 @@ fn render_gallery(
             &render_sidebar(config, csrf, folders, active, false),
         )
         .replace("{{BREADCRUMB}}", &breadcrumb)
-        .replace("{{HEADING}}", &esc(&heading))
+        .replace("{{FOLDERS_SECTION}}", &folder_section)
         .replace("{{COUNT}}", &esc(&count))
         .replace("{{CARDS}}", &cards)
         .replace("{{PAGER}}", &pager)
@@ -2700,9 +2720,9 @@ fn render_upload_form(csrf: &str, folder_id: &str) -> String {
           <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
           <input type=\"hidden\" name=\"folder_id\" value=\"{folder}\">\
           <div class=\"ap-new__pick\">\
-            <label for=\"fileInput\" class=\"btn btn-primary ap-new__btn\">\
-              <svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4\"/><path d=\"m17 8-5-5-5 5\"/><path d=\"M12 3v12\"/></svg>\
-              Upload file\
+            <label for=\"fileInput\" class=\"ap-newbtn\">\
+              <span class=\"ap-newbtn__plus\" aria-hidden=\"true\">+</span>\
+              <span>New / Upload</span>\
             </label>\
             <input id=\"fileInput\" class=\"dropzone__input\" type=\"file\" name=\"file\" required>\
             <span id=\"fileName\" class=\"dropzone__hint\">Nothing selected yet</span>\
@@ -2739,7 +2759,7 @@ fn render_trash_gallery(
         render_trash_cards(files, csrf)
     };
     let breadcrumb =
-        "<nav class=\"breadcrumb\" aria-label=\"Folder path\"><a class=\"breadcrumb__crumb\" href=\"/\">All files</a><span class=\"breadcrumb__sep\" aria-hidden=\"true\">/</span><span class=\"breadcrumb__here\">Trash</span></nav>";
+        "<nav class=\"breadcrumb\" aria-label=\"Folder path\"><a class=\"breadcrumb__crumb\" href=\"/\">My Drive</a><span class=\"breadcrumb__sep\" aria-hidden=\"true\">&rsaquo;</span><span class=\"breadcrumb__here\">Trash</span></nav>";
     GALLERY_HTML
         .replace("{{CSS}}", app_css())
         .replace("{{DYNAMIC}}", dynamic_js())
@@ -2752,7 +2772,7 @@ fn render_trash_gallery(
             &render_sidebar(config, csrf, folders, None, true),
         )
         .replace("{{BREADCRUMB}}", breadcrumb)
-        .replace("{{HEADING}}", "Trash")
+        .replace("{{FOLDERS_SECTION}}", "")
         .replace("{{COUNT}}", &esc(&count))
         .replace("{{CARDS}}", &cards)
         .replace("{{PAGER}}", "")
@@ -2925,21 +2945,19 @@ fn render_sidebar(
     };
 
     format!(
-        "{new_folder}\
-         <nav class=\"ap-tree\" aria-label=\"Drive folders\">\
-           <a class=\"ap-tree__row{all_active}\" href=\"/\">\
-             <svg class=\"ap-tree__ico\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z\"/></svg>\
-             <span class=\"ap-tree__name\">All files</span>\
+        "<nav class=\"ap-nav\" aria-label=\"Drive folders\">\
+           <a class=\"ap-nav__row{all_active}\" href=\"/\">\
+             <svg class=\"ap-nav__ico\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z\"/></svg>\
+             <span class=\"ap-nav__name\">My Drive</span>\
            </a>\
            {tree}\
            <div class=\"ap-rail__rule\" aria-hidden=\"true\"></div>\
-           <a class=\"ap-tree__row{trash_active_class}\" href=\"/?view=trash\">\
-             <svg class=\"ap-tree__ico\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M3 6h18\"/><path d=\"M8 6V4h8v2\"/><path d=\"m19 6-1 14H6L5 6\"/></svg>\
-             <span class=\"ap-tree__name\">Trash</span>\
+           <a class=\"ap-nav__row{trash_active_class}\" href=\"/?view=trash\">\
+             <svg class=\"ap-nav__ico\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M3 6h18\"/><path d=\"M8 6V4h8v2\"/><path d=\"m19 6-1 14H6L5 6\"/></svg>\
+             <span class=\"ap-nav__name\">Trash</span>\
            </a>\
          </nav>\
-         {settings}\
-         {foot}",
+         <div class=\"ap-rail__tools\">{new_folder}{settings}{foot}</div>",
         new_folder = new_folder,
         all_active = all_active,
         tree = tree,
@@ -2971,15 +2989,15 @@ fn render_folder_tree_level(
     if children.is_empty() {
         return String::new();
     }
-    let mut out = String::from("<ul>");
+    let mut out = String::from("<ul class=\"ap-nav__tree\">");
     for f in children {
         let active = active_id == Some(f.id.as_str());
         let expanded = chain.iter().any(|c| c.id == f.id);
         let class = if active { " is-active" } else { "" };
         out.push_str(&format!(
-            "<li><a class=\"ap-tree__row{class}\" href=\"/?folder={id}\" title=\"{name}\">\
-               <svg class=\"ap-tree__ico\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M4 5h5l2 2.5h9a1 1 0 0 1 1 1V18a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Z\"/></svg>\
-               <span class=\"ap-tree__name\">{name}</span>\
+            "<li><a class=\"ap-nav__row{class}\" href=\"/?folder={id}\" title=\"{name}\">\
+               <svg class=\"ap-nav__ico\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M4 5h5l2 2.5h9a1 1 0 0 1 1 1V18a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Z\"/></svg>\
+               <span class=\"ap-nav__name\">{name}</span>\
              </a>",
             class = class,
             id = esc(&f.id),
@@ -3112,14 +3130,62 @@ fn render_cards(files: &[FileRec], csrf: &str) -> String {
             let tone = ap_tone_class(&f.content_type);
             let date = fmt_ts(f.created_at);
             let badges = render_card_badges(f);
-            // Every card loads its thumbnail through the derived-thumbnail route: an image resolves
-            // to its full bytes (302), a non-image to a cached, mime-keyed type icon. One uniform
-            // `<img>` path replaces the old image-vs-generic-icon branch.
-            let thumb = format!(
-                "<span class=\"thumb\"><img src=\"/d/{id}/thumb\" alt=\"{alt}\" loading=\"lazy\"></span>",
-                id = esc(&f.id),
-                alt = esc(&f.name),
-            );
+            let kind = if f.is_video() {
+                "video"
+            } else if f.is_audio() {
+                "audio"
+            } else if f.is_image() {
+                "image"
+            } else {
+                "file"
+            };
+            let media = f.is_media();
+            let preview_attrs = if media {
+                format!(
+                    " data-preview data-preview-id=\"{id}\" data-preview-kind=\"{kind}\" data-preview-name=\"{name}\"",
+                    id = esc(&f.id),
+                    kind = kind,
+                    name = esc(&f.name),
+                )
+            } else {
+                String::new()
+            };
+            let media_class = if media { " file-card--media" } else { "" };
+            let play = if f.is_video() || f.is_audio() {
+                format!(
+                    "<span class=\"thumb__play\" aria-hidden=\"true\">{PLAY_SVG}</span>",
+                    PLAY_SVG = PLAY_SVG,
+                )
+            } else {
+                String::new()
+            };
+            let thumb = if f.is_image() {
+                format!(
+                    "<span class=\"thumb thumb--image\"><img src=\"/d/{id}/thumb\" alt=\"{alt}\" loading=\"lazy\"></span>",
+                    id = esc(&f.id),
+                    alt = esc(&f.name),
+                )
+            } else {
+                let glyph = if f.is_video() {
+                    VIDEO_SVG
+                } else if f.is_audio() {
+                    AUDIO_SVG
+                } else {
+                    FILE_SVG
+                };
+                format!(
+                    "<span class=\"thumb thumb--file thumb--{kind} {tone}\">\
+                       <span class=\"thumb__glyph\" aria-hidden=\"true\">{glyph}</span>\
+                       <span class=\"thumb__ext {tone}\">{ext}</span>\
+                       {play}\
+                     </span>",
+                    kind = kind,
+                    tone = tone,
+                    glyph = glyph,
+                    ext = esc(&ext_label(&f.name)),
+                    play = play,
+                )
+            };
             // Per-card actions live in a native <details> menu — no-JS: expand, rename/trash via
             // the real forms (302 back). With JS: the rename becomes an inline PATCH-like update
             // and "Move to trash" removes the card optimistically. All owner-scoped + CSRF-checked.
@@ -3145,7 +3211,7 @@ fn render_cards(files: &[FileRec], csrf: &str) -> String {
                 name = esc(&f.name),
             );
             format!(
-                "<li class=\"file-card\" id=\"file-{id}\" data-file-id=\"{id}\">\
+                "<li class=\"file-card file-card--{kind}{media_class}\" id=\"file-{id}\" data-file-id=\"{id}\"{preview_attrs}>\
                    <a class=\"file-card__link\" href=\"/f/{id}\">{thumb}</a>\
                    <div class=\"file-card__body\">\
                      <div class=\"ap-name-row\"><span class=\"ap-glyph {tone}\" aria-hidden=\"true\">{ext}</span><a class=\"file-card__name\" href=\"/f/{id}\" title=\"{name}\" data-file-name>{name}</a></div>\
@@ -3155,6 +3221,9 @@ fn render_cards(files: &[FileRec], csrf: &str) -> String {
                  </li>",
                 id = esc(&f.id),
                 name = esc(&f.name),
+                kind = kind,
+                media_class = media_class,
+                preview_attrs = preview_attrs,
                 tone = tone,
                 ext = esc(&ext_label(&f.name)),
                 badges = badges,
@@ -3218,6 +3287,8 @@ fn render_card_badges(f: &FileRec) -> String {
 /// Which inline preview a file gets on its detail page.
 enum Preview {
     Image,
+    Video,
+    Audio,
     Text,
     Pdf,
     None,
@@ -3227,6 +3298,10 @@ enum Preview {
 fn preview_kind(rec: &FileRec) -> Preview {
     if rec.is_image() {
         Preview::Image
+    } else if rec.is_video() {
+        Preview::Video
+    } else if rec.is_audio() {
+        Preview::Audio
     } else if rec.content_type == "application/pdf" {
         Preview::Pdf
     } else if is_text_preview(&rec.content_type, &rec.name) {
@@ -3253,15 +3328,26 @@ fn is_text_preview(content_type: &str, name: &str) -> bool {
 }
 
 /// Build the inline preview block for the detail page. Images render inline (click to open full
-/// size — a tiny CSS/JS lightbox, no library); text/markdown is fetched, escaped and shown in a
-/// `<pre>` (this crate ships no markdown renderer, so the safe escaped fallback is used); PDFs are
-/// embedded in a sandboxed `<iframe>` of the inline-served bytes; everything else shows the type
-/// icon + a download prompt.
+/// size — a tiny CSS/JS lightbox, no library); video/audio use native browser controls pointed at
+/// the Range-enabled raw route; text/markdown is fetched, escaped and shown in a `<pre>` (this
+/// crate ships no markdown renderer, so the safe escaped fallback is used); PDFs are embedded in a
+/// sandboxed `<iframe>` of the inline-served bytes; everything else shows the type icon + a download
+/// prompt.
 async fn build_preview(state: &AppState, rec: &FileRec) -> String {
     match preview_kind(rec) {
         Preview::Image => format!(
             "<a class=\"lightbox-trigger\" href=\"/f/{id}/raw\" title=\"Open full size\">\
                <img class=\"preview-img\" src=\"/f/{id}/raw\" alt=\"{alt}\"></a>",
+            id = esc(&rec.id),
+            alt = esc(&rec.name),
+        ),
+        Preview::Video => format!(
+            "<video class=\"ap-player\" controls preload=\"metadata\" playsinline src=\"/f/{id}/raw\" title=\"{alt}\"></video>",
+            id = esc(&rec.id),
+            alt = esc(&rec.name),
+        ),
+        Preview::Audio => format!(
+            "<audio class=\"ap-player ap-player--audio\" controls preload=\"metadata\" src=\"/f/{id}/raw\" title=\"{alt}\"></audio>",
             id = esc(&rec.id),
             alt = esc(&rec.name),
         ),
@@ -3384,6 +3470,8 @@ fn render_detail(ctx: DetailRender<'_>) -> String {
     );
     let stage_mod = match preview_kind(rec) {
         Preview::Image => "ap-stage--checker",
+        Preview::Video => "ap-stage--player ap-stage--video",
+        Preview::Audio => "ap-stage--player ap-stage--audio",
         Preview::Text | Preview::Pdf => "ap-stage--doc",
         Preview::None => "",
     };
@@ -3608,7 +3696,7 @@ fn render_move_section(rec: &FileRec, csrf: &str, folders: &[FolderRec]) -> Stri
         ""
     };
     let mut options = format!(
-        "<option value=\"\"{root_sel}>No folder (All files)</option>",
+        "<option value=\"\"{root_sel}>No folder (My Drive)</option>",
         root_sel = root_sel,
     );
     for f in folders {

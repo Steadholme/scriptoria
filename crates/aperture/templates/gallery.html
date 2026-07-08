@@ -20,37 +20,58 @@
     <div class="appbar__right">{{USERBOX}}</div>
   </header>
 
-	  <main class="console">
-	    <div class="console__head">
-	      <h1>Your drive</h1>
-	      <p class="sub">Private files, folders and links from your single sign-on session.</p>
-	    </div>
-	
-	    <div class="drive-layout">
-	      <aside class="folder-rail ap-rail">{{UPLOAD}}{{SIDEBAR}}{{USAGE}}</aside>
-	
-	      <div class="drive-content" id="ap-drive" data-spark="view:grid" data-spark-persist="view=aperture:view">
-	        <div class="ap-toolbar">
-	          <div class="ap-toolbar__main">
-	            {{BREADCRUMB}}
-	            <h2>{{HEADING}}</h2>
-	          </div>
-	          <span class="count-badge" id="countBadge">{{COUNT}}</span>
-	          <div class="view-toggle" id="viewToggle" role="group" aria-label="Layout" hidden data-spark-uncloak>
-	            <button type="button" class="view-toggle__btn is-active" data-view="grid" aria-label="Grid view" aria-pressed="true" data-spark-click="set:view=grid" data-spark-class="is-active:view=grid" data-spark-attr="aria-pressed:view=grid"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></button>
-	            <button type="button" class="view-toggle__btn" data-view="list" aria-label="List view" aria-pressed="false" data-spark-click="set:view=list" data-spark-class="is-active:view=list" data-spark-attr="aria-pressed:view=list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg></button>
-	          </div>
-	        </div>
-	
-	        <div class="ap-list-head" hidden data-spark-class="is-list:view=list" aria-hidden="true"><span></span><span>Name</span><span data-col="shared">Shared</span><span>Size</span><span data-col="modified">Modified</span><span></span></div>
-	        <ul class="gallery-grid" data-spark-class="is-list:view=list">
-	          {{CARDS}}
-	        </ul>
+  <main class="console console--drive">
+    <div class="drive-layout">
+      <aside class="folder-rail ap-rail" aria-label="Drive navigation">
+        <div class="ap-rail__top">{{UPLOAD}}</div>
+        <div class="ap-rail__nav">{{SIDEBAR}}</div>
+        <div class="ap-rail__bottom">{{USAGE}}</div>
+      </aside>
+
+      <div class="drive-content" id="ap-drive" data-spark="view:grid" data-spark-persist="view=aperture:view">
+        <div class="ap-toolbar">
+          <div class="ap-toolbar__main">{{BREADCRUMB}}</div>
+          <div class="ap-toolbar__side">
+            <span class="count-badge" id="countBadge">{{COUNT}}</span>
+            <div class="view-toggle" id="viewToggle" role="group" aria-label="Layout" hidden data-spark-uncloak>
+              <button type="button" class="view-toggle__btn is-active" data-view="grid" aria-label="Grid view" aria-pressed="true" data-spark-click="set:view=grid" data-spark-class="is-active:view=grid" data-spark-attr="aria-pressed:view=grid"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></button>
+              <button type="button" class="view-toggle__btn" data-view="list" aria-label="List view" aria-pressed="false" data-spark-click="set:view=list" data-spark-class="is-active:view=list" data-spark-attr="aria-pressed:view=list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg></button>
+            </div>
+          </div>
+        </div>
+
+        {{FOLDERS_SECTION}}
+
+        <section class="drive-section drive-section--files" aria-labelledby="filesLabel">
+          <div class="drive-section__head">
+            <h2 class="drive-section__label" id="filesLabel">Files</h2>
+          </div>
+          <div class="ap-list-head" hidden data-spark-class="is-list:view=list" aria-hidden="true"><span></span><span>Name</span><span data-col="shared">Shared</span><span>Size</span><span data-col="modified">Modified</span><span></span></div>
+          <ul class="gallery-grid" data-spark-class="is-list:view=list">
+            {{CARDS}}
+          </ul>
+        </section>
 
         {{PAGER}}
       </div>
-	    </div>
-	  </main>
+    </div>
+  </main>
+
+  <div class="ap-preview" id="apPreview" hidden aria-hidden="true" role="dialog" aria-modal="true" aria-label="File preview">
+    <button class="ap-preview__scrim" type="button" data-preview-close aria-label="Close preview"></button>
+    <section class="ap-preview__panel" role="document">
+      <header class="ap-preview__bar">
+        <div class="ap-preview__title" data-preview-title></div>
+        <div class="ap-preview__actions">
+          <a class="btn btn-ghost btn-sm" href="/" data-preview-detail>Open detail</a>
+          <a class="btn btn-secondary btn-sm" href="/" data-preview-download>Download</a>
+          <button class="ap-preview__close" type="button" data-preview-close aria-label="Close preview">×</button>
+        </div>
+      </header>
+      <div class="ap-preview__body" data-preview-body></div>
+    </section>
+  </div>
+
 	  <div class="ap-dropscrim" aria-hidden="true"></div>
 	
 	  <div class="toast-host" id="hf-toasts" data-toast-host aria-live="polite" aria-atomic="false"></div>
@@ -175,6 +196,96 @@
             e.preventDefault();
             upload();
           }
+        });
+      })();
+
+      // ---- Inline media preview overlay ------------------------------------
+      (function () {
+        var overlay = document.getElementById('apPreview');
+        if (!overlay) { return; }
+        var body = overlay.querySelector('[data-preview-body]');
+        var title = overlay.querySelector('[data-preview-title]');
+        var detail = overlay.querySelector('[data-preview-detail]');
+        var download = overlay.querySelector('[data-preview-download]');
+        var closeBtns = overlay.querySelectorAll('[data-preview-close]');
+        if (!body || !title || !detail || !download) { return; }
+
+        function clearPreview() {
+          var players = body.querySelectorAll('video, audio');
+          Array.prototype.forEach.call(players, function (player) {
+            try { player.pause(); } catch (e) {}
+            player.removeAttribute('src');
+            try { player.load(); } catch (e) {}
+          });
+          body.textContent = '';
+        }
+
+        function closePreview() {
+          clearPreview();
+          overlay.hidden = true;
+          overlay.setAttribute('aria-hidden', 'true');
+          document.body.classList.remove('has-preview');
+        }
+
+        function mediaNode(kind, src, name) {
+          var node;
+          if (kind === 'video') {
+            node = document.createElement('video');
+            node.className = 'ap-preview__media ap-preview__media--video';
+            node.controls = true;
+            node.preload = 'metadata';
+            node.setAttribute('playsinline', '');
+          } else if (kind === 'audio') {
+            node = document.createElement('audio');
+            node.className = 'ap-preview__media ap-preview__media--audio';
+            node.controls = true;
+            node.preload = 'metadata';
+          } else if (kind === 'image') {
+            node = document.createElement('img');
+            node.className = 'ap-preview__media ap-preview__media--image';
+            node.alt = name;
+          } else {
+            return null;
+          }
+          node.src = src;
+          return node;
+        }
+
+        function openPreview(card) {
+          var id = card.getAttribute('data-preview-id');
+          var kind = card.getAttribute('data-preview-kind');
+          var name = card.getAttribute('data-preview-name') || 'Preview';
+          if (!id || !kind) { return false; }
+          var detailUrl = '/f/' + encodeURIComponent(id);
+          var rawUrl = detailUrl + '/raw';
+          var node = mediaNode(kind, rawUrl, name);
+          if (!node) { return false; }
+          clearPreview();
+          title.textContent = name;
+          detail.setAttribute('href', detailUrl);
+          download.setAttribute('href', rawUrl);
+          body.appendChild(node);
+          overlay.hidden = false;
+          overlay.setAttribute('aria-hidden', 'false');
+          document.body.classList.add('has-preview');
+          var close = overlay.querySelector('.ap-preview__close');
+          if (close && close.focus) { close.focus(); }
+          return true;
+        }
+
+        document.addEventListener('click', function (e) {
+          if (e.defaultPrevented || e.button || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) { return; }
+          var target = e.target;
+          var card = target.closest ? target.closest('[data-preview]') : null;
+          if (!card) { return; }
+          if (target.closest('form, button, input, select, textarea, details.card-menu')) { return; }
+          if (openPreview(card)) { e.preventDefault(); }
+        });
+        Array.prototype.forEach.call(closeBtns, function (btn) {
+          btn.addEventListener('click', closePreview);
+        });
+        document.addEventListener('keydown', function (e) {
+          if (e.key === 'Escape' && !overlay.hidden) { closePreview(); }
         });
       })();
 

@@ -581,7 +581,9 @@ async fn upload_detail_raw_share_delete_lifecycle() {
     // GET / mints a CSRF cookie; the dropzone embeds the same token.
     let home = send(&app, get("/", Some("alice"))).await;
     assert_eq!(home.status, StatusCode::OK);
-    assert!(home.text().contains("Your drive"));
+    assert!(home.text().contains("ap-toolbar"));
+    assert!(home.text().contains("My Drive"));
+    assert!(!home.text().contains("Private files, folders and links"));
     assert!(home.text().contains("Your drive is empty"));
     let csrf = home.csrf_cookie().expect("csrf cookie on GET /");
 
@@ -784,6 +786,13 @@ async fn video_raw_supports_range_and_inline_playback() {
     let video = b"\x00\x00\x00\x18ftypmp42aperture-video".to_vec();
     let size = video.len();
     let (id, _) = upload_file(&app, "alice", "clip.mp4", "video/mp4", &video).await;
+
+    let home = send(&app, get("/", Some("alice"))).await;
+    assert!(home.text().contains("id=\"apPreview\""));
+    assert!(home.text().contains("data-preview-body"));
+    assert!(home.text().contains(&format!("data-preview-id=\"{id}\"")));
+    assert!(home.text().contains("data-preview-kind=\"video\""));
+    assert!(home.text().contains("thumb__play"));
 
     let full = send(&app, get(&format!("/f/{id}/raw"), Some("alice"))).await;
     assert_eq!(full.status, StatusCode::OK);
@@ -2000,11 +2009,11 @@ async fn folder_tree_subfolders_breadcrumb_and_scoped_upload() {
         "root does not list a nested child"
     );
 
-    // Parent view: breadcrumb back to All files, the Child tile, and an Up-to-root tile.
+    // Parent view: breadcrumb back to My Drive, the Child tile, and an Up-to-root tile.
     let pv = send(&app, get(&format!("/?folder={pfid}"), Some("alice"))).await;
     assert!(pv.text().contains("breadcrumb"));
     assert!(
-        pv.text().contains(">All files<"),
+        pv.text().contains(">My Drive<"),
         "breadcrumb links back to root"
     );
     assert!(
@@ -2659,6 +2668,47 @@ async fn preview_routing_by_content_type() {
     assert!(pr.header(header::CONTENT_DISPOSITION).starts_with("inline"));
     assert_eq!(pr.header(header::X_CONTENT_TYPE_OPTIONS), "nosniff");
     assert_eq!(pr.header(header::CONTENT_SECURITY_POLICY), "sandbox");
+
+    // Video/audio -> native controls pointed at the Range-enabled raw route.
+    let uv = send(
+        &app,
+        upload_req(
+            &csrf,
+            &csrf,
+            "alice",
+            "clip.mp4",
+            "video/mp4",
+            b"\x00\x00\x00\x18ftypmp42detail-video",
+        ),
+    )
+    .await;
+    let vid = uv.location().trim_start_matches("/f/").to_string();
+    let dv = send(&app, get(&format!("/f/{vid}"), Some("alice"))).await;
+    assert!(dv.text().contains("<video class=\"ap-player\""));
+    assert!(dv
+        .text()
+        .contains("controls preload=\"metadata\" playsinline"));
+    assert!(dv.text().contains(&format!("src=\"/f/{vid}/raw\"")));
+
+    let ua = send(
+        &app,
+        upload_req(
+            &csrf,
+            &csrf,
+            "alice",
+            "voice.mp3",
+            "audio/mpeg",
+            b"ID3\x04\x00\x00\x00\x00\x00\x21detail-audio",
+        ),
+    )
+    .await;
+    let aid = ua.location().trim_start_matches("/f/").to_string();
+    let da = send(&app, get(&format!("/f/{aid}"), Some("alice"))).await;
+    assert!(da
+        .text()
+        .contains("<audio class=\"ap-player ap-player--audio\""));
+    assert!(da.text().contains("controls preload=\"metadata\""));
+    assert!(da.text().contains(&format!("src=\"/f/{aid}/raw\"")));
 
     // Non-previewable binary -> the type icon + "No inline preview".
     let ub = send(
