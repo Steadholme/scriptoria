@@ -2555,7 +2555,7 @@ fn render_breadcrumb(chain: &[FolderRec]) -> String {
     if chain.is_empty() {
         out.push_str("<span class=\"breadcrumb__here\">My Drive</span>");
     } else {
-        out.push_str("<a class=\"breadcrumb__crumb\" href=\"/\" data-wire data-wire-target=\"#ap-drive\">My Drive</a>");
+        out.push_str("<a class=\"breadcrumb__crumb\" href=\"/\">My Drive</a>");
         for (i, f) in chain.iter().enumerate() {
             out.push_str("<span class=\"breadcrumb__sep\" aria-hidden=\"true\">&rsaquo;</span>");
             if i + 1 == chain.len() {
@@ -2565,7 +2565,7 @@ fn render_breadcrumb(chain: &[FolderRec]) -> String {
                 ));
             } else {
                 out.push_str(&format!(
-                    "<a class=\"breadcrumb__crumb\" href=\"/?folder={id}\" data-wire data-wire-target=\"#ap-drive\">{name}</a>",
+                    "<a class=\"breadcrumb__crumb\" href=\"/?folder={id}\">{name}</a>",
                     id = esc(&f.id),
                     name = esc(&f.name),
                 ));
@@ -2583,11 +2583,11 @@ fn render_folder_tiles(children: &[&FolderRec], up_href: Option<&str>) -> String
     if let Some(href) = up_href {
         out.push_str(&format!(
             "<li class=\"folder-tile file-card file-card--folder file-card--up\">\
-               <a class=\"file-card__link\" href=\"{href}\" data-wire data-wire-target=\"#ap-drive\">\
+               <a class=\"file-card__link\" href=\"{href}\">\
                  <span class=\"thumb thumb--folder\">{FOLDER_UP_SVG}</span>\
                </a>\
                <div class=\"file-card__body folder-tile__body\">\
-                 <a class=\"file-card__name\" href=\"{href}\" data-wire data-wire-target=\"#ap-drive\">Up one level</a>\
+                 <a class=\"file-card__name\" href=\"{href}\">Up one level</a>\
                  <span class=\"folder-tile__badge\">Parent</span>\
                  <span class=\"ap-folder-cue\" aria-hidden=\"true\">›</span>\
                </div>\
@@ -2607,11 +2607,11 @@ fn render_folder_tiles(children: &[&FolderRec], up_href: Option<&str>) -> String
         }
         out.push_str(&format!(
             "<li class=\"folder-tile file-card file-card--folder\">\
-               <a class=\"file-card__link\" href=\"{href}\" data-wire data-wire-target=\"#ap-drive\">\
+               <a class=\"file-card__link\" href=\"{href}\">\
                  <span class=\"thumb thumb--folder\">{FOLDER_SVG}</span>\
                </a>\
                <div class=\"file-card__body folder-tile__body\">\
-                 <div class=\"ap-name-row\"><a class=\"file-card__name\" href=\"{href}\" title=\"{name}\" data-wire data-wire-target=\"#ap-drive\">{name}</a><span class=\"ap-folder-cue\" aria-hidden=\"true\">›</span></div>\
+                 <div class=\"ap-name-row\"><a class=\"file-card__name\" href=\"{href}\" title=\"{name}\">{name}</a><span class=\"ap-folder-cue\" aria-hidden=\"true\">›</span></div>\
                  <div class=\"file-card__meta\"><span class=\"folder-tile__badge\">Folder</span><span class=\"ap-badges\">{badges}</span></div>\
                </div>\
              </li>",
@@ -2759,7 +2759,7 @@ fn render_trash_gallery(
         render_trash_cards(files, csrf)
     };
     let breadcrumb =
-        "<nav class=\"breadcrumb\" aria-label=\"Folder path\"><a class=\"breadcrumb__crumb\" href=\"/\" data-wire data-wire-target=\"#ap-drive\">My Drive</a><span class=\"breadcrumb__sep\" aria-hidden=\"true\">&rsaquo;</span><span class=\"breadcrumb__here\">Trash</span></nav>";
+        "<nav class=\"breadcrumb\" aria-label=\"Folder path\"><a class=\"breadcrumb__crumb\" href=\"/\">My Drive</a><span class=\"breadcrumb__sep\" aria-hidden=\"true\">&rsaquo;</span><span class=\"breadcrumb__here\">Trash</span></nav>";
     GALLERY_HTML
         .replace("{{CSS}}", app_css())
         .replace("{{DYNAMIC}}", dynamic_js())
@@ -2946,13 +2946,13 @@ fn render_sidebar(
 
     format!(
         "<nav class=\"ap-nav\" aria-label=\"Drive folders\">\
-           <a class=\"ap-nav__row{all_active}\" href=\"/\" data-wire data-wire-target=\"#ap-drive\">\
+           <a class=\"ap-nav__row{all_active}\" href=\"/\">\
              <svg class=\"ap-nav__ico\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z\"/></svg>\
              <span class=\"ap-nav__name\">My Drive</span>\
            </a>\
            {tree}\
            <div class=\"ap-rail__rule\" aria-hidden=\"true\"></div>\
-           <a class=\"ap-nav__row{trash_active_class}\" href=\"/?view=trash\" data-wire data-wire-target=\"#ap-drive\">\
+           <a class=\"ap-nav__row{trash_active_class}\" href=\"/?view=trash\">\
              <svg class=\"ap-nav__ico\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M3 6h18\"/><path d=\"M8 6V4h8v2\"/><path d=\"m19 6-1 14H6L5 6\"/></svg>\
              <span class=\"ap-nav__name\">Trash</span>\
            </a>\
@@ -2995,7 +2995,7 @@ fn render_folder_tree_level(
         let expanded = chain.iter().any(|c| c.id == f.id);
         let class = if active { " is-active" } else { "" };
         out.push_str(&format!(
-            "<li><a class=\"ap-nav__row{class}\" href=\"/?folder={id}\" title=\"{name}\" data-wire data-wire-target=\"#ap-drive\">\
+            "<li><a class=\"ap-nav__row{class}\" href=\"/?folder={id}\" title=\"{name}\">\
                <svg class=\"ap-nav__ico\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M4 5h5l2 2.5h9a1 1 0 0 1 1 1V18a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Z\"/></svg>\
                <span class=\"ap-nav__name\">{name}</span>\
              </a>",
@@ -3212,7 +3212,7 @@ fn render_cards(files: &[FileRec], csrf: &str) -> String {
             );
             format!(
                 "<li class=\"file-card file-card--{kind}{media_class}\" id=\"file-{id}\" data-file-id=\"{id}\"{preview_attrs}>\
-                   <a class=\"file-card__link\" href=\"/f/{id}\">{thumb}</a>\
+                   <a class=\"file-card__link\" href=\"/f/{id}\" data-wire-off>{thumb}</a>\
                    <div class=\"file-card__body\">\
                      <div class=\"ap-name-row\"><span class=\"ap-glyph {tone}\" aria-hidden=\"true\">{ext}</span><a class=\"file-card__name\" href=\"/f/{id}\" title=\"{name}\" data-file-name>{name}</a></div>\
                      <div class=\"file-card__meta\">{badges}<span class=\"ap-size\">{size}</span><time class=\"ap-date\" data-spark-reltime data-ts=\"{created_ts}\" title=\"{date}\">{date}</time></div>\
