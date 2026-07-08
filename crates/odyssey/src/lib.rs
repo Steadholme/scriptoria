@@ -2,10 +2,14 @@
 pub const APP_CSS: &str = concat!(
     include_str!("../css/font.css"),
     include_str!("../css/tokens.css"),
-    include_str!("../css/components.css")
+    include_str!("../css/components.css"),
+    include_str!("../css/motion.css")
 );
 pub const WIRE_JS: &str = include_str!("../js/wire.js");
 pub const SPARK_JS: &str = include_str!("../js/spark.js");
+/// W8 motion helper (same-document View Transition wrapper + FLIP list animator). The cross-document
+/// continuity headline is pure CSS in motion.css and needs none of this; this is optional polish.
+pub const MOTION_JS: &str = include_str!("../js/motion.js");
 
 pub mod controls;
 pub mod data;
@@ -61,7 +65,7 @@ mod tests {
             ["insert", "adjacent", "html"].concat(),
             ["{", "{"].concat(),
         ];
-        for js in [WIRE_JS, SPARK_JS] {
+        for js in [WIRE_JS, SPARK_JS, MOTION_JS] {
             let lower = js.to_ascii_lowercase();
             for needle in &banned {
                 assert!(
@@ -73,6 +77,10 @@ mod tests {
         assert!(
             !SPARK_JS.to_ascii_lowercase().contains(&["fetch", "("].concat()),
             "spark must stay network-free"
+        );
+        assert!(
+            !MOTION_JS.to_ascii_lowercase().contains(&["fetch", "("].concat()),
+            "motion must stay network-free"
         );
     }
 
@@ -93,6 +101,12 @@ mod tests {
         assert!(SPARK_JS.contains("odyssey:swap"));
         assert!(SPARK_JS.contains("toast--ok"));
 
+        assert!(MOTION_JS.lines().count() <= 350);
+        assert!(MOTION_JS.contains("odyssey-motion v1"));
+        assert!(MOTION_JS.contains("window.OdysseyMotion"));
+        assert!(MOTION_JS.contains("data-motion-list"));
+        assert!(MOTION_JS.contains("startViewTransition"));
+
         let scripts = dynamic_scripts();
         assert_eq!(scripts.as_str().matches("<script>").count(), 1);
         assert!(scripts.as_str().contains("odyssey-wire v1"));
@@ -103,5 +117,24 @@ mod tests {
     fn app_css_contains_dynamic_visibility_hooks() {
         assert!(APP_CSS.contains("[hidden]{display:none"));
         assert!(APP_CSS.contains("[data-spark-cloak]"));
+    }
+
+    #[test]
+    fn app_css_contains_view_transition_layer() {
+        // The cross-document continuity headline: @view-transition opt-in + the reduced-motion guard
+        // that reaches the ::view-transition-* pseudos the global `*{animation:none}` rule cannot.
+        assert!(APP_CSS.contains("@view-transition"));
+        assert!(APP_CSS.contains("navigation:auto"));
+        assert!(APP_CSS.contains("::view-transition-group(*)"));
+        assert!(APP_CSS.contains("view-transition-name:ody-appbar"));
+    }
+
+    #[test]
+    fn app_css_contains_motion_and_elevation_tokens() {
+        assert!(APP_CSS.contains("--ease-out:"));
+        assert!(APP_CSS.contains("--dur-3:240ms"));
+        assert!(APP_CSS.contains("--elev-sticky"));
+        // Dark scaffold ships ready but inert (nothing stamps data-theme this wave).
+        assert!(APP_CSS.contains("[data-theme=\"dark\"]"));
     }
 }
