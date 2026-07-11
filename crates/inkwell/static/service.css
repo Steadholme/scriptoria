@@ -376,6 +376,7 @@ body.page {
 
 @media (max-width:720px) {
   .usermenu__name { display:none; }
+  .appbar__name > span { display:none; }
   .appbar__nav {
     display:flex;
     overflow-x:auto;

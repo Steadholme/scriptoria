@@ -305,7 +305,7 @@
 
 [data-ap-share-room] .sr-gate,
 [data-ap-share-room] .sr-inbox,
-[data-ap-share-room] .sr-error { width: min(680px, 100%); margin: 0 auto; }
+[data-ap-share-room] .sr-error { max-width: 680px; }
 [data-ap-share-room] .sr-card { padding: clamp(26px, 6vw, 52px); border: 1px solid var(--ap-line); border-radius: var(--ap-radius); background: var(--ap-surface); box-shadow: var(--ap-shadow); }
 [data-ap-share-room] .sr-card__icon { width: 58px; height: 58px; margin-bottom: 22px; display: grid; place-items: center; border-radius: 18px; background: var(--ap-blue-soft); color: var(--ap-blue-dark); font-size: 26px; }
 [data-ap-share-room] .sr-field { margin-top: 20px; }
