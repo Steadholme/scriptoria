@@ -6,12 +6,48 @@
 
 use serde::Serialize;
 
+/// Product behaviour attached to a category. A discussion is an open conversation; a question
+/// participates in the answered/unanswered workflow and may have one accepted reply.
+///
+/// The textual representation is persisted in PostgreSQL so migrations remain transparent and
+/// operator-readable. Unknown values are rejected by handlers before write and treated as the
+/// conservative `discussion` mode when reading a manually-corrupted row.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CategoryFormat {
+    #[default]
+    Discussion,
+    Question,
+}
+
+impl CategoryFormat {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Discussion => "discussion",
+            Self::Question => "question",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "discussion" => Some(Self::Discussion),
+            "question" => Some(Self::Question),
+            _ => None,
+        }
+    }
+
+    pub const fn is_question(self) -> bool {
+        matches!(self, Self::Question)
+    }
+}
+
 /// A discussion category (maps 1:1 to a `categories` row). Ordered by `sort_order` then name.
 #[derive(Clone, Debug, Serialize)]
 pub struct Category {
     pub id: String,
     pub name: String,
     pub sort_order: i64,
+    pub format: CategoryFormat,
 }
 
 /// A thread of discussion within a category (maps 1:1 to a `threads` row). `last_at` tracks
@@ -52,6 +88,11 @@ pub struct ThreadDigest {
 pub struct ThreadSearchHit {
     pub thread: Thread,
     pub first_body_md: String,
+    /// Accepted-reply body, when the thread currently has a valid accepted reply.
+    pub accepted_body_md: String,
+    /// Whether the search query matched the accepted reply. The UI uses this to display the
+    /// solution excerpt and make the source of the result explicit.
+    pub matched_in_solution: bool,
     pub reply_count: i64,
 }
 

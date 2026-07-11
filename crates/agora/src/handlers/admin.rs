@@ -18,7 +18,7 @@ use crate::auth;
 use crate::error::AppError;
 use crate::handlers::forum::{html_response, redirect_to, render_admin_thread_toolbar};
 use crate::handlers::{email_display, esc, fmt_ts, render_page};
-use crate::model::{BannedAuthor, Category};
+use crate::model::{BannedAuthor, Category, CategoryFormat};
 use crate::{now_secs, AppState};
 
 /// Recent threads listed on the admin dashboard.
@@ -60,6 +60,14 @@ pub async fn dashboard(
     <input type="text" name="name" maxlength="{maxn}" value="{name}" required>
     <button class="btn btn-secondary btn-sm" type="submit">Rename</button>
   </form>
+  <form class="inline-form" method="post" action="/admin/categories/{id}/format">
+    <input type="hidden" name="csrf" value="{csrf}">
+    <select name="format" aria-label="Category format">
+      <option value="discussion"{discussion_selected}>Discussion</option>
+      <option value="question"{question_selected}>Question</option>
+    </select>
+    <button class="btn btn-secondary btn-sm" type="submit">Set format</button>
+  </form>
   <span class="muted">{count} {tw} · <code>{id}</code></span>
   <form class="inline-form" method="post" action="/admin/categories/{id}/reorder">
     <input type="hidden" name="csrf" value="{csrf}">
@@ -77,6 +85,16 @@ pub async fn dashboard(
             name = esc(&c.name),
             count = count,
             tw = if count == 1 { "thread" } else { "threads" },
+            discussion_selected = if c.format == CategoryFormat::Discussion {
+                " selected"
+            } else {
+                ""
+            },
+            question_selected = if c.format == CategoryFormat::Question {
+                " selected"
+            } else {
+                ""
+            },
         ));
     }
 
@@ -85,6 +103,10 @@ pub async fn dashboard(
   <input type="hidden" name="csrf" value="{csrf}">
   <input type="text" name="id" maxlength="{maxid}" placeholder="slug-id" required>
   <input type="text" name="name" maxlength="{maxn}" placeholder="Display name" required>
+  <select name="format" aria-label="Category format">
+    <option value="discussion">Discussion</option>
+    <option value="question">Question</option>
+  </select>
   <button class="btn btn-primary btn-sm" type="submit">Add category</button>
 </form></div>"#,
         csrf = esc(&csrf),
@@ -193,6 +215,8 @@ pub struct CreateCategoryForm {
     pub id: String,
     #[serde(default)]
     pub name: String,
+    #[serde(default)]
+    pub format: String,
 }
 
 pub async fn create_category(
@@ -219,6 +243,7 @@ pub async fn create_category(
             "a category with that id already exists".to_string(),
         ));
     }
+    let format = parse_category_format(&form.format)?;
 
     // Append to the end of the current ordering.
     let next_order = state
@@ -234,6 +259,7 @@ pub async fn create_category(
         id: id.to_string(),
         name: name.to_string(),
         sort_order: next_order,
+        format,
     };
     state.store.create_category(&category).await?;
     state.audit.emit(AuditEvent::notice(
@@ -277,6 +303,41 @@ pub async fn rename_category(
         name,
     ));
     Ok(redirect_to("/admin"))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetCategoryFormatForm {
+    #[serde(default)]
+    pub csrf: String,
+    #[serde(default)]
+    pub format: String,
+}
+
+pub async fn set_category_format(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<SetCategoryFormatForm>,
+) -> Result<Response, AppError> {
+    auth::verify_csrf(&headers, &form.csrf)?;
+    let format = parse_category_format(&form.format)?;
+    state.store.transition_category_format(&id, format).await?;
+    state.audit.emit(AuditEvent::notice(
+        "admin.category.format",
+        &actor(&headers),
+        &id,
+        format.as_str(),
+    ));
+    Ok(redirect_to("/admin"))
+}
+
+fn parse_category_format(raw: &str) -> Result<CategoryFormat, AppError> {
+    if raw.trim().is_empty() {
+        return Ok(CategoryFormat::Discussion);
+    }
+    CategoryFormat::parse(raw).ok_or_else(|| {
+        AppError::InvalidRequest("category format must be discussion or question".to_string())
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -428,14 +489,11 @@ pub async fn move_thread(
     Form(form): Form<MoveThreadForm>,
 ) -> Result<Response, AppError> {
     auth::verify_csrf(&headers, &form.csrf)?;
-    if state.store.get_thread(&id).await?.is_none() {
-        return Err(AppError::NotFound("thread not found".to_string()));
-    }
     let category_id = form.category.trim();
-    if state.store.get_category(category_id).await?.is_none() {
-        return Err(AppError::InvalidRequest("unknown category".to_string()));
-    }
-    state.store.move_thread(&id, category_id).await?;
+    state
+        .store
+        .move_thread_to_category(&id, category_id)
+        .await?;
     state.audit.emit(AuditEvent::notice(
         "admin.thread.move",
         &actor(&headers),

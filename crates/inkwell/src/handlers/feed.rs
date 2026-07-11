@@ -2,46 +2,42 @@
 //!
 //! Both are DERIVED, read-only views over the blog's PUBLISHED posts — drafts are never exposed,
 //! exactly like the public index. No new schema: they read the same `posts` the index does,
-//! newest-first (the store already returns that order), and emit ABSOLUTE URLs under the blog's
-//! canonical origin so feed readers and crawlers resolve links correctly. Being public reads, they
-//! carry no identity, no CSRF, and no mutation, so there is nothing to audit.
+//! and emit ABSOLUTE URLs under the blog's canonical origin so feed readers and crawlers resolve
+//! links correctly. RSS uses effective publication chronology; sitemap uses a lightweight Store
+//! projection. Being public reads, they carry no identity, no CSRF, and no mutation.
 
 use axum::extract::State;
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 
-use crate::config::MAX_PAGE;
-use crate::handlers::esc;
-use crate::markdown;
-use crate::store::Post;
+use crate::error::AppError;
+use crate::handlers::{esc, post_excerpt};
+use crate::store::SitemapEntry;
 use crate::AppState;
-
-/// Canonical public origin of the blog (Inkwell serves `blog.w33d.xyz` behind the gateway).
-/// Absolute links in the feed/sitemap resolve against this, matching the estate's other hardcoded
-/// origins (the app-bar portal + gateway logout links).
-const SITE_BASE_URL: &str = "https://blog.w33d.xyz";
 
 /// How many characters of the post body to carry as an RSS item `<description>`.
 const FEED_DESC_CHARS: usize = 500;
-
 // ---------------------------------------------------------------------------
 // GET /feed.xml — RSS 2.0
 // ---------------------------------------------------------------------------
 
-/// `GET /feed.xml` — RSS 2.0 of the published posts, newest-first (the same order the index uses).
-pub async fn feed_xml(State(state): State<AppState>) -> Response {
-    let posts = published_newest_first(&state).await;
-    // Newest post's timestamp drives lastBuildDate; fall back to now for an empty blog.
+/// `GET /feed.xml` — RSS 2.0 of the 100 most recently effective public publications. Homepage
+/// pinning never changes chronology, and the Store applies visibility/order before `LIMIT`.
+pub async fn feed_xml(State(state): State<AppState>) -> Result<Response, AppError> {
+    let settings = state.store.get_settings().await;
+    let posts = state.store.feed_posts(crate::now_secs()).await?;
+    // Content edits and a scheduled post's actual publication can each advance the feed. Never emit
+    // a lastBuildDate older than either event.
     let last_build = posts
         .iter()
-        .map(|p| p.updated_at.max(p.created_at))
+        .map(|post| post.updated_at.max(post.effective_publish_at()))
         .max()
         .unwrap_or_else(crate::now_secs);
 
     let mut items = String::new();
     for p in &posts {
         let url = post_url(&p.slug);
-        let desc = markdown::excerpt(&p.body_md, FEED_DESC_CHARS);
+        let desc = post_excerpt(p, FEED_DESC_CHARS);
         items.push_str(&format!(
             "  <item>\n\
              \x20   <title>{title}</title>\n\
@@ -52,7 +48,7 @@ pub async fn feed_xml(State(state): State<AppState>) -> Response {
              \x20 </item>\n",
             title = esc(&p.title),
             url = esc(&url),
-            date = fmt_rfc822(p.created_at),
+            date = fmt_rfc822(p.effective_publish_at()),
             desc = esc(&desc),
         ));
     }
@@ -61,18 +57,20 @@ pub async fn feed_xml(State(state): State<AppState>) -> Response {
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\">\n\
          <channel>\n\
-         \x20 <title>Inkwell · HOLDFAST</title>\n\
+         \x20 <title>{title}</title>\n\
          \x20 <link>{base}/</link>\n\
          \x20 <atom:link href=\"{base}/feed.xml\" rel=\"self\" type=\"application/rss+xml\"/>\n\
-         \x20 <description>Notes, essays, and changelog from the HOLDFAST estate.</description>\n\
+         \x20 <description>{description}</description>\n\
          \x20 <lastBuildDate>{last_build}</lastBuildDate>\n\
          {items}</channel>\n\
          </rss>\n",
-        base = SITE_BASE_URL,
+        base = crate::config::SITE_BASE_URL,
+        title = esc(&settings.title),
+        description = esc(&settings.tagline),
         last_build = fmt_rfc822(last_build),
         items = items,
     );
-    xml_response("application/rss+xml; charset=utf-8", body)
+    Ok(xml_response("application/rss+xml; charset=utf-8", body))
 }
 
 // ---------------------------------------------------------------------------
@@ -80,20 +78,25 @@ pub async fn feed_xml(State(state): State<AppState>) -> Response {
 // ---------------------------------------------------------------------------
 
 /// `GET /sitemap.xml` — the index page plus every published post, newest-first, with `<lastmod>`.
-pub async fn sitemap_xml(State(state): State<AppState>) -> Response {
-    let posts = published_newest_first(&state).await;
+pub async fn sitemap_xml(State(state): State<AppState>) -> Result<Response, AppError> {
+    let entries = state.store.sitemap_entries(crate::now_secs()).await?;
 
     let mut urls = String::new();
     // The index page itself.
     urls.push_str(&format!(
         "  <url>\n    <loc>{base}/</loc>\n  </url>\n",
-        base = SITE_BASE_URL,
+        base = crate::config::SITE_BASE_URL,
     ));
-    for p in &posts {
+    for entry in &entries {
+        // An explicit external canonical says this local URL is a duplicate source. Match Ghost's
+        // behavior and omit it from the sitemap while keeping the authenticated reading route.
+        if has_external_canonical(entry) {
+            continue;
+        }
         urls.push_str(&format!(
             "  <url>\n    <loc>{url}</loc>\n    <lastmod>{lastmod}</lastmod>\n  </url>\n",
-            url = esc(&post_url(&p.slug)),
-            lastmod = fmt_iso8601(p.updated_at),
+            url = esc(&post_url(&entry.slug)),
+            lastmod = fmt_iso8601(entry.updated_at),
         ));
     }
 
@@ -103,28 +106,23 @@ pub async fn sitemap_xml(State(state): State<AppState>) -> Response {
          {urls}</urlset>\n",
         urls = urls,
     );
-    xml_response("application/xml; charset=utf-8", body)
+    Ok(xml_response("application/xml; charset=utf-8", body))
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// One bounded, newest-first page of the PUBLISHED posts (drafts filtered out — never syndicated).
-async fn published_newest_first(state: &AppState) -> Vec<Post> {
-    let now = crate::now_secs();
-    state
-        .store
-        .list_posts(None, MAX_PAGE)
-        .await
-        .into_iter()
-        .filter(|p| p.is_public_at(now))
-        .collect()
-}
-
 /// Absolute reading-view URL for a post slug (slugs are already URL-safe `[a-z0-9-]`).
 fn post_url(slug: &str) -> String {
-    format!("{SITE_BASE_URL}/p/{slug}")
+    format!("{}/p/{slug}", crate::config::SITE_BASE_URL)
+}
+
+fn has_external_canonical(entry: &SitemapEntry) -> bool {
+    let override_url = entry.canonical_url.trim();
+    !override_url.is_empty()
+        && super::posts::canonical_url_is_safe(override_url)
+        && override_url != post_url(&entry.slug)
 }
 
 /// An XML response with the given content type.

@@ -6,6 +6,8 @@
 
 /// Default listen address (all interfaces, internal-only port 8700).
 pub const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8700";
+/// Canonical reader origin. Inkwell is mounted at the subdomain root behind Sluice.
+pub const SITE_BASE_URL: &str = "https://blog.w33d.xyz";
 
 /// How many posts the index renders per page when no `?limit=` is given. Keyset ("Load older")
 /// pagination makes the full archive reachable page by page, so the default page stays small.
@@ -17,6 +19,15 @@ pub const MAX_PAGE: i64 = 200;
 pub const INDEX_REFRESH_POST_LIMIT: i64 = 200;
 /// Maximum visibility-validated chunks Search/Ask may rank for one request.
 pub const INDEX_CHUNK_LIMIT: i64 = 20_000;
+/// RSS is a recent-publication surface, not an archive.
+pub const FEED_ITEM_LIMIT: usize = 100;
+/// The sitemap also emits its root URL, so 49,999 post URLs keep the response within the
+/// sitemaps.org 50,000-URL protocol ceiling.
+pub const SITEMAP_POST_LIMIT: usize = 49_999;
+/// Maximum authoritative rows a sparse tag request scans before returning a continuation cursor.
+/// Keeping this separate from the sitemap ceiling prevents a single tag page from materialising or
+/// examining tens of thousands of posts while still making the full archive reachable.
+pub const TAG_SCAN_POST_LIMIT: usize = 2_000;
 
 /// Clamp a requested page size into `1..=MAX_PAGE`, falling back to [`DEFAULT_PAGE`] when the
 /// request omits `?limit=` or passes a non-positive value.

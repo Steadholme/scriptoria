@@ -15,8 +15,8 @@
 //! - `GET  /`                categories (with thread counts) + recent threads
 //! - `GET  /c/{id}`          threads in a category
 //! - `GET  /t/{id}`          a thread: original post + a keyset page of replies (markdown
-//!                           rendered) + reply form. `?before=`/`?after=` page older/newer,
-//!                           `?latest=1` jumps to the newest page.
+//!   rendered) + reply form. `?before=`/`?after=` page older/newer, `?latest=1` jumps to the
+//!   newest page.
 //! - `GET  /new?cat=`        new-thread form (with live "similar existing threads" hints)
 //! - `POST /new`             create a thread
 //! - `POST /t/{id}/reply`    post a reply
@@ -25,9 +25,9 @@
 //! - `GET/POST /t/{tid}/p/{pid}/edit`   edit one's OWN reply
 //! - `POST /t/{tid}/p/{pid}/delete`     delete one's OWN reply
 //! - `POST /t/{tid}/p/{pid}/react`      toggle a reaction (up/heart) on a post
-//! - `POST /t/{id}/accept`   thread author/admin mark (or unmark) a reply as the accepted answer
+//! - `POST /t/{id}/accept`   thread author/admin explicitly accept or clear an accepted answer
 //! - `POST /t/{id}/subscribe` toggle the current user's thread subscription
-//! - `GET  /search`           shareable title + original-post search (`?q=&category=`)
+//! - `GET  /search`           shareable thread + accepted-answer search (`?q=&category=&status=`)
 //! - `GET  /api/search/suggest` bounded same-origin quick-search suggestions
 //! - `POST /api/similar`     (sso+CSRF) top-3 existing threads similar to a draft {title,body}
 //! - `GET  /api/thread/{id}/summary`  extractive summary (top sentences) of a thread
@@ -53,7 +53,7 @@ use rand::RngCore;
 
 use crate::audit::AuditSink;
 use crate::config::{env_nonempty, Config};
-use crate::model::Category;
+use crate::model::{Category, CategoryFormat};
 pub use crate::notify::KlaxonNotifier;
 use crate::store::{InMemoryStore, PgStore, Store};
 
@@ -75,6 +75,7 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(handlers::health::healthz))
         .route("/", get(handlers::forum::home))
+        .route("/questions", get(handlers::forum::questions))
         .route("/c/{id}", get(handlers::forum::category))
         .route("/t/{id}", get(handlers::forum::thread))
         .route("/t/{id}/reply", post(handlers::forum::reply))
@@ -113,6 +114,10 @@ fn admin_router() -> Router<AppState> {
         .route("/admin", get(handlers::admin::dashboard))
         .route("/admin/categories", post(handlers::admin::create_category))
         .route("/admin/categories/{id}/rename", post(handlers::admin::rename_category))
+        .route(
+            "/admin/categories/{id}/format",
+            post(handlers::admin::set_category_format),
+        )
         .route("/admin/categories/{id}/reorder", post(handlers::admin::reorder_category))
         .route("/admin/categories/{id}/delete", post(handlers::admin::delete_category))
         .route("/admin/threads/{id}/lock", post(handlers::admin::lock_thread))
@@ -162,16 +167,19 @@ pub fn default_categories() -> Vec<Category> {
             id: "announcements".to_string(),
             name: "Announcements".to_string(),
             sort_order: 0,
+            format: CategoryFormat::Discussion,
         },
         Category {
             id: "general".to_string(),
             name: "General Discussion".to_string(),
             sort_order: 1,
+            format: CategoryFormat::Discussion,
         },
         Category {
             id: "support".to_string(),
             name: "Support".to_string(),
             sort_order: 2,
+            format: CategoryFormat::Question,
         },
     ]
 }

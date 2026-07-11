@@ -20,7 +20,7 @@ use crate::audit::AuditEvent;
 use crate::auth;
 use crate::config::MAX_PAGE;
 use crate::error::AppError;
-use crate::handlers::{esc, page_shell};
+use crate::handlers::{esc, page_shell, PageShell};
 use crate::store::{Post, Settings};
 use crate::{now_secs, AppState};
 
@@ -83,16 +83,17 @@ pub async fn index(
         .replace("{{SETTINGS_TAGLINE}}", &esc(&settings.tagline))
         .replace("{{SETTINGS_PPP}}", &settings.posts_per_page.to_string())
         .replace("{{ROWS}}", &rows);
-    let page = page_shell(
-        "Admin · Inkwell",
-        "page-console",
-        false,
-        "Admin",
-        &email,
-        true,
+    let page = page_shell(PageShell {
+        head_title: "Admin · Inkwell",
+        body_class: "page-console",
+        rss: false,
+        nav_title: "Admin",
+        email: &email,
+        is_admin: true,
         theme,
-        &fragment,
-    );
+        fragment: &fragment,
+        metadata: None,
+    });
 
     Ok(html_with_cookie(page, set_cookie))
 }

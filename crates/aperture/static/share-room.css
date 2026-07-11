@@ -185,6 +185,8 @@
   margin: 12px 0 0;
   color: var(--ap-ink-soft);
   font-size: 14px;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 [data-ap-share-room] .sr-chips {
@@ -268,6 +270,8 @@
   border-top: 1px solid var(--ap-line);
   color: var(--ap-ink-soft);
   font-size: 12px;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 [data-ap-share-room] .embed-box {
@@ -306,7 +310,7 @@
 [data-ap-share-room] .sr-gate,
 [data-ap-share-room] .sr-inbox,
 [data-ap-share-room] .sr-error { max-width: 680px; }
-[data-ap-share-room] .sr-card { padding: clamp(26px, 6vw, 52px); border: 1px solid var(--ap-line); border-radius: var(--ap-radius); background: var(--ap-surface); box-shadow: var(--ap-shadow); }
+[data-ap-share-room] .sr-card { min-width: 0; padding: clamp(26px, 6vw, 52px); border: 1px solid var(--ap-line); border-radius: var(--ap-radius); background: var(--ap-surface); box-shadow: var(--ap-shadow); }
 [data-ap-share-room] .sr-card__icon { width: 58px; height: 58px; margin-bottom: 22px; display: grid; place-items: center; border-radius: 18px; background: var(--ap-blue-soft); color: var(--ap-blue-dark); font-size: 26px; }
 [data-ap-share-room] .sr-field { margin-top: 20px; }
 [data-ap-share-room] .sr-field label { display: block; margin-bottom: 7px; font-size: 12px; font-weight: 780; }

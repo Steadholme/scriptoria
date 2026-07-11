@@ -6,6 +6,7 @@ use serde_json::Value;
 use tower::ServiceExt;
 
 use agora::model::{Post, Thread};
+use agora::store::AcceptedAnswerAction;
 use agora::{app, build_dev_state, AppState};
 
 #[tokio::test]
@@ -22,11 +23,6 @@ async fn search_page_matches_title_and_original_body_with_result_context() {
     .await;
     seed_reply(&state, "t_rust", "p_rust_reply_1", 110).await;
     seed_reply(&state, "t_rust", "p_rust_reply_2", 120).await;
-    state
-        .store
-        .set_accepted_post("t_rust", "p_rust_reply_2")
-        .await
-        .unwrap();
     seed_thread(
         &state,
         "t_support",
@@ -42,7 +38,6 @@ async fn search_page_matches_title_and_original_body_with_result_context() {
     assert!(title_html.contains("Rust ownership patterns"));
     assert!(title_html.contains("General Discussion"));
     assert!(title_html.contains("2 replies"));
-    assert!(title_html.contains("Answered"));
     assert!(title_html.contains("Active"));
 
     let (status, _, body_html) = send(&state, get("/search?q=lifetimes&category=general")).await;
@@ -199,6 +194,92 @@ async fn suggest_clamps_query_and_limit_and_filters_category() {
     .await;
     let bounded: Value = serde_json::from_str(&bounded).unwrap();
     assert_eq!(bounded["query"].as_str().unwrap().chars().count(), 160);
+}
+
+#[tokio::test]
+async fn search_filters_question_status_and_surfaces_accepted_solution_matches() {
+    let state = build_dev_state().await;
+    seed_thread(
+        &state,
+        "t_answered_search",
+        "support",
+        "Status matrix answered",
+        "Original question without the solution phrase.",
+        100,
+    )
+    .await;
+    let solution = Post {
+        id: "p_answered_solution_search".to_string(),
+        thread_id: "t_answered_search".to_string(),
+        body_md: "The durable fix uses a cobalt rendezvous token.".to_string(),
+        quoted_post_id: String::new(),
+        author_sub: "u_expert".to_string(),
+        author_email: "expert@holdfast.local".to_string(),
+        created_at: 110,
+    };
+    state.store.add_reply(&solution).await.unwrap();
+    state
+        .store
+        .mutate_accepted_answer(
+            "t_answered_search",
+            AcceptedAnswerAction::Accept {
+                post_id: solution.id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    seed_thread(
+        &state,
+        "t_unanswered_search",
+        "support",
+        "Status matrix unanswered",
+        "A cobalt question still waiting for help.",
+        200,
+    )
+    .await;
+    seed_thread(
+        &state,
+        "t_discussion_search",
+        "general",
+        "Status matrix discussion",
+        "A cobalt open conversation, not a question.",
+        300,
+    )
+    .await;
+
+    let (status, _, solution_html) = send(
+        &state,
+        get("/search?q=rendezvous&status=answered"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(solution_html.contains("Status matrix answered"));
+    assert!(solution_html.contains("Matched in accepted answer"));
+    assert!(solution_html.contains("cobalt rendezvous token"));
+    assert!(solution_html.contains(r#"value="answered" selected"#));
+
+    let (_, _, suggestions) = send(
+        &state,
+        get("/api/search/suggest?q=rendezvous&status=answered"),
+    )
+    .await;
+    let suggestions: Value = serde_json::from_str(&suggestions).unwrap();
+    assert_eq!(suggestions["status"], "answered");
+    assert_eq!(suggestions["results"][0]["matchSource"], "solution");
+    assert!(suggestions["results"][0]["excerpt"]
+        .as_str()
+        .unwrap()
+        .contains("rendezvous token"));
+
+    let (_, _, unanswered) = send(&state, get("/search?q=cobalt&status=unanswered")).await;
+    assert!(unanswered.contains("Status matrix unanswered"));
+    assert!(!unanswered.contains("Status matrix answered"));
+    assert!(!unanswered.contains("Status matrix discussion"));
+
+    let (_, _, answered) = send(&state, get("/search?q=cobalt&status=answered")).await;
+    assert!(answered.contains("Status matrix answered"));
+    assert!(!answered.contains("Status matrix unanswered"));
+    assert!(!answered.contains("Status matrix discussion"));
 }
 
 #[tokio::test]

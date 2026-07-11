@@ -22,9 +22,9 @@ use axum::http::{header, Request, StatusCode};
 use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
 
-use agora::store::{PgStore, Store};
+use agora::store::{AcceptedAnswerAction, PgStore, ReplyAnchor, Store};
 use agora::{app, build_dev_state, default_categories, new_id, now_secs, AppState};
-use agora::model::{Post, Thread};
+use agora::model::{CategoryFormat, Post, Thread};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pg_store_full_integration() {
@@ -51,12 +51,34 @@ async fn pg_store_full_integration() {
 
     let cats = pg.list_categories().await.expect("list categories");
     assert_eq!(cats.len(), 3, "three default categories seeded");
+    assert_eq!(
+        cats.iter().find(|category| category.id == "support").unwrap().format,
+        CategoryFormat::Question
+    );
+    assert_eq!(
+        cats.iter().find(|category| category.id == "general").unwrap().format,
+        CategoryFormat::Discussion
+    );
+    // Startup migration classifies only NULL legacy rows; it must never overwrite a later
+    // operator choice on every restart.
+    pg.transition_category_format("support", CategoryFormat::Discussion)
+        .await
+        .unwrap();
+    pg.migrate().await.expect("format migration rerun");
+    assert_eq!(
+        pg.get_category("support").await.unwrap().unwrap().format,
+        CategoryFormat::Discussion,
+        "idempotent migration preserves operator format"
+    );
+    pg.transition_category_format("support", CategoryFormat::Question)
+        .await
+        .unwrap();
 
     // --- direct store: create a thread + first post, then reply ------------
     let now = now_secs();
     let thread = Thread {
         id: new_id("t"),
-        category_id: "general".to_string(),
+        category_id: "support".to_string(),
         title: "Postgres-backed thread".to_string(),
         author_sub: "u_1".to_string(),
         author_email: "alice@holdfast.local".to_string(),
@@ -77,7 +99,7 @@ async fn pg_store_full_integration() {
     };
     pg.create_thread(&thread, &first).await.expect("create thread");
 
-    assert_eq!(pg.count_threads("general").await.unwrap(), 1);
+    assert_eq!(pg.count_threads("support").await.unwrap(), 1);
     assert_eq!(pg.count_posts(&thread.id).await.unwrap(), 1);
 
     let reply = Post {
@@ -140,7 +162,7 @@ async fn pg_store_full_integration() {
         .unwrap();
     let resp = app(state.clone()).oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    assert_eq!(pg.count_threads("support").await.unwrap(), 1, "HTTP create persisted to PG");
+    assert_eq!(pg.count_threads("support").await.unwrap(), 2, "HTTP create persisted to PG");
 
     // --- author edit/delete of own thread + reply (portable UPDATE/DELETE) -
     // Edit the thread: title + original-post body update atomically, and the denormalised
@@ -177,12 +199,52 @@ async fn pg_store_full_integration() {
     assert!(!counts_other.iter().find(|c| c.kind == "up").unwrap().mine, "stranger is not a reactor");
 
     // --- accepted answer: set, read back, and clear-on-delete -------------
-    pg.set_accepted_post(&thread.id, &reply.id).await.expect("set accepted");
+    pg.mutate_accepted_answer(
+        &thread.id,
+        AcceptedAnswerAction::Accept {
+            post_id: reply.id.clone(),
+        },
+    )
+    .await
+    .expect("set accepted");
     assert_eq!(
         pg.get_thread(&thread.id).await.unwrap().unwrap().accepted_post_id,
         reply.id,
         "accepted_post_id persisted"
     );
+
+    // The accepted solution is excluded before LIMIT so the fixed solution region can render it
+    // exactly once while ordinary reply pages remain full.
+    let mut extra_reply_ids = Vec::new();
+    for index in 0..21 {
+        let extra = Post {
+            id: new_id("p"),
+            thread_id: thread.id.clone(),
+            body_md: format!("Paged ordinary reply {index}"),
+            author_sub: "u_page".to_string(),
+            author_email: "page@holdfast.local".to_string(),
+            created_at: now + 100 + index,
+            quoted_post_id: String::new(),
+        };
+        extra_reply_ids.push(extra.id.clone());
+        pg.add_reply(&extra).await.unwrap();
+    }
+    let first_page = pg
+        .replies_page(
+            &thread.id,
+            &first.id,
+            Some(&reply.id),
+            &ReplyAnchor::First,
+            20,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_page.len(), 20, "accepted exclusion happens before LIMIT");
+    assert!(first_page.iter().all(|post| post.id != reply.id));
+    for id in &extra_reply_ids {
+        pg.delete_post(id).await.unwrap();
+    }
+    assert_eq!(pg.count_posts(&thread.id).await.unwrap(), 2);
 
     // Edit then delete the reply (a single-post UPDATE / DELETE).
     pg.update_post(&reply.id, "Edited reply.").await.expect("update reply");
@@ -202,7 +264,11 @@ async fn pg_store_full_integration() {
 
     // Delete the whole thread: thread + remaining posts go together.
     pg.delete_thread(&thread.id).await.expect("delete thread");
-    assert_eq!(pg.count_threads("general").await.unwrap(), 0, "thread row gone");
+    assert_eq!(
+        pg.count_threads("support").await.unwrap(),
+        1,
+        "only the separately-created HTTP thread remains"
+    );
     assert_eq!(pg.count_posts(&thread.id).await.unwrap(), 0, "thread's posts gone");
     assert!(pg.get_thread(&thread.id).await.unwrap().is_none());
 

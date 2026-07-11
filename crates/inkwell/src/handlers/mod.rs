@@ -132,36 +132,119 @@ fn theme_switcher(current: &str) -> String {
     )
 }
 
-pub fn page_shell(
-    head_title: &str,
-    body_class: &str,
-    rss: bool,
-    nav_title: &str,
-    email: &str,
-    is_admin: bool,
-    theme: &str,
-    fragment: &str,
-) -> String {
-    let rss_link = if rss {
+/// Typed per-page metadata. Keeping every value as data (rather than accepting a raw head
+/// fragment) makes escaping mandatory and prevents author-controlled metadata from becoming HTML.
+#[derive(Clone, Debug, Default)]
+pub struct PageMeta {
+    pub description: Option<String>,
+    pub canonical: Option<String>,
+    pub robots: Option<String>,
+    pub og_type: Option<String>,
+    pub og_title: Option<String>,
+    pub og_description: Option<String>,
+    pub og_image: Option<String>,
+    pub twitter_card: Option<String>,
+    pub twitter_title: Option<String>,
+    pub twitter_description: Option<String>,
+    pub twitter_image: Option<String>,
+}
+
+/// Typed inputs for the shared document shell. Grouping the chrome, body, and optional metadata
+/// contract keeps call sites self-documenting and prevents positional argument drift.
+pub struct PageShell<'a> {
+    pub head_title: &'a str,
+    pub body_class: &'a str,
+    pub rss: bool,
+    pub nav_title: &'a str,
+    pub email: &'a str,
+    pub is_admin: bool,
+    pub theme: &'a str,
+    pub fragment: &'a str,
+    pub metadata: Option<&'a PageMeta>,
+}
+
+/// Render the shared shell plus an optional, escaped metadata contract.
+pub fn page_shell(page: PageShell<'_>) -> String {
+    let rss_link = if page.rss {
         r#"<link rel="alternate" type="application/rss+xml" title="Inkwell · HOLDFAST" href="/feed.xml">"#
     } else {
         ""
     };
+    let head_meta = page.metadata.map(render_page_meta).unwrap_or_default();
     format!(
         r#"<!DOCTYPE html><html lang="en"{theme_attr}><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="{color_scheme}">
-<title>{title}</title>{rss_link}<style>{css}</style></head><body class="{body_class}">
+<title>{title}</title>{rss_link}{head_meta}<style>{css}</style></head><body class="{body_class}">
 {topbar}{fragment}</body></html>"#,
-        theme_attr = odyssey::html_theme_attr(theme),
-        color_scheme = odyssey::color_scheme_meta(theme),
-        title = esc(head_title),
+        theme_attr = odyssey::html_theme_attr(page.theme),
+        color_scheme = odyssey::color_scheme_meta(page.theme),
+        title = esc(page.head_title),
         rss_link = rss_link,
+        head_meta = head_meta,
         css = app_css(),
-        body_class = body_class,
-        topbar = topbar(nav_title, email, is_admin, theme),
-        fragment = fragment,
+        body_class = page.body_class,
+        topbar = topbar(page.nav_title, page.email, page.is_admin, page.theme),
+        fragment = page.fragment,
     )
+}
+
+fn render_page_meta(meta: &PageMeta) -> String {
+    let mut out = String::new();
+    push_name_meta(&mut out, "description", meta.description.as_deref());
+    if let Some(url) = meta.canonical.as_deref() {
+        out.push_str(&format!("<link rel=\"canonical\" href=\"{}\">", esc(url)));
+    }
+    push_name_meta(&mut out, "robots", meta.robots.as_deref());
+    push_property_meta(&mut out, "og:type", meta.og_type.as_deref());
+    push_property_meta(&mut out, "og:title", meta.og_title.as_deref());
+    push_property_meta(&mut out, "og:description", meta.og_description.as_deref());
+    push_property_meta(&mut out, "og:url", meta.canonical.as_deref());
+    push_property_meta(&mut out, "og:image", meta.og_image.as_deref());
+    push_name_meta(&mut out, "twitter:card", meta.twitter_card.as_deref());
+    push_name_meta(&mut out, "twitter:title", meta.twitter_title.as_deref());
+    push_name_meta(
+        &mut out,
+        "twitter:description",
+        meta.twitter_description.as_deref(),
+    );
+    push_name_meta(&mut out, "twitter:image", meta.twitter_image.as_deref());
+    out
+}
+
+fn push_name_meta(out: &mut String, name: &str, value: Option<&str>) {
+    if let Some(value) = value.filter(|value| !value.is_empty()) {
+        out.push_str(&format!(
+            "<meta name=\"{}\" content=\"{}\">",
+            esc(name),
+            esc(value)
+        ));
+    }
+}
+
+fn push_property_meta(out: &mut String, property: &str, value: Option<&str>) {
+    if let Some(value) = value.filter(|value| !value.is_empty()) {
+        out.push_str(&format!(
+            "<meta property=\"{}\" content=\"{}\">",
+            esc(property),
+            esc(value)
+        ));
+    }
+}
+
+/// Product excerpt: prefer the author's explicit summary, falling back to Markdown-derived text.
+/// The requested character cap is applied to either source so cards/feeds keep their contracts.
+pub fn post_excerpt(post: &crate::store::Post, max_chars: usize) -> String {
+    let explicit = post.custom_excerpt.trim();
+    if explicit.is_empty() {
+        return crate::markdown::excerpt(&post.body_md, max_chars);
+    }
+    if explicit.chars().count() > max_chars {
+        let truncated: String = explicit.chars().take(max_chars).collect();
+        format!("{}…", truncated.trim_end())
+    } else {
+        explicit.to_string()
+    }
 }
 
 /// The app-bar's right cluster (shared by every Inkwell surface): the "All apps" waffle to the
@@ -280,14 +363,16 @@ pub fn error_page(status: StatusCode, message: &str) -> String {
         reason = esc(reason),
         msg = esc(message),
     );
-    page_shell(
-        &format!("{code} {reason} · Inkwell"),
-        "page-reading",
-        false,
-        "Inkwell",
-        "—",
-        false,
-        "light",
-        &fragment,
-    )
+    let head_title = format!("{code} {reason} · Inkwell");
+    page_shell(PageShell {
+        head_title: &head_title,
+        body_class: "page-reading",
+        rss: false,
+        nav_title: "Inkwell",
+        email: "—",
+        is_admin: false,
+        theme: "light",
+        fragment: &fragment,
+        metadata: None,
+    })
 }

@@ -72,6 +72,12 @@ impl MemoryBlobs {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Number of currently stored objects. Primarily a reconciliation/test diagnostic; callers
+    /// cannot inspect keys or bytes through it.
+    pub fn object_count(&self) -> usize {
+        self.objects.lock().expect("objects lock poisoned").len()
+    }
 }
 
 #[async_trait]

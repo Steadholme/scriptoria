@@ -306,9 +306,26 @@ body.page { max-width:none; margin:0; padding:0; }
 /* agora — instant sort tabs row + subscribed filter alignment. Tabs reuse the
    shared .tabs/.tab kit; this only lays out the control row. */
 .thread-controls { display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin-bottom:16px; }
-.sort-tabs { margin-bottom:0; }
+.thread-controls__tabs { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.sort-tabs, .answer-tabs { margin-bottom:0; }
+.answer-tabs { padding-left:10px; border-left:1px solid var(--hairline); }
 .thread-filter { margin-left:auto; }
-@media (max-width:720px){ .thread-filter { margin-left:0; } }
+.ag-answer-state { white-space:nowrap; }
+.ag-answer-state--open {
+  color:var(--warn-ink);
+  background:var(--warn-soft);
+  border-color:var(--warn-border);
+}
+.ag-answer-state--done {
+  color:var(--ok-ink);
+  background:var(--ok-soft);
+  border-color:var(--ok-border);
+}
+@media (max-width:720px){
+  .thread-filter { margin-left:0; }
+  .thread-controls, .thread-controls__tabs { align-items:stretch; }
+  .answer-tabs { padding-left:0; border-left:0; }
+}
 
 /* ag S0 brand aliases */
 :root {
@@ -994,6 +1011,13 @@ a.ag-chip:hover {
   height:34px;
   font-size:13px;
 }
+.ag-admin--cat select,
+.ag-admin-new select {
+  width:auto;
+  min-width:126px;
+  height:34px;
+  font-size:13px;
+}
 .ag-admin--cat code {
   font-family:var(--mono);
   font-size:12px;
@@ -1161,7 +1185,7 @@ a.ag-chip:hover {
 .ag-search-head { margin-bottom:var(--sp-4); }
 .ag-search-form {
   display:grid;
-  grid-template-columns:minmax(0,1fr) minmax(180px,240px) auto;
+  grid-template-columns:minmax(0,1fr) minmax(160px,220px) minmax(170px,220px) auto;
   gap:var(--sp-3);
   align-items:end;
   padding:var(--sp-4);
@@ -1208,6 +1232,16 @@ a.ag-chip:hover {
   font-size:var(--fs-body);
   line-height:1.55;
 }
+.ag-search-hit__source {
+  width:max-content;
+  padding:2px 8px;
+  border:1px solid var(--ok-border);
+  border-radius:var(--r-pill);
+  color:var(--ok-ink);
+  background:var(--ok-soft);
+  font-size:var(--fs-micro);
+  font-weight:var(--fw-semibold);
+}
 .ag-search-hit__meta {
   display:flex;
   align-items:center;
@@ -1241,7 +1275,7 @@ a.ag-chip:hover {
   }
 }
 @media (max-width:860px) {
-  .ag-home { grid-template-columns:1fr; }
+  .ag-home { grid-template-columns:minmax(0,1fr); }
   .ag-rail { position:static; }
   .ag-rail__nav {
     flex-direction:row;

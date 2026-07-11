@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>{{TITLE}} · Upload request · Drive</title>
+  <style>{{CSS}}</style>
+</head>
+<body class="page-console">
+  <header class="appbar">
+    <a class="appbar__brand" href="/" aria-label="HOLDFAST Drive home">
+      <span class="app-tile" aria-hidden="true">⇧</span>
+      <span class="appbar__name"><b>Drive</b><span>drive.w33d.xyz</span></span>
+    </a>
+    <nav class="appbar__nav" aria-label="Drive">
+      <a class="appnav" href="/">Files</a>
+      <a class="appnav is-active" href="/requests">Requests</a>
+    </nav>
+    <span class="appbar__spacer"></span>
+    <div class="appbar__right">{{USERBOX}}</div>
+  </header>
+
+  <main class="console console--narrow request-console">
+    <div class="console__head console__head--row request-head">
+      <div><p class="eyebrow"><a href="/requests">Upload requests</a> / {{STATE}}</p><h1>{{TITLE}}</h1><p class="sub">{{DESCRIPTION}}</p></div>
+      <div class="request-head__actions">{{ACTION}}</div>
+    </div>
+
+    <section class="card">
+      <div class="card__head"><div><p class="eyebrow">Public capability</p><h2>Share this upload-only link</h2></div><span class="badge">{{STATE}}</span></div>
+      <div class="embed-box__row"><input class="embed-box__input" readonly value="{{URL}}"><button class="btn btn-secondary copy-btn" type="button" data-copy=".embed-box__input" data-label="Copy">Copy</button></div>
+      <div class="request-facts"><span>Destination <b>{{FOLDER}}</b></span><span>{{EXPIRY}}</span><span>{{USED_FILES}} files · {{USED_BYTES}}</span></div>
+      <form method="post" action="/requests/{{ID}}/rotate" onsubmit="return confirm('Rotate this capability? The old link will stop working immediately.');">
+        <input type="hidden" name="csrf_token" value="{{CSRF}}">
+        <input type="hidden" name="expected_token" value="{{EXPECTED_TOKEN}}">
+        <button class="btn btn-danger btn-sm" type="submit">Rotate link</button>
+      </form>
+    </section>
+
+    <section class="card">
+      <div class="card__head"><div><p class="eyebrow">Policy</p><h2>Request limits</h2></div></div>
+      <form class="request-policy" method="post" action="/requests/{{ID}}/update">
+        <input type="hidden" name="csrf_token" value="{{CSRF}}">
+        <label>Title<input name="title" value="{{TITLE}}" maxlength="120" required></label>
+        <label class="request-policy__wide">Instructions<textarea name="description" maxlength="2000">{{DESCRIPTION}}</textarea></label>
+        <label>Lifetime<select name="expiry"><option value="3600">1 hour from save</option><option value="86400">1 day from save</option><option value="604800" selected>7 days from save</option><option value="2592000">30 days from save</option></select></label>
+        <label>Max file (MiB)<input type="number" name="max_file_mib" min="1" value="{{MAX_FILE_MIB}}" required></label>
+        <label>Total budget (MiB)<input type="number" name="max_total_mib" min="1" value="{{MAX_TOTAL_MIB}}" required></label>
+        <label>Max files<input type="number" name="max_files" min="1" max="1000" value="{{MAX_FILES}}" required></label>
+        <label class="request-policy__wide">Allowed MIME types<input name="allowed_types" value="{{ALLOWED_TYPES}}" required><small>Restrictive rooms verify PNG, JPEG, GIF, WEBP, BMP and PDF signatures. Use <code>*/*</code> when other download-only formats are required.</small></label>
+        <div class="request-policy__wide"><button class="btn btn-primary" type="submit">Save policy</button></div>
+      </form>
+    </section>
+
+    <section class="card">
+      <div class="card__head"><div><p class="eyebrow">Owner receipt</p><h2>Files received</h2></div></div>
+      <ol class="request-receipts">{{RECEIPTS}}</ol>
+    </section>
+  </main>
+  {{DYNAMIC}}
+  <script>
+    (function () {
+      var buttons = document.querySelectorAll('.copy-btn');
+      Array.prototype.forEach.call(buttons, function (button) {
+        button.addEventListener('click', function () {
+          var row = button.closest ? button.closest('.embed-box__row') : button.parentNode;
+          var input = row ? row.querySelector(button.getAttribute('data-copy') || '') : null;
+          if (!input) { return; }
+          input.select();
+          if (input.setSelectionRange) { input.setSelectionRange(0, input.value.length); }
+          var done = function () {
+            button.textContent = 'Copied';
+            setTimeout(function () { button.textContent = button.getAttribute('data-label') || 'Copy'; }, 1200);
+          };
+          if (navigator.clipboard) {
+            navigator.clipboard.writeText(input.value).then(done, function () {
+              try { document.execCommand('copy'); done(); } catch (error) {}
+            });
+          } else {
+            try { document.execCommand('copy'); done(); } catch (error) {}
+          }
+        });
+      });
+    })();
+  </script>
+</body>
+</html>

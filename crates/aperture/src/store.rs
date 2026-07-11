@@ -15,7 +15,84 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::config::clamp_page;
-use crate::model::{FileComment, FileRec, FolderRec, OwnerUsage, VersionRec};
+use crate::model::{
+    FileComment, FileRec, FolderRec, OwnerUsage, UploadRequestRec, UploadSubmission, VersionRec,
+};
+
+/// Safe, finite defaults for a newly-created upload request. The per-file limit is additionally
+/// clamped to the runtime `MAX_UPLOAD` by the handler.
+pub const DEFAULT_REQUEST_MAX_FILE_BYTES: i64 = 25 * 1024 * 1024;
+pub const DEFAULT_REQUEST_MAX_TOTAL_BYTES: i64 = 100 * 1024 * 1024;
+pub const DEFAULT_REQUEST_MAX_FILES: i64 = 50;
+pub const DEFAULT_REQUEST_ALLOWED_TYPES: &str = "*/*";
+
+/// Domain result of the atomic public-upload reservation. Expected policy rejections are values,
+/// not backend errors, so the public handler can collapse them into its fixed capability shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadReserve {
+    Reserved,
+    Unavailable,
+    FileTooLarge,
+    TotalBudgetExceeded,
+    FileCountExceeded,
+    TypeDenied,
+    OwnerQuotaExceeded,
+    Collision,
+}
+
+/// Inputs to one atomic public-upload reservation. Keeping authority, verified type and budgets in
+/// one value makes it harder for callers to omit a check when the reservation contract evolves.
+#[derive(Debug, Clone, Copy)]
+pub struct UploadReserveInput<'a> {
+    pub request_id: &'a str,
+    pub expected_token: &'a str,
+    pub reservation_id: &'a str,
+    pub size: i64,
+    pub content_type: &'a str,
+    pub content_type_verified: bool,
+    pub owner_quota: Option<i64>,
+    pub now: i64,
+}
+
+/// One durable reservation claimed by startup recovery. The reservation id is also the blob's
+/// object key, so recovery can remove bytes before it returns the request budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadRecoveryItem {
+    pub reservation_id: String,
+    pub object_key: String,
+}
+
+/// Atomic result of trying to lease every outstanding upload reservation for recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UploadRecoveryClaim {
+    /// This startup owns these rows until it completes or abandons the lease.
+    Claimed(Vec<UploadRecoveryItem>),
+    /// There are no outstanding reservations.
+    Empty,
+    /// Another startup currently owns the outstanding rows. Failing this startup avoids serving
+    /// while cleanup outcome is unknown.
+    Busy,
+}
+
+/// Tokens are fixed-size capabilities, but compare every byte without an early mismatch return so
+/// the authority check behaves consistently in both Store implementations.
+fn capability_token_eq(actual: &str, expected: &str) -> bool {
+    if actual.len() != expected.len() {
+        return false;
+    }
+    actual
+        .bytes()
+        .zip(expected.bytes())
+        .fold(0_u8, |diff, (left, right)| diff | (left ^ right))
+        == 0
+}
+
+fn request_allows_unverified_type(request: &UploadRequestRec) -> bool {
+    request
+        .allowed_types
+        .split(',')
+        .any(|pattern| pattern.trim() == "*/*")
+}
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
 #[derive(Debug, Error)]
@@ -284,6 +361,109 @@ pub trait Store: Send + Sync {
 
     /// Delete all comments for a file, used by hard purge.
     async fn delete_comments_for_file(&self, file_id: &str) -> Result<(), StoreError>;
+
+    // ------------------------------------------------------------------
+    // Product-level public upload requests.
+    // ------------------------------------------------------------------
+
+    async fn create_upload_request(&self, request: &UploadRequestRec) -> Result<bool, StoreError>;
+
+    async fn list_upload_requests(
+        &self,
+        owner_sub: &str,
+    ) -> Result<Vec<UploadRequestRec>, StoreError>;
+
+    async fn get_upload_request(
+        &self,
+        id: &str,
+        owner_sub: &str,
+    ) -> Result<Option<UploadRequestRec>, StoreError>;
+
+    async fn get_upload_request_by_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<UploadRequestRec>, StoreError>;
+
+    /// Replace all owner-editable request settings. Implementations reject a budget lower than
+    /// already-consumed usage and never change token, owner, destination or counters here.
+    async fn update_upload_request(&self, request: &UploadRequestRec) -> Result<bool, StoreError>;
+
+    async fn set_upload_request_status(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        status: &str,
+        updated_at: i64,
+    ) -> Result<bool, StoreError>;
+
+    /// Reopen a request without replacing any owner policy. An expired finite request receives
+    /// `renewed_expires_at`; a still-live or legacy no-expiry request keeps its current expiry.
+    async fn reopen_upload_request(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        now: i64,
+        renewed_expires_at: i64,
+    ) -> Result<bool, StoreError>;
+
+    async fn rotate_upload_request_token(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        expected_token: &str,
+        token: &str,
+        updated_at: i64,
+    ) -> Result<bool, StoreError>;
+
+    async fn list_upload_submissions(
+        &self,
+        request_id: &str,
+        owner_sub: &str,
+    ) -> Result<Vec<UploadSubmission>, StoreError>;
+
+    /// Atomically reserve one request/file slot and owner quota before touching the blob store.
+    /// `owner_quota=None` means the owner has no configured global limit; the request's own finite
+    /// budgets are always enforced. A reservation counts toward both request and owner usage.
+    async fn reserve_request_upload(
+        &self,
+        input: UploadReserveInput<'_>,
+    ) -> Result<UploadReserve, StoreError>;
+
+    /// Commit a successfully-written blob into the file index and immutable request receipt.
+    async fn commit_request_upload(
+        &self,
+        reservation_id: &str,
+        file: &FileRec,
+        submission: &UploadSubmission,
+    ) -> Result<bool, StoreError>;
+
+    /// Release a failed reservation and return its bytes/file slot to the request budget.
+    async fn release_request_upload(&self, reservation_id: &str) -> Result<bool, StoreError>;
+
+    /// Atomically lease all stale reservations for one startup recovery worker. A lease older than
+    /// `lease_expired_before` can be reclaimed after a recovery process itself crashed.
+    async fn claim_upload_recovery(
+        &self,
+        lease_id: &str,
+        leased_at: i64,
+        lease_expired_before: i64,
+    ) -> Result<UploadRecoveryClaim, StoreError>;
+
+    /// Finish one leased recovery item after its blob was deleted. This is the only recovery path
+    /// that returns bytes/file counters, and the lease predicate makes it exactly-once.
+    async fn complete_upload_recovery(
+        &self,
+        reservation_id: &str,
+        lease_id: &str,
+    ) -> Result<bool, StoreError>;
+
+    /// Give back a recovery lease without changing counters. Used when blob deletion fails so a
+    /// later startup can retry the same durable row.
+    async fn abandon_upload_recovery(
+        &self,
+        reservation_id: &str,
+        lease_id: &str,
+    ) -> Result<bool, StoreError>;
 }
 
 // --------------------------------------------------------------------------------------
@@ -302,6 +482,26 @@ pub struct InMemoryStore {
     quotas: Mutex<Vec<(String, i64)>>,
     /// Per-file comments (mirrors the `file_comments` table).
     comments: Mutex<Vec<FileComment>>,
+    /// Upload-request control plane and its short-lived reservations. Keeping these three vectors
+    /// behind one lock makes reserve/commit/release atomic in the memory implementation.
+    request_state: Mutex<MemoryRequestState>,
+}
+
+#[derive(Default)]
+struct MemoryRequestState {
+    requests: Vec<UploadRequestRec>,
+    submissions: Vec<UploadSubmission>,
+    reservations: Vec<MemoryUploadReservation>,
+}
+
+#[derive(Clone)]
+struct MemoryUploadReservation {
+    id: String,
+    request_id: String,
+    owner_sub: String,
+    size: i64,
+    recovery_lease: Option<String>,
+    recovery_leased_at: Option<i64>,
 }
 
 impl InMemoryStore {
@@ -975,6 +1175,492 @@ impl Store for InMemoryStore {
         comments.retain(|c| c.file_id != file_id);
         Ok(())
     }
+
+    async fn create_upload_request(&self, request: &UploadRequestRec) -> Result<bool, StoreError> {
+        let mut state = self
+            .request_state
+            .lock()
+            .expect("request state lock poisoned");
+        if state
+            .requests
+            .iter()
+            .any(|item| item.id == request.id || item.token == request.token)
+        {
+            return Ok(false);
+        }
+        state.requests.push(request.clone());
+        Ok(true)
+    }
+
+    async fn list_upload_requests(
+        &self,
+        owner_sub: &str,
+    ) -> Result<Vec<UploadRequestRec>, StoreError> {
+        let state = self
+            .request_state
+            .lock()
+            .expect("request state lock poisoned");
+        let mut out: Vec<_> = state
+            .requests
+            .iter()
+            .filter(|request| request.owner_sub == owner_sub)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        Ok(out)
+    }
+
+    async fn get_upload_request(
+        &self,
+        id: &str,
+        owner_sub: &str,
+    ) -> Result<Option<UploadRequestRec>, StoreError> {
+        let state = self
+            .request_state
+            .lock()
+            .expect("request state lock poisoned");
+        Ok(state
+            .requests
+            .iter()
+            .find(|request| request.id == id && request.owner_sub == owner_sub)
+            .cloned())
+    }
+
+    async fn get_upload_request_by_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<UploadRequestRec>, StoreError> {
+        let state = self
+            .request_state
+            .lock()
+            .expect("request state lock poisoned");
+        Ok(state
+            .requests
+            .iter()
+            .find(|request| request.token == token)
+            .cloned())
+    }
+
+    async fn update_upload_request(&self, request: &UploadRequestRec) -> Result<bool, StoreError> {
+        let mut state = self
+            .request_state
+            .lock()
+            .expect("request state lock poisoned");
+        let Some(current) = state
+            .requests
+            .iter_mut()
+            .find(|item| item.id == request.id && item.owner_sub == request.owner_sub)
+        else {
+            return Ok(false);
+        };
+        if request.max_total_bytes < current.used_bytes || request.max_files < current.used_files {
+            return Ok(false);
+        }
+        current.title = request.title.clone();
+        current.description = request.description.clone();
+        current.expires_at = request.expires_at;
+        current.max_file_bytes = request.max_file_bytes;
+        current.max_total_bytes = request.max_total_bytes;
+        current.max_files = request.max_files;
+        current.allowed_types = request.allowed_types.clone();
+        current.updated_at = request.updated_at;
+        Ok(true)
+    }
+
+    async fn set_upload_request_status(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        status: &str,
+        updated_at: i64,
+    ) -> Result<bool, StoreError> {
+        let mut state = self
+            .request_state
+            .lock()
+            .expect("request state lock poisoned");
+        let Some(request) = state
+            .requests
+            .iter_mut()
+            .find(|item| item.id == id && item.owner_sub == owner_sub)
+        else {
+            return Ok(false);
+        };
+        request.status = status.to_string();
+        request.updated_at = updated_at;
+        Ok(true)
+    }
+
+    async fn reopen_upload_request(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        now: i64,
+        renewed_expires_at: i64,
+    ) -> Result<bool, StoreError> {
+        let mut state = self
+            .request_state
+            .lock()
+            .expect("request state lock poisoned");
+        let Some(request) = state
+            .requests
+            .iter_mut()
+            .find(|item| item.id == id && item.owner_sub == owner_sub)
+        else {
+            return Ok(false);
+        };
+        if request.is_expired(now) {
+            request.expires_at = Some(renewed_expires_at);
+        }
+        request.status = "open".to_string();
+        request.updated_at = now;
+        Ok(true)
+    }
+
+    async fn rotate_upload_request_token(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        expected_token: &str,
+        token: &str,
+        updated_at: i64,
+    ) -> Result<bool, StoreError> {
+        let mut state = self
+            .request_state
+            .lock()
+            .expect("request state lock poisoned");
+        if state
+            .requests
+            .iter()
+            .any(|item| item.token == token && item.id != id)
+        {
+            return Ok(false);
+        }
+        let Some(request) = state.requests.iter_mut().find(|item| {
+            item.id == id
+                && item.owner_sub == owner_sub
+                && capability_token_eq(&item.token, expected_token)
+        }) else {
+            return Ok(false);
+        };
+        request.token = token.to_string();
+        request.updated_at = updated_at;
+        Ok(true)
+    }
+
+    async fn list_upload_submissions(
+        &self,
+        request_id: &str,
+        owner_sub: &str,
+    ) -> Result<Vec<UploadSubmission>, StoreError> {
+        let state = self
+            .request_state
+            .lock()
+            .expect("request state lock poisoned");
+        if !state
+            .requests
+            .iter()
+            .any(|request| request.id == request_id && request.owner_sub == owner_sub)
+        {
+            return Ok(Vec::new());
+        }
+        let mut out: Vec<_> = state
+            .submissions
+            .iter()
+            .filter(|submission| submission.request_id == request_id)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        Ok(out)
+    }
+
+    async fn reserve_request_upload(
+        &self,
+        input: UploadReserveInput<'_>,
+    ) -> Result<UploadReserve, StoreError> {
+        let UploadReserveInput {
+            request_id,
+            expected_token,
+            reservation_id,
+            size,
+            content_type,
+            content_type_verified,
+            owner_quota,
+            now,
+        } = input;
+        let mut state = self
+            .request_state
+            .lock()
+            .expect("request state lock poisoned");
+        let Some(index) = state
+            .requests
+            .iter()
+            .position(|request| request.id == request_id)
+        else {
+            return Ok(UploadReserve::Unavailable);
+        };
+        let request = state.requests[index].clone();
+        if !capability_token_eq(&request.token, expected_token)
+            || !request.is_open()
+            || request.is_expired(now)
+        {
+            return Ok(UploadReserve::Unavailable);
+        }
+        if size <= 0 || size > request.max_file_bytes {
+            return Ok(UploadReserve::FileTooLarge);
+        }
+        if (!content_type_verified && !request_allows_unverified_type(&request))
+            || !request.accepts_content_type(content_type)
+        {
+            return Ok(UploadReserve::TypeDenied);
+        }
+        if request.used_bytes.saturating_add(size) > request.max_total_bytes {
+            return Ok(UploadReserve::TotalBudgetExceeded);
+        }
+        if request.used_files.saturating_add(1) > request.max_files {
+            return Ok(UploadReserve::FileCountExceeded);
+        }
+        if state
+            .reservations
+            .iter()
+            .any(|reservation| reservation.id == reservation_id)
+        {
+            return Ok(UploadReserve::Collision);
+        }
+
+        let files = self.files.lock().expect("files lock poisoned");
+        if files.iter().any(|file| file.id == reservation_id) {
+            return Ok(UploadReserve::Collision);
+        }
+        let committed: i64 = files
+            .iter()
+            .filter(|file| file.owner_sub == request.owner_sub)
+            .map(|file| file.size)
+            .sum();
+        let owned_ids: Vec<&str> = files
+            .iter()
+            .filter(|file| file.owner_sub == request.owner_sub)
+            .map(|file| file.id.as_str())
+            .collect();
+        let versions = self.versions.lock().expect("versions lock poisoned");
+        let version_bytes: i64 = versions
+            .iter()
+            .filter(|version| owned_ids.contains(&version.file_id.as_str()))
+            .map(|version| version.size)
+            .sum();
+        let reserved: i64 = state
+            .reservations
+            .iter()
+            .filter(|reservation| reservation.owner_sub == request.owner_sub)
+            .map(|reservation| reservation.size)
+            .sum();
+        if owner_quota.is_some_and(|quota| {
+            committed
+                .saturating_add(version_bytes)
+                .saturating_add(reserved)
+                .saturating_add(size)
+                > quota
+        }) {
+            return Ok(UploadReserve::OwnerQuotaExceeded);
+        }
+        drop(versions);
+        drop(files);
+
+        state.requests[index].used_bytes = request.used_bytes.saturating_add(size);
+        state.requests[index].used_files = request.used_files.saturating_add(1);
+        state.requests[index].updated_at = now;
+        state.reservations.push(MemoryUploadReservation {
+            id: reservation_id.to_string(),
+            request_id: request.id,
+            owner_sub: request.owner_sub,
+            size,
+            recovery_lease: None,
+            recovery_leased_at: None,
+        });
+        Ok(UploadReserve::Reserved)
+    }
+
+    async fn commit_request_upload(
+        &self,
+        reservation_id: &str,
+        file: &FileRec,
+        submission: &UploadSubmission,
+    ) -> Result<bool, StoreError> {
+        let mut state = self
+            .request_state
+            .lock()
+            .expect("request state lock poisoned");
+        let Some(reservation) = state
+            .reservations
+            .iter()
+            .find(|reservation| reservation.id == reservation_id)
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        if reservation.recovery_lease.is_some() {
+            return Ok(false);
+        }
+        if file.id != reservation.id
+            || file.owner_sub != reservation.owner_sub
+            || file.size != reservation.size
+            || submission.request_id != reservation.request_id
+            || submission.file_id != file.id
+        {
+            return Ok(false);
+        }
+        if state
+            .submissions
+            .iter()
+            .any(|item| item.id == submission.id || item.file_id == submission.file_id)
+        {
+            return Ok(false);
+        }
+        let mut files = self.files.lock().expect("files lock poisoned");
+        if files.iter().any(|existing| {
+            existing.id == file.id
+                || (file.share_token.is_some() && existing.share_token == file.share_token)
+        }) {
+            return Ok(false);
+        }
+        files.push(file.clone());
+        state.submissions.push(submission.clone());
+        state
+            .reservations
+            .retain(|reservation| reservation.id != reservation_id);
+        Ok(true)
+    }
+
+    async fn release_request_upload(&self, reservation_id: &str) -> Result<bool, StoreError> {
+        let mut state = self
+            .request_state
+            .lock()
+            .expect("request state lock poisoned");
+        let Some(index) = state
+            .reservations
+            .iter()
+            .position(|reservation| reservation.id == reservation_id)
+        else {
+            return Ok(false);
+        };
+        if state.reservations[index].recovery_lease.is_some() {
+            return Ok(false);
+        }
+        let reservation = state.reservations.remove(index);
+        if let Some(request) = state
+            .requests
+            .iter_mut()
+            .find(|request| request.id == reservation.request_id)
+        {
+            request.used_bytes = request.used_bytes.saturating_sub(reservation.size);
+            request.used_files = request.used_files.saturating_sub(1);
+        }
+        Ok(true)
+    }
+
+    async fn claim_upload_recovery(
+        &self,
+        lease_id: &str,
+        leased_at: i64,
+        lease_expired_before: i64,
+    ) -> Result<UploadRecoveryClaim, StoreError> {
+        let mut state = self
+            .request_state
+            .lock()
+            .expect("request state lock poisoned");
+        if state.reservations.is_empty() {
+            return Ok(UploadRecoveryClaim::Empty);
+        }
+        let held_by_other = state.reservations.iter().any(|reservation| {
+            reservation
+                .recovery_lease
+                .as_deref()
+                .is_some_and(|current| {
+                    current != lease_id
+                        && reservation
+                            .recovery_leased_at
+                            .is_none_or(|at| at > lease_expired_before)
+                })
+        });
+        if held_by_other {
+            return Ok(UploadRecoveryClaim::Busy);
+        }
+        for reservation in &mut state.reservations {
+            let available = reservation.recovery_lease.as_deref() == Some(lease_id)
+                || reservation.recovery_lease.is_none()
+                || reservation
+                    .recovery_leased_at
+                    .is_some_and(|at| at <= lease_expired_before);
+            if available {
+                reservation.recovery_lease = Some(lease_id.to_string());
+                reservation.recovery_leased_at = Some(leased_at);
+            }
+        }
+        let claimed: Vec<_> = state
+            .reservations
+            .iter()
+            .filter(|reservation| reservation.recovery_lease.as_deref() == Some(lease_id))
+            .map(|reservation| UploadRecoveryItem {
+                reservation_id: reservation.id.clone(),
+                object_key: reservation.id.clone(),
+            })
+            .collect();
+        Ok(UploadRecoveryClaim::Claimed(claimed))
+    }
+
+    async fn complete_upload_recovery(
+        &self,
+        reservation_id: &str,
+        lease_id: &str,
+    ) -> Result<bool, StoreError> {
+        let mut state = self
+            .request_state
+            .lock()
+            .expect("request state lock poisoned");
+        let Some(index) = state.reservations.iter().position(|reservation| {
+            reservation.id == reservation_id
+                && reservation.recovery_lease.as_deref() == Some(lease_id)
+        }) else {
+            return Ok(false);
+        };
+        let reservation = state.reservations.remove(index);
+        if let Some(request) = state
+            .requests
+            .iter_mut()
+            .find(|request| request.id == reservation.request_id)
+        {
+            request.used_bytes = request.used_bytes.saturating_sub(reservation.size);
+            request.used_files = request.used_files.saturating_sub(1);
+        }
+        Ok(true)
+    }
+
+    async fn abandon_upload_recovery(
+        &self,
+        reservation_id: &str,
+        lease_id: &str,
+    ) -> Result<bool, StoreError> {
+        let mut state = self
+            .request_state
+            .lock()
+            .expect("request state lock poisoned");
+        let Some(reservation) = state.reservations.iter_mut().find(|reservation| {
+            reservation.id == reservation_id
+                && reservation.recovery_lease.as_deref() == Some(lease_id)
+        }) else {
+            return Ok(false);
+        };
+        reservation.recovery_lease = None;
+        reservation.recovery_leased_at = None;
+        Ok(true)
+    }
 }
 
 // --------------------------------------------------------------------------------------
@@ -999,6 +1685,10 @@ const FOLDER_COLS: &str =
 
 /// Column list shared by every version SELECT.
 const VERSION_COLS: &str = "id, file_id, object_key, size, content_type, created_at";
+
+const UPLOAD_REQUEST_COLS: &str = "id, owner_sub, folder_id, token, title, description, status, \
+     expires_at, max_file_bytes, max_total_bytes, max_files, used_bytes, used_files, allowed_types, \
+     created_at, updated_at";
 
 /// Keep at most this many versions per file; older snapshots are pruned (blobs deleted).
 pub const MAX_VERSIONS_PER_FILE: i64 = 10;
@@ -1195,6 +1885,193 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+
+        // Product-level upload requests. Limits are stored on the capability itself so every
+        // anonymous write is bounded even when the owner's global quota is intentionally unlimited.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS upload_requests (\
+                 id TEXT PRIMARY KEY, \
+                 owner_sub TEXT NOT NULL, \
+                 folder_id TEXT NOT NULL, \
+                 token TEXT NOT NULL UNIQUE, \
+                 title TEXT NOT NULL, \
+                 description TEXT NOT NULL, \
+                 status TEXT NOT NULL, \
+                 expires_at BIGINT, \
+                 max_file_bytes BIGINT NOT NULL, \
+                 max_total_bytes BIGINT NOT NULL, \
+                 max_files BIGINT NOT NULL, \
+                 used_bytes BIGINT NOT NULL, \
+                 used_files BIGINT NOT NULL, \
+                 allowed_types TEXT NOT NULL, \
+                 created_at BIGINT NOT NULL, \
+                 updated_at BIGINT NOT NULL\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_upload_requests_owner_updated \
+             ON upload_requests (owner_sub, updated_at)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_upload_requests_folder \
+             ON upload_requests (owner_sub, folder_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Immutable owner receipts. Snapshotting display metadata keeps request history useful even
+        // after the destination file is moved, renamed or purged.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS upload_submissions (\
+                 id TEXT PRIMARY KEY, \
+                 request_id TEXT NOT NULL, \
+                 file_id TEXT NOT NULL UNIQUE, \
+                 name TEXT NOT NULL, \
+                 content_type TEXT NOT NULL, \
+                 size BIGINT NOT NULL, \
+                 created_at BIGINT NOT NULL\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_upload_submissions_request \
+             ON upload_submissions (request_id, created_at)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Reservations bridge Postgres and Cairn: budgets are claimed transactionally before the
+        // blob write, committed only after the write, and released on every failure path.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS upload_reservations (\
+                 id TEXT PRIMARY KEY, \
+                 request_id TEXT NOT NULL, \
+                 owner_sub TEXT NOT NULL, \
+                 size BIGINT NOT NULL, \
+                 created_at BIGINT NOT NULL, \
+                 recovery_lease TEXT, \
+                 recovery_leased_at BIGINT\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("ALTER TABLE upload_reservations ADD COLUMN IF NOT EXISTS recovery_lease TEXT")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            "ALTER TABLE upload_reservations ADD COLUMN IF NOT EXISTS recovery_leased_at BIGINT",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_upload_reservations_owner \
+             ON upload_reservations (owner_sub)",
+        )
+        .execute(&self.pool)
+        .await?;
+        // One lockable row per owner serializes quota decisions across that owner's request rooms.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS owner_storage_guards (\
+                 owner_sub TEXT PRIMARY KEY\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Preserve every legacy `/u/{folders.upload_token}` URL. Lock and materialize the source
+        // rows before inserting anything: without this lock, a concurrent legacy revoke can clear
+        // `upload_token` between INSERT and validation, make validation skip the source, and leave
+        // the just-created request live. Scriptoria migrations run during a quiescent single-active
+        // boot; the row locks additionally make an accidental current-version writer serialize
+        // behind this transaction instead of producing a torn backfill.
+        let mut legacy_tx = self.pool.begin().await?;
+        let source_rows = sqlx::query(
+            "SELECT id, owner_sub, upload_token, name, created_at \
+             FROM folders WHERE upload_token IS NOT NULL \
+             ORDER BY id ASC FOR UPDATE",
+        )
+        .fetch_all(&mut *legacy_tx)
+        .await?;
+        let mut legacy_sources = Vec::with_capacity(source_rows.len());
+        for row in source_rows {
+            legacy_sources.push((
+                row.try_get::<String, _>("id")?,
+                row.try_get::<String, _>("owner_sub")?,
+                row.try_get::<String, _>("upload_token")?,
+                row.try_get::<String, _>("name")?,
+                row.try_get::<i64, _>("created_at")?,
+            ));
+        }
+
+        for (folder_id, owner_sub, token, name, created_at) in &legacy_sources {
+            let request_id = format!("legacy_{folder_id}");
+            sqlx::query(
+                "INSERT INTO upload_requests \
+                     (id, owner_sub, folder_id, token, title, description, status, expires_at, \
+                      max_file_bytes, max_total_bytes, max_files, used_bytes, used_files, \
+                      allowed_types, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, '', 'open', NULL, $6, $7, $8, 0, 0, $9, $10, $10) \
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(&request_id)
+            .bind(owner_sub)
+            .bind(folder_id)
+            .bind(token)
+            .bind(format!("{name} uploads"))
+            .bind(DEFAULT_REQUEST_MAX_FILE_BYTES)
+            .bind(DEFAULT_REQUEST_MAX_TOTAL_BYTES)
+            .bind(DEFAULT_REQUEST_MAX_FILES)
+            .bind(DEFAULT_REQUEST_ALLOWED_TYPES)
+            .bind(created_at)
+            .execute(&mut *legacy_tx)
+            .await?;
+
+            let exact = sqlx::query(
+                "SELECT 1 FROM upload_requests \
+                 WHERE id = $1 AND owner_sub = $2 AND folder_id = $3 AND token = $4",
+            )
+            .bind(&request_id)
+            .bind(owner_sub)
+            .bind(folder_id)
+            .bind(token)
+            .fetch_optional(&mut *legacy_tx)
+            .await?
+            .is_some();
+            if !exact {
+                let conflict_id = folder_id.clone();
+                legacy_tx.rollback().await?;
+                return Err(sqlx::Error::Protocol(format!(
+                    "legacy upload request conflict for folder {conflict_id}"
+                )));
+            }
+        }
+
+        // The exact request rows are now authoritative. Compare every clear against the locked
+        // snapshot; a missing row or changed token is a migration failure, never a reason to skip.
+        for (folder_id, owner_sub, token, _, _) in &legacy_sources {
+            let cleared = sqlx::query(
+                "UPDATE folders SET upload_token = NULL \
+                 WHERE id = $1 AND owner_sub = $2 AND upload_token = $3",
+            )
+            .bind(folder_id)
+            .bind(owner_sub)
+            .bind(token)
+            .execute(&mut *legacy_tx)
+            .await?;
+            if cleared.rows_affected() != 1 {
+                let conflict_id = folder_id.clone();
+                legacy_tx.rollback().await?;
+                return Err(sqlx::Error::Protocol(format!(
+                    "legacy upload source changed for folder {conflict_id}"
+                )));
+            }
+        }
+        legacy_tx.commit().await?;
         Ok(())
     }
 
@@ -1248,6 +2125,43 @@ impl PgStore {
             file_id: row.try_get("file_id")?,
             author_sub: row.try_get("author_sub")?,
             body: row.try_get("body")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+
+    fn upload_request_from_row(
+        row: &sqlx::postgres::PgRow,
+    ) -> Result<UploadRequestRec, sqlx::Error> {
+        Ok(UploadRequestRec {
+            id: row.try_get("id")?,
+            owner_sub: row.try_get("owner_sub")?,
+            folder_id: row.try_get("folder_id")?,
+            token: row.try_get("token")?,
+            title: row.try_get("title")?,
+            description: row.try_get("description")?,
+            status: row.try_get("status")?,
+            expires_at: row.try_get("expires_at")?,
+            max_file_bytes: row.try_get("max_file_bytes")?,
+            max_total_bytes: row.try_get("max_total_bytes")?,
+            max_files: row.try_get("max_files")?,
+            used_bytes: row.try_get("used_bytes")?,
+            used_files: row.try_get("used_files")?,
+            allowed_types: row.try_get("allowed_types")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+        })
+    }
+
+    fn upload_submission_from_row(
+        row: &sqlx::postgres::PgRow,
+    ) -> Result<UploadSubmission, sqlx::Error> {
+        Ok(UploadSubmission {
+            id: row.try_get("id")?,
+            request_id: row.try_get("request_id")?,
+            file_id: row.try_get("file_id")?,
+            name: row.try_get("name")?,
+            content_type: row.try_get("content_type")?,
+            size: row.try_get("size")?,
             created_at: row.try_get("created_at")?,
         })
     }
@@ -2044,6 +2958,658 @@ impl PgStore {
             .await?;
         Ok(())
     }
+
+    async fn create_upload_request_async(
+        &self,
+        request: &UploadRequestRec,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "INSERT INTO upload_requests \
+                 (id, owner_sub, folder_id, token, title, description, status, expires_at, \
+                  max_file_bytes, max_total_bytes, max_files, used_bytes, used_files, \
+                  allowed_types, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(&request.id)
+        .bind(&request.owner_sub)
+        .bind(&request.folder_id)
+        .bind(&request.token)
+        .bind(&request.title)
+        .bind(&request.description)
+        .bind(&request.status)
+        .bind(request.expires_at)
+        .bind(request.max_file_bytes)
+        .bind(request.max_total_bytes)
+        .bind(request.max_files)
+        .bind(request.used_bytes)
+        .bind(request.used_files)
+        .bind(&request.allowed_types)
+        .bind(request.created_at)
+        .bind(request.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn list_upload_requests_async(
+        &self,
+        owner_sub: &str,
+    ) -> Result<Vec<UploadRequestRec>, sqlx::Error> {
+        let rows = sqlx::query(&format!(
+            "SELECT {UPLOAD_REQUEST_COLS} FROM upload_requests WHERE owner_sub = $1 \
+             ORDER BY updated_at DESC, id DESC"
+        ))
+        .bind(owner_sub)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::upload_request_from_row).collect()
+    }
+
+    async fn get_upload_request_async(
+        &self,
+        id: &str,
+        owner_sub: &str,
+    ) -> Result<Option<UploadRequestRec>, sqlx::Error> {
+        let row = sqlx::query(&format!(
+            "SELECT {UPLOAD_REQUEST_COLS} FROM upload_requests WHERE id = $1 AND owner_sub = $2"
+        ))
+        .bind(id)
+        .bind(owner_sub)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(Self::upload_request_from_row).transpose()
+    }
+
+    async fn get_upload_request_by_token_async(
+        &self,
+        token: &str,
+    ) -> Result<Option<UploadRequestRec>, sqlx::Error> {
+        let row = sqlx::query(&format!(
+            "SELECT {UPLOAD_REQUEST_COLS} FROM upload_requests WHERE token = $1"
+        ))
+        .bind(token)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(Self::upload_request_from_row).transpose()
+    }
+
+    async fn update_upload_request_async(
+        &self,
+        request: &UploadRequestRec,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE upload_requests \
+             SET title = $1, description = $2, expires_at = $3, max_file_bytes = $4, \
+                 max_total_bytes = $5, max_files = $6, allowed_types = $7, updated_at = $8 \
+             WHERE id = $9 AND owner_sub = $10 AND used_bytes <= $5 AND used_files <= $6",
+        )
+        .bind(&request.title)
+        .bind(&request.description)
+        .bind(request.expires_at)
+        .bind(request.max_file_bytes)
+        .bind(request.max_total_bytes)
+        .bind(request.max_files)
+        .bind(&request.allowed_types)
+        .bind(request.updated_at)
+        .bind(&request.id)
+        .bind(&request.owner_sub)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn set_upload_request_status_async(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        status: &str,
+        updated_at: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE upload_requests SET status = $1, updated_at = $2 \
+             WHERE id = $3 AND owner_sub = $4",
+        )
+        .bind(status)
+        .bind(updated_at)
+        .bind(id)
+        .bind(owner_sub)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn reopen_upload_request_async(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        now: i64,
+        renewed_expires_at: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE upload_requests \
+             SET status = 'open', \
+                 expires_at = CASE \
+                     WHEN expires_at IS NOT NULL AND expires_at <= $1 THEN $2 \
+                     ELSE expires_at \
+                 END, \
+                 updated_at = $1 \
+             WHERE id = $3 AND owner_sub = $4",
+        )
+        .bind(now)
+        .bind(renewed_expires_at)
+        .bind(id)
+        .bind(owner_sub)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn rotate_upload_request_token_async(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        expected_token: &str,
+        token: &str,
+        updated_at: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE upload_requests SET token = $1, updated_at = $2 \
+             WHERE id = $3 AND owner_sub = $4 AND token = $5 \
+               AND NOT EXISTS (SELECT 1 FROM upload_requests WHERE token = $1 AND id <> $3)",
+        )
+        .bind(token)
+        .bind(updated_at)
+        .bind(id)
+        .bind(owner_sub)
+        .bind(expected_token)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn list_upload_submissions_async(
+        &self,
+        request_id: &str,
+        owner_sub: &str,
+    ) -> Result<Vec<UploadSubmission>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT s.id, s.request_id, s.file_id, s.name, s.content_type, s.size, s.created_at \
+             FROM upload_submissions s \
+             JOIN upload_requests r ON r.id = s.request_id \
+             WHERE s.request_id = $1 AND r.owner_sub = $2 \
+             ORDER BY s.created_at DESC, s.id DESC",
+        )
+        .bind(request_id)
+        .bind(owner_sub)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::upload_submission_from_row).collect()
+    }
+
+    async fn reserve_request_upload_async(
+        &self,
+        input: UploadReserveInput<'_>,
+    ) -> Result<UploadReserve, sqlx::Error> {
+        let UploadReserveInput {
+            request_id,
+            expected_token,
+            reservation_id,
+            size,
+            content_type,
+            content_type_verified,
+            owner_quota,
+            now,
+        } = input;
+        let mut tx = self.pool.begin().await?;
+        let request_row = sqlx::query(&format!(
+            "SELECT {UPLOAD_REQUEST_COLS} FROM upload_requests WHERE id = $1 FOR UPDATE"
+        ))
+        .bind(request_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(request_row) = request_row else {
+            tx.rollback().await?;
+            return Ok(UploadReserve::Unavailable);
+        };
+        let request = Self::upload_request_from_row(&request_row)?;
+        if !capability_token_eq(&request.token, expected_token)
+            || !request.is_open()
+            || request.is_expired(now)
+        {
+            tx.rollback().await?;
+            return Ok(UploadReserve::Unavailable);
+        }
+        if size <= 0 || size > request.max_file_bytes {
+            tx.rollback().await?;
+            return Ok(UploadReserve::FileTooLarge);
+        }
+        if (!content_type_verified && !request_allows_unverified_type(&request))
+            || !request.accepts_content_type(content_type)
+        {
+            tx.rollback().await?;
+            return Ok(UploadReserve::TypeDenied);
+        }
+        if request.used_bytes.saturating_add(size) > request.max_total_bytes {
+            tx.rollback().await?;
+            return Ok(UploadReserve::TotalBudgetExceeded);
+        }
+        if request.used_files.saturating_add(1) > request.max_files {
+            tx.rollback().await?;
+            return Ok(UploadReserve::FileCountExceeded);
+        }
+
+        // Lock one stable row per owner so simultaneous uploads through DIFFERENT request rooms
+        // cannot both pass the global quota decision.
+        sqlx::query(
+            "INSERT INTO owner_storage_guards (owner_sub) VALUES ($1) ON CONFLICT DO NOTHING",
+        )
+        .bind(&request.owner_sub)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("SELECT owner_sub FROM owner_storage_guards WHERE owner_sub = $1 FOR UPDATE")
+            .bind(&request.owner_sub)
+            .fetch_one(&mut *tx)
+            .await?;
+
+        if sqlx::query("SELECT 1 FROM files WHERE id = $1")
+            .bind(reservation_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some()
+        {
+            tx.rollback().await?;
+            return Ok(UploadReserve::Collision);
+        }
+
+        if let Some(quota) = owner_quota {
+            let files = sqlx::query(
+                "SELECT CAST(COALESCE(SUM(size), 0) AS BIGINT) AS bytes \
+                 FROM files WHERE owner_sub = $1",
+            )
+            .bind(&request.owner_sub)
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get::<i64, _>("bytes")?;
+            let versions = sqlx::query(
+                "SELECT CAST(COALESCE(SUM(v.size), 0) AS BIGINT) AS bytes \
+                 FROM file_versions v JOIN files f ON f.id = v.file_id WHERE f.owner_sub = $1",
+            )
+            .bind(&request.owner_sub)
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get::<i64, _>("bytes")?;
+            let reservations = sqlx::query(
+                "SELECT CAST(COALESCE(SUM(size), 0) AS BIGINT) AS bytes \
+                 FROM upload_reservations WHERE owner_sub = $1",
+            )
+            .bind(&request.owner_sub)
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get::<i64, _>("bytes")?;
+            if files
+                .saturating_add(versions)
+                .saturating_add(reservations)
+                .saturating_add(size)
+                > quota
+            {
+                tx.rollback().await?;
+                return Ok(UploadReserve::OwnerQuotaExceeded);
+            }
+        }
+
+        let inserted = sqlx::query(
+            "INSERT INTO upload_reservations (id, request_id, owner_sub, size, created_at) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+        )
+        .bind(reservation_id)
+        .bind(&request.id)
+        .bind(&request.owner_sub)
+        .bind(size)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        if inserted.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(UploadReserve::Collision);
+        }
+        sqlx::query(
+            "UPDATE upload_requests \
+             SET used_bytes = used_bytes + $1, used_files = used_files + 1, updated_at = $2 \
+             WHERE id = $3",
+        )
+        .bind(size)
+        .bind(now)
+        .bind(&request.id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(UploadReserve::Reserved)
+    }
+
+    async fn commit_request_upload_async(
+        &self,
+        reservation_id: &str,
+        file: &FileRec,
+        submission: &UploadSubmission,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        // Peek only to discover the immutable request/owner lock keys. Every writer then takes
+        // locks in request -> owner guard -> reservation order, matching reserve. The reservation
+        // is re-read FOR UPDATE below before any state is committed.
+        let reservation_hint = sqlx::query(
+            "SELECT request_id, owner_sub, size FROM upload_reservations \
+             WHERE id = $1 AND recovery_lease IS NULL",
+        )
+        .bind(reservation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(reservation_hint) = reservation_hint else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        let request_id: String = reservation_hint.try_get("request_id")?;
+        let owner_sub: String = reservation_hint.try_get("owner_sub")?;
+        let reserved_size: i64 = reservation_hint.try_get("size")?;
+        if file.id != reservation_id
+            || file.owner_sub != owner_sub
+            || file.size != reserved_size
+            || submission.request_id != request_id
+            || submission.file_id != file.id
+        {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
+        let request_locked = sqlx::query("SELECT id FROM upload_requests WHERE id = $1 FOR UPDATE")
+            .bind(&request_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+        if !request_locked {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
+        // Serialize the reservation -> file conversion with every public quota decision for this
+        // owner. Without this lock, a READ COMMITTED reserve could read `files` before this commit
+        // and `upload_reservations` after it, missing the same bytes in both snapshots.
+        sqlx::query(
+            "INSERT INTO owner_storage_guards (owner_sub) VALUES ($1) ON CONFLICT DO NOTHING",
+        )
+        .bind(&owner_sub)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("SELECT owner_sub FROM owner_storage_guards WHERE owner_sub = $1 FOR UPDATE")
+            .bind(&owner_sub)
+            .fetch_one(&mut *tx)
+            .await?;
+
+        let reservation = sqlx::query(
+            "SELECT request_id, owner_sub, size FROM upload_reservations \
+             WHERE id = $1 AND recovery_lease IS NULL FOR UPDATE",
+        )
+        .bind(reservation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(reservation) = reservation else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        if reservation.try_get::<String, _>("request_id")? != request_id
+            || reservation.try_get::<String, _>("owner_sub")? != owner_sub
+            || reservation.try_get::<i64, _>("size")? != reserved_size
+        {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
+        let inserted_file = sqlx::query(
+            "INSERT INTO files \
+                 (id, owner_sub, name, content_type, size, bucket, object_key, share_token, \
+                  created_at, expires_at, share_password_hash, folder_id, trashed_at, view_count) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(&file.id)
+        .bind(&file.owner_sub)
+        .bind(&file.name)
+        .bind(&file.content_type)
+        .bind(file.size)
+        .bind(&file.bucket)
+        .bind(&file.object_key)
+        .bind(&file.share_token)
+        .bind(file.created_at)
+        .bind(file.expires_at)
+        .bind(&file.share_password_hash)
+        .bind(&file.folder_id)
+        .bind(file.trashed_at)
+        .bind(file.view_count)
+        .execute(&mut *tx)
+        .await?;
+        if inserted_file.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let inserted_receipt = sqlx::query(
+            "INSERT INTO upload_submissions \
+                 (id, request_id, file_id, name, content_type, size, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
+        )
+        .bind(&submission.id)
+        .bind(&submission.request_id)
+        .bind(&submission.file_id)
+        .bind(&submission.name)
+        .bind(&submission.content_type)
+        .bind(submission.size)
+        .bind(submission.created_at)
+        .execute(&mut *tx)
+        .await?;
+        if inserted_receipt.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query("DELETE FROM upload_reservations WHERE id = $1")
+            .bind(reservation_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    async fn release_request_upload_async(
+        &self,
+        reservation_id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let reservation_hint = sqlx::query(
+            "SELECT request_id FROM upload_reservations \
+             WHERE id = $1 AND recovery_lease IS NULL",
+        )
+        .bind(reservation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(reservation_hint) = reservation_hint else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        let request_id: String = reservation_hint.try_get("request_id")?;
+        let request_locked = sqlx::query("SELECT id FROM upload_requests WHERE id = $1 FOR UPDATE")
+            .bind(&request_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+        if !request_locked {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let reservation = sqlx::query(
+            "SELECT request_id, size FROM upload_reservations \
+             WHERE id = $1 AND recovery_lease IS NULL FOR UPDATE",
+        )
+        .bind(reservation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(reservation) = reservation else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        if reservation.try_get::<String, _>("request_id")? != request_id {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let size: i64 = reservation.try_get("size")?;
+        sqlx::query("DELETE FROM upload_reservations WHERE id = $1")
+            .bind(reservation_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE upload_requests \
+             SET used_bytes = CASE WHEN used_bytes >= $1 THEN used_bytes - $1 ELSE 0 END, \
+                 used_files = CASE WHEN used_files >= 1 THEN used_files - 1 ELSE 0 END \
+             WHERE id = $2",
+        )
+        .bind(size)
+        .bind(&request_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    async fn claim_upload_recovery_async(
+        &self,
+        lease_id: &str,
+        leased_at: i64,
+        lease_expired_before: i64,
+    ) -> Result<UploadRecoveryClaim, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE upload_reservations \
+             SET recovery_lease = $1, recovery_leased_at = $2 \
+             WHERE recovery_lease IS NULL OR recovery_leased_at <= $3",
+        )
+        .bind(lease_id)
+        .bind(leased_at)
+        .bind(lease_expired_before)
+        .execute(&mut *tx)
+        .await?;
+        let rows = sqlx::query(
+            "SELECT id FROM upload_reservations \
+             WHERE recovery_lease = $1 ORDER BY created_at ASC, id ASC",
+        )
+        .bind(lease_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let outstanding: i64 =
+            sqlx::query("SELECT CAST(COUNT(*) AS BIGINT) AS count FROM upload_reservations")
+                .fetch_one(&mut *tx)
+                .await?
+                .try_get("count")?;
+        if outstanding == 0 {
+            tx.commit().await?;
+            return Ok(UploadRecoveryClaim::Empty);
+        }
+        if rows.len() as i64 != outstanding {
+            // Roll back any rows this worker tentatively claimed. Recovery is all-or-busy: serving
+            // must not start while even one outstanding row remains under another live lease.
+            tx.rollback().await?;
+            return Ok(UploadRecoveryClaim::Busy);
+        }
+        let claimed = rows
+            .iter()
+            .map(|row| {
+                let id: String = row.try_get("id")?;
+                Ok(UploadRecoveryItem {
+                    reservation_id: id.clone(),
+                    object_key: id,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
+        tx.commit().await?;
+        Ok(UploadRecoveryClaim::Claimed(claimed))
+    }
+
+    async fn complete_upload_recovery_async(
+        &self,
+        reservation_id: &str,
+        lease_id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let reservation_hint = sqlx::query(
+            "SELECT request_id FROM upload_reservations \
+             WHERE id = $1 AND recovery_lease = $2",
+        )
+        .bind(reservation_id)
+        .bind(lease_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(reservation_hint) = reservation_hint else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        let request_id: String = reservation_hint.try_get("request_id")?;
+        let request_locked = sqlx::query("SELECT id FROM upload_requests WHERE id = $1 FOR UPDATE")
+            .bind(&request_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+        if !request_locked {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let reservation = sqlx::query(
+            "SELECT request_id, size FROM upload_reservations \
+             WHERE id = $1 AND recovery_lease = $2 FOR UPDATE",
+        )
+        .bind(reservation_id)
+        .bind(lease_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(reservation) = reservation else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        if reservation.try_get::<String, _>("request_id")? != request_id {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let size: i64 = reservation.try_get("size")?;
+        sqlx::query("DELETE FROM upload_reservations WHERE id = $1 AND recovery_lease = $2")
+            .bind(reservation_id)
+            .bind(lease_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE upload_requests \
+             SET used_bytes = CASE WHEN used_bytes >= $1 THEN used_bytes - $1 ELSE 0 END, \
+                 used_files = CASE WHEN used_files >= 1 THEN used_files - 1 ELSE 0 END \
+             WHERE id = $2",
+        )
+        .bind(size)
+        .bind(&request_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    async fn abandon_upload_recovery_async(
+        &self,
+        reservation_id: &str,
+        lease_id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE upload_reservations \
+             SET recovery_lease = NULL, recovery_leased_at = NULL \
+             WHERE id = $1 AND recovery_lease = $2",
+        )
+        .bind(reservation_id)
+        .bind(lease_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
 }
 
 #[async_trait]
@@ -2376,6 +3942,150 @@ impl Store for PgStore {
 
     async fn delete_comments_for_file(&self, file_id: &str) -> Result<(), StoreError> {
         self.delete_comments_for_file_async(file_id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn create_upload_request(&self, request: &UploadRequestRec) -> Result<bool, StoreError> {
+        self.create_upload_request_async(request)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn list_upload_requests(
+        &self,
+        owner_sub: &str,
+    ) -> Result<Vec<UploadRequestRec>, StoreError> {
+        self.list_upload_requests_async(owner_sub)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn get_upload_request(
+        &self,
+        id: &str,
+        owner_sub: &str,
+    ) -> Result<Option<UploadRequestRec>, StoreError> {
+        self.get_upload_request_async(id, owner_sub)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn get_upload_request_by_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<UploadRequestRec>, StoreError> {
+        self.get_upload_request_by_token_async(token)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn update_upload_request(&self, request: &UploadRequestRec) -> Result<bool, StoreError> {
+        self.update_upload_request_async(request)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn set_upload_request_status(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        status: &str,
+        updated_at: i64,
+    ) -> Result<bool, StoreError> {
+        self.set_upload_request_status_async(id, owner_sub, status, updated_at)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn reopen_upload_request(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        now: i64,
+        renewed_expires_at: i64,
+    ) -> Result<bool, StoreError> {
+        self.reopen_upload_request_async(id, owner_sub, now, renewed_expires_at)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn rotate_upload_request_token(
+        &self,
+        id: &str,
+        owner_sub: &str,
+        expected_token: &str,
+        token: &str,
+        updated_at: i64,
+    ) -> Result<bool, StoreError> {
+        self.rotate_upload_request_token_async(id, owner_sub, expected_token, token, updated_at)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn list_upload_submissions(
+        &self,
+        request_id: &str,
+        owner_sub: &str,
+    ) -> Result<Vec<UploadSubmission>, StoreError> {
+        self.list_upload_submissions_async(request_id, owner_sub)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn reserve_request_upload(
+        &self,
+        input: UploadReserveInput<'_>,
+    ) -> Result<UploadReserve, StoreError> {
+        self.reserve_request_upload_async(input)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn commit_request_upload(
+        &self,
+        reservation_id: &str,
+        file: &FileRec,
+        submission: &UploadSubmission,
+    ) -> Result<bool, StoreError> {
+        self.commit_request_upload_async(reservation_id, file, submission)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn release_request_upload(&self, reservation_id: &str) -> Result<bool, StoreError> {
+        self.release_request_upload_async(reservation_id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn claim_upload_recovery(
+        &self,
+        lease_id: &str,
+        leased_at: i64,
+        lease_expired_before: i64,
+    ) -> Result<UploadRecoveryClaim, StoreError> {
+        self.claim_upload_recovery_async(lease_id, leased_at, lease_expired_before)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn complete_upload_recovery(
+        &self,
+        reservation_id: &str,
+        lease_id: &str,
+    ) -> Result<bool, StoreError> {
+        self.complete_upload_recovery_async(reservation_id, lease_id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn abandon_upload_recovery(
+        &self,
+        reservation_id: &str,
+        lease_id: &str,
+    ) -> Result<bool, StoreError> {
+        self.abandon_upload_recovery_async(reservation_id, lease_id)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
     }

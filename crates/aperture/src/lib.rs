@@ -34,8 +34,11 @@
 //!   subtree (subfolders + files + version blobs) (CSRF) [SSO]
 //! - `POST /folders/{id}/share` — set a folder's public share-link expiry + optional password (CSRF) [SSO]
 //! - `POST /folders/{id}/revoke` — revoke a folder's public share link (CSRF) [SSO]
-//! - `POST /folders/{id}/upload` — create a public upload-only request link (CSRF) [SSO]
-//! - `POST /folders/{id}/upload/revoke` — revoke a public upload request link (CSRF) [SSO]
+//! - `GET /requests` / `GET /requests/{id}` — list and inspect owner-scoped upload requests [SSO]
+//! - `POST /folders/{id}/requests` — create an independent, finite upload request (CSRF) [SSO]
+//! - `POST /requests/{id}/update|close|reopen|rotate` — manage policy and lifecycle (CSRF) [SSO]
+//! - `POST /folders/{id}/upload|upload/revoke` — compatibility aliases for legacy folder upload
+//!   links; newly created capabilities are backed by an independent request record [SSO]
 //! - `GET /admin` — per-owner storage usage + quota overrides (admin groups only) [SSO]
 //! - `POST /admin/quota` — set/clear an owner's quota override (CSRF) [SSO, admin]
 //! - `GET /s/{token}` — fetch a shared file by unguessable token, NO SSO (410 past expiry;
@@ -43,7 +46,8 @@
 //! - `POST /s/{token}` — submit a protected share link's password, NO SSO [PUBLIC `/s/` prefix]
 //! - `GET /s/folder/{token}` — public index of a shared folder's files; `POST` unlocks a protected one;
 //!   `GET|POST /s/folder/{token}/f/{fid}` downloads one listed file, NO SSO [PUBLIC `/s/folder/` prefix]
-//! - `GET|POST /u/{token}` — public upload-only inbox for a folder, NO SSO [PUBLIC `/u/` prefix]
+//! - `GET|POST /u/{token}` — public upload-only request room, NO SSO; cannot enumerate its private
+//!   destination and enforces expiry/type/file/count/byte budgets [PUBLIC `/u/` prefix]
 //! - `GET /s/share-room.css|js` — product-owned public Share Room assets [PUBLIC, read-only]
 
 pub mod audit;
@@ -67,7 +71,7 @@ use rand::RngCore;
 use crate::audit::AuditSink;
 use crate::blobs::{Blobs, MemoryBlobs, S3Blobs};
 use crate::config::Config;
-use crate::store::{InMemoryStore, PgStore, Store};
+use crate::store::{InMemoryStore, PgStore, Store, UploadRecoveryClaim};
 
 /// Shared application state. Cheap to clone (everything behind `Arc` / a cloneable sink).
 #[derive(Clone)]
@@ -138,6 +142,13 @@ pub fn app(state: AppState) -> Router {
             "/folders/{id}/upload/revoke",
             post(handlers::files::revoke_folder_upload),
         )
+        .route("/requests", get(handlers::requests::index))
+        .route("/requests/{id}", get(handlers::requests::detail))
+        .route("/folders/{id}/requests", post(handlers::requests::create))
+        .route("/requests/{id}/update", post(handlers::requests::update))
+        .route("/requests/{id}/close", post(handlers::requests::close))
+        .route("/requests/{id}/reopen", post(handlers::requests::reopen))
+        .route("/requests/{id}/rotate", post(handlers::requests::rotate))
         .route(
             "/s/{token}",
             get(handlers::files::share).post(handlers::files::share_unlock),
@@ -291,6 +302,8 @@ pub async fn build_state_from_env() -> Result<AppState, String> {
         other => return Err(format!("unknown APERTURE_BLOBS={other} (use memory|s3)")),
     };
 
+    recover_stale_request_uploads(store.as_ref(), blobs.as_ref()).await?;
+
     // The audit sink is enabled by `AUDIT_ENABLED` + `WATCHTOWER_URL` + `AUDIT_INGEST_TOKEN`;
     // any misconfiguration only warns and turns audit OFF (never fails startup).
     let audit = AuditSink::start(
@@ -305,6 +318,86 @@ pub async fn build_state_from_env() -> Result<AppState, String> {
         blobs,
         audit,
     })
+}
+
+/// Reconcile public-upload reservations left by a process that stopped after reserving budget and
+/// possibly writing its blob, but before committing file metadata. The Store lease is durable and
+/// exactly one startup may complete each row: bytes are deleted first, then counters are returned.
+/// A delete/metadata failure leaves the row unclaimed for the next startup and fails this startup.
+///
+/// Embedders that construct Aperture state themselves (the Scriptoria monolith) must call this
+/// after the blob backend is ready and before serving the router.
+pub async fn recover_stale_request_uploads(
+    store: &dyn Store,
+    blobs: &dyn Blobs,
+) -> Result<(), String> {
+    const RECOVERY_LEASE_TTL_SECS: i64 = 5 * 60;
+
+    let leased_at = now_secs();
+    let lease_id = random_alnum(32);
+    let claim = store
+        .claim_upload_recovery(
+            &lease_id,
+            leased_at,
+            leased_at.saturating_sub(RECOVERY_LEASE_TTL_SECS),
+        )
+        .await
+        .map_err(|error| format!("claim stale upload reservations: {error}"))?;
+    let items = match claim {
+        UploadRecoveryClaim::Empty => return Ok(()),
+        UploadRecoveryClaim::Busy => {
+            return Err(
+                "stale upload reservation recovery is already leased by another startup"
+                    .to_string(),
+            )
+        }
+        UploadRecoveryClaim::Claimed(items) => items,
+    };
+
+    for (index, item) in items.iter().enumerate() {
+        if let Err(error) = blobs.delete(&item.object_key).await {
+            for pending in &items[index..] {
+                let _ = store
+                    .abandon_upload_recovery(&pending.reservation_id, &lease_id)
+                    .await;
+            }
+            return Err(format!(
+                "delete stale upload blob {}: {error}",
+                item.object_key
+            ));
+        }
+        match store
+            .complete_upload_recovery(&item.reservation_id, &lease_id)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                for pending in &items[index..] {
+                    let _ = store
+                        .abandon_upload_recovery(&pending.reservation_id, &lease_id)
+                        .await;
+                }
+                return Err(format!(
+                    "stale upload reservation {} lost its recovery lease",
+                    item.reservation_id
+                ));
+            }
+            Err(error) => {
+                for pending in &items[index..] {
+                    let _ = store
+                        .abandon_upload_recovery(&pending.reservation_id, &lease_id)
+                        .await;
+                }
+                return Err(format!(
+                    "complete stale upload reservation {}: {error}",
+                    item.reservation_id
+                ));
+            }
+        }
+    }
+
+    tracing::info!(count = items.len(), "stale public uploads recovered");
+    Ok(())
 }
 
 /// Interpret a boolean-ish env var (`on` / `true` / `1` / `yes`, case-insensitive).

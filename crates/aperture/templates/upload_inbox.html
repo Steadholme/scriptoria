@@ -21,11 +21,13 @@
       <div class="sr-card__icon" aria-hidden="true">⇧</div>
       <p class="sr-eyebrow">Files requested</p>
       <h1 id="inboxTitle">{{HEADING}}</h1>
-      <p class="sr-summary">Send files directly to this private request folder. Existing files and the owner’s Drive remain hidden.</p>
+      <p class="sr-summary">{{DESCRIPTION}}</p>
       <div class="sr-chips" aria-label="Upload room status">
         <span class="sr-chip sr-chip--safe">Upload only</span>
         <span class="sr-chip">Files stay private</span>
         <span class="sr-chip">Up to {{MAX_UPLOAD}} each</span>
+        <span class="sr-chip">{{REMAINING_FILES}} slots left</span>
+        <span class="sr-chip">{{REMAINING_BYTES}} remaining</span>
       </div>
 
       {{STATUS}}
@@ -33,7 +35,7 @@
 
       <form class="sr-dropzone" method="post" action="{{ACTION}}" enctype="multipart/form-data" data-upload-form>
         <input type="hidden" name="csrf_token" value="{{CSRF}}">
-        <input id="fileInput" class="sr-dropzone__input" type="file" name="file" required>
+        <input id="fileInput" class="sr-dropzone__input" type="file" name="file"{{ACCEPT}} required>
         <label class="sr-dropzone__pick" for="fileInput">
           <span class="sr-dropzone__mark" aria-hidden="true">+</span>
           <strong>Choose a file</strong>
@@ -49,7 +51,7 @@
         <ul class="sr-queue__list" data-upload-list></ul>
       </section>
 
-      <p class="sr-trust-note">This capability allows uploads only. Visitors cannot browse, preview, replace, or download anything already in the folder.</p>
+      <p class="sr-trust-note">Accepted types: {{ALLOWED_TYPES}}. This capability allows uploads only. Visitors cannot browse, preview, replace, or download anything already in the folder.</p>
     </section>
   </main>
 

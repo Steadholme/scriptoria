@@ -24,10 +24,16 @@ use crate::error::AppError;
 use crate::handlers::{
     app_css, dynamic_js, esc, expiry_options, fmt_ts, human_size, parse_expiry,
     render_share_room_error, resolve_content_type, safe_filename, share_room_html,
-    share_room_html_with_csrf, userbox, FILE_SVG, SHIELD_SVG,
+    share_room_html_with_csrf, sniff_verified_upload_type, userbox, FILE_SVG, SHIELD_SVG,
 };
-use crate::model::{FileComment, FileRec, FolderRec, VersionRec};
-use crate::store::{FolderDelete, MAX_VERSIONS_PER_FILE};
+use crate::model::{
+    FileComment, FileRec, FolderRec, UploadRequestRec, UploadSubmission, VersionRec,
+};
+use crate::store::{
+    FolderDelete, UploadReserve, UploadReserveInput, DEFAULT_REQUEST_ALLOWED_TYPES,
+    DEFAULT_REQUEST_MAX_FILES, DEFAULT_REQUEST_MAX_FILE_BYTES, DEFAULT_REQUEST_MAX_TOTAL_BYTES,
+    MAX_VERSIONS_PER_FILE,
+};
 use crate::{now_secs, random_alnum, AppState};
 
 /// Length of the short random file id / object key (62-symbol alphabet, ~59 bits at 10 chars).
@@ -42,6 +48,8 @@ const SHARE_TOKEN_LEN: usize = 32;
 const UPLOAD_TOKEN_LEN: usize = 32;
 /// Length of a file comment id.
 const COMMENT_ID_LEN: usize = 10;
+/// Length of an immutable upload-request receipt id.
+const SUBMISSION_ID_LEN: usize = 12;
 /// Hard cap on a stored display file name (characters).
 const MAX_NAME_CHARS: usize = 255;
 /// Hard cap on a submitted comment body (characters).
@@ -335,8 +343,8 @@ pub async fn upload(
         size,
         bucket: state.blobs.bucket().to_string(),
         object_key: String::new(),
-        // A fresh upload is shareable immediately with no expiry and no password (the owner tunes
-        // the share-link lifecycle afterwards on the detail page). Backward compatible.
+        // Private by default. A public capability exists only after the owner explicitly creates it
+        // from the detail page.
         share_token: None,
         created_at: now,
         expires_at: None,
@@ -347,13 +355,11 @@ pub async fn upload(
         view_count: 0,
     };
 
-    // Reserve a unique row (id + share token) BEFORE writing the blob, retrying on the rare
-    // unique collision. Cheap — no bytes have been uploaded yet.
+    // Reserve a unique private row BEFORE writing the blob, retrying on the rare id collision.
     let mut reserved = false;
     for _ in 0..6 {
         rec.id = random_alnum(FILE_ID_LEN);
         rec.object_key = rec.id.clone();
-        rec.share_token = Some(random_alnum(SHARE_TOKEN_LEN));
         if state.store.create(&rec).await? {
             reserved = true;
             break;
@@ -1003,6 +1009,12 @@ fn share_room_response(result: Result<Response, AppError>) -> Response {
                     "Share not found",
                     "This share link is invalid or has been removed.".to_string(),
                 ),
+                AppError::Gone(detail) if detail.contains("upload request") => (
+                    StatusCode::GONE,
+                    "Upload room closed",
+                    "This upload room is closed or has expired and is no longer accepting files."
+                        .to_string(),
+                ),
                 AppError::Gone(_) => (
                     StatusCode::GONE,
                     "Share expired",
@@ -1283,9 +1295,9 @@ async fn upload_inbox_inner(
     headers: HeaderMap,
     token: String,
 ) -> Result<Response, AppError> {
-    let folder = load_upload_folder(&state, &token).await?;
+    let request = load_upload_request(&state, &token).await?;
     let csrf = auth::existing_or_new_csrf_token(&headers);
-    let html = render_upload_inbox(&state.config, &folder, &token, &csrf, None);
+    let html = render_upload_inbox(&state.config, &request, &token, &csrf, None);
     Ok(share_room_html_with_csrf(StatusCode::OK, html, &csrf))
 }
 
@@ -1315,7 +1327,14 @@ async fn upload_inbox_submit_inner(
     token: String,
     mut multipart: Multipart,
 ) -> Result<Response, AppError> {
-    let folder = load_upload_folder(&state, &token).await?;
+    let request = load_upload_request(&state, &token).await?;
+    // A request whose private destination disappeared is unusable. Keep the public response
+    // indistinguishable from an invalid/revoked capability.
+    state
+        .store
+        .get_folder(&request.folder_id, &request.owner_sub)
+        .await?
+        .ok_or_else(|| AppError::NotFound("The upload destination is unavailable.".to_string()))?;
     let mut csrf_field = String::new();
     let mut file: Option<(String, String, Vec<u8>)> = None;
 
@@ -1373,62 +1392,88 @@ async fn upload_inbox_submit_inner(
         )));
     }
 
-    let content_type = resolve_content_type(&bytes, &client_type);
+    let verified_content_type = sniff_verified_upload_type(&bytes);
+    let content_type_verified = verified_content_type.is_some();
+    let content_type = verified_content_type
+        .map(str::to_string)
+        .unwrap_or_else(|| resolve_content_type(&bytes, &client_type));
     let size = bytes.len() as i64;
-    if let Some(quota) = effective_quota(
-        state.store.get_quota(&folder.owner_sub).await?,
+    let owner_quota = effective_quota(
+        state.store.get_quota(&request.owner_sub).await?,
         state.config.default_quota_bytes,
-    ) {
-        let used = state.store.usage_for_owner(&folder.owner_sub).await?;
-        if used.saturating_add(size) > quota {
-            tracing::info!(
-                owner = folder.owner_sub,
-                folder = folder.id,
-                used,
-                size,
-                quota,
-                "public upload rejected: over quota"
-            );
-            state.audit.emit(AuditEvent::warning(
-                "folder.upload_inbox.quota.reject",
-                &folder.owner_sub,
-                &folder.id,
-                "over-quota public upload rejected",
-            ));
-            return Err(AppError::QuotaExceeded(format!(
-                "Not enough storage. This file is {size}, but only {free} of the owner's {quota} quota is free.",
-                size = human_size(size),
-                free = human_size((quota - used).max(0)),
-                quota = human_size(quota),
-            )));
-        }
-    }
-
-    let unique_name = unique_upload_name(&state, &folder.owner_sub, &folder.id, &name).await?;
+    );
+    let unique_name =
+        unique_upload_name(&state, &request.owner_sub, &request.folder_id, &name).await?;
+    let now = now_secs();
     let mut rec = FileRec {
         id: String::new(),
-        owner_sub: folder.owner_sub.clone(),
+        owner_sub: request.owner_sub.clone(),
         name: unique_name,
         content_type,
         size,
         bucket: state.blobs.bucket().to_string(),
         object_key: String::new(),
+        // Files received from an anonymous request are private until the owner explicitly shares
+        // them. Possession of an upload capability never creates a read capability.
         share_token: None,
-        created_at: now_secs(),
+        created_at: now,
         expires_at: None,
         share_password_hash: None,
-        folder_id: Some(folder.id.clone()),
+        folder_id: Some(request.folder_id.clone()),
         trashed_at: 0,
         view_count: 0,
     };
+
+    // Claim request budget + global owner quota in one Store operation BEFORE touching Cairn. The
+    // Postgres implementation locks both the request and an owner guard row, so concurrent uploads
+    // (even via different rooms) cannot pass on the same remaining bytes.
     let mut reserved = false;
     for _ in 0..6 {
         rec.id = random_alnum(FILE_ID_LEN);
         rec.object_key = rec.id.clone();
-        rec.share_token = Some(random_alnum(SHARE_TOKEN_LEN));
-        if state.store.create(&rec).await? {
-            reserved = true;
-            break;
+        match state
+            .store
+            .reserve_request_upload(UploadReserveInput {
+                request_id: &request.id,
+                expected_token: &token,
+                reservation_id: &rec.id,
+                size,
+                content_type: &rec.content_type,
+                content_type_verified,
+                owner_quota,
+                now,
+            })
+            .await?
+        {
+            UploadReserve::Reserved => {
+                reserved = true;
+                break;
+            }
+            UploadReserve::Collision => continue,
+            UploadReserve::Unavailable => {
+                return Err(AppError::Gone(
+                    "This upload request is closed or expired.".to_string(),
+                ))
+            }
+            UploadReserve::TypeDenied => {
+                return Err(AppError::BadRequest(
+                    "This file type is not accepted by the upload request.".to_string(),
+                ))
+            }
+            UploadReserve::FileTooLarge
+            | UploadReserve::TotalBudgetExceeded
+            | UploadReserve::FileCountExceeded
+            | UploadReserve::OwnerQuotaExceeded => {
+                state.audit.emit(AuditEvent::warning(
+                    "upload_request.budget.reject",
+                    &request.owner_sub,
+                    &request.id,
+                    "public upload budget rejected",
+                ));
+                return Err(AppError::QuotaExceeded(
+                    "upload request budget unavailable".to_string(),
+                ));
+            }
         }
     }
     if !reserved {
@@ -1437,32 +1482,100 @@ async fn upload_inbox_submit_inner(
         ));
     }
     if let Err(e) = state.blobs.put(&rec.object_key, bytes).await {
-        let _ = state.store.delete(&rec.id, &folder.owner_sub).await;
+        // `put` may have failed after a partial backend write. Delete is idempotent, then release
+        // the database reservation. If deletion fails, retain the durable reservation: startup
+        // recovery still knows the object key and can retry without losing the cleanup anchor.
+        compensate_failed_request_upload(&state, &rec.object_key, &rec.id).await;
         return Err(e.into());
+    }
+
+    let mut committed = false;
+    for _ in 0..6 {
+        let submission = UploadSubmission {
+            id: random_alnum(SUBMISSION_ID_LEN),
+            request_id: request.id.clone(),
+            file_id: rec.id.clone(),
+            name: rec.name.clone(),
+            content_type: rec.content_type.clone(),
+            size: rec.size,
+            created_at: now,
+        };
+        match state
+            .store
+            .commit_request_upload(&rec.id, &rec, &submission)
+            .await
+        {
+            Ok(true) => {
+                committed = true;
+                break;
+            }
+            Ok(false) => continue,
+            Err(error) => {
+                compensate_failed_request_upload(&state, &rec.object_key, &rec.id).await;
+                return Err(error.into());
+            }
+        }
+    }
+    if !committed {
+        compensate_failed_request_upload(&state, &rec.object_key, &rec.id).await;
+        return Err(AppError::Internal(
+            "could not commit public upload receipt".to_string(),
+        ));
     }
 
     tracing::info!(
         id = rec.id,
-        owner = folder.owner_sub,
-        folder = folder.id,
+        owner = request.owner_sub,
+        request = request.id,
         size,
         "public upload accepted"
     );
     state.audit.emit(AuditEvent::info(
-        "folder.upload_inbox.file",
-        &folder.owner_sub,
-        &folder.id,
+        "upload_request.file",
+        &request.owner_sub,
+        &request.id,
         "file",
     ));
     let status = Some(format!("Uploaded {}.", rec.name));
     let html = render_upload_inbox(
         &state.config,
-        &folder,
+        &request,
         &token,
         &csrf_field,
         status.as_deref(),
     );
     Ok(share_room_html_with_csrf(StatusCode::OK, html, &csrf_field))
+}
+
+/// Compensate an upload that reserved database capacity but did not commit metadata. Cairn bytes
+/// are always removed first. Only a confirmed idempotent delete permits releasing the reservation;
+/// otherwise the row remains the durable object-key recovery anchor for a later startup.
+async fn compensate_failed_request_upload(
+    state: &AppState,
+    object_key: &str,
+    reservation_id: &str,
+) {
+    if let Err(error) = state.blobs.delete(object_key).await {
+        tracing::error!(
+            reservation = reservation_id,
+            object_key,
+            error = %error,
+            "public upload compensation kept reservation after blob delete failure"
+        );
+        return;
+    }
+    match state.store.release_request_upload(reservation_id).await {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            reservation = reservation_id,
+            "public upload compensation could not release reservation; recovery retains authority"
+        ),
+        Err(error) => tracing::error!(
+            reservation = reservation_id,
+            error = %error,
+            "public upload compensation kept reservation after release failure"
+        ),
+    }
 }
 
 /// Load a folder by its public share token, enforcing the lifecycle (missing/revoked -> 404,
@@ -1483,20 +1596,27 @@ async fn load_shared_folder(state: &AppState, token: &str) -> Result<FolderRec, 
     Ok(folder)
 }
 
-/// Load a folder by upload-inbox token. Missing/revoked tokens are indistinguishable.
-async fn load_upload_folder(state: &AppState, token: &str) -> Result<FolderRec, AppError> {
-    state
+/// Load an independent upload request by capability token. Missing/rotated tokens are
+/// indistinguishable; closed and expired requests return 410 without leaking their destination.
+async fn load_upload_request(state: &AppState, token: &str) -> Result<UploadRequestRec, AppError> {
+    let request = state
         .store
-        .get_folder_by_upload_token(token)
+        .get_upload_request_by_token(token)
         .await?
         .ok_or_else(|| {
             AppError::NotFound("This upload link is invalid or has been removed.".to_string())
-        })
+        })?;
+    if !request.is_open() || request.is_expired(now_secs()) {
+        return Err(AppError::Gone(
+            "This upload request is closed or expired.".to_string(),
+        ));
+    }
+    Ok(request)
 }
 
 fn render_upload_inbox(
     config: &Config,
-    folder: &FolderRec,
+    request: &UploadRequestRec,
     token: &str,
     csrf: &str,
     status: Option<&str>,
@@ -1505,12 +1625,39 @@ fn render_upload_inbox(
         Some(msg) => format!("<p class=\"sr-status\" role=\"status\">{}</p>", esc(msg)),
         None => String::new(),
     };
+    let accept = if request.allowed_types == "*/*" {
+        String::new()
+    } else {
+        format!(" accept=\"{}\"", esc(&request.allowed_types))
+    };
     UPLOAD_INBOX_HTML
-        .replace("{{HEADING}}", &esc(&folder.name))
+        .replace("{{HEADING}}", &esc(&request.title))
+        .replace(
+            "{{DESCRIPTION}}",
+            &esc(if request.description.is_empty() {
+                "Send the requested files directly to this private upload room."
+            } else {
+                &request.description
+            }),
+        )
         .replace(
             "{{MAX_UPLOAD}}",
-            &esc(&human_size(config.max_upload as i64)),
+            &esc(&human_size(
+                request.max_file_bytes.min(config.max_upload as i64),
+            )),
         )
+        .replace(
+            "{{REMAINING_FILES}}",
+            &(request.max_files - request.used_files).max(0).to_string(),
+        )
+        .replace(
+            "{{REMAINING_BYTES}}",
+            &esc(&human_size(
+                (request.max_total_bytes - request.used_bytes).max(0),
+            )),
+        )
+        .replace("{{ALLOWED_TYPES}}", &esc(&request.allowed_types))
+        .replace("{{ACCEPT}}", &accept)
         .replace("{{STATUS}}", &status_html)
         .replace("{{ACTION}}", &format!("/u/{}", esc(token)))
         .replace("{{CSRF}}", &esc(csrf))
@@ -2100,6 +2247,57 @@ pub async fn configure_folder_upload(
         .store
         .configure_folder_upload(&id, &actor.subject, Some(token))
         .await?;
+    let token = state
+        .store
+        .get_folder(&id, &actor.subject)
+        .await?
+        .and_then(|folder| folder.upload_token)
+        .ok_or_else(|| AppError::Internal("upload token was not persisted".to_string()))?;
+    if state
+        .store
+        .get_upload_request_by_token(&token)
+        .await?
+        .is_none()
+    {
+        let now = now_secs();
+        let mut request = UploadRequestRec {
+            id: String::new(),
+            owner_sub: actor.subject.clone(),
+            folder_id: id.clone(),
+            token,
+            title: format!("{} uploads", folder.name),
+            description: String::new(),
+            status: "open".to_string(),
+            expires_at: Some(now.saturating_add(7 * 24 * 60 * 60)),
+            max_file_bytes: DEFAULT_REQUEST_MAX_FILE_BYTES.min(state.config.max_upload as i64),
+            max_total_bytes: DEFAULT_REQUEST_MAX_TOTAL_BYTES,
+            max_files: DEFAULT_REQUEST_MAX_FILES,
+            used_bytes: 0,
+            used_files: 0,
+            allowed_types: DEFAULT_REQUEST_ALLOWED_TYPES.to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        let mut created = false;
+        for _ in 0..6 {
+            request.id = random_alnum(12);
+            if state.store.create_upload_request(&request).await? {
+                created = true;
+                break;
+            }
+        }
+        if !created {
+            return Err(AppError::Internal(
+                "could not create upload request".to_string(),
+            ));
+        }
+    }
+    // The independent request row is authoritative. Clear the deprecated folder column so future
+    // migrations cannot resurrect this pre-rotation token.
+    state
+        .store
+        .configure_folder_upload(&id, &actor.subject, None)
+        .await?;
     tracing::info!(id, owner = actor.subject, "folder upload inbox configured");
     state.audit.emit(AuditEvent::notice(
         "folder.upload_inbox.update",
@@ -2123,12 +2321,35 @@ pub async fn revoke_folder_upload(
         ));
     }
     let actor = auth::identity(&headers);
+    let folder = state
+        .store
+        .get_folder(&id, &actor.subject)
+        .await?
+        .ok_or_else(|| AppError::NotFound("No such folder.".to_string()))?;
     if !state
         .store
         .configure_folder_upload(&id, &actor.subject, None)
         .await?
     {
         return Err(AppError::NotFound("No such folder.".to_string()));
+    }
+    if let Some(token) = folder.upload_token {
+        if let Some(request) = state.store.get_upload_request_by_token(&token).await? {
+            let _ = state
+                .store
+                .set_upload_request_status(&request.id, &actor.subject, "closed", now_secs())
+                .await?;
+        }
+    }
+    // Once migrated, `folders.upload_token` is intentionally NULL. Preserve the legacy revoke
+    // route by closing every independent request targeting this folder.
+    for request in state.store.list_upload_requests(&actor.subject).await? {
+        if request.folder_id == id && request.is_open() {
+            let _ = state
+                .store
+                .set_upload_request_status(&request.id, &actor.subject, "closed", now_secs())
+                .await?;
+        }
     }
     tracing::info!(id, owner = actor.subject, "folder upload inbox revoked");
     state.audit.emit(AuditEvent::notice(
@@ -3266,39 +3487,21 @@ fn render_folder_share_section(config: &Config, folder: &FolderRec, csrf: &str) 
 
 /// Build the public upload-inbox control for a folder. This is intentionally separate from the
 /// folder share link: upload visitors get `/u/{token}`, which never lists or downloads files.
-fn render_folder_upload_section(config: &Config, folder: &FolderRec, csrf: &str) -> String {
-    match &folder.upload_token {
-        Some(token) => {
-            let upload_url = format!("{}/u/{}", config.public_base, token);
-            format!(
-                "<div class=\"field\">\
-                   <label for=\"folderUploadUrl\">Upload request link</label>\
-                   <div class=\"share-row\">\
-                     <input id=\"folderUploadUrl\" type=\"text\" readonly value=\"{url}\">\
-                   </div>\
-                   <p class=\"muted\">Visitors can upload into this folder, but cannot view existing files.</p>\
-                 </div>\
-                 <form class=\"folder-form\" method=\"post\" action=\"/folders/{id}/upload/revoke\" \
-                   onsubmit=\"return confirm('Revoke this upload request link?');\">\
-                   <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
-                   <button class=\"btn btn-danger btn-sm\" type=\"submit\">Revoke upload request</button>\
-                 </form>",
-                url = esc(&upload_url),
-                id = esc(&folder.id),
-                csrf = esc(csrf),
-            )
-        }
-        None => format!(
-            "<form class=\"folder-form\" method=\"post\" action=\"/folders/{id}/upload\">\
-               <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
-               <label>Request files</label>\
-               <p class=\"muted\">Create a public upload-only link for this folder.</p>\
-               <button class=\"btn btn-secondary btn-sm\" type=\"submit\">Create upload request</button>\
-             </form>",
-            id = esc(&folder.id),
-            csrf = esc(csrf),
-        ),
-    }
+fn render_folder_upload_section(_config: &Config, folder: &FolderRec, csrf: &str) -> String {
+    format!(
+        "<form class=\"folder-form\" method=\"post\" action=\"/folders/{id}/requests\">\
+           <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+           <input type=\"hidden\" name=\"title\" value=\"{title}\">\
+           <input type=\"hidden\" name=\"expiry\" value=\"604800\">\
+           <label>Request files</label>\
+           <p class=\"muted\">Create a finite upload-only room, then manage its deadline and budgets.</p>\
+           <div class=\"share-row\"><button class=\"btn btn-secondary btn-sm\" type=\"submit\">Create upload request</button>\
+           <a class=\"btn btn-ghost btn-sm\" href=\"/requests\">Manage requests</a></div>\
+         </form>",
+        id = esc(&folder.id),
+        csrf = esc(csrf),
+        title = esc(&format!("{} uploads", folder.name)),
+    )
 }
 
 fn render_cards(files: &[FileRec], csrf: &str) -> String {

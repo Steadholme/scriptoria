@@ -49,6 +49,22 @@ pub struct Post {
     /// an arbitrary third-party host. Backed by a nullable TEXT column; empty string when the post
     /// has no cover. Additive: pre-existing rows read back as NULL -> empty string.
     pub cover_url: String,
+    /// Author-written summary used by cards and feeds. Empty falls back to a body-derived excerpt.
+    /// Nullable in PostgreSQL for additive migration compatibility; exposed as an empty string here.
+    pub custom_excerpt: String,
+    /// Optional search-engine title. Empty falls back to the post title.
+    pub meta_title: String,
+    /// Optional search-engine description. Empty falls back to the custom/body excerpt.
+    pub meta_description: String,
+    /// Optional absolute HTTP(S) canonical URL. Validation happens at the authoring boundary and
+    /// rendering re-checks it defensively before emitting a `<link rel="canonical">`.
+    pub canonical_url: String,
+    /// Optional social-card title. Empty falls back through `meta_title` to the post title.
+    pub social_title: String,
+    /// Optional social-card description. Empty falls back through `meta_description` and excerpt.
+    pub social_description: String,
+    /// Optional social-card image. It uses the same trusted Aperture URL policy as cover images.
+    pub social_image: String,
 }
 
 impl Post {
@@ -60,6 +76,16 @@ impl Post {
     /// True when this is a checked "published" post whose publish time is still in the future.
     pub fn is_scheduled_at(&self, now: i64) -> bool {
         self.published && self.publish_at > now
+    }
+
+    /// The chronological publication instant used by RSS. Legacy immediate posts use their
+    /// creation time; scheduled posts use the instant at which they actually became public.
+    pub fn effective_publish_at(&self) -> i64 {
+        if self.publish_at > 0 {
+            self.publish_at
+        } else {
+            self.created_at
+        }
     }
 
     /// Advance the content/cache version even when two mutations land in the same wall-clock
@@ -85,6 +111,15 @@ impl PostCursor {
             id: post.id.clone(),
         }
     }
+}
+
+/// Lightweight authoritative sitemap projection. A sitemap needs no body, author, tags, or social
+/// metadata, so keeping this separate from [`Post`] bounds memory even at the protocol ceiling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SitemapEntry {
+    pub slug: String,
+    pub updated_at: i64,
+    pub canonical_url: String,
 }
 
 /// Single-row site settings, editable from /admin and applied to the index/head. Kept in its own
@@ -160,6 +195,12 @@ pub trait Store: Send + Sync {
         now: i64,
         viewer_sub: Option<&str>,
     ) -> Option<Post>;
+    /// The 100 most recently effective public publications, independent of homepage pinning.
+    /// Implementations apply the public-due predicate before ordering and limiting.
+    async fn feed_posts(&self, now: i64) -> Result<Vec<Post>, StoreError>;
+    /// Public-due sitemap rows as a lightweight bounded projection. Backend failures are returned
+    /// so the HTTP layer never mistakes a partial/failed database read for a valid `200` sitemap.
+    async fn sitemap_entries(&self, now: i64) -> Result<Vec<SitemapEntry>, StoreError>;
     /// Up to `limit` public posts sharing tags with `tags`, ranked by shared-tag count.
     async fn related_posts_by_tags(
         &self,
@@ -301,6 +342,38 @@ impl Store for InMemoryStore {
             .cloned()
     }
 
+    async fn feed_posts(&self, now: i64) -> Result<Vec<Post>, StoreError> {
+        let posts = self.posts.lock().expect("posts lock poisoned");
+        let mut public: Vec<&Post> = posts
+            .iter()
+            .filter(|post| post.is_public_at(now))
+            .collect();
+        sort_feed_refs(&mut public);
+        Ok(public
+            .into_iter()
+            .take(crate::config::FEED_ITEM_LIMIT)
+            .cloned()
+            .collect())
+    }
+
+    async fn sitemap_entries(&self, now: i64) -> Result<Vec<SitemapEntry>, StoreError> {
+        let posts = self.posts.lock().expect("posts lock poisoned");
+        let mut public: Vec<&Post> = posts
+            .iter()
+            .filter(|post| post.is_public_at(now))
+            .collect();
+        sort_feed_refs(&mut public);
+        Ok(public
+            .into_iter()
+            .take(crate::config::SITEMAP_POST_LIMIT)
+            .map(|post| SitemapEntry {
+                slug: post.slug.clone(),
+                updated_at: post.updated_at,
+                canonical_url: post.canonical_url.clone(),
+            })
+            .collect())
+    }
+
     async fn related_posts_by_tags(
         &self,
         slug: &str,
@@ -341,6 +414,13 @@ impl Store for InMemoryStore {
                 existing.pinned = post.pinned;
                 existing.tags = post.tags.clone();
                 existing.cover_url = post.cover_url.clone();
+                existing.custom_excerpt = post.custom_excerpt.clone();
+                existing.meta_title = post.meta_title.clone();
+                existing.meta_description = post.meta_description.clone();
+                existing.canonical_url = post.canonical_url.clone();
+                existing.social_title = post.social_title.clone();
+                existing.social_description = post.social_description.clone();
+                existing.social_image = post.social_image.clone();
                 Ok(())
             }
             None => Err(StoreError::Backend(format!(
@@ -494,6 +574,16 @@ fn sort_public(posts: &mut [Post]) {
     });
 }
 
+/// Authoritative RSS/sitemap chronology over borrowed rows, deliberately independent of homepage
+/// pins. Memory discovery clones only the selected top rows/projection, never every post body.
+fn sort_feed_refs(posts: &mut [&Post]) {
+    posts.sort_by(|a, b| {
+        b.effective_publish_at()
+            .cmp(&a.effective_publish_at())
+            .then_with(|| b.id.cmp(&a.id))
+    });
+}
+
 /// Whether `post` sorts strictly after `cursor` in the public keyset order.
 fn after_public_cursor(post: &Post, cursor: &PostCursor) -> bool {
     if post.pinned != cursor.pinned {
@@ -554,7 +644,8 @@ use sqlx::Row;
 
 const POST_COLS: &str = "SELECT id, slug, title, body_md, author_sub, author_email, \
                          created_at, updated_at, published, publish_at, featured, pinned, \
-                         tags, cover_url \
+                         tags, cover_url, custom_excerpt, meta_title, meta_description, \
+                         canonical_url, social_title, social_description, social_image \
                          FROM posts";
 
 /// PostgreSQL-backed [`Store`]. Holds a `PgPool`; the async `Mutex` serializes index rebuilds so a
@@ -628,6 +719,23 @@ impl PgStore {
         sqlx::query("ALTER TABLE posts ADD COLUMN IF NOT EXISTS cover_url TEXT")
             .execute(&self.pool)
             .await?;
+        // Additive publication metadata. Nullable columns let legacy rows migrate without a
+        // table rewrite; row mapping normalizes NULL to the product's empty/fallback semantics.
+        for column in [
+            "custom_excerpt",
+            "meta_title",
+            "meta_description",
+            "canonical_url",
+            "social_title",
+            "social_description",
+            "social_image",
+        ] {
+            sqlx::query(&format!(
+                "ALTER TABLE posts ADD COLUMN IF NOT EXISTS {column} TEXT"
+            ))
+            .execute(&self.pool)
+            .await?;
+        }
         // Backs the newest-first index scan.
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts (created_at)")
             .execute(&self.pool)
@@ -854,6 +962,27 @@ impl PgStore {
             cover_url: row
                 .try_get::<Option<String>, _>("cover_url")?
                 .unwrap_or_default(),
+            custom_excerpt: row
+                .try_get::<Option<String>, _>("custom_excerpt")?
+                .unwrap_or_default(),
+            meta_title: row
+                .try_get::<Option<String>, _>("meta_title")?
+                .unwrap_or_default(),
+            meta_description: row
+                .try_get::<Option<String>, _>("meta_description")?
+                .unwrap_or_default(),
+            canonical_url: row
+                .try_get::<Option<String>, _>("canonical_url")?
+                .unwrap_or_default(),
+            social_title: row
+                .try_get::<Option<String>, _>("social_title")?
+                .unwrap_or_default(),
+            social_description: row
+                .try_get::<Option<String>, _>("social_description")?
+                .unwrap_or_default(),
+            social_image: row
+                .try_get::<Option<String>, _>("social_image")?
+                .unwrap_or_default(),
         })
     }
 
@@ -1035,6 +1164,42 @@ impl PgStore {
         }
     }
 
+    async fn feed_posts_async(&self, now: i64) -> Result<Vec<Post>, sqlx::Error> {
+        let rows = sqlx::query(&format!(
+            "{POST_COLS} WHERE published = TRUE AND (publish_at = 0 OR publish_at <= $1) \
+             ORDER BY CASE WHEN publish_at > 0 THEN publish_at ELSE created_at END DESC, id DESC \
+             LIMIT $2"
+        ))
+        .bind(now)
+        .bind(crate::config::FEED_ITEM_LIMIT as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::post_from_row).collect()
+    }
+
+    async fn sitemap_entries_async(&self, now: i64) -> Result<Vec<SitemapEntry>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT slug, updated_at, COALESCE(canonical_url, '') AS canonical_url \
+             FROM posts \
+             WHERE published = TRUE AND (publish_at = 0 OR publish_at <= $1) \
+             ORDER BY CASE WHEN publish_at > 0 THEN publish_at ELSE created_at END DESC, id DESC \
+             LIMIT $2",
+        )
+        .bind(now)
+        .bind(crate::config::SITEMAP_POST_LIMIT as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(SitemapEntry {
+                    slug: row.try_get("slug")?,
+                    updated_at: row.try_get("updated_at")?,
+                    canonical_url: row.try_get("canonical_url")?,
+                })
+            })
+            .collect()
+    }
+
     async fn related_posts_by_tags_async(
         &self,
         slug: &str,
@@ -1059,8 +1224,11 @@ impl PgStore {
         sqlx::query(
             "INSERT INTO posts \
                  (id, slug, title, body_md, author_sub, author_email, created_at, updated_at, \
-                  published, publish_at, featured, pinned, tags, cover_url) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+                  published, publish_at, featured, pinned, tags, cover_url, custom_excerpt, \
+                  meta_title, meta_description, canonical_url, social_title, social_description, \
+                  social_image) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
+                     $15, $16, $17, $18, $19, $20, $21)",
         )
         .bind(&p.id)
         .bind(&p.slug)
@@ -1076,6 +1244,13 @@ impl PgStore {
         .bind(p.pinned)
         .bind(&p.tags)
         .bind(&p.cover_url)
+        .bind(&p.custom_excerpt)
+        .bind(&p.meta_title)
+        .bind(&p.meta_description)
+        .bind(&p.canonical_url)
+        .bind(&p.social_title)
+        .bind(&p.social_description)
+        .bind(&p.social_image)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1084,8 +1259,11 @@ impl PgStore {
     async fn update_post_async(&self, p: &Post) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE posts SET title = $1, body_md = $2, published = $3, updated_at = $4, \
-                    publish_at = $5, featured = $6, pinned = $7, tags = $8, cover_url = $9 \
-             WHERE slug = $10",
+                    publish_at = $5, featured = $6, pinned = $7, tags = $8, cover_url = $9, \
+                    custom_excerpt = $10, meta_title = $11, meta_description = $12, \
+                    canonical_url = $13, social_title = $14, social_description = $15, \
+                    social_image = $16 \
+             WHERE slug = $17",
         )
         .bind(&p.title)
         .bind(&p.body_md)
@@ -1096,6 +1274,13 @@ impl PgStore {
         .bind(p.pinned)
         .bind(&p.tags)
         .bind(&p.cover_url)
+        .bind(&p.custom_excerpt)
+        .bind(&p.meta_title)
+        .bind(&p.meta_description)
+        .bind(&p.canonical_url)
+        .bind(&p.social_title)
+        .bind(&p.social_description)
+        .bind(&p.social_image)
         .bind(&p.slug)
         .execute(&self.pool)
         .await?;
@@ -1161,6 +1346,18 @@ impl Store for PgStore {
                 tracing::error!(error = %e, "pg get_visible_post failed");
                 None
             })
+    }
+
+    async fn feed_posts(&self, now: i64) -> Result<Vec<Post>, StoreError> {
+        self.feed_posts_async(now)
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))
+    }
+
+    async fn sitemap_entries(&self, now: i64) -> Result<Vec<SitemapEntry>, StoreError> {
+        self.sitemap_entries_async(now)
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))
     }
 
     async fn related_posts_by_tags(
@@ -1281,6 +1478,13 @@ mod tests {
             pinned: false,
             tags: String::new(),
             cover_url: String::new(),
+            custom_excerpt: String::new(),
+            meta_title: String::new(),
+            meta_description: String::new(),
+            canonical_url: String::new(),
+            social_title: String::new(),
+            social_description: String::new(),
+            social_image: String::new(),
         }
     }
 

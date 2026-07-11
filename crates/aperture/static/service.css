@@ -1387,6 +1387,34 @@ body.is-dragging .ap-dropscrim { display:grid; }
 }
 body.has-preview { overflow:hidden; }
 
+/* Request Rooms: owner control plane. Public upload rooms keep their independent stylesheet. */
+.request-console { display:grid; gap:20px; }
+.request-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:16px; }
+.request-card { display:grid; min-width:0; align-content:start; gap:12px; }
+.request-card h2 { margin:5px 0 0; overflow-wrap:anywhere; }
+.request-card p { min-width:0; margin:0; color:var(--muted); overflow-wrap:anywhere; }
+.request-card__meta,
+.request-facts { display:flex; flex-wrap:wrap; gap:8px 16px; color:var(--muted); font-size:.86rem; }
+.request-create-list { display:grid; gap:10px; margin-top:16px; }
+.request-create-row { display:grid; grid-template-columns:minmax(130px,.7fr) minmax(180px,1fr) auto; gap:10px; align-items:center; padding:10px 0; border-top:1px solid var(--border); }
+.request-policy { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; }
+.request-policy label { display:grid; gap:6px; color:var(--muted); font-size:.82rem; font-weight:650; }
+.request-policy input,
+.request-policy textarea,
+.request-policy select { width:100%; }
+.request-policy textarea { min-height:92px; resize:vertical; }
+.request-policy__wide { grid-column:1/-1; }
+.request-receipts { display:grid; gap:0; margin:0; padding:0; list-style:none; }
+.request-receipt { display:flex; justify-content:space-between; gap:14px; padding:12px 0; border-top:1px solid var(--border); }
+.request-receipt span { color:var(--muted); font-size:.82rem; text-align:right; }
+.request-head__actions { flex:0 0 auto; }
+.request-head,
+.request-head > div:first-child { min-width:0; }
+.request-head h1,
+.request-head .sub,
+.request-receipt a,
+.request-policy small { min-width:0; overflow-wrap:anywhere; }
+
 @media (max-width:900px) {
   .console--drive .drive-layout { grid-template-columns:1fr; }
   .folder-rail.ap-rail {
@@ -1399,6 +1427,10 @@ body.has-preview { overflow:hidden; }
   .drive-content { padding:20px 18px 54px; }
 }
 @media (max-width:720px) {
+  .request-policy { grid-template-columns:1fr; }
+  .request-create-row { grid-template-columns:1fr; }
+  .request-receipt { align-items:flex-start; flex-direction:column; }
+  .request-receipt span { text-align:left; }
   .ap-toolbar {
     position:static;
     align-items:flex-start;

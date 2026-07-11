@@ -151,6 +151,78 @@ pub struct FolderRec {
     pub upload_token: Option<String>,
 }
 
+/// A product-level public file request. Unlike the legacy `folders.upload_token` flag, a request
+/// has its own lifecycle and finite abuse budget. The destination folder remains private: the
+/// public capability can only append files and can never enumerate the folder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UploadRequestRec {
+    /// Short owner-facing id used by `/requests/{id}`.
+    pub id: String,
+    /// Owner charged for every accepted submission.
+    pub owner_sub: String,
+    /// Private destination folder owned by `owner_sub`.
+    pub folder_id: String,
+    /// Unguessable public `/u/{token}` capability. Rotation replaces this atomically.
+    pub token: String,
+    /// Public request-room title.
+    pub title: String,
+    /// Optional public instructions; stored as literal text and escaped on render.
+    pub description: String,
+    /// `open` accepts uploads; `closed` keeps receipts but rejects the public capability.
+    pub status: String,
+    /// Optional absolute close instant. New requests always receive a finite default; `None` is
+    /// retained only for migrated legacy links so migration never silently breaks them.
+    pub expires_at: Option<i64>,
+    /// Per-file byte ceiling, additionally bounded by the service-wide HTTP upload limit.
+    pub max_file_bytes: i64,
+    /// Cumulative byte budget for this request, including in-flight reservations.
+    pub max_total_bytes: i64,
+    /// Cumulative file-count budget for this request, including in-flight reservations.
+    pub max_files: i64,
+    /// Committed plus in-flight bytes consumed from this request's budget.
+    pub used_bytes: i64,
+    /// Committed plus in-flight files consumed from this request's budget.
+    pub used_files: i64,
+    /// Comma-separated normalized MIME patterns (`image/*`, `application/pdf`, or `*/*`).
+    pub allowed_types: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl UploadRequestRec {
+    pub fn is_open(&self) -> bool {
+        self.status == "open"
+    }
+
+    pub fn is_expired(&self, now: i64) -> bool {
+        matches!(self.expires_at, Some(expiry) if now >= expiry)
+    }
+
+    pub fn accepts_content_type(&self, content_type: &str) -> bool {
+        self.allowed_types.split(',').any(|raw| {
+            let pattern = raw.trim();
+            pattern == "*/*"
+                || pattern == content_type
+                || pattern
+                    .strip_suffix("/*")
+                    .is_some_and(|prefix| content_type.starts_with(&format!("{prefix}/")))
+        })
+    }
+}
+
+/// Immutable receipt for one file accepted through an [`UploadRequestRec`]. File metadata is
+/// snapshotted here so the request history remains intelligible after the file is moved or purged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UploadSubmission {
+    pub id: String,
+    pub request_id: String,
+    pub file_id: String,
+    pub name: String,
+    pub content_type: String,
+    pub size: i64,
+    pub created_at: i64,
+}
+
 impl FileRec {
     /// True when this file is a raster image we render inline.
     pub fn is_image(&self) -> bool {

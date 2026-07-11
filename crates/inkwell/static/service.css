@@ -1248,6 +1248,112 @@ body.page {
   margin-top:var(--sp-2);
 }
 
+.ink-editor__rail textarea {
+  min-height:76px;
+  resize:vertical;
+}
+
+.ink-settings-disclosure > summary {
+  display:grid;
+  grid-template-columns:minmax(0,1fr) auto;
+  align-items:center;
+  gap:2px var(--sp-3);
+  padding:var(--sp-3) var(--sp-4);
+  list-style:none;
+  cursor:pointer;
+  user-select:none;
+}
+
+.ink-settings-disclosure > summary::-webkit-details-marker { display:none; }
+
+.ink-settings-disclosure > summary span {
+  font-size:var(--fs-micro);
+  font-weight:var(--fw-semibold);
+  letter-spacing:.07em;
+  text-transform:uppercase;
+  color:var(--ink-3);
+}
+
+.ink-settings-disclosure > summary small {
+  grid-column:1;
+  grid-row:2;
+  overflow:hidden;
+  color:var(--ink-4);
+  font-size:var(--fs-micro);
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+
+.ink-settings-disclosure > summary::after {
+  content:"+";
+  grid-column:2;
+  grid-row:1 / span 2;
+  color:var(--brand-ink);
+  font-size:18px;
+  font-weight:var(--fw-medium);
+}
+
+.ink-settings-disclosure[open] > summary {
+  border-bottom:1px solid var(--hairline);
+}
+
+.ink-settings-disclosure[open] > summary::after { content:"−"; }
+
+.ink-publish-details .field,
+.ink-social-settings .field { margin-bottom:var(--sp-4); }
+
+.ink-social-preview {
+  overflow:hidden;
+  border:1px solid var(--border);
+  border-radius:var(--r-sm);
+  background:var(--surface-2);
+}
+
+.ink-social-preview__image {
+  display:block;
+  width:100%;
+  aspect-ratio:1.91 / 1;
+  object-fit:cover;
+  border-bottom:1px solid var(--hairline);
+}
+
+.ink-social-preview__body {
+  display:flex;
+  flex-direction:column;
+  gap:4px;
+  padding:var(--sp-3);
+  min-width:0;
+}
+
+.ink-social-preview__host {
+  color:var(--ink-4);
+  font-size:var(--fs-micro);
+  letter-spacing:.025em;
+  text-transform:uppercase;
+}
+
+.ink-social-preview__body strong,
+.ink-social-preview__body > span:last-child {
+  overflow:hidden;
+  display:-webkit-box;
+  -webkit-box-orient:vertical;
+}
+
+.ink-social-preview__body strong {
+  -webkit-line-clamp:2;
+  color:var(--ink);
+  font-family:var(--serif);
+  font-size:var(--fs-body);
+  line-height:1.35;
+}
+
+.ink-social-preview__body > span:last-child {
+  -webkit-line-clamp:3;
+  color:var(--ink-3);
+  font-size:var(--fs-sm);
+  line-height:1.45;
+}
+
 .tag-suggestions {
   display:flex;
   flex-wrap:wrap;

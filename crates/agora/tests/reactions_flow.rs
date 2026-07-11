@@ -123,7 +123,7 @@ async fn author_marks_accepted_answer_sorts_first_with_badge() {
     // A non-author (bob) cannot mark the accepted answer.
     let (s, _h, _b) = send(
         &state,
-        post_as(&format!("/t/{tid}/accept"), TOK, BOB_SUB, BOB_EMAIL, form(&[("csrf", TOK), ("post_id", &second_reply)])),
+        post_as(&format!("/t/{tid}/accept"), TOK, BOB_SUB, BOB_EMAIL, form(&[("csrf", TOK), ("action", "accept"), ("post_id", &second_reply)])),
     )
     .await;
     assert_eq!(s, StatusCode::FORBIDDEN, "only the thread author/admin may accept");
@@ -131,7 +131,7 @@ async fn author_marks_accepted_answer_sorts_first_with_badge() {
     // The thread author (alice) marks the SECOND reply as accepted.
     let (s, _h, _b) = send(
         &state,
-        post_as(&format!("/t/{tid}/accept"), TOK, ALICE_SUB, ALICE_EMAIL, form(&[("csrf", TOK), ("post_id", &second_reply)])),
+        post_as(&format!("/t/{tid}/accept"), TOK, ALICE_SUB, ALICE_EMAIL, form(&[("csrf", TOK), ("action", "accept"), ("post_id", &second_reply)])),
     )
     .await;
     assert_eq!(s, StatusCode::SEE_OTHER);
@@ -147,15 +147,24 @@ async fn author_marks_accepted_answer_sorts_first_with_badge() {
     let first = page.find("First reply").expect("first reply present");
     assert!(acc < first, "accepted reply sorts before the earlier reply");
 
-    // Idempotent unmark: re-accepting the same reply clears it (toggle-off).
+    // Accept is idempotent: repeating it leaves the same solution selected.
     let (s, _h, _b) = send(
         &state,
-        post_as(&format!("/t/{tid}/accept"), TOK, ALICE_SUB, ALICE_EMAIL, form(&[("csrf", TOK), ("post_id", &second_reply)])),
+        post_as(&format!("/t/{tid}/accept"), TOK, ALICE_SUB, ALICE_EMAIL, form(&[("csrf", TOK), ("action", "accept"), ("post_id", &second_reply)])),
     )
     .await;
     assert_eq!(s, StatusCode::SEE_OTHER);
     let reloaded = state.store.get_thread(&tid).await.unwrap().unwrap();
-    assert!(reloaded.accepted_post_id.is_empty(), "re-accepting the same reply unmarks it");
+    assert_eq!(reloaded.accepted_post_id, second_reply);
+
+    // Clear is its own idempotent command and does not depend on a target field.
+    let (s, _h, _b) = send(
+        &state,
+        post_as(&format!("/t/{tid}/accept"), TOK, ALICE_SUB, ALICE_EMAIL, form(&[("csrf", TOK), ("action", "clear")])),
+    )
+    .await;
+    assert_eq!(s, StatusCode::SEE_OTHER);
+    assert!(state.store.get_thread(&tid).await.unwrap().unwrap().accepted_post_id.is_empty());
 }
 
 #[tokio::test]
@@ -167,7 +176,7 @@ async fn original_post_cannot_be_accepted() {
 
     let (s, _h, _b) = send(
         &state,
-        post_as(&format!("/t/{tid}/accept"), TOK, ALICE_SUB, ALICE_EMAIL, form(&[("csrf", TOK), ("post_id", &op_id)])),
+        post_as(&format!("/t/{tid}/accept"), TOK, ALICE_SUB, ALICE_EMAIL, form(&[("csrf", TOK), ("action", "accept"), ("post_id", &op_id)])),
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "the OP can never be the accepted answer");
@@ -178,7 +187,7 @@ async fn original_post_cannot_be_accepted() {
 // --- helpers ---------------------------------------------------------------------------
 
 async fn create_thread(state: &AppState, title: &str, body_md: &str) -> String {
-    let body = form(&[("csrf", TOK), ("category", "general"), ("title", title), ("body", body_md)]);
+    let body = form(&[("csrf", TOK), ("category", "support"), ("title", title), ("body", body_md)]);
     let (status, h, _b) = send(state, post_as("/new", TOK, ALICE_SUB, ALICE_EMAIL, body)).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     h.get(header::LOCATION).unwrap().to_str().unwrap().to_string()

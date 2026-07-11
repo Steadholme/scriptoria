@@ -4,9 +4,13 @@
 //! Covers: `/feed.xml` (RSS 2.0) and `/sitemap.xml` derived from the published posts, the
 //! draft-exclusion invariant (drafts are never syndicated), and the index `<link rel="alternate">`.
 
+use std::sync::Arc;
+
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
+use inkwell::store::{PgStore, Post, Settings};
 use inkwell::{app, build_dev_state, now_secs, AppState};
+use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
 
 const CSRF: &str = "tok_csrf_for_tests";
@@ -19,6 +23,15 @@ async fn feeds_expose_published_posts_only() {
     create(&state, "Published Post", "hello body", true).await;
     create(&state, "Secret Draft", "wip body", false).await;
     create_scheduled(&state, "Future Post", "later body").await;
+    state
+        .store
+        .update_settings(&Settings {
+            title: "Test Publication".to_string(),
+            tagline: "A test feed description.".to_string(),
+            posts_per_page: 50,
+        })
+        .await
+        .unwrap();
 
     // --- /feed.xml ---------------------------------------------------------
     let (status, ctype, body) = call(&state, "/feed.xml").await;
@@ -28,6 +41,8 @@ async fn feeds_expose_published_posts_only() {
         "rss content-type, got {ctype}"
     );
     assert!(body.contains("<rss version=\"2.0\""), "declares RSS 2.0");
+    assert!(body.contains("<title>Test Publication</title>"));
+    assert!(body.contains("<description>A test feed description.</description>"));
     assert!(
         body.contains("<title>Published Post</title>"),
         "published post is in the feed"
@@ -106,6 +121,163 @@ async fn empty_blog_feeds_are_well_formed() {
     assert!(body.contains("<loc>https://blog.w33d.xyz/</loc>"));
 }
 
+#[tokio::test]
+async fn feed_caps_recent_public_items_while_sitemap_traverses_the_archive() {
+    let state = build_dev_state();
+    state
+        .store
+        .create_post(&stored_post("deep-public", "Deep Public Story", 1, true, 0))
+        .await
+        .unwrap();
+    // More than MAX_PAGE private rows sort ahead of the public post, but cannot consume an RSS
+    // slot because the feed reads authoritative public rows directly.
+    for index in 0..=inkwell::config::MAX_PAGE {
+        state
+            .store
+            .create_post(&stored_post(
+                &format!("newer-draft-{index:04}"),
+                &format!("Newer Draft {index:04}"),
+                90_000 + index,
+                false,
+                0,
+            ))
+            .await
+            .unwrap();
+    }
+    let (_, _, feed) = call(&state, "/feed.xml").await;
+    assert!(feed.contains("Deep Public Story"));
+    assert!(!feed.contains("Newer Draft"));
+
+    // The sitemap is the full bounded archive, while RSS remains a 100-item recent-content view.
+    for index in 0..=inkwell::config::MAX_PAGE {
+        state
+            .store
+            .create_post(&stored_post(
+                &format!("newer-public-{index:04}"),
+                &format!("Newer Public {index:04}"),
+                10_000 + index,
+                true,
+                0,
+            ))
+            .await
+            .unwrap();
+    }
+    state
+        .store
+        .create_post(&stored_post(
+            "secret-at-top",
+            "Secret At Top",
+            99_999,
+            false,
+            0,
+        ))
+        .await
+        .unwrap();
+    state
+        .store
+        .create_post(&stored_post(
+            "future-at-top",
+            "Future At Top",
+            99_998,
+            true,
+            now_secs() + 3_600,
+        ))
+        .await
+        .unwrap();
+    let due_at = now_secs() - 1;
+    state
+        .store
+        .create_post(&stored_post(
+            "schedule-arrived",
+            "Schedule Arrived",
+            2,
+            true,
+            due_at,
+        ))
+        .await
+        .unwrap();
+    // Homepage pins are intentionally orthogonal to feed chronology. One hundred ancient pinned
+    // rows would consume every slot if RSS first took the homepage page and sorted afterwards.
+    for index in 0..inkwell::config::FEED_ITEM_LIMIT {
+        let mut pinned = stored_post(
+            &format!("old-pinned-{index:03}"),
+            &format!("Old Pinned {index:03}"),
+            100 + index as i64,
+            true,
+            0,
+        );
+        pinned.pinned = true;
+        state.store.create_post(&pinned).await.unwrap();
+    }
+
+    let (_, _, feed) = call(&state, "/feed.xml").await;
+    assert!(feed.contains("Schedule Arrived"));
+    assert!(feed.contains("Newer Public 0200"));
+    assert!(!feed.contains("Old Pinned 000"));
+    assert!(!feed.contains("Secret At Top"));
+    assert!(!feed.contains("Future At Top"));
+    assert_eq!(
+        feed.matches("<item>").count(),
+        100,
+        "RSS is capped even when the public archive is larger"
+    );
+    assert!(
+        !feed.contains("Deep Public Story"),
+        "old archive entries stay in the sitemap rather than bloating RSS"
+    );
+    let schedule_item = feed
+        .split("<title>Schedule Arrived</title>")
+        .nth(1)
+        .expect("scheduled item in feed");
+    let pub_date = schedule_item
+        .split("<pubDate>")
+        .nth(1)
+        .and_then(|tail| tail.split("</pubDate>").next())
+        .expect("scheduled item pubDate");
+    assert!(
+        feed.contains(&format!(
+            "<lastBuildDate>{pub_date}</lastBuildDate>"
+        )),
+        "lastBuildDate advances to the old-created post's actual due instant"
+    );
+
+    let authoritative = state.store.feed_posts(now_secs()).await.unwrap();
+    assert_eq!(
+        authoritative.len(),
+        inkwell::config::FEED_ITEM_LIMIT,
+        "Store owns the RSS cap"
+    );
+    assert_eq!(authoritative[0].slug, "schedule-arrived");
+    let projected = state.store.sitemap_entries(now_secs()).await.unwrap();
+    assert!(projected.iter().any(|entry| entry.slug == "deep-public"));
+    assert!(projected
+        .iter()
+        .all(|entry| entry.slug != "secret-at-top" && entry.slug != "future-at-top"));
+
+    let (_, _, sitemap) = call(&state, "/sitemap.xml").await;
+    assert!(sitemap.contains("/p/deep-public"));
+    assert!(sitemap.contains("/p/schedule-arrived"));
+    assert!(!sitemap.contains("/p/secret-at-top"));
+    assert!(!sitemap.contains("/p/future-at-top"));
+}
+
+#[tokio::test]
+async fn sitemap_store_failure_is_a_500_not_a_partial_success() {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
+        .expect("syntactically valid lazy pool");
+    pool.close().await;
+    let mut state = build_dev_state();
+    state.store = Arc::new(PgStore::from_pool(pool));
+
+    let (status, _, body) = call(&state, "/sitemap.xml").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        !body.contains("<urlset"),
+        "a failed authoritative projection never returns a partial sitemap"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
@@ -181,6 +353,32 @@ async fn create_scheduled(state: &AppState, title: &str, body: &str) {
         StatusCode::SEE_OTHER,
         "scheduled post created"
     );
+}
+
+fn stored_post(slug: &str, title: &str, created_at: i64, published: bool, publish_at: i64) -> Post {
+    Post {
+        id: format!("id-{slug}"),
+        slug: slug.to_string(),
+        title: title.to_string(),
+        body_md: "discovery scale body".to_string(),
+        author_sub: "u_alice".to_string(),
+        author_email: "alice@hf".to_string(),
+        created_at,
+        updated_at: created_at,
+        published,
+        publish_at,
+        featured: false,
+        pinned: false,
+        tags: String::new(),
+        cover_url: String::new(),
+        custom_excerpt: String::new(),
+        meta_title: String::new(),
+        meta_description: String::new(),
+        canonical_url: String::new(),
+        social_title: String::new(),
+        social_description: String::new(),
+        social_image: String::new(),
+    }
 }
 
 /// Minimal application/x-www-form-urlencoded value encoder.

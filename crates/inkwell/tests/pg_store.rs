@@ -57,6 +57,13 @@ async fn pg_store_full_integration() {
         pinned: false,
         tags: "rust, postgres".to_string(),
         cover_url: "https://drive.w33d.xyz/s/cover_tok".to_string(),
+        custom_excerpt: "A PostgreSQL-backed hello.".to_string(),
+        meta_title: "PG metadata title".to_string(),
+        meta_description: "PG metadata description".to_string(),
+        canonical_url: "https://example.com/original-pg-hello".to_string(),
+        social_title: "PG social title".to_string(),
+        social_description: "PG social description".to_string(),
+        social_image: "https://drive.w33d.xyz/s/social_tok".to_string(),
     };
     pg.create_post(&post).await.expect("create");
 
@@ -89,6 +96,13 @@ async fn pg_store_full_integration() {
         pinned: false,
         tags: String::new(),
         cover_url: String::new(),
+        custom_excerpt: String::new(),
+        meta_title: String::new(),
+        meta_description: String::new(),
+        canonical_url: String::new(),
+        social_title: String::new(),
+        social_description: String::new(),
+        social_image: String::new(),
     };
     pg.create_post(&post2).await.expect("create 2");
 
@@ -148,6 +162,31 @@ async fn pg_store_full_integration() {
             .is_some(),
         "author can read scheduled post",
     );
+    let feed_posts = pg.feed_posts(now).await.expect("authoritative PG feed");
+    let second_pos = feed_posts
+        .iter()
+        .position(|post| post.slug == "pg-second")
+        .expect("recent post in feed");
+    let pinned_pos = feed_posts
+        .iter()
+        .position(|post| post.slug == "pg-pinned")
+        .expect("old pinned post in feed");
+    assert!(
+        second_pos < pinned_pos,
+        "PG feed chronology is independent of homepage pinning"
+    );
+    assert!(feed_posts.iter().all(|post| post.slug != "pg-future"));
+    let sitemap = pg
+        .sitemap_entries(now)
+        .await
+        .expect("lightweight PG sitemap projection");
+    let sitemap_hello = sitemap
+        .iter()
+        .find(|entry| entry.slug == "pg-hello")
+        .expect("public post in sitemap projection");
+    assert_eq!(sitemap_hello.updated_at, post.updated_at);
+    assert_eq!(sitemap_hello.canonical_url, post.canonical_url);
+    assert!(sitemap.iter().all(|entry| entry.slug != "pg-future"));
     let related = pg
         .related_posts_by_tags("pg-pinned", "rust, postgres", now, 3)
         .await;
@@ -167,10 +206,32 @@ async fn pg_store_full_integration() {
         fetched.cover_url, "https://drive.w33d.xyz/s/cover_tok",
         "cover_url column round-trips through pg",
     );
+    assert_eq!(fetched.custom_excerpt, "A PostgreSQL-backed hello.");
+    assert_eq!(fetched.meta_title, "PG metadata title");
+    assert_eq!(fetched.meta_description, "PG metadata description");
+    assert_eq!(
+        fetched.canonical_url,
+        "https://example.com/original-pg-hello"
+    );
+    assert_eq!(fetched.social_title, "PG social title");
+    assert_eq!(fetched.social_description, "PG social description");
+    assert_eq!(fetched.social_image, "https://drive.w33d.xyz/s/social_tok");
+    let mut metadata_state = build_dev_state();
+    metadata_state.store = pg.clone();
+    let (status, html) = raw_call(&metadata_state, get("/p/pg-hello")).await;
+    assert_eq!(status, StatusCode::OK);
+    let html = String::from_utf8_lossy(&html);
+    assert!(html.contains("<title>PG metadata title · Inkwell</title>"));
+    assert!(html.contains(r#"<link rel="canonical" href="https://example.com/original-pg-hello">"#));
+    assert!(html
+        .contains(r#"<meta property="og:image" content="https://drive.w33d.xyz/s/social_tok">"#));
     let mut edited = fetched.clone();
     edited.title = "PG Hello (edited)".to_string();
     edited.tags = "rust".to_string();
     edited.cover_url = String::new();
+    edited.custom_excerpt = "Updated PG excerpt".to_string();
+    edited.meta_description = "Updated PG description".to_string();
+    edited.social_image = String::new();
     edited.published = false;
     edited.updated_at = now;
     pg.update_post(&edited).await.expect("update");
@@ -178,6 +239,9 @@ async fn pg_store_full_integration() {
     assert_eq!(after.title, "PG Hello (edited)");
     assert_eq!(after.tags, "rust", "tags update persisted in pg");
     assert_eq!(after.cover_url, "", "cover_url cleared through pg update");
+    assert_eq!(after.custom_excerpt, "Updated PG excerpt");
+    assert_eq!(after.meta_description, "Updated PG description");
+    assert_eq!(after.social_image, "");
     assert!(!after.published);
 
     // --- full HTTP flow through the PG-backed app --------------------------

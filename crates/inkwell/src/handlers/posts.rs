@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::audit::AuditEvent;
 use crate::auth;
 use crate::error::AppError;
-use crate::handlers::{esc, fmt_date, page_shell, tag_chips};
+use crate::handlers::{esc, fmt_date, page_shell, post_excerpt, tag_chips, PageMeta, PageShell};
 use crate::markdown;
 use crate::store::{Post, PostCursor};
 use crate::{now_nanos, now_secs, unique_slug, AppState};
@@ -25,6 +25,14 @@ use crate::{now_nanos, now_secs, unique_slug, AppState};
 const LIST_HTML: &str = include_str!("../../templates/list.html");
 const POST_HTML: &str = include_str!("../../templates/post.html");
 const EDITOR_HTML: &str = include_str!("../../templates/editor.html");
+
+pub const CUSTOM_EXCERPT_MAX: usize = 500;
+pub const META_TITLE_MAX: usize = 200;
+pub const META_DESCRIPTION_MAX: usize = 500;
+pub const CANONICAL_URL_MAX: usize = 2_048;
+pub const SOCIAL_TITLE_MAX: usize = 200;
+pub const SOCIAL_DESCRIPTION_MAX: usize = 500;
+pub const SOCIAL_IMAGE_MAX: usize = 600;
 
 /// Form body shared by compose + edit. Publication changes require an explicit [`PublishIntent`];
 /// identity is NEVER taken from the form — only from the gateway headers.
@@ -41,6 +49,24 @@ pub struct PostForm {
     /// via [`sanitize_cover`]; empty (or omitted) means no cover.
     #[serde(default)]
     pub cover_url: String,
+    /// Optional author-written summary for cards and feeds.
+    #[serde(default)]
+    pub custom_excerpt: String,
+    /// Optional search metadata. Text values are server-truncated to the documented limits.
+    #[serde(default)]
+    pub meta_title: String,
+    #[serde(default)]
+    pub meta_description: String,
+    /// Optional absolute HTTP(S) canonical URL.
+    #[serde(default)]
+    pub canonical_url: String,
+    /// Optional social-card overrides. The image follows the trusted Aperture URL policy.
+    #[serde(default)]
+    pub social_title: String,
+    #[serde(default)]
+    pub social_description: String,
+    #[serde(default)]
+    pub social_image: String,
     /// Optional UTC datetime-local value. Blank or omitted keeps the legacy immediate behavior.
     #[serde(default)]
     pub publish_at: String,
@@ -250,24 +276,24 @@ pub async fn index(
             .get(axum::http::header::COOKIE)
             .and_then(|v| v.to_str().ok()),
     );
-    let page = page_shell(
-        &format!("{} · HOLDFAST", settings.title),
-        "page-reading",
-        true,
-        &settings.title,
-        &email,
+    let head_title = format!("{} · HOLDFAST", settings.title);
+    let page = page_shell(PageShell {
+        head_title: &head_title,
+        body_class: "page-reading",
+        rss: true,
+        nav_title: &settings.title,
+        email: &email,
         is_admin,
         theme,
-        &fragment,
-    );
+        fragment: &fragment,
+        metadata: None,
+    });
     Html(page).into_response()
 }
 
-/// `GET /tag/{slug}` — one keyset page of posts carrying the tag `slug`, newest-first. Reuses the
-/// index's `list_posts` + in-handler filtering (visibility THEN tag membership) and the same
-/// `?before=`/`?limit=` cursor, so drafts never leak and the whole tagged archive stays reachable
-/// page by page. The "Load older" cursor is derived from the store page's LAST row (before
-/// filtering) exactly like the index, so paging never desyncs.
+/// `GET /tag/{slug}` — one keyset page of posts carrying the tag `slug`, newest-first. It traverses
+/// authoritative visible-post pages until it fills a tag page (or reaches the bounded continuation),
+/// so sparse tags remain reachable beyond the generic `MAX_PAGE` window without leaking drafts.
 pub async fn tag_index(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -282,18 +308,15 @@ pub async fn tag_index(
     let before = q.before.as_deref().and_then(parse_before);
     let limit = crate::config::clamp_page_with_default(q.limit, settings.posts_per_page);
     let now = now_secs();
-    let posts = state
-        .store
-        .list_visible_posts(before, limit, now, viewer.as_deref())
-        .await;
-
-    let next_cursor = if posts.len() as i64 == limit {
-        posts
-            .last()
-            .map(|p| format_cursor(&PostCursor::from_post(p)))
-    } else {
-        None
-    };
+    let (posts, next_cursor) = scan_tag_page(
+        &state,
+        &tag_slug,
+        before,
+        limit as usize,
+        now,
+        viewer.as_deref(),
+    )
+    .await;
 
     // Recover a display label for the tag from the first matching post (the URL only carries the
     // slug); fall back to the slug itself when this page has no match to name it.
@@ -301,9 +324,6 @@ pub async fn tag_index(
     let mut shown = 0usize;
     let mut label: Option<String> = None;
     for p in &posts {
-        if !crate::tags::has_tag(&p.tags, &tag_slug) {
-            continue;
-        }
         if label.is_none() {
             label = crate::tags::parse_tags(&p.tags)
                 .into_iter()
@@ -344,17 +364,84 @@ pub async fn tag_index(
             .get(axum::http::header::COOKIE)
             .and_then(|v| v.to_str().ok()),
     );
-    let page = page_shell(
-        &format!("{heading} · HOLDFAST"),
-        "page-reading",
-        true,
-        &heading,
-        &email,
+    let head_title = format!("{heading} · HOLDFAST");
+    let page = page_shell(PageShell {
+        head_title: &head_title,
+        body_class: "page-reading",
+        rss: true,
+        nav_title: &heading,
+        email: &email,
         is_admin,
         theme,
-        &fragment,
-    );
+        fragment: &fragment,
+        metadata: None,
+    });
     Html(page).into_response()
+}
+
+/// Traverse authoritative visible-post pages until one full tag page (plus one look-ahead match)
+/// is found. This fixes the old "paginate everything, then filter" behavior where sparse tags
+/// produced empty pages and older tagged posts disappeared behind the generic `MAX_PAGE` window.
+///
+/// Work is bounded to [`crate::config::TAG_SCAN_POST_LIMIT`] rows per request. If that bound
+/// is reached, the continuation cursor points at the last scanned authoritative row, so no content
+/// is skipped and the caller can continue the traversal on the next request.
+async fn scan_tag_page(
+    state: &AppState,
+    tag_slug: &str,
+    before: Option<PostCursor>,
+    limit: usize,
+    now: i64,
+    viewer_sub: Option<&str>,
+) -> (Vec<Post>, Option<String>) {
+    let wanted = limit.max(1);
+    let mut matches = Vec::with_capacity(wanted.saturating_add(1));
+    let mut cursor = before;
+    let mut scanned = 0usize;
+    let mut exhausted = false;
+
+    while scanned < crate::config::TAG_SCAN_POST_LIMIT && matches.len() <= wanted {
+        let remaining = crate::config::TAG_SCAN_POST_LIMIT - scanned;
+        let batch_limit = remaining.min(crate::config::MAX_PAGE as usize).max(1);
+        let batch = state
+            .store
+            .list_visible_posts(cursor.clone(), batch_limit as i64, now, viewer_sub)
+            .await;
+        if batch.is_empty() {
+            exhausted = true;
+            break;
+        }
+        let batch_len = batch.len();
+        for post in batch {
+            scanned += 1;
+            cursor = Some(PostCursor::from_post(&post));
+            if crate::tags::has_tag(&post.tags, tag_slug) {
+                matches.push(post);
+                if matches.len() > wanted {
+                    break;
+                }
+            }
+        }
+        if matches.len() > wanted {
+            break;
+        }
+        if batch_len < batch_limit {
+            exhausted = true;
+            break;
+        }
+    }
+
+    if matches.len() > wanted {
+        matches.truncate(wanted);
+        let next = matches
+            .last()
+            .map(|post| format_cursor(&PostCursor::from_post(post)));
+        (matches, next)
+    } else if !exhausted && scanned >= crate::config::TAG_SCAN_POST_LIMIT {
+        (matches, cursor.as_ref().map(format_cursor))
+    } else {
+        (matches, None)
+    }
 }
 
 /// Parse a `?before=<created_at>_<id>` keyset cursor into `(created_at, id)`. `created_at` is a
@@ -470,16 +557,31 @@ pub async fn view(
             .get(axum::http::header::COOKIE)
             .and_then(|v| v.to_str().ok()),
     );
-    let page = page_shell(
-        &format!("{} · Inkwell", post.title),
-        "page-reading",
-        true,
-        "Reading",
-        &email,
+    let page_meta = if post.is_public_at(now) {
+        public_post_meta(&post)
+    } else {
+        PageMeta {
+            robots: Some("noindex,nofollow".to_string()),
+            ..PageMeta::default()
+        }
+    };
+    let document_title = if post.is_public_at(now) && !post.meta_title.trim().is_empty() {
+        post.meta_title.trim()
+    } else {
+        post.title.as_str()
+    };
+    let head_title = format!("{document_title} · Inkwell");
+    let page = page_shell(PageShell {
+        head_title: &head_title,
+        body_class: "page-reading",
+        rss: true,
+        nav_title: "Reading",
+        email: &email,
         is_admin,
         theme,
-        &fragment,
-    );
+        fragment: &fragment,
+        metadata: Some(&page_meta),
+    });
 
     Ok(html_with_cookie(page, set_cookie))
 }
@@ -515,6 +617,13 @@ pub async fn new_form(State(_state): State<AppState>, headers: HeaderMap) -> Res
         body_value: "",
         tags_value: "",
         cover_value: "",
+        custom_excerpt_value: "",
+        meta_title_value: "",
+        meta_description_value: "",
+        canonical_url_value: "",
+        social_title_value: "",
+        social_description_value: "",
+        social_image_value: "",
         publish_at_value: "",
         pinned: false,
         cancel_href: "/",
@@ -538,6 +647,7 @@ pub async fn create(
     }
     let body_md = form.body.trim().to_string();
     let cover_url = sanitize_cover(&form.cover_url)?;
+    let publication_meta = publication_metadata(&form)?;
     let now = now_secs();
     let intent = PublishIntent::for_create(&form.intent)?;
     let (published, publish_at) = publication_from_intent(intent, &form, now, false, 0)?;
@@ -559,6 +669,13 @@ pub async fn create(
         pinned: form.pinned.is_some(),
         tags: crate::tags::normalize(&form.tags),
         cover_url,
+        custom_excerpt: publication_meta.custom_excerpt,
+        meta_title: publication_meta.meta_title,
+        meta_description: publication_meta.meta_description,
+        canonical_url: publication_meta.canonical_url,
+        social_title: publication_meta.social_title,
+        social_description: publication_meta.social_description,
+        social_image: publication_meta.social_image,
     };
     state.store.create_post(&post).await?;
     tracing::info!(slug = %slug, "post created");
@@ -664,6 +781,13 @@ pub async fn edit_form(
         body_value: &post.body_md,
         tags_value: &post.tags,
         cover_value: &post.cover_url,
+        custom_excerpt_value: &post.custom_excerpt,
+        meta_title_value: &post.meta_title,
+        meta_description_value: &post.meta_description,
+        canonical_url_value: &post.canonical_url,
+        social_title_value: &post.social_title,
+        social_description_value: &post.social_description,
+        social_image_value: &post.social_image,
         publish_at_value: &format_publish_at_value(post.publish_at),
         pinned: post.pinned,
         cancel_href: &format!("/p/{}", esc(&post.slug)),
@@ -701,6 +825,14 @@ pub async fn update(
     post.body_md = form.body.trim().to_string();
     post.tags = crate::tags::normalize(&form.tags);
     post.cover_url = sanitize_cover(&form.cover_url)?;
+    let publication_meta = publication_metadata(&form)?;
+    post.custom_excerpt = publication_meta.custom_excerpt;
+    post.meta_title = publication_meta.meta_title;
+    post.meta_description = publication_meta.meta_description;
+    post.canonical_url = publication_meta.canonical_url;
+    post.social_title = publication_meta.social_title;
+    post.social_description = publication_meta.social_description;
+    post.social_image = publication_meta.social_image;
     let now = now_secs();
     let intent = PublishIntent::for_update(&form.intent)?;
     let (published, publish_at) =
@@ -776,6 +908,141 @@ pub async fn delete(
 // Render helpers
 // ---------------------------------------------------------------------------
 
+struct PublicationMetadata {
+    custom_excerpt: String,
+    meta_title: String,
+    meta_description: String,
+    canonical_url: String,
+    social_title: String,
+    social_description: String,
+    social_image: String,
+}
+
+/// Normalize the optional publication fields at the server boundary. Text is character-truncated
+/// to the same limits advertised by the no-JavaScript form; URLs are rejected rather than truncated
+/// because silently cutting a URL can change its authority or resource.
+fn publication_metadata(form: &PostForm) -> Result<PublicationMetadata, AppError> {
+    Ok(PublicationMetadata {
+        custom_excerpt: truncate_text(&form.custom_excerpt, CUSTOM_EXCERPT_MAX),
+        meta_title: truncate_text(&form.meta_title, META_TITLE_MAX),
+        meta_description: truncate_text(&form.meta_description, META_DESCRIPTION_MAX),
+        canonical_url: sanitize_canonical_url(&form.canonical_url)?,
+        social_title: truncate_text(&form.social_title, SOCIAL_TITLE_MAX),
+        social_description: truncate_text(&form.social_description, SOCIAL_DESCRIPTION_MAX),
+        social_image: sanitize_social_image(&form.social_image)?,
+    })
+}
+
+fn truncate_text(raw: &str, max_chars: usize) -> String {
+    raw.trim().chars().take(max_chars).collect()
+}
+
+/// Canonical URLs are optional, but when present must be a bounded absolute HTTP(S) URL with an
+/// authority and no embedded userinfo. `http::Uri` also rejects whitespace/control/fragment tricks.
+fn sanitize_canonical_url(raw: &str) -> Result<String, AppError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if trimmed.chars().count() > CANONICAL_URL_MAX {
+        return Err(AppError::InvalidRequest(format!(
+            "canonical URL must be at most {CANONICAL_URL_MAX} characters"
+        )));
+    }
+    let uri = trimmed.parse::<axum::http::Uri>().map_err(|_| {
+        AppError::InvalidRequest("canonical URL must be absolute HTTP(S)".to_string())
+    })?;
+    let scheme_ok = uri
+        .scheme_str()
+        .is_some_and(|scheme| matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https"));
+    let authority_ok = uri.authority().is_some_and(|authority| {
+        !authority.as_str().contains('@') && !authority.host().trim().is_empty()
+    });
+    if !scheme_ok || !authority_ok {
+        return Err(AppError::InvalidRequest(
+            "canonical URL must be absolute HTTP(S) without userinfo".to_string(),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+pub(crate) fn canonical_url_is_safe(raw: &str) -> bool {
+    sanitize_canonical_url(raw).is_ok()
+}
+
+fn sanitize_social_image(raw: &str) -> Result<String, AppError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if trimmed.chars().count() > SOCIAL_IMAGE_MAX {
+        return Err(AppError::InvalidRequest(format!(
+            "social image must be at most {SOCIAL_IMAGE_MAX} characters"
+        )));
+    }
+    if !markdown::is_estate_image_url(trimmed) {
+        return Err(AppError::InvalidRequest(
+            "social image must be an Aperture share URL (https://drive.w33d.xyz/s/…)".to_string(),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Build the complete public head contract for a reader-visible post. Every value is escaped by
+/// [`page_shell`]; URL fields are also revalidated here so a legacy/manually-written row
+/// cannot bypass the current authoring policy.
+fn public_post_meta(post: &Post) -> PageMeta {
+    let local_url = format!("{}/p/{}", crate::config::SITE_BASE_URL, post.slug);
+    let canonical = sanitize_canonical_url(&post.canonical_url)
+        .ok()
+        .filter(|url| !url.is_empty())
+        .unwrap_or(local_url);
+    let excerpt = post_excerpt(post, META_DESCRIPTION_MAX);
+    let description = if post.meta_description.trim().is_empty() {
+        excerpt
+    } else {
+        post.meta_description.trim().to_string()
+    };
+    let meta_title = if post.meta_title.trim().is_empty() {
+        post.title.clone()
+    } else {
+        post.meta_title.trim().to_string()
+    };
+    let social_title = if post.social_title.trim().is_empty() {
+        meta_title.clone()
+    } else {
+        post.social_title.trim().to_string()
+    };
+    let social_description = if post.social_description.trim().is_empty() {
+        description.clone()
+    } else {
+        post.social_description.trim().to_string()
+    };
+    let social_image = [&post.social_image, &post.cover_url]
+        .into_iter()
+        .find(|url| markdown::is_estate_image_url(url.trim()))
+        .map(|url| url.trim().to_string());
+    let twitter_card = if social_image.is_some() {
+        "summary_large_image"
+    } else {
+        "summary"
+    };
+
+    PageMeta {
+        description: Some(description.clone()),
+        canonical: Some(canonical),
+        og_type: Some("article".to_string()),
+        og_title: Some(social_title.clone()),
+        og_description: Some(social_description.clone()),
+        og_image: social_image.clone(),
+        twitter_card: Some(twitter_card.to_string()),
+        twitter_title: Some(social_title),
+        twitter_description: Some(social_description),
+        twitter_image: social_image,
+        ..PageMeta::default()
+    }
+}
+
 /// Validate a submitted cover URL. Empty is fine (no cover); otherwise it MUST be an estate image
 /// URL (an Aperture share link), so the rendered `<img src>` can never point at an arbitrary host.
 /// Fails loud with a 400 rather than silently dropping a mistyped URL.
@@ -817,7 +1084,10 @@ fn publication_from_intent(
 ) -> Result<(bool, i64), AppError> {
     match intent {
         PublishIntent::SaveDraft => Ok((false, 0)),
-        PublishIntent::PublishNow => Ok((true, 0)),
+        // `publish_at` doubles as the actual publication timestamp. A value equal to `now` is
+        // already public (`is_scheduled_at` is strictly future) while preserving the chronology of
+        // an old Draft that is published or republished today.
+        PublishIntent::PublishNow => Ok((true, now)),
         PublishIntent::Preserve => Ok((current_published, current_publish_at)),
         PublishIntent::Schedule => {
             let publish_at = if form.publish_at_epoch.trim().is_empty() {
@@ -1082,7 +1352,7 @@ fn render_hero(post: &Post, viewer_sub: Option<&str>, now: i64) -> String {
         badge = state_badge(post, now),
         slug = esc(&post.slug),
         title = esc(&post.title),
-        excerpt = esc(&markdown::excerpt(&post.body_md, 280)),
+        excerpt = esc(&post_excerpt(post, 280)),
         initial = esc(&author_initial(&post.author_email)),
         author = esc(&post.author_email),
         date = esc(&fmt_date(post.created_at)),
@@ -1115,7 +1385,7 @@ fn render_card(post: &Post, viewer_sub: Option<&str>, now: i64) -> String {
         date = esc(&fmt_date(post.created_at)),
         mins = read_minutes(&post.body_md),
         owner = owner_link,
-        excerpt = esc(&markdown::excerpt(&post.body_md, 200)),
+        excerpt = esc(&post_excerpt(post, 200)),
         tags = tag_chips(&post.tags),
     )
 }
@@ -1136,6 +1406,13 @@ struct EditorView<'a> {
     body_value: &'a str,
     tags_value: &'a str,
     cover_value: &'a str,
+    custom_excerpt_value: &'a str,
+    meta_title_value: &'a str,
+    meta_description_value: &'a str,
+    canonical_url_value: &'a str,
+    social_title_value: &'a str,
+    social_description_value: &'a str,
+    social_image_value: &'a str,
     publish_at_value: &'a str,
     pinned: bool,
     cancel_href: &'a str,
@@ -1189,6 +1466,16 @@ fn render_editor(v: EditorView<'_>) -> String {
         .replace("{{BODY_VALUE}}", &esc(v.body_value))
         .replace("{{TAGS_VALUE}}", &esc(v.tags_value))
         .replace("{{COVER_VALUE}}", &esc(v.cover_value))
+        .replace("{{CUSTOM_EXCERPT_VALUE}}", &esc(v.custom_excerpt_value))
+        .replace("{{META_TITLE_VALUE}}", &esc(v.meta_title_value))
+        .replace("{{META_DESCRIPTION_VALUE}}", &esc(v.meta_description_value))
+        .replace("{{CANONICAL_URL_VALUE}}", &esc(v.canonical_url_value))
+        .replace("{{SOCIAL_TITLE_VALUE}}", &esc(v.social_title_value))
+        .replace(
+            "{{SOCIAL_DESCRIPTION_VALUE}}",
+            &esc(v.social_description_value),
+        )
+        .replace("{{SOCIAL_IMAGE_VALUE}}", &esc(v.social_image_value))
         .replace("{{PUBLISH_AT_VALUE}}", &esc(v.publish_at_value))
         .replace("{{PINNED_CHECKED}}", if v.pinned { "checked" } else { "" })
         .replace("{{STATE_PILL}}", &state_pill_html)
@@ -1196,16 +1483,18 @@ fn render_editor(v: EditorView<'_>) -> String {
         .replace("{{PRESERVE_ACTION}}", preserve_action)
         .replace("{{CANCEL_HREF}}", v.cancel_href)
         .replace("{{DELETE}}", &delete_block);
-    page_shell(
-        &format!("{} · Inkwell", v.heading),
-        "page-console",
-        false,
-        v.heading,
-        v.email,
-        v.is_admin,
-        v.theme,
-        &fragment,
-    )
+    let head_title = format!("{} · Inkwell", v.heading);
+    page_shell(PageShell {
+        head_title: &head_title,
+        body_class: "page-console",
+        rss: false,
+        nav_title: v.heading,
+        email: v.email,
+        is_admin: v.is_admin,
+        theme: v.theme,
+        fragment: &fragment,
+        metadata: None,
+    })
 }
 
 /// A 303 redirect (post/redirect/get).

@@ -6,17 +6,61 @@
 //! the public share-token fetch, image vs. download serving, and the size cap. This is the
 //! default `cargo test` suite and stays DB-free.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use aperture::blobs::{Blobs, MemoryBlobs};
+use aperture::blobs::{BlobError, Blobs, MemoryBlobs};
 use aperture::config::Config;
-use aperture::store::{InMemoryStore, Store};
+use aperture::model::UploadRequestRec;
+use aperture::store::{
+    InMemoryStore, Store, UploadRecoveryClaim, UploadReserve, UploadReserveInput,
+};
 use aperture::{app, build_dev_state, AppState};
 use axum::body::Body;
 use axum::http::{header, HeaderMap, Request, StatusCode};
 use tower::ServiceExt;
 
 const BOUNDARY: &str = "----apertureTESTboundary7MA4YWxkTrZu0gW";
+
+struct FailingPutBlobs {
+    deletes: Arc<AtomicUsize>,
+    fail_delete: bool,
+}
+
+#[async_trait::async_trait]
+impl Blobs for FailingPutBlobs {
+    fn bucket(&self) -> &str {
+        "failing"
+    }
+
+    async fn put(&self, _key: &str, _bytes: Vec<u8>) -> Result<(), BlobError> {
+        Err(BlobError::Backend("injected put failure".to_string()))
+    }
+
+    async fn get(&self, _key: &str) -> Result<Vec<u8>, BlobError> {
+        Err(BlobError::NotFound)
+    }
+
+    async fn get_range(
+        &self,
+        _key: &str,
+        _start: u64,
+        _end_inclusive: u64,
+    ) -> Result<Vec<u8>, BlobError> {
+        Err(BlobError::NotFound)
+    }
+
+    async fn delete(&self, _key: &str) -> Result<(), BlobError> {
+        self.deletes.fetch_add(1, Ordering::SeqCst);
+        if self.fail_delete {
+            Err(BlobError::Backend(
+                "injected compensation delete failure".to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
 
 /// Minimal byte payloads whose leading magic bytes drive the sniffer.
 fn png_bytes() -> Vec<u8> {
@@ -269,6 +313,28 @@ async fn upload_file(
     (id, csrf)
 }
 
+/// Explicitly create a public read capability for a private-by-default upload.
+async fn enable_file_share(
+    app: &axum::Router,
+    store: &Arc<dyn Store>,
+    id: &str,
+    subject: &str,
+    csrf: &str,
+) -> String {
+    let response = send(
+        app,
+        post_form(
+            &format!("/f/{id}/share"),
+            csrf,
+            subject,
+            format!("csrf_token={csrf}&expiry=never"),
+        ),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::FOUND, "{}", response.text());
+    store.get(id).await.unwrap().unwrap().share_token.unwrap()
+}
+
 #[tokio::test]
 async fn production_owner_routes_fail_closed_but_capabilities_remain_anonymous() {
     let mut state = build_dev_state();
@@ -325,7 +391,7 @@ async fn public_file_share_room_is_product_owned_and_escapes_remote_names() {
     let state = build_dev_state();
     let store: Arc<dyn Store> = state.store.clone();
     let app = app(state);
-    let (id, _) = upload_file(
+    let (id, csrf) = upload_file(
         &app,
         "alice",
         "proof<svg onload=alert(1)>.png",
@@ -333,7 +399,7 @@ async fn public_file_share_room_is_product_owned_and_escapes_remote_names() {
         &png_bytes(),
     )
     .await;
-    let token = store.get(&id).await.unwrap().unwrap().share_token.unwrap();
+    let token = enable_file_share(&app, &store, &id, "alice", &csrf).await;
 
     let page = send(&app, get(&format!("/s/{token}/view"), None)).await;
     assert_eq!(page.status, StatusCode::OK);
@@ -384,7 +450,7 @@ async fn share_expiry_returns_410_after_expiry() {
     let store: Arc<dyn Store> = state.store.clone();
     let app = app(state);
     let (id, csrf) = upload_png(&app, "alice").await;
-    let token = store.get(&id).await.unwrap().unwrap().share_token.unwrap();
+    let token = enable_file_share(&app, &store, &id, "alice", &csrf).await;
 
     // Configure an expiry 1 hour out -> the public link still serves.
     let set = send(
@@ -428,7 +494,7 @@ async fn share_password_prompts_then_serves() {
     let store: Arc<dyn Store> = state.store.clone();
     let app = app(state);
     let (id, csrf) = upload_png(&app, "alice").await;
-    let token = store.get(&id).await.unwrap().unwrap().share_token.unwrap();
+    let token = enable_file_share(&app, &store, &id, "alice", &csrf).await;
 
     // Set a password on the share link.
     let set = send(
@@ -476,8 +542,8 @@ async fn share_landing_for_image_unfurls_and_counts_views() {
     let state = build_dev_state();
     let store: Arc<dyn Store> = state.store.clone();
     let app = app(state);
-    let (id, _) = upload_png(&app, "alice").await;
-    let token = store.get(&id).await.unwrap().unwrap().share_token.unwrap();
+    let (id, csrf) = upload_png(&app, "alice").await;
+    let token = enable_file_share(&app, &store, &id, "alice", &csrf).await;
 
     let first = send(&app, get(&format!("/s/{token}/view"), None)).await;
     assert_eq!(first.status, StatusCode::OK);
@@ -525,7 +591,7 @@ async fn share_landing_respects_expiry_and_password_privacy() {
     let store: Arc<dyn Store> = state.store.clone();
     let app = app(state);
     let (id, csrf) = upload_png(&app, "alice").await;
-    let token = store.get(&id).await.unwrap().unwrap().share_token.unwrap();
+    let token = enable_file_share(&app, &store, &id, "alice", &csrf).await;
 
     let set_password = send(
         &app,
@@ -585,7 +651,7 @@ async fn share_landing_for_non_image_uses_summary_card_without_image_embeds() {
     .await;
     assert_eq!(created.status, StatusCode::FOUND);
     let id = created.location().trim_start_matches("/f/").to_string();
-    let token = store.get(&id).await.unwrap().unwrap().share_token.unwrap();
+    let token = enable_file_share(&app, &store, &id, "alice", &csrf).await;
 
     let page = send(&app, get(&format!("/s/{token}/view"), None)).await;
     assert_eq!(page.status, StatusCode::OK);
@@ -605,7 +671,7 @@ async fn share_revoke_clears_the_token() {
     let store: Arc<dyn Store> = state.store.clone();
     let app = app(state);
     let (id, csrf) = upload_png(&app, "alice").await;
-    let token = store.get(&id).await.unwrap().unwrap().share_token.unwrap();
+    let token = enable_file_share(&app, &store, &id, "alice", &csrf).await;
 
     // The link works before revoke.
     assert_eq!(
@@ -732,17 +798,20 @@ async fn upload_detail_raw_share_delete_lifecycle() {
 
     // The metadata row + blob both exist; the content type was sniffed to image/png.
     let rec = store.get(&id).await.unwrap().expect("metadata row");
-    let token = rec
-        .share_token
-        .clone()
-        .expect("fresh upload has a share token");
+    assert!(
+        rec.share_token.is_none(),
+        "fresh uploads are private until explicitly shared"
+    );
     assert_eq!(rec.owner_sub, "alice");
     assert_eq!(rec.name, "screenshot.png");
     assert_eq!(rec.content_type, "image/png");
     assert_eq!(rec.size as usize, png.len());
     assert_eq!(blobs.get(&rec.object_key).await.unwrap(), png);
 
-    // GET /f/{id} renders the detail page with an inline image preview + share link.
+    // The private detail offers an explicit capability action; creating it enables `/s/{token}`.
+    let private_detail = send(&app, get(&loc, Some("alice"))).await;
+    assert!(private_detail.text().contains("Create share link"));
+    let token = enable_file_share(&app, &store, &id, "alice", &csrf).await;
     let detail = send(&app, get(&loc, Some("alice"))).await;
     assert_eq!(detail.status, StatusCode::OK);
     assert!(detail.text().contains("screenshot.png"));
@@ -1020,7 +1089,7 @@ async fn video_share_supports_range_after_public_gates() {
     let video = b"\x00\x00\x00\x18ftypmp42shared-video".to_vec();
     let size = video.len();
     let (id, csrf) = upload_file(&app, "alice", "shared.mp4", "video/mp4", &video).await;
-    let token = store.get(&id).await.unwrap().unwrap().share_token.unwrap();
+    let token = enable_file_share(&app, &store, &id, "alice", &csrf).await;
 
     let part = send(&app, get_range(&format!("/s/{token}"), None, "bytes=2-5")).await;
     assert_eq!(part.status, StatusCode::PARTIAL_CONTENT);
@@ -1223,6 +1292,38 @@ async fn gallery_paginates_backward_with_before_cursor() {
 /// Extract the folder id from a `302 /?folder={id}` create/rename redirect Location.
 fn folder_from_location(loc: &str) -> String {
     loc.trim_start_matches("/?folder=").to_string()
+}
+
+async fn create_upload_request(
+    app: &axum::Router,
+    store: &Arc<dyn Store>,
+    folder_id: &str,
+    csrf: &str,
+    extra: &str,
+) -> UploadRequestRec {
+    let body = format!(
+        "csrf_token={csrf}&title=Evidence+intake&description=Send+the+requested+evidence&expiry=604800{extra}"
+    );
+    let response = send(
+        app,
+        post_form(
+            &format!("/folders/{folder_id}/requests"),
+            csrf,
+            "alice",
+            body,
+        ),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::FOUND, "{}", response.text());
+    let id = response
+        .location()
+        .trim_start_matches("/requests/")
+        .to_string();
+    store
+        .get_upload_request(&id, "alice")
+        .await
+        .unwrap()
+        .expect("created upload request")
 }
 
 #[tokio::test]
@@ -1525,8 +1626,8 @@ async fn trash_restore_and_purge_lifecycle() {
     let blobs: Arc<dyn Blobs> = state.blobs.clone();
     let app = app(state);
     let (id, csrf) = upload_png(&app, "alice").await;
+    let token = enable_file_share(&app, &store, &id, "alice", &csrf).await;
     let rec = store.get(&id).await.unwrap().unwrap();
-    let token = rec.share_token.clone().unwrap();
 
     let del = send(
         &app,
@@ -2676,12 +2777,20 @@ async fn public_upload_inbox_accepts_uploads_without_listing_files() {
     .await;
     assert_eq!(enabled.status, StatusCode::FOUND);
     let token = store
+        .list_upload_requests("alice")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|request| request.folder_id == fid)
+        .unwrap()
+        .token;
+    assert!(store
         .get_folder(&fid, "alice")
         .await
         .unwrap()
         .unwrap()
         .upload_token
-        .unwrap();
+        .is_none());
 
     let page = send(&app, get(&format!("/u/{token}"), None)).await;
     assert_eq!(page.status, StatusCode::OK);
@@ -2832,8 +2941,772 @@ async fn public_upload_inbox_accepts_uploads_without_listing_files() {
     assert_eq!(revoked.status, StatusCode::FOUND);
     assert_eq!(
         send(&app, get(&format!("/u/{token}"), None)).await.status,
+        StatusCode::GONE
+    );
+}
+
+#[tokio::test]
+async fn request_rooms_owner_lifecycle_rotation_and_receipts() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let home = send(&app, get("/", Some("alice"))).await;
+    let csrf = home.csrf_cookie().unwrap();
+    let made = send(
+        &app,
+        post_form(
+            "/folders",
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&name=Evidence"),
+        ),
+    )
+    .await;
+    let folder_id = folder_from_location(&made.location());
+    let request = create_upload_request(
+        &app,
+        &store,
+        &folder_id,
+        &csrf,
+        "&max_file_mib=2&max_total_mib=4&max_files=3&allowed_types=image%2F*",
+    )
+    .await;
+
+    let list = send(&app, get("/requests", Some("alice"))).await;
+    assert_eq!(list.status, StatusCode::OK);
+    assert!(list.text().contains("Evidence intake"));
+    assert!(list.text().contains("Create request"));
+    let detail = send(
+        &app,
+        get(&format!("/requests/{}", request.id), Some("alice")),
+    )
+    .await;
+    assert_eq!(detail.status, StatusCode::OK);
+    assert!(detail.text().contains("Request limits"));
+    assert!(detail.text().contains("Files received"));
+    assert!(detail.text().contains(&format!(
+        "name=\"expected_token\" value=\"{}\"",
+        request.token
+    )));
+
+    let public = send(&app, get(&format!("/u/{}", request.token), None)).await;
+    assert_eq!(public.status, StatusCode::OK);
+    let public_csrf = public.csrf_cookie().unwrap();
+    let received = send(
+        &app,
+        public_upload_req(
+            &public_csrf,
+            &public_csrf,
+            &request.token,
+            "proof.png",
+            "image/png",
+            &png_bytes(),
+        ),
+    )
+    .await;
+    assert_eq!(received.status, StatusCode::OK, "{}", received.text());
+    let submissions = store
+        .list_upload_submissions(&request.id, "alice")
+        .await
+        .unwrap();
+    assert_eq!(submissions.len(), 1);
+    let received_file = store.get(&submissions[0].file_id).await.unwrap().unwrap();
+    assert!(
+        received_file.share_token.is_none(),
+        "upload capability must not mint a read capability"
+    );
+
+    // Full owner update keeps consumed counters but changes the public policy.
+    let updated = send(
+        &app,
+        post_form(
+            &format!("/requests/{}/update", request.id),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&title=Updated+request&description=PNG+only&expiry=86400&max_file_mib=2&max_total_mib=5&max_files=4&allowed_types=image%2Fpng"),
+        ),
+    )
+    .await;
+    assert_eq!(updated.status, StatusCode::FOUND, "{}", updated.text());
+    let stored = store
+        .get_upload_request(&request.id, "alice")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.title, "Updated request");
+    assert_eq!(stored.used_files, 1);
+    assert_eq!(stored.allowed_types, "image/png");
+
+    let closed = send(
+        &app,
+        post_form(
+            &format!("/requests/{}/close", request.id),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(closed.status, StatusCode::FOUND);
+    assert_eq!(
+        send(&app, get(&format!("/u/{}", request.token), None))
+            .await
+            .status,
+        StatusCode::GONE
+    );
+    let reopened = send(
+        &app,
+        post_form(
+            &format!("/requests/{}/reopen", request.id),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(reopened.status, StatusCode::FOUND);
+    assert_eq!(
+        send(&app, get(&format!("/u/{}", request.token), None))
+            .await
+            .status,
+        StatusCode::OK
+    );
+
+    let rotated = send(
+        &app,
+        post_form(
+            &format!("/requests/{}/rotate", request.id),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&expected_token={}", request.token),
+        ),
+    )
+    .await;
+    assert_eq!(rotated.status, StatusCode::FOUND);
+    let new_token = store
+        .get_upload_request(&request.id, "alice")
+        .await
+        .unwrap()
+        .unwrap()
+        .token;
+    assert_ne!(new_token, request.token);
+    assert_eq!(
+        send(&app, get(&format!("/u/{}", request.token), None))
+            .await
+            .status,
         StatusCode::NOT_FOUND
     );
+    assert_eq!(
+        send(&app, get(&format!("/u/{new_token}"), None))
+            .await
+            .status,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn request_rooms_enforce_type_file_total_count_and_expiry_without_leaks() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let home = send(&app, get("/", Some("alice"))).await;
+    let csrf = home.csrf_cookie().unwrap();
+    let made = send(
+        &app,
+        post_form(
+            "/folders",
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&name=Bounded"),
+        ),
+    )
+    .await;
+    let folder_id = folder_from_location(&made.location());
+    let mut request = create_upload_request(
+        &app,
+        &store,
+        &folder_id,
+        &csrf,
+        "&max_file_mib=1&max_total_mib=1&max_files=1&allowed_types=image%2F*",
+    )
+    .await;
+    let public = send(&app, get(&format!("/u/{}", request.token), None)).await;
+    let public_csrf = public.csrf_cookie().unwrap();
+
+    let denied = send(
+        &app,
+        public_upload_req(
+            &public_csrf,
+            &public_csrf,
+            &request.token,
+            "note.txt",
+            "text/plain",
+            b"not accepted",
+        ),
+    )
+    .await;
+    assert_eq!(denied.status, StatusCode::BAD_REQUEST);
+    assert!(denied.text().contains("could not accept this request"));
+    assert!(!denied.text().contains("text/plain"));
+
+    let forged_image = send(
+        &app,
+        public_upload_req(
+            &public_csrf,
+            &public_csrf,
+            &request.token,
+            "forged.png",
+            "image/png",
+            b"<!doctype html><script>alert(1)</script>",
+        ),
+    )
+    .await;
+    assert_eq!(forged_image.status, StatusCode::BAD_REQUEST);
+    assert!(store
+        .list_upload_submissions(&request.id, "alice")
+        .await
+        .unwrap()
+        .is_empty());
+
+    request.allowed_types = "application/pdf".to_string();
+    request.updated_at += 1;
+    assert!(store.update_upload_request(&request).await.unwrap());
+    let forged_pdf = send(
+        &app,
+        public_upload_req(
+            &public_csrf,
+            &public_csrf,
+            &request.token,
+            "forged.pdf",
+            "application/pdf",
+            b"<!doctype html><script>alert(1)</script>",
+        ),
+    )
+    .await;
+    assert_eq!(forged_pdf.status, StatusCode::BAD_REQUEST);
+    request.allowed_types = "image/*".to_string();
+    request.updated_at += 1;
+    assert!(store.update_upload_request(&request).await.unwrap());
+
+    let mut oversized = png_bytes();
+    oversized.resize(1024 * 1024 + 1, 0);
+    let too_large = send(
+        &app,
+        public_upload_req(
+            &public_csrf,
+            &public_csrf,
+            &request.token,
+            "large.png",
+            "image/png",
+            &oversized,
+        ),
+    )
+    .await;
+    assert_eq!(too_large.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(!too_large.text().contains("1048576"));
+    assert!(!too_large.text().contains("quota"));
+
+    let mut accepted = png_bytes();
+    accepted.resize(600 * 1024, 0);
+    let first = send(
+        &app,
+        public_upload_req(
+            &public_csrf,
+            &public_csrf,
+            &request.token,
+            "first.png",
+            "image/png",
+            &accepted,
+        ),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.text());
+    let second = send(
+        &app,
+        public_upload_req(
+            &public_csrf,
+            &public_csrf,
+            &request.token,
+            "second.png",
+            "image/png",
+            &accepted,
+        ),
+    )
+    .await;
+    assert_eq!(second.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(!second.text().contains("owner's"));
+    assert!(!second.text().contains("quota"));
+    assert!(!second.text().contains("store error"));
+    let consumed = store
+        .get_upload_request(&request.id, "alice")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(consumed.used_files, 1);
+    assert_eq!(consumed.used_bytes, accepted.len() as i64);
+
+    request = consumed;
+    request.expires_at = Some(1);
+    request.updated_at += 1;
+    assert!(store.update_upload_request(&request).await.unwrap());
+    assert_eq!(
+        send(&app, get(&format!("/u/{}", request.token), None))
+            .await
+            .status,
+        StatusCode::GONE
+    );
+}
+
+#[tokio::test]
+async fn request_blob_failure_releases_budget_and_leaves_no_receipt_or_file() {
+    let base = build_dev_state();
+    let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    let deletes = Arc::new(AtomicUsize::new(0));
+    let state = AppState {
+        config: base.config,
+        store: store.clone(),
+        blobs: Arc::new(FailingPutBlobs {
+            deletes: deletes.clone(),
+            fail_delete: false,
+        }),
+        audit: aperture::audit::AuditSink::disabled(),
+    };
+    let app = app(state);
+    let home = send(&app, get("/", Some("alice"))).await;
+    let csrf = home.csrf_cookie().unwrap();
+    let made = send(
+        &app,
+        post_form(
+            "/folders",
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&name=Failure"),
+        ),
+    )
+    .await;
+    let folder_id = folder_from_location(&made.location());
+    let request = create_upload_request(&app, &store, &folder_id, &csrf, "").await;
+    let public = send(&app, get(&format!("/u/{}", request.token), None)).await;
+    let public_csrf = public.csrf_cookie().unwrap();
+    let failed = send(
+        &app,
+        public_upload_req(
+            &public_csrf,
+            &public_csrf,
+            &request.token,
+            "failure.png",
+            "image/png",
+            &png_bytes(),
+        ),
+    )
+    .await;
+    assert_eq!(failed.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(!failed.text().contains("injected put failure"));
+    assert!(deletes.load(Ordering::SeqCst) >= 1);
+    let after = store
+        .get_upload_request(&request.id, "alice")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((after.used_files, after.used_bytes), (0, 0));
+    assert!(store
+        .list_upload_submissions(&request.id, "alice")
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .list_files_in_folder(&folder_id, "alice")
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn request_blob_delete_failure_keeps_the_durable_recovery_anchor() {
+    let base = build_dev_state();
+    let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    let deletes = Arc::new(AtomicUsize::new(0));
+    let state = AppState {
+        config: base.config,
+        store: store.clone(),
+        blobs: Arc::new(FailingPutBlobs {
+            deletes: deletes.clone(),
+            fail_delete: true,
+        }),
+        audit: aperture::audit::AuditSink::disabled(),
+    };
+    let app = app(state);
+    let home = send(&app, get("/", Some("alice"))).await;
+    let csrf = home.csrf_cookie().unwrap();
+    let made = send(
+        &app,
+        post_form(
+            "/folders",
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&name=DurableFailure"),
+        ),
+    )
+    .await;
+    let folder_id = folder_from_location(&made.location());
+    let request = create_upload_request(&app, &store, &folder_id, &csrf, "").await;
+    let public = send(&app, get(&format!("/u/{}", request.token), None)).await;
+    let public_csrf = public.csrf_cookie().unwrap();
+    let failed = send(
+        &app,
+        public_upload_req(
+            &public_csrf,
+            &public_csrf,
+            &request.token,
+            "orphan.png",
+            "image/png",
+            &png_bytes(),
+        ),
+    )
+    .await;
+    assert_eq!(failed.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(deletes.load(Ordering::SeqCst), 1);
+
+    let after = store
+        .get_upload_request(&request.id, "alice")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.used_files, 1,
+        "failed delete keeps the file slot reserved"
+    );
+    assert_eq!(after.used_bytes, png_bytes().len() as i64);
+    let claim = store
+        .claim_upload_recovery("recovery-owner", 100, 0)
+        .await
+        .unwrap();
+    let UploadRecoveryClaim::Claimed(items) = claim else {
+        panic!("failed compensation must leave one recoverable reservation");
+    };
+    assert_eq!(items.len(), 1);
+}
+
+#[tokio::test]
+async fn request_memory_reservation_is_atomic_under_concurrency() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let home = send(&app, get("/", Some("alice"))).await;
+    let csrf = home.csrf_cookie().unwrap();
+    let made = send(
+        &app,
+        post_form(
+            "/folders",
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&name=Atomic"),
+        ),
+    )
+    .await;
+    let folder_id = folder_from_location(&made.location());
+    let request = create_upload_request(
+        &app,
+        &store,
+        &folder_id,
+        &csrf,
+        "&max_file_mib=1&max_total_mib=1&max_files=1",
+    )
+    .await;
+    let left = store.clone();
+    let right = store.clone();
+    let request_id = request.id.clone();
+    let request_id_two = request.id.clone();
+    let request_token = request.token.clone();
+    let request_token_two = request.token.clone();
+    let (a, b) = tokio::join!(
+        async move {
+            left.reserve_request_upload(UploadReserveInput {
+                request_id: &request_id,
+                expected_token: &request_token,
+                reservation_id: "reserve-a",
+                size: 1,
+                content_type: "image/png",
+                content_type_verified: true,
+                owner_quota: None,
+                now: 10,
+            })
+            .await
+            .unwrap()
+        },
+        async move {
+            right
+                .reserve_request_upload(UploadReserveInput {
+                    request_id: &request_id_two,
+                    expected_token: &request_token_two,
+                    reservation_id: "reserve-b",
+                    size: 1,
+                    content_type: "image/png",
+                    content_type_verified: true,
+                    owner_quota: None,
+                    now: 10,
+                })
+                .await
+                .unwrap()
+        }
+    );
+    assert_eq!(
+        [a, b]
+            .into_iter()
+            .filter(|outcome| *outcome == UploadReserve::Reserved)
+            .count(),
+        1
+    );
+    assert!(matches!(
+        [a, b]
+            .into_iter()
+            .find(|outcome| *outcome != UploadReserve::Reserved),
+        Some(UploadReserve::FileCountExceeded)
+    ));
+    let winner = if a == UploadReserve::Reserved {
+        "reserve-a"
+    } else {
+        "reserve-b"
+    };
+    assert!(store.release_request_upload(winner).await.unwrap());
+    let released = store
+        .get_upload_request(&request.id, "alice")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((released.used_files, released.used_bytes), (0, 0));
+}
+
+#[tokio::test]
+async fn request_memory_recovery_claim_is_all_or_busy() {
+    let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    let mut request = store_request("memory-recovery", "memory-recovery-token");
+    request.status = "open".to_string();
+    request.expires_at = Some(1_000);
+    assert!(store.create_upload_request(&request).await.unwrap());
+    for id in ["memory-recovery-a", "memory-recovery-b"] {
+        assert_eq!(
+            store
+                .reserve_request_upload(UploadReserveInput {
+                    request_id: &request.id,
+                    expected_token: &request.token,
+                    reservation_id: id,
+                    size: 1,
+                    content_type: "image/png",
+                    content_type_verified: true,
+                    owner_quota: None,
+                    now: 10,
+                })
+                .await
+                .unwrap(),
+            UploadReserve::Reserved
+        );
+    }
+    let first = store
+        .claim_upload_recovery("first-worker", 20, 0)
+        .await
+        .unwrap();
+    assert!(matches!(first, UploadRecoveryClaim::Claimed(ref items) if items.len() == 2));
+    assert!(store
+        .abandon_upload_recovery("memory-recovery-a", "first-worker")
+        .await
+        .unwrap());
+    assert_eq!(
+        store
+            .claim_upload_recovery("second-worker", 21, 0)
+            .await
+            .unwrap(),
+        UploadRecoveryClaim::Busy
+    );
+    assert!(store
+        .release_request_upload("memory-recovery-a")
+        .await
+        .unwrap());
+    assert!(
+        !store
+            .release_request_upload("memory-recovery-b")
+            .await
+            .unwrap(),
+        "a leased release fails without deleting the recovery anchor"
+    );
+    assert!(store
+        .complete_upload_recovery("memory-recovery-b", "first-worker")
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn request_rotation_invalidates_a_previously_resolved_token_at_reservation() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let home = send(&app, get("/", Some("alice"))).await;
+    let csrf = home.csrf_cookie().unwrap();
+    let made = send(
+        &app,
+        post_form(
+            "/folders",
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&name=RotateRace"),
+        ),
+    )
+    .await;
+    let folder_id = folder_from_location(&made.location());
+    let request = create_upload_request(&app, &store, &folder_id, &csrf, "").await;
+    let resolved = Arc::new(tokio::sync::Notify::new());
+    let rotated = Arc::new(tokio::sync::Notify::new());
+
+    let uploader_store = store.clone();
+    let uploader_resolved = resolved.clone();
+    let uploader_rotated = rotated.clone();
+    let old_token = request.token.clone();
+    let rotate_expected_token = old_token.clone();
+    let upload = async move {
+        let stale_page = uploader_store
+            .get_upload_request_by_token(&old_token)
+            .await
+            .unwrap()
+            .unwrap();
+        uploader_resolved.notify_one();
+        uploader_rotated.notified().await;
+        uploader_store
+            .reserve_request_upload(UploadReserveInput {
+                request_id: &stale_page.id,
+                expected_token: &old_token,
+                reservation_id: "old-token-reservation",
+                size: 1,
+                content_type: "application/octet-stream",
+                content_type_verified: false,
+                owner_quota: None,
+                now: 10,
+            })
+            .await
+            .unwrap()
+    };
+    let owner_store = store.clone();
+    let owner_resolved = resolved;
+    let owner_rotated = rotated;
+    let request_id = request.id.clone();
+    let rotate = async move {
+        owner_resolved.notified().await;
+        assert!(owner_store
+            .rotate_upload_request_token(
+                &request_id,
+                "alice",
+                &rotate_expected_token,
+                "replacement-token",
+                11,
+            )
+            .await
+            .unwrap());
+        owner_rotated.notify_one();
+    };
+    let (outcome, ()) = tokio::join!(upload, rotate);
+    assert_eq!(outcome, UploadReserve::Unavailable);
+    let stored = store
+        .get_upload_request(&request.id, "alice")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((stored.used_files, stored.used_bytes), (0, 0));
+}
+
+fn store_request(id: &str, token: &str) -> UploadRequestRec {
+    UploadRequestRec {
+        id: id.to_string(),
+        owner_sub: "alice".to_string(),
+        folder_id: "folder".to_string(),
+        token: token.to_string(),
+        title: "Original policy".to_string(),
+        description: "Original description".to_string(),
+        status: "closed".to_string(),
+        expires_at: Some(5),
+        max_file_bytes: 1024,
+        max_total_bytes: 4096,
+        max_files: 4,
+        used_bytes: 0,
+        used_files: 0,
+        allowed_types: "image/*".to_string(),
+        created_at: 1,
+        updated_at: 1,
+    }
+}
+
+#[tokio::test]
+async fn request_rotation_is_expected_token_compare_and_swap() {
+    let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    let request = store_request("rotate-cas", "original-token");
+    assert!(store.create_upload_request(&request).await.unwrap());
+    let left = store.clone();
+    let right = store.clone();
+    let (a, b) = tokio::join!(
+        left.rotate_upload_request_token(
+            "rotate-cas",
+            "alice",
+            "original-token",
+            "left-token",
+            10,
+        ),
+        right.rotate_upload_request_token(
+            "rotate-cas",
+            "alice",
+            "original-token",
+            "right-token",
+            10,
+        )
+    );
+    assert_eq!(
+        [a.unwrap(), b.unwrap()]
+            .into_iter()
+            .filter(|ok| *ok)
+            .count(),
+        1
+    );
+    let stored = store
+        .get_upload_request("rotate-cas", "alice")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        stored.token.as_str(),
+        "left-token" | "right-token"
+    ));
+}
+
+#[tokio::test]
+async fn request_reopen_does_not_replace_a_concurrent_policy_update() {
+    let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    let request = store_request("reopen-cas", "reopen-token");
+    assert!(store.create_upload_request(&request).await.unwrap());
+    let mut policy = request.clone();
+    policy.title = "Concurrent policy".to_string();
+    policy.description = "Must survive reopen".to_string();
+    policy.max_total_bytes = 8192;
+    policy.max_files = 8;
+    policy.allowed_types = "application/pdf".to_string();
+    policy.expires_at = Some(500);
+    policy.updated_at = 100;
+    let left = store.clone();
+    let right = store.clone();
+    let (updated, reopened) = tokio::join!(
+        left.update_upload_request(&policy),
+        right.reopen_upload_request("reopen-cas", "alice", 100, 700),
+    );
+    assert!(updated.unwrap());
+    assert!(reopened.unwrap());
+    let stored = store
+        .get_upload_request("reopen-cas", "alice")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.title, "Concurrent policy");
+    assert_eq!(stored.description, "Must survive reopen");
+    assert_eq!(stored.max_total_bytes, 8192);
+    assert_eq!(stored.max_files, 8);
+    assert_eq!(stored.allowed_types, "application/pdf");
+    assert_eq!(stored.status, "open");
+    assert!(stored.expires_at.is_some_and(|expiry| expiry > 100));
 }
 
 // ---------------------------------------------------------------------------

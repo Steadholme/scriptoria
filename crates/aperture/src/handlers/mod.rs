@@ -2,6 +2,7 @@
 //!
 //! - [`health`] — unauthenticated liveness probe (`/healthz`).
 //! - [`files`] — the drive surface (gallery, upload, detail, raw, delete, public share).
+//! - [`requests`] — owner control plane for finite public Upload Request rooms.
 //! - [`admin`] — the admin panel (per-owner storage usage + quota overrides; admin groups only).
 //!
 //! The shared design tokens / CSS are embedded (via `include_str!`) and inlined into every page,
@@ -13,6 +14,7 @@
 pub mod admin;
 pub mod files;
 pub mod health;
+pub mod requests;
 
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
@@ -216,6 +218,12 @@ pub fn sniff_image(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
+/// Detect file types that a restrictive public Request Room can verify from server-observed
+/// bytes. Client multipart headers are deliberately excluded from this authority decision.
+pub fn sniff_verified_upload_type(bytes: &[u8]) -> Option<&'static str> {
+    sniff_image(bytes).or_else(|| bytes.starts_with(b"%PDF-").then_some("application/pdf"))
+}
+
 /// Sanitize a client-supplied content type to a conservative token, defaulting to
 /// `application/octet-stream`. Only `type/subtype` of safe characters survives; anything else
 /// (header-injection attempts, blanks) collapses to the default.
@@ -406,6 +414,11 @@ mod tests {
         assert_eq!(sniff_image(&jpeg), Some("image/jpeg"));
         assert_eq!(sniff_image(b"GIF89a...."), Some("image/gif"));
         assert_eq!(sniff_image(b"not an image"), None);
+        assert_eq!(
+            sniff_verified_upload_type(b"%PDF-1.7\n"),
+            Some("application/pdf")
+        );
+        assert_eq!(sniff_verified_upload_type(b"<html>"), None);
     }
 
     #[test]

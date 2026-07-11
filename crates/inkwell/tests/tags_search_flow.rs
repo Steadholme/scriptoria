@@ -7,6 +7,7 @@
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
+use inkwell::store::Post;
 use inkwell::{app, build_dev_state, AppState};
 use tower::ServiceExt;
 
@@ -76,6 +77,79 @@ async fn search_ranks_and_highlights_excluding_drafts() {
     assert!(html.contains("No matches"), "empty-match path");
 }
 
+#[tokio::test]
+async fn sparse_tag_continues_across_scan_cap_without_skip_or_duplication() {
+    let state = build_dev_state();
+    state
+        .store
+        .create_post(&stored_post(
+            "deep-tagged",
+            "Deep Tagged Story",
+            1,
+            true,
+            "Needle",
+        ))
+        .await
+        .unwrap();
+    state
+        .store
+        .create_post(&stored_post(
+            "deeper-tagged",
+            "Deeper Tagged Story",
+            0,
+            true,
+            "Needle",
+        ))
+        .await
+        .unwrap();
+    state
+        .store
+        .create_post(&stored_post(
+            "private-deep-tagged",
+            "Private Deep Tagged Story",
+            -1,
+            false,
+            "Needle",
+        ))
+        .await
+        .unwrap();
+    for index in 0..inkwell::config::TAG_SCAN_POST_LIMIT {
+        state
+            .store
+            .create_post(&stored_post(
+                &format!("ordinary-{index:04}"),
+                &format!("Ordinary {index:04}"),
+                10_000 + index as i64,
+                true,
+                "Other",
+            ))
+            .await
+            .unwrap();
+    }
+
+    let (status, page) = call(&state, get("/tag/needle?limit=10")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !page.contains("Deep Tagged Story") && !page.contains("Deeper Tagged Story"),
+        "the first bounded scan may legitimately contain no sparse-tag match"
+    );
+    assert!(!page.contains("No posts tagged"));
+    let cursor = page
+        .split("/tag/needle?before=")
+        .nth(1)
+        .and_then(|tail| tail.split('"').next())
+        .expect("empty bounded page exposes a continuation cursor");
+    let (_, next) = call(
+        &state,
+        get(&format!("/tag/needle?before={cursor}&limit=10")),
+    )
+    .await;
+    assert_eq!(next.matches("Deep Tagged Story").count(), 1);
+    assert_eq!(next.matches("Deeper Tagged Story").count(), 1);
+    assert!(!page.contains("Private Deep Tagged Story"));
+    assert!(!next.contains("Private Deep Tagged Story"));
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
@@ -86,6 +160,32 @@ async fn create(state: &AppState, title: &str, body: &str, tags: &str, published
     let form = form(&pairs);
     let (status, _) = call(state, post_csrf("/new", &form, Some(("u_alice", "alice@hf")))).await;
     assert_eq!(status, StatusCode::SEE_OTHER, "seed post created");
+}
+
+fn stored_post(slug: &str, title: &str, created_at: i64, published: bool, tags: &str) -> Post {
+    Post {
+        id: format!("id-{slug}"),
+        slug: slug.to_string(),
+        title: title.to_string(),
+        body_md: "scale-test body".to_string(),
+        author_sub: "u_alice".to_string(),
+        author_email: "alice@hf".to_string(),
+        created_at,
+        updated_at: created_at,
+        published,
+        publish_at: 0,
+        featured: false,
+        pinned: false,
+        tags: tags.to_string(),
+        cover_url: String::new(),
+        custom_excerpt: String::new(),
+        meta_title: String::new(),
+        meta_description: String::new(),
+        canonical_url: String::new(),
+        social_title: String::new(),
+        social_description: String::new(),
+        social_image: String::new(),
+    }
 }
 
 async fn call(state: &AppState, req: Request<Body>) -> (StatusCode, String) {

@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Upload requests · Drive · HOLDFAST</title>
+  <style>{{CSS}}</style>
+</head>
+<body class="page-console">
+  <header class="appbar">
+    <a class="appbar__brand" href="/" aria-label="HOLDFAST Drive home">
+      <span class="app-tile" aria-hidden="true">⇧</span>
+      <span class="appbar__name"><b>Drive</b><span>drive.w33d.xyz</span></span>
+    </a>
+    <nav class="appbar__nav" aria-label="Drive">
+      <a class="appnav" href="/">Files</a>
+      <a class="appnav is-active" href="/requests">Requests</a>
+    </nav>
+    <span class="appbar__spacer"></span>
+    <div class="appbar__right">{{USERBOX}}</div>
+  </header>
+
+  <main class="console console--narrow request-console">
+    <div class="console__head console__head--row">
+      <div><p class="eyebrow">External intake</p><h1>Upload requests</h1><p class="sub">Finite, upload-only rooms that never reveal your Drive.</p></div>
+    </div>
+    <section class="request-grid" aria-label="Upload requests">{{REQUESTS}}</section>
+    <section class="card request-create">
+      <div class="card__head"><div><p class="eyebrow">New request</p><h2>Choose a destination folder</h2></div></div>
+      <p class="muted">The public room can add files only. You can tune its deadline, budgets and MIME allow-list after creation.</p>
+      <div class="request-create-list">{{FOLDERS}}</div>
+    </section>
+  </main>
+  {{DYNAMIC}}
+  <script>
+    (function () {
+      var buttons = document.querySelectorAll('.copy-btn');
+      Array.prototype.forEach.call(buttons, function (button) {
+        button.addEventListener('click', function () {
+          var row = button.closest ? button.closest('.embed-box__row') : button.parentNode;
+          var input = row ? row.querySelector(button.getAttribute('data-copy') || '') : null;
+          if (!input) { return; }
+          input.select();
+          if (input.setSelectionRange) { input.setSelectionRange(0, input.value.length); }
+          var done = function () {
+            button.textContent = 'Copied';
+            setTimeout(function () { button.textContent = button.getAttribute('data-label') || 'Copy'; }, 1200);
+          };
+          if (navigator.clipboard) {
+            navigator.clipboard.writeText(input.value).then(done, function () {
+              try { document.execCommand('copy'); done(); } catch (error) {}
+            });
+          } else {
+            try { document.execCommand('copy'); done(); } catch (error) {}
+          }
+        });
+      });
+    })();
+  </script>
+</body>
+</html>

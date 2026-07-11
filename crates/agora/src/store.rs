@@ -12,7 +12,7 @@
 //! and NO sync-over-async bridge. The in-memory store never holds a lock across an `.await`.
 //!
 //! Tables (all standard SQL):
-//! - `categories(id TEXT PK, name TEXT, sort_order BIGINT)`
+//! - `categories(id TEXT PK, name TEXT, sort_order BIGINT, format TEXT)`
 //! - `threads(id TEXT PK, category_id TEXT, title TEXT, author_sub TEXT, author_email TEXT,
 //!    created_at BIGINT, last_at BIGINT)`
 //! - `posts(id TEXT PK, thread_id TEXT, body_md TEXT, quoted_post_id TEXT, author_sub TEXT,
@@ -27,7 +27,8 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::model::{
-    BannedAuthor, Category, Mention, Post, ReactionCount, Thread, ThreadDigest, ThreadSearchHit,
+    BannedAuthor, Category, CategoryFormat, Mention, Post, ReactionCount, Thread, ThreadDigest,
+    ThreadSearchHit,
 };
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
@@ -37,6 +38,8 @@ pub enum StoreError {
     Backend(String),
     #[error("invalid store operation: {0}")]
     InvalidOperation(String),
+    #[error("store record not found: {0}")]
+    NotFound(String),
 }
 
 /// Which keyset page of a thread's replies to fetch, over the shared `(created_at, id)` cursor.
@@ -65,6 +68,36 @@ pub enum ThreadSort {
     Hot,
 }
 
+/// Product-level scope for forum lists and search. Answered/unanswered are meaningful only for
+/// question categories, so both variants implicitly exclude discussion categories. `Questions`
+/// is the all-status scope used by `/questions`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ThreadStatusFilter {
+    #[default]
+    Any,
+    Questions,
+    Answered,
+    Unanswered,
+}
+
+/// Explicit, idempotent accepted-answer mutation. `Accept` never toggles: accepting an already
+/// accepted reply is a successful no-op, while `Clear` always clears the pointer and does not
+/// depend on the old target post still existing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AcceptedAnswerAction {
+    Accept { post_id: String },
+    Clear,
+}
+
+/// Atomic result returned to the handler after the Store has validated category, thread, original
+/// post and target reply under one guard/transaction.
+#[derive(Clone, Debug)]
+pub struct AcceptedAnswerMutation {
+    pub thread: Thread,
+    pub accepted_post: Option<Post>,
+    pub changed: bool,
+}
+
 /// Pluggable forum store. All methods are `async` and `.await`ed on the serving runtime.
 #[async_trait]
 pub trait Store: Send + Sync {
@@ -83,11 +116,18 @@ pub trait Store: Send + Sync {
     async fn create_category(&self, category: &Category) -> Result<(), StoreError>;
     /// Rename a category (its display `name`). Admin-only.
     async fn rename_category(&self, id: &str, name: &str) -> Result<(), StoreError>;
+    /// Atomically change a category's product format. A transition to `discussion` is rejected
+    /// while any thread in the category has a valid accepted reply.
+    async fn transition_category_format(
+        &self,
+        id: &str,
+        format: CategoryFormat,
+    ) -> Result<(), StoreError>;
     /// Set a category's `sort_order` (used to reorder the list). Admin-only.
     async fn set_category_order(&self, id: &str, sort_order: i64) -> Result<(), StoreError>;
-    /// Delete a category. Admin-only; the caller refuses when it still holds threads.
+    /// Delete an empty category atomically. The Store rechecks emptiness under the category guard
+    /// so a concurrent thread creation/move cannot leave an orphan.
     async fn delete_category(&self, id: &str) -> Result<(), StoreError>;
-
     /// The most recently active threads across all categories (by `last_at` DESC), capped.
     async fn recent_threads(&self, limit: i64) -> Result<Vec<Thread>, StoreError>;
     /// Threads in one category, most recently active first, capped.
@@ -103,6 +143,7 @@ pub trait Store: Send + Sync {
         category_id: Option<&str>,
         sort: ThreadSort,
         subscribed_sub: Option<&str>,
+        status: ThreadStatusFilter,
         limit: i64,
         now: i64,
     ) -> Result<Vec<Thread>, StoreError>;
@@ -112,6 +153,7 @@ pub trait Store: Send + Sync {
         &self,
         query: &str,
         category_id: Option<&str>,
+        status: ThreadStatusFilter,
         limit: i64,
     ) -> Result<Vec<ThreadSearchHit>, StoreError>;
     /// A single thread by id, if it exists.
@@ -125,6 +167,13 @@ pub trait Store: Send + Sync {
     async fn count_posts(&self, thread_id: &str) -> Result<i64, StoreError>;
     /// A single post by id, if it exists (used by admin post-deletion + audit).
     async fn get_post(&self, id: &str) -> Result<Option<Post>, StoreError>;
+    /// The thread's accepted reply only when the pointer is valid: the post exists, belongs to the
+    /// same thread and is not the recorded original post. Category format is deliberately not part
+    /// of this predicate so a historical discussion solution remains readable on its detail page.
+    async fn get_valid_accepted_post(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<Post>, StoreError>;
     /// All posts in a thread, with its stable original post first, then replies oldest-first.
     async fn posts_in_thread(&self, thread_id: &str) -> Result<Vec<Post>, StoreError>;
 
@@ -141,13 +190,16 @@ pub trait Store: Send + Sync {
         &self,
         thread_id: &str,
         op_id: &str,
+        excluded_post_id: Option<&str>,
         anchor: &ReplyAnchor,
         limit: i64,
     ) -> Result<Vec<Post>, StoreError>;
 
-    /// Create a thread together with its original post, atomically.
+    /// Create a thread together with its original post, atomically, after locking and confirming
+    /// its category still exists.
     async fn create_thread(&self, thread: &Thread, first_post: &Post) -> Result<(), StoreError>;
-    /// Append a reply and bump the parent thread's `last_at` to the reply's timestamp.
+    /// Append a reply and bump the parent thread's `last_at` to the reply's timestamp. The Store
+    /// locks category then thread and rechecks that the thread exists and is still unlocked.
     async fn add_reply(&self, post: &Post) -> Result<(), StoreError>;
 
     /// Replace the parsed mentions for one post with the supplied normalised usernames.
@@ -192,13 +244,20 @@ pub trait Store: Send + Sync {
     async fn set_thread_locked(&self, thread_id: &str, locked: bool) -> Result<(), StoreError>;
     /// Set a thread's `pinned` flag (pinned threads sort first in the lists). Admin-only.
     async fn set_thread_pinned(&self, thread_id: &str, pinned: bool) -> Result<(), StoreError>;
-    /// Move a thread to another category. Admin-only; the caller validates the target exists.
-    async fn move_thread(&self, thread_id: &str, category_id: &str) -> Result<(), StoreError>;
+    /// Atomically move a thread. A valid accepted reply cannot be moved into a discussion category.
+    async fn move_thread_to_category(
+        &self,
+        thread_id: &str,
+        category_id: &str,
+    ) -> Result<(), StoreError>;
 
-    /// Set (or clear, with an empty string) a thread's `accepted_post_id` — the reply the thread
-    /// author/admin marked as the accepted answer. Idempotent (setting the same value twice is a
-    /// no-op change). Authorisation is enforced by the caller.
-    async fn set_accepted_post(&self, thread_id: &str, post_id: &str) -> Result<(), StoreError>;
+    /// Atomically accept or clear an answer. The Store owns all category/thread/post invariants;
+    /// authorisation remains a handler concern because identity is gateway-owned.
+    async fn mutate_accepted_answer(
+        &self,
+        thread_id: &str,
+        action: AcceptedAnswerAction,
+    ) -> Result<AcceptedAnswerMutation, StoreError>;
 
     /// Toggle one user's subscription to a thread. Returns `true` when subscribed, `false` when the
     /// existing subscription was removed.
@@ -251,6 +310,9 @@ pub trait Store: Send + Sync {
 
 #[derive(Default)]
 pub struct InMemoryStore {
+    /// One fixed outer lock domain for category/thread/post invariant commands. Commands then take
+    /// data locks in category -> thread metadata -> post order and never await while held.
+    qa_guard: Mutex<()>,
     categories: Mutex<Vec<Category>>,
     threads: Mutex<Vec<Thread>>,
     posts: Mutex<Vec<Post>>,
@@ -350,6 +412,41 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
+    async fn transition_category_format(
+        &self,
+        id: &str,
+        format: CategoryFormat,
+    ) -> Result<(), StoreError> {
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        let mut cats = self.categories.lock().expect("categories lock poisoned");
+        let category = cats
+            .iter_mut()
+            .find(|category| category.id == id)
+            .ok_or_else(|| StoreError::NotFound("category not found".to_string()))?;
+        if category.format == format {
+            return Ok(());
+        }
+
+        let threads = self.threads.lock().expect("threads lock poisoned");
+        let original_posts = self
+            .original_posts
+            .lock()
+            .expect("original_posts lock poisoned");
+        let posts = self.posts.lock().expect("posts lock poisoned");
+        if format == CategoryFormat::Discussion
+            && threads.iter().any(|thread| {
+                thread.category_id == id
+                    && valid_accepted_post(thread, &original_posts, &posts).is_some()
+            })
+        {
+            return Err(StoreError::InvalidOperation(
+                "unmark accepted answers before changing this category to discussion".to_string(),
+            ));
+        }
+        category.format = format;
+        Ok(())
+    }
+
     async fn set_category_order(&self, id: &str, sort_order: i64) -> Result<(), StoreError> {
         let mut cats = self.categories.lock().expect("categories lock poisoned");
         if let Some(c) = cats.iter_mut().find(|c| c.id == id) {
@@ -359,10 +456,15 @@ impl Store for InMemoryStore {
     }
 
     async fn delete_category(&self, id: &str) -> Result<(), StoreError> {
-        self.categories
-            .lock()
-            .expect("categories lock poisoned")
-            .retain(|c| c.id != id);
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        let mut categories = self.categories.lock().expect("categories lock poisoned");
+        let threads = self.threads.lock().expect("threads lock poisoned");
+        if threads.iter().any(|thread| thread.category_id == id) {
+            return Err(StoreError::InvalidOperation(
+                "category still has threads — move or delete them first".to_string(),
+            ));
+        }
+        categories.retain(|category| category.id != id);
         Ok(())
     }
 
@@ -396,6 +498,7 @@ impl Store for InMemoryStore {
         category_id: Option<&str>,
         sort: ThreadSort,
         subscribed_sub: Option<&str>,
+        status: ThreadStatusFilter,
         limit: i64,
         now: i64,
     ) -> Result<Vec<Thread>, StoreError> {
@@ -408,13 +511,40 @@ impl Store for InMemoryStore {
                 .map(|s| s.thread_id.clone())
                 .collect()
         });
-        let posts = self.posts.lock().expect("posts lock poisoned").clone();
-        let mut rows: Vec<(Thread, i64)> = self
-            .threads
-            .lock()
-            .expect("threads lock poisoned")
+        let (category_formats, threads, original_posts, posts) = {
+            let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+            let category_formats: HashMap<String, CategoryFormat> = self
+                .categories
+                .lock()
+                .expect("categories lock poisoned")
+                .iter()
+                .map(|category| (category.id.clone(), category.format))
+                .collect();
+            let threads = self.threads.lock().expect("threads lock poisoned").clone();
+            let original_posts = self
+                .original_posts
+                .lock()
+                .expect("original_posts lock poisoned")
+                .clone();
+            let posts = self.posts.lock().expect("posts lock poisoned").clone();
+            (category_formats, threads, original_posts, posts)
+        };
+        let mut rows: Vec<(Thread, i64)> = threads
             .iter()
             .filter(|t| category_id.map(|cid| t.category_id == cid).unwrap_or(true))
+            .filter(|thread| {
+                let format = category_formats
+                    .get(&thread.category_id)
+                    .copied()
+                    .unwrap_or_default();
+                let valid = has_valid_question_solution(
+                    thread,
+                    format,
+                    &original_posts,
+                    &posts,
+                );
+                thread_matches_status(valid, format.is_question(), status)
+            })
             .filter(|t| {
                 subscribed_threads
                     .as_ref()
@@ -424,7 +554,12 @@ impl Store for InMemoryStore {
             .cloned()
             .map(|t| {
                 let post_count = posts.iter().filter(|p| p.thread_id == t.id).count() as i64;
-                (t, (post_count - 1).max(0))
+                let format = category_formats
+                    .get(&t.category_id)
+                    .copied()
+                    .unwrap_or_default();
+                let valid = has_valid_question_solution(&t, format, &original_posts, &posts);
+                (public_thread(t, valid), (post_count - 1).max(0))
             })
             .collect();
         sort_thread_rows(&mut rows, sort, now);
@@ -436,6 +571,7 @@ impl Store for InMemoryStore {
         &self,
         query: &str,
         category_id: Option<&str>,
+        status: ThreadStatusFilter,
         limit: i64,
     ) -> Result<Vec<ThreadSearchHit>, StoreError> {
         let needle = query.trim().to_lowercase();
@@ -443,40 +579,81 @@ impl Store for InMemoryStore {
             return Ok(Vec::new());
         }
 
-        // Build one original-post/count record per thread up front. This keeps search O(posts +
-        // threads), instead of rescanning and sorting the complete post corpus for every thread.
-        let posts = self.posts.lock().expect("posts lock poisoned").clone();
-        let original_posts = self
-            .original_posts
-            .lock()
-            .expect("original_posts lock poisoned")
-            .clone();
+        // Build one original-post/accepted-post/count record per thread up front. This keeps search
+        // O(posts + threads), instead of rescanning the complete post corpus for every thread.
+        let (category_formats, threads, original_posts, posts) = {
+            let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+            let category_formats: HashMap<String, CategoryFormat> = self
+                .categories
+                .lock()
+                .expect("categories lock poisoned")
+                .iter()
+                .map(|category| (category.id.clone(), category.format))
+                .collect();
+            let threads = self.threads.lock().expect("threads lock poisoned").clone();
+            let original_posts = self
+                .original_posts
+                .lock()
+                .expect("original_posts lock poisoned")
+                .clone();
+            let posts = self.posts.lock().expect("posts lock poisoned").clone();
+            (category_formats, threads, original_posts, posts)
+        };
         let mut post_counts: HashMap<String, i64> = HashMap::new();
         let mut original_bodies: HashMap<String, String> = HashMap::new();
-        for post in posts {
+        let mut posts_by_id: HashMap<String, Post> = HashMap::new();
+        for post in &posts {
             *post_counts.entry(post.thread_id.clone()).or_insert(0) += 1;
             if original_posts.get(&post.thread_id) == Some(&post.id) {
-                original_bodies.insert(post.thread_id.clone(), post.body_md);
+                original_bodies.insert(post.thread_id.clone(), post.body_md.clone());
             }
+            posts_by_id.insert(post.id.clone(), post.clone());
         }
-        let mut hits: Vec<ThreadSearchHit> = self
-            .threads
-            .lock()
-            .expect("threads lock poisoned")
+        let mut hits: Vec<ThreadSearchHit> = threads
             .iter()
             .filter(|thread| {
                 category_id
                     .map(|category_id| thread.category_id == category_id)
                     .unwrap_or(true)
             })
+            .filter(|thread| {
+                let format = category_formats
+                    .get(&thread.category_id)
+                    .copied()
+                    .unwrap_or_default();
+                let valid = has_valid_question_solution(
+                    thread,
+                    format,
+                    &original_posts,
+                    &posts,
+                );
+                thread_matches_status(valid, format.is_question(), status)
+            })
             .filter_map(|thread| {
                 let first_body_md = original_bodies.get(&thread.id).cloned().unwrap_or_default();
+                let format = category_formats
+                    .get(&thread.category_id)
+                    .copied()
+                    .unwrap_or_default();
+                let valid_post = format
+                    .is_question()
+                    .then(|| valid_accepted_post(thread, &original_posts, &posts))
+                    .flatten();
+                let valid_solution = valid_post.is_some();
+                let accepted_body_md = valid_post
+                    .and_then(|post| posts_by_id.get(&post.id))
+                    .map(|post| post.body_md.clone())
+                    .unwrap_or_default();
                 let post_count = post_counts.get(&thread.id).copied().unwrap_or_default();
+                let matched_in_solution = accepted_body_md.to_lowercase().contains(&needle);
                 let matches = thread.title.to_lowercase().contains(&needle)
-                    || first_body_md.to_lowercase().contains(&needle);
+                    || first_body_md.to_lowercase().contains(&needle)
+                    || matched_in_solution;
                 matches.then(|| ThreadSearchHit {
-                    thread: thread.clone(),
+                    thread: public_thread(thread.clone(), valid_solution),
                     first_body_md,
+                    accepted_body_md,
+                    matched_in_solution,
                     reply_count: (post_count - 1).max(0),
                 })
             })
@@ -503,6 +680,7 @@ impl Store for InMemoryStore {
             b.last_at
                 .cmp(&a.last_at)
                 .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| b.id.cmp(&a.id))
         });
         threads.truncate(limit.max(0) as usize);
         // Clone the posts once, then resolve each thread's explicit original-post identity.
@@ -548,6 +726,29 @@ impl Store for InMemoryStore {
             .expect("posts lock poisoned")
             .iter()
             .find(|p| p.id == id)
+            .cloned())
+    }
+
+    async fn get_valid_accepted_post(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<Post>, StoreError> {
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        let thread = self
+            .threads
+            .lock()
+            .expect("threads lock poisoned")
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .cloned();
+        let original_posts = self
+            .original_posts
+            .lock()
+            .expect("original_posts lock poisoned");
+        let posts = self.posts.lock().expect("posts lock poisoned");
+        Ok(thread
+            .as_ref()
+            .and_then(|thread| valid_accepted_post(thread, &original_posts, &posts))
             .cloned())
     }
 
@@ -598,16 +799,23 @@ impl Store for InMemoryStore {
         &self,
         thread_id: &str,
         op_id: &str,
+        excluded_post_id: Option<&str>,
         anchor: &ReplyAnchor,
         limit: i64,
     ) -> Result<Vec<Post>, StoreError> {
-        // Replies are every post in the thread except the original (`op_id`).
+        // Replies are every post in the thread except the original and the separately-rendered
+        // accepted solution. Excluding the solution before LIMIT keeps every page full and avoids
+        // rendering it twice when its natural position falls inside the current page.
         let mut v: Vec<Post> = self
             .posts
             .lock()
             .expect("posts lock poisoned")
             .iter()
-            .filter(|p| p.thread_id == thread_id && p.id != op_id)
+            .filter(|p| {
+                p.thread_id == thread_id
+                    && p.id != op_id
+                    && excluded_post_id.map(|id| p.id != id).unwrap_or(true)
+            })
             .cloned()
             .collect();
         // Same keyset predicate as the SQL path: strictly newer/older than the composite cursor.
@@ -646,26 +854,62 @@ impl Store for InMemoryStore {
     }
 
     async fn create_thread(&self, thread: &Thread, first_post: &Post) -> Result<(), StoreError> {
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        if first_post.thread_id != thread.id {
+            return Err(StoreError::InvalidOperation(
+                "the original post must belong to the new thread".to_string(),
+            ));
+        }
+        let categories = self.categories.lock().expect("categories lock poisoned");
+        if categories
+            .iter()
+            .all(|category| category.id != thread.category_id)
+        {
+            return Err(StoreError::NotFound("category not found".to_string()));
+        }
         let mut threads = self.threads.lock().expect("threads lock poisoned");
+        let mut original_posts = self
+            .original_posts
+            .lock()
+            .expect("original_posts lock poisoned");
         let mut posts = self.posts.lock().expect("posts lock poisoned");
         threads.push(thread.clone());
+        original_posts.insert(thread.id.clone(), first_post.id.clone());
         posts.push(first_post.clone());
-        self.original_posts
-            .lock()
-            .expect("original_posts lock poisoned")
-            .insert(thread.id.clone(), first_post.id.clone());
         Ok(())
     }
 
     async fn add_reply(&self, post: &Post) -> Result<(), StoreError> {
-        {
-            let mut posts = self.posts.lock().expect("posts lock poisoned");
-            posts.push(post.clone());
-        }
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        let categories = self.categories.lock().expect("categories lock poisoned");
         let mut threads = self.threads.lock().expect("threads lock poisoned");
-        if let Some(t) = threads.iter_mut().find(|t| t.id == post.thread_id) {
-            t.last_at = post.created_at;
+        let thread = threads
+            .iter_mut()
+            .find(|thread| thread.id == post.thread_id)
+            .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
+        if categories
+            .iter()
+            .all(|category| category.id != thread.category_id)
+        {
+            return Err(StoreError::NotFound("category not found".to_string()));
         }
+        if thread.locked {
+            return Err(StoreError::InvalidOperation(
+                "this thread is locked — no new replies".to_string(),
+            ));
+        }
+        let mut posts = self.posts.lock().expect("posts lock poisoned");
+        if !post.quoted_post_id.is_empty()
+            && posts.iter().all(|quoted| {
+                quoted.id != post.quoted_post_id || quoted.thread_id != post.thread_id
+            })
+        {
+            return Err(StoreError::InvalidOperation(
+                "quoted post must belong to this thread".to_string(),
+            ));
+        }
+        posts.push(post.clone());
+        thread.last_at = post.created_at;
         Ok(())
     }
 
@@ -757,29 +1001,35 @@ impl Store for InMemoryStore {
     }
 
     async fn delete_thread(&self, thread_id: &str) -> Result<(), StoreError> {
-        // Collect the doomed posts' ids first so their reactions can be dropped too.
-        let removed_ids: Vec<String> = {
-            let posts = self.posts.lock().expect("posts lock poisoned");
-            posts
-                .iter()
-                .filter(|p| p.thread_id == thread_id)
-                .map(|p| p.id.clone())
-                .collect()
-        };
-        {
-            let mut threads = self.threads.lock().expect("threads lock poisoned");
-            threads.retain(|t| t.id != thread_id);
-        }
-        {
-            let mut posts = self.posts.lock().expect("posts lock poisoned");
-            posts.retain(|p| p.thread_id != thread_id);
-        }
-        self.original_posts
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        let _category_hint = self
+            .threads
             .lock()
-            .expect("original_posts lock poisoned")
-            .remove(thread_id);
+            .expect("threads lock poisoned")
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .map(|thread| thread.category_id.clone());
+        let categories = self.categories.lock().expect("categories lock poisoned");
+        let mut threads = self.threads.lock().expect("threads lock poisoned");
+        let mut original_posts = self
+            .original_posts
+            .lock()
+            .expect("original_posts lock poisoned");
+        let mut posts = self.posts.lock().expect("posts lock poisoned");
+        let removed_ids: HashSet<String> = posts
+            .iter()
+            .filter(|post| post.thread_id == thread_id)
+            .map(|post| post.id.clone())
+            .collect();
+        threads.retain(|thread| thread.id != thread_id);
+        posts.retain(|post| post.thread_id != thread_id);
+        original_posts.remove(thread_id);
+        drop(posts);
+        drop(original_posts);
+        drop(threads);
+        drop(categories);
         let mut reactions = self.reactions.lock().expect("reactions lock poisoned");
-        reactions.retain(|r| !removed_ids.iter().any(|id| id == &r.post_id));
+        reactions.retain(|reaction| !removed_ids.contains(&reaction.post_id));
         let mut mentions = self.mentions.lock().expect("mentions lock poisoned");
         mentions.retain(|m| m.thread_id != thread_id);
         let mut subscriptions = self
@@ -799,60 +1049,77 @@ impl Store for InMemoryStore {
     }
 
     async fn delete_post(&self, post_id: &str) -> Result<(), StoreError> {
-        let (thread_id, op_id, newest_at) = {
-            let mut posts = self.posts.lock().expect("posts lock poisoned");
-            let thread_id = posts
-                .iter()
-                .find(|post| post.id == post_id)
-                .map(|post| post.thread_id.clone());
-            let op_id = thread_id.as_deref().and_then(|thread_id| {
-                self.original_posts
-                    .lock()
-                    .expect("original_posts lock poisoned")
-                    .get(thread_id)
-                    .cloned()
-            });
-            if op_id.as_deref() == Some(post_id) {
-                return Err(StoreError::InvalidOperation(
-                    "the original post cannot be deleted separately; delete the thread".to_string(),
-                ));
-            }
-            for p in posts.iter_mut().filter(|p| p.quoted_post_id == post_id) {
-                p.quoted_post_id.clear();
-            }
-            posts.retain(|p| p.id != post_id);
-            let newest_at = thread_id.as_deref().and_then(|thread_id| {
-                posts
-                    .iter()
-                    .filter(|post| post.thread_id == thread_id)
-                    .map(|post| post.created_at)
-                    .max()
-            });
-            (thread_id, op_id, newest_at)
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        let thread_hint = self
+            .posts
+            .lock()
+            .expect("posts lock poisoned")
+            .iter()
+            .find(|post| post.id == post_id)
+            .map(|post| post.thread_id.clone());
+        let Some(thread_id) = thread_hint else {
+            return Ok(());
         };
-        // Drop this post's reactions, and clear it as any thread's accepted answer.
-        {
-            let mut reactions = self.reactions.lock().expect("reactions lock poisoned");
-            reactions.retain(|r| r.post_id != post_id);
-        }
-        {
-            let mut mentions = self.mentions.lock().expect("mentions lock poisoned");
-            mentions.retain(|m| m.post_id != post_id);
-        }
+        let _category_hint = self
+            .threads
+            .lock()
+            .expect("threads lock poisoned")
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .map(|thread| thread.category_id.clone())
+            .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
+
+        let categories = self.categories.lock().expect("categories lock poisoned");
         let mut threads = self.threads.lock().expect("threads lock poisoned");
-        for t in threads.iter_mut().filter(|t| t.accepted_post_id == post_id) {
-            t.accepted_post_id.clear();
+        let original_posts = self
+            .original_posts
+            .lock()
+            .expect("original_posts lock poisoned");
+        let mut posts = self.posts.lock().expect("posts lock poisoned");
+        let Some(post) = posts.iter().find(|post| post.id == post_id) else {
+            return Ok(());
+        };
+        if post.thread_id != thread_id {
+            return Err(StoreError::Backend(
+                "post changed thread during guarded delete".to_string(),
+            ));
         }
-        if let Some(thread_id) = thread_id {
-            if let Some(thread) = threads.iter_mut().find(|thread| thread.id == thread_id) {
-                // OP deletion is rejected above. Repair any pre-existing invalid accepted=OP state,
-                // and keep last_at aligned with the newest post that still exists.
-                if op_id.as_deref() == Some(thread.accepted_post_id.as_str()) {
-                    thread.accepted_post_id.clear();
-                }
-                thread.last_at = newest_at.unwrap_or(thread.created_at);
+        let op_id = original_posts.get(&thread_id).cloned();
+        if op_id.as_deref() == Some(post_id) {
+            return Err(StoreError::InvalidOperation(
+                "the original post cannot be deleted separately; delete the thread".to_string(),
+            ));
+        }
+        for post in posts.iter_mut().filter(|post| post.quoted_post_id == post_id) {
+            post.quoted_post_id.clear();
+        }
+        posts.retain(|post| post.id != post_id);
+        let newest_at = posts
+            .iter()
+            .filter(|post| post.thread_id == thread_id)
+            .map(|post| post.created_at)
+            .max();
+        if let Some(thread) = threads.iter_mut().find(|thread| thread.id == thread_id) {
+            if thread.accepted_post_id == post_id
+                || op_id.as_deref() == Some(thread.accepted_post_id.as_str())
+            {
+                thread.accepted_post_id.clear();
             }
+            thread.last_at = newest_at.unwrap_or(thread.created_at);
         }
+        drop(posts);
+        drop(original_posts);
+        drop(threads);
+        drop(categories);
+
+        self.reactions
+            .lock()
+            .expect("reactions lock poisoned")
+            .retain(|reaction| reaction.post_id != post_id);
+        self.mentions
+            .lock()
+            .expect("mentions lock poisoned")
+            .retain(|mention| mention.post_id != post_id);
         Ok(())
     }
 
@@ -872,20 +1139,117 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
-    async fn move_thread(&self, thread_id: &str, category_id: &str) -> Result<(), StoreError> {
-        let mut threads = self.threads.lock().expect("threads lock poisoned");
-        if let Some(t) = threads.iter_mut().find(|t| t.id == thread_id) {
-            t.category_id = category_id.to_string();
+    async fn move_thread_to_category(
+        &self,
+        thread_id: &str,
+        category_id: &str,
+    ) -> Result<(), StoreError> {
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        let source_hint = self
+            .threads
+            .lock()
+            .expect("threads lock poisoned")
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .map(|thread| thread.category_id.clone())
+            .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
+
+        let categories = self.categories.lock().expect("categories lock poisoned");
+        if categories.iter().all(|category| category.id != source_hint) {
+            return Err(StoreError::NotFound("source category not found".to_string()));
         }
+        let target = categories
+            .iter()
+            .find(|category| category.id == category_id)
+            .ok_or_else(|| StoreError::InvalidOperation("unknown category".to_string()))?;
+        let mut threads = self.threads.lock().expect("threads lock poisoned");
+        let thread = threads
+            .iter_mut()
+            .find(|thread| thread.id == thread_id)
+            .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
+        let original_posts = self
+            .original_posts
+            .lock()
+            .expect("original_posts lock poisoned");
+        let posts = self.posts.lock().expect("posts lock poisoned");
+        let valid_solution = valid_accepted_post(thread, &original_posts, &posts).is_some();
+        if thread.category_id != category_id && valid_solution && !target.format.is_question() {
+            return Err(StoreError::InvalidOperation(
+                "unmark the accepted answer before moving this thread to a discussion category"
+                    .to_string(),
+            ));
+        }
+        if !thread.accepted_post_id.is_empty() && !valid_solution {
+            thread.accepted_post_id.clear();
+        }
+        thread.category_id = category_id.to_string();
         Ok(())
     }
 
-    async fn set_accepted_post(&self, thread_id: &str, post_id: &str) -> Result<(), StoreError> {
+    async fn mutate_accepted_answer(
+        &self,
+        thread_id: &str,
+        action: AcceptedAnswerAction,
+    ) -> Result<AcceptedAnswerMutation, StoreError> {
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        let category_hint = self
+            .threads
+            .lock()
+            .expect("threads lock poisoned")
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .map(|thread| thread.category_id.clone())
+            .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
+        let categories = self.categories.lock().expect("categories lock poisoned");
+        let category = categories
+            .iter()
+            .find(|category| category.id == category_hint)
+            .ok_or_else(|| StoreError::NotFound("category not found".to_string()))?;
         let mut threads = self.threads.lock().expect("threads lock poisoned");
-        if let Some(t) = threads.iter_mut().find(|t| t.id == thread_id) {
-            t.accepted_post_id = post_id.to_string();
-        }
-        Ok(())
+        let thread = threads
+            .iter_mut()
+            .find(|thread| thread.id == thread_id)
+            .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
+        let original_posts = self
+            .original_posts
+            .lock()
+            .expect("original_posts lock poisoned");
+        let posts = self.posts.lock().expect("posts lock poisoned");
+
+        let (accepted_post, next_id) = match action {
+            AcceptedAnswerAction::Clear => (None, String::new()),
+            AcceptedAnswerAction::Accept { post_id } => {
+                if !category.format.is_question() {
+                    return Err(StoreError::InvalidOperation(
+                        "accepted answers are available only in question categories".to_string(),
+                    ));
+                }
+                let post_id = post_id.trim();
+                if post_id.is_empty() {
+                    return Err(StoreError::InvalidOperation(
+                        "reply is required when accepting an answer".to_string(),
+                    ));
+                }
+                if original_posts.get(thread_id).map(String::as_str) == Some(post_id) {
+                    return Err(StoreError::InvalidOperation(
+                        "the original post cannot be the accepted answer".to_string(),
+                    ));
+                }
+                let post = posts
+                    .iter()
+                    .find(|post| post.id == post_id && post.thread_id == thread_id)
+                    .cloned()
+                    .ok_or_else(|| StoreError::NotFound("reply not found".to_string()))?;
+                (Some(post), post_id.to_string())
+            }
+        };
+        let changed = thread.accepted_post_id != next_id;
+        thread.accepted_post_id = next_id;
+        Ok(AcceptedAnswerMutation {
+            thread: thread.clone(),
+            accepted_post,
+            changed,
+        })
     }
 
     async fn toggle_thread_subscription(
@@ -1021,6 +1385,57 @@ fn thread_display_order(a: &Thread, b: &Thread) -> std::cmp::Ordering {
         .cmp(&a.pinned)
         .then_with(|| b.last_at.cmp(&a.last_at))
         .then_with(|| b.created_at.cmp(&a.created_at))
+        .then_with(|| b.id.cmp(&a.id))
+}
+
+/// One authoritative accepted-answer predicate shared by every in-memory read and mutation.
+/// A category is intentionally not consulted here: historical discussion solutions remain valid
+/// records for their detail page, even though only Question categories expose them publicly.
+fn valid_accepted_post<'a>(
+    thread: &Thread,
+    original_posts: &HashMap<String, String>,
+    posts: &'a [Post],
+) -> Option<&'a Post> {
+    let accepted_id = thread.accepted_post_id.trim();
+    if accepted_id.is_empty()
+        || original_posts.get(&thread.id).map(String::as_str) == Some(accepted_id)
+    {
+        return None;
+    }
+    posts
+        .iter()
+        .find(|post| post.id == accepted_id && post.thread_id == thread.id)
+}
+
+fn has_valid_question_solution(
+    thread: &Thread,
+    category_format: CategoryFormat,
+    original_posts: &HashMap<String, String>,
+    posts: &[Post],
+) -> bool {
+    category_format.is_question() && valid_accepted_post(thread, original_posts, posts).is_some()
+}
+
+/// Public list/search rows expose the pointer only for a valid Question solution. The raw pointer
+/// remains available through `get_thread` for detail-page legacy recovery and explicit clearing.
+fn public_thread(mut thread: Thread, has_valid_question_solution: bool) -> Thread {
+    if !has_valid_question_solution {
+        thread.accepted_post_id.clear();
+    }
+    thread
+}
+
+fn thread_matches_status(
+    has_valid_question_solution: bool,
+    is_question: bool,
+    status: ThreadStatusFilter,
+) -> bool {
+    match status {
+        ThreadStatusFilter::Any => true,
+        ThreadStatusFilter::Questions => is_question,
+        ThreadStatusFilter::Answered => has_valid_question_solution,
+        ThreadStatusFilter::Unanswered => is_question && !has_valid_question_solution,
+    }
 }
 
 /// Sort threads with their reply counts. Pinned threads remain first for every mode; each
@@ -1108,11 +1523,30 @@ impl PgStore {
             "CREATE TABLE IF NOT EXISTS categories (\
                  id TEXT PRIMARY KEY, \
                  name TEXT NOT NULL, \
-                 sort_order BIGINT NOT NULL DEFAULT 0\
+                 sort_order BIGINT NOT NULL DEFAULT 0, \
+                 format TEXT NOT NULL DEFAULT 'discussion'\
              )",
         )
         .execute(&self.pool)
         .await?;
+        // Existing deployments predate category formats. Add the column nullable, classify only
+        // rows that have never been classified, then lock in the default/invariant. The `IS NULL`
+        // guard is essential: startup migration must never undo an operator's later format edit.
+        sqlx::query("ALTER TABLE categories ADD COLUMN IF NOT EXISTS format TEXT")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            "UPDATE categories SET format = CASE WHEN id = 'support' THEN 'question' \
+             ELSE 'discussion' END WHERE format IS NULL",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("ALTER TABLE categories ALTER COLUMN format SET DEFAULT 'discussion'")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("ALTER TABLE categories ALTER COLUMN format SET NOT NULL")
+            .execute(&self.pool)
+            .await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS threads (\
                  id TEXT PRIMARY KEY, \
@@ -1217,6 +1651,21 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+        // Accepted pointers predate the guarded command contract. Keep a historical Discussion
+        // solution when it is structurally valid, but clear every dangling, cross-thread or OP
+        // pointer. Already-valid and already-empty rows remain unchanged, so this is idempotent.
+        sqlx::query(
+            "UPDATE threads AS t SET accepted_post_id = '' \
+             WHERE t.accepted_post_id <> '' \
+               AND NOT EXISTS (\
+                   SELECT 1 FROM posts AS p \
+                   WHERE p.id = t.accepted_post_id \
+                     AND p.thread_id = t.id \
+                     AND p.id <> t.first_post_id\
+               )",
+        )
+        .execute(&self.pool)
+        .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_posts_quote ON posts (quoted_post_id)")
             .execute(&self.pool)
             .await?;
@@ -1287,10 +1736,12 @@ impl PgStore {
     }
 
     fn category_from_row(row: &sqlx::postgres::PgRow) -> Result<Category, sqlx::Error> {
+        let format: String = row.try_get("format")?;
         Ok(Category {
             id: row.try_get("id")?,
             name: row.try_get("name")?,
             sort_order: row.try_get("sort_order")?,
+            format: CategoryFormat::parse(&format).unwrap_or_default(),
         })
     }
 
@@ -1325,6 +1776,10 @@ impl PgStore {
         "id, category_id, title, author_sub, author_email, created_at, last_at, locked, pinned, accepted_post_id";
     const POST_COLS: &'static str =
         "id, thread_id, body_md, quoted_post_id, author_sub, author_email, created_at";
+    const POST_COLS_P: &'static str =
+        "p.id AS id, p.thread_id AS thread_id, p.body_md AS body_md, \
+         p.quoted_post_id AS quoted_post_id, p.author_sub AS author_sub, \
+         p.author_email AS author_email, p.created_at AS created_at";
 
     async fn seed_async(&self, defaults: &[Category]) -> Result<(), sqlx::Error> {
         let row = sqlx::query("SELECT COUNT(*) AS n FROM categories")
@@ -1336,12 +1791,13 @@ impl PgStore {
         }
         for c in defaults {
             sqlx::query(
-                "INSERT INTO categories (id, name, sort_order) VALUES ($1, $2, $3) \
+                "INSERT INTO categories (id, name, sort_order, format) VALUES ($1, $2, $3, $4) \
                  ON CONFLICT (id) DO NOTHING",
             )
             .bind(&c.id)
             .bind(&c.name)
             .bind(c.sort_order)
+            .bind(c.format.as_str())
             .execute(&self.pool)
             .await?;
         }
@@ -1349,15 +1805,16 @@ impl PgStore {
     }
 
     async fn list_categories_async(&self) -> Result<Vec<Category>, sqlx::Error> {
-        let rows =
-            sqlx::query("SELECT id, name, sort_order FROM categories ORDER BY sort_order, name")
-                .fetch_all(&self.pool)
-                .await?;
+        let rows = sqlx::query(
+            "SELECT id, name, sort_order, format FROM categories ORDER BY sort_order, name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         rows.iter().map(Self::category_from_row).collect()
     }
 
     async fn get_category_async(&self, id: &str) -> Result<Option<Category>, sqlx::Error> {
-        let row = sqlx::query("SELECT id, name, sort_order FROM categories WHERE id = $1")
+        let row = sqlx::query("SELECT id, name, sort_order, format FROM categories WHERE id = $1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -1374,12 +1831,13 @@ impl PgStore {
 
     async fn create_category_async(&self, c: &Category) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "INSERT INTO categories (id, name, sort_order) VALUES ($1, $2, $3) \
+            "INSERT INTO categories (id, name, sort_order, format) VALUES ($1, $2, $3, $4) \
              ON CONFLICT (id) DO NOTHING",
         )
         .bind(&c.id)
         .bind(&c.name)
         .bind(c.sort_order)
+        .bind(c.format.as_str())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1394,6 +1852,87 @@ impl PgStore {
         Ok(())
     }
 
+    async fn transition_category_format_async(
+        &self,
+        id: &str,
+        format: CategoryFormat,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        let row = sqlx::query("SELECT format FROM categories WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(backend)?
+            .ok_or_else(|| StoreError::NotFound("category not found".to_string()))?;
+        let current: String = row.try_get("format").map_err(backend)?;
+        if CategoryFormat::parse(&current).unwrap_or_default() == format {
+            tx.commit().await.map_err(backend)?;
+            return Ok(());
+        }
+
+        if format == CategoryFormat::Discussion {
+            let thread_rows = sqlx::query(
+                "SELECT id, first_post_id, accepted_post_id FROM threads \
+                 WHERE category_id = $1 ORDER BY id FOR UPDATE",
+            )
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(backend)?;
+            let locked_threads: Vec<(String, String, String)> = thread_rows
+                .iter()
+                .map(|row| {
+                    Ok((
+                        row.try_get("id")?,
+                        row.try_get("first_post_id")?,
+                        row.try_get("accepted_post_id")?,
+                    ))
+                })
+                .collect::<Result<_, sqlx::Error>>()
+                .map_err(backend)?;
+            let mut accepted_ids: Vec<String> = locked_threads
+                .iter()
+                .map(|(_, _, accepted_id)| accepted_id.clone())
+                .filter(|accepted| !accepted.trim().is_empty())
+                .collect();
+            accepted_ids.sort();
+            accepted_ids.dedup();
+            let mut accepted_threads: HashMap<String, String> = HashMap::new();
+            for accepted_id in accepted_ids {
+                if let Some(post_thread_id) = sqlx::query_scalar::<_, String>(
+                    "SELECT thread_id FROM posts WHERE id = $1 FOR UPDATE",
+                )
+                .bind(&accepted_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(backend)?
+                {
+                    accepted_threads.insert(accepted_id, post_thread_id);
+                }
+            }
+            for (thread_id, op_id, accepted_id) in locked_threads {
+                if !accepted_id.is_empty()
+                    && accepted_id != op_id
+                    && accepted_threads.get(&accepted_id) == Some(&thread_id)
+                {
+                    return Err(StoreError::InvalidOperation(
+                        "unmark accepted answers before changing this category to discussion"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+
+        sqlx::query("UPDATE categories SET format = $1 WHERE id = $2")
+            .bind(format.as_str())
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
+        Ok(())
+    }
+
     async fn set_category_order_async(&self, id: &str, sort_order: i64) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE categories SET sort_order = $1 WHERE id = $2")
             .bind(sort_order)
@@ -1403,17 +1942,47 @@ impl PgStore {
         Ok(())
     }
 
-    async fn delete_category_async(&self, id: &str) -> Result<(), sqlx::Error> {
+    async fn delete_category_async(&self, id: &str) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        let category = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM categories WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(backend)?;
+        if category.is_none() {
+            tx.commit().await.map_err(backend)?;
+            return Ok(());
+        }
+        let thread_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM threads WHERE category_id = $1",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(backend)?;
+        if thread_count > 0 {
+            return Err(StoreError::InvalidOperation(
+                "category still has threads — move or delete them first".to_string(),
+            ));
+        }
         sqlx::query("DELETE FROM categories WHERE id = $1")
             .bind(id)
-            .execute(&self.pool)
-            .await?;
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
         Ok(())
     }
 
     async fn recent_threads_async(&self, limit: i64) -> Result<Vec<Thread>, sqlx::Error> {
+        if limit <= 0 {
+            return Ok(Vec::new());
+        }
         let sql = format!(
-            "SELECT {} FROM threads ORDER BY pinned DESC, last_at DESC, created_at DESC LIMIT $1",
+            "SELECT {} FROM threads \
+             ORDER BY pinned DESC, last_at DESC, created_at DESC, id DESC LIMIT $1",
             Self::THREAD_COLS
         );
         let rows = sqlx::query(&sql).bind(limit).fetch_all(&self.pool).await?;
@@ -1425,8 +1994,12 @@ impl PgStore {
         category_id: &str,
         limit: i64,
     ) -> Result<Vec<Thread>, sqlx::Error> {
+        if limit <= 0 {
+            return Ok(Vec::new());
+        }
         let sql = format!(
-            "SELECT {} FROM threads WHERE category_id = $1 ORDER BY pinned DESC, last_at DESC, created_at DESC LIMIT $2",
+            "SELECT {} FROM threads WHERE category_id = $1 \
+             ORDER BY pinned DESC, last_at DESC, created_at DESC, id DESC LIMIT $2",
             Self::THREAD_COLS
         );
         let rows = sqlx::query(&sql)
@@ -1442,19 +2015,30 @@ impl PgStore {
         category_id: Option<&str>,
         sort: ThreadSort,
         subscribed_sub: Option<&str>,
+        status: ThreadStatusFilter,
         limit: i64,
         now: i64,
     ) -> Result<Vec<Thread>, sqlx::Error> {
+        if limit <= 0 {
+            return Ok(Vec::new());
+        }
         let cols = "t.id AS id, t.category_id AS category_id, t.title AS title, \
                     t.author_sub AS author_sub, t.author_email AS author_email, \
                     t.created_at AS created_at, t.last_at AS last_at, t.locked AS locked, \
-                    t.pinned AS pinned, t.accepted_post_id AS accepted_post_id";
+                    t.pinned AS pinned, \
+                    CASE WHEN c.format = 'question' AND accepted.id IS NOT NULL \
+                         THEN t.accepted_post_id ELSE '' END AS accepted_post_id";
         let group_cols = "t.id, t.category_id, t.title, t.author_sub, t.author_email, \
-                          t.created_at, t.last_at, t.locked, t.pinned, t.accepted_post_id";
+                          t.created_at, t.last_at, t.locked, t.pinned, t.accepted_post_id, \
+                          t.first_post_id, c.format, accepted.id";
 
         let mut sql = format!(
             "SELECT {cols}, COUNT(p.id) AS post_count \
              FROM threads t \
+             LEFT JOIN categories c ON c.id = t.category_id \
+             LEFT JOIN posts accepted ON accepted.id = t.accepted_post_id \
+                                     AND accepted.thread_id = t.id \
+                                     AND accepted.id <> t.first_post_id \
              LEFT JOIN posts p ON p.thread_id = t.id"
         );
         let mut where_parts: Vec<String> = Vec::new();
@@ -1469,6 +2053,14 @@ impl PgStore {
             next_param += 1;
             n
         });
+        let hot_now_param = if sort == ThreadSort::Hot {
+            let n = next_param;
+            next_param += 1;
+            Some(n)
+        } else {
+            None
+        };
+        let limit_param = next_param;
         if let Some(n) = category_param {
             where_parts.push(format!("t.category_id = ${n}"));
         }
@@ -1478,12 +2070,45 @@ impl PgStore {
             );
             sql.push_str(&n.to_string());
         }
+        match status {
+            ThreadStatusFilter::Any => {}
+            ThreadStatusFilter::Questions => where_parts.push("c.format = 'question'".to_string()),
+            ThreadStatusFilter::Answered => {
+                where_parts.push("c.format = 'question'".to_string());
+                where_parts.push("accepted.id IS NOT NULL".to_string());
+            }
+            ThreadStatusFilter::Unanswered => {
+                where_parts.push("c.format = 'question'".to_string());
+                where_parts.push("accepted.id IS NULL".to_string());
+            }
+        }
         if !where_parts.is_empty() {
             sql.push_str(" WHERE ");
             sql.push_str(&where_parts.join(" AND "));
         }
         sql.push_str(" GROUP BY ");
         sql.push_str(group_cols);
+        sql.push_str(" ORDER BY t.pinned DESC, ");
+        match sort {
+            ThreadSort::Latest => {
+                sql.push_str("t.last_at DESC, t.created_at DESC, t.id DESC");
+            }
+            ThreadSort::Top => {
+                sql.push_str(
+                    "COUNT(p.id) DESC, t.last_at DESC, t.created_at DESC, t.id DESC",
+                );
+            }
+            ThreadSort::Hot => {
+                let now_param = hot_now_param.expect("hot sort has timestamp parameter");
+                sql.push_str(&format!(
+                    "CAST(GREATEST(COUNT(p.id) - 1, 0) AS DOUBLE PRECISION) / \
+                     POWER(CAST(GREATEST(${now_param} - t.created_at, 0) AS DOUBLE PRECISION) \
+                     / 3600.0 + 2.0, 1.5) DESC, COUNT(p.id) DESC, t.last_at DESC, \
+                     t.created_at DESC, t.id DESC"
+                ));
+            }
+        }
+        sql.push_str(&format!(" LIMIT ${limit_param}"));
 
         let mut query = sqlx::query(&sql);
         if let Some(category_id) = category_id {
@@ -1492,24 +2117,19 @@ impl PgStore {
         if let Some(subscriber_sub) = subscribed_sub {
             query = query.bind(subscriber_sub);
         }
+        if hot_now_param.is_some() {
+            query = query.bind(now);
+        }
+        query = query.bind(limit);
         let rows = query.fetch_all(&self.pool).await?;
-        let mut threads_with_counts: Vec<(Thread, i64)> = rows
-            .iter()
-            .map(|row| {
-                let thread = Self::thread_from_row(row)?;
-                let post_count: i64 = row.try_get("post_count")?;
-                Ok((thread, (post_count - 1).max(0)))
-            })
-            .collect::<Result<Vec<_>, sqlx::Error>>()?;
-        sort_thread_rows(&mut threads_with_counts, sort, now);
-        threads_with_counts.truncate(limit.max(0) as usize);
-        Ok(threads_with_counts.into_iter().map(|(t, _)| t).collect())
+        rows.iter().map(Self::thread_from_row).collect()
     }
 
     async fn search_threads_async(
         &self,
         query: &str,
         category_id: Option<&str>,
+        status: ThreadStatusFilter,
         limit: i64,
     ) -> Result<Vec<ThreadSearchHit>, sqlx::Error> {
         if query.trim().is_empty() || limit <= 0 {
@@ -1519,26 +2139,51 @@ impl PgStore {
         let cols = "t.id AS id, t.category_id AS category_id, t.title AS title, \
                     t.author_sub AS author_sub, t.author_email AS author_email, \
                     t.created_at AS created_at, t.last_at AS last_at, t.locked AS locked, \
-                    t.pinned AS pinned, t.accepted_post_id AS accepted_post_id";
+                    t.pinned AS pinned, \
+                    CASE WHEN c.format = 'question' AND accepted.id IS NOT NULL \
+                         THEN t.accepted_post_id ELSE '' END AS accepted_post_id";
         let mut sql = format!(
             "SELECT {cols}, t.first_body_md AS first_body_md, \
+                    COALESCE(accepted.body_md, '') AS accepted_body_md, \
+                    (LOWER(COALESCE(accepted.body_md, '')) LIKE $1 ESCAPE '!') \
+                        AS matched_in_solution, \
                     (SELECT COUNT(*) FROM posts p WHERE p.thread_id = t.id) AS post_count \
              FROM threads t \
+             LEFT JOIN categories c ON c.id = t.category_id \
+             LEFT JOIN posts accepted ON accepted.id = t.accepted_post_id \
+                                      AND accepted.thread_id = t.id \
+                                      AND accepted.id <> t.first_post_id \
+                                      AND c.format = 'question' \
              WHERE (LOWER(t.title) LIKE $1 ESCAPE '!' \
-                    OR LOWER(t.first_body_md) LIKE $1 ESCAPE '!')"
+                    OR LOWER(t.first_body_md) LIKE $1 ESCAPE '!' \
+                    OR LOWER(COALESCE(accepted.body_md, '')) LIKE $1 ESCAPE '!')"
         );
-        if category_id.is_some() {
-            sql.push_str(" AND t.category_id = $2");
-            sql.push_str(
-                " ORDER BY t.pinned DESC, t.last_at DESC, t.created_at DESC, t.id DESC LIMIT $3",
-            );
-        } else {
-            sql.push_str(
-                " ORDER BY t.pinned DESC, t.last_at DESC, t.created_at DESC, t.id DESC LIMIT $2",
-            );
+        let mut next_param = 2;
+        let category_param = category_id.map(|_| {
+            let n = next_param;
+            next_param += 1;
+            n
+        });
+        if let Some(param) = category_param {
+            sql.push_str(&format!(" AND t.category_id = ${param}"));
         }
+        match status {
+            ThreadStatusFilter::Any => {}
+            ThreadStatusFilter::Questions => sql.push_str(" AND c.format = 'question'"),
+            ThreadStatusFilter::Answered => {
+                sql.push_str(" AND c.format = 'question' AND accepted.id IS NOT NULL");
+            }
+            ThreadStatusFilter::Unanswered => {
+                sql.push_str(" AND c.format = 'question' AND accepted.id IS NULL");
+            }
+        }
+        let limit_param = next_param;
+        sql.push_str(&format!(
+            " ORDER BY t.pinned DESC, t.last_at DESC, t.created_at DESC, t.id DESC \
+             LIMIT ${limit_param}"
+        ));
 
-        let mut query_builder = sqlx::query(&sql).bind(like_contains_pattern(query));
+        let mut query_builder = sqlx::query(&sql).bind(like_contains_pattern(query.trim()));
         if let Some(category_id) = category_id {
             query_builder = query_builder.bind(category_id);
         }
@@ -1549,6 +2194,8 @@ impl PgStore {
                 Ok(ThreadSearchHit {
                     thread: Self::thread_from_row(row)?,
                     first_body_md: row.try_get("first_body_md")?,
+                    accepted_body_md: row.try_get("accepted_body_md")?,
+                    matched_in_solution: row.try_get("matched_in_solution")?,
                     reply_count: (post_count - 1).max(0),
                 })
             })
@@ -1565,9 +2212,12 @@ impl PgStore {
     }
 
     async fn thread_digests_async(&self, limit: i64) -> Result<Vec<ThreadDigest>, sqlx::Error> {
+        if limit <= 0 {
+            return Ok(Vec::new());
+        }
         let rows = sqlx::query(
             "SELECT id, category_id, title, first_body_md FROM threads \
-             ORDER BY last_at DESC, created_at DESC LIMIT $1",
+             ORDER BY last_at DESC, created_at DESC, id DESC LIMIT $1",
         )
         .bind(limit)
         .fetch_all(&self.pool)
@@ -1596,6 +2246,26 @@ impl PgStore {
         let sql = format!("SELECT {} FROM posts WHERE id = $1", Self::POST_COLS);
         let row = sqlx::query(&sql)
             .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(Self::post_from_row).transpose()
+    }
+
+    async fn get_valid_accepted_post_async(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<Post>, sqlx::Error> {
+        let sql = format!(
+            "SELECT {} FROM posts p \
+             JOIN threads t ON t.id = $1 \
+             WHERE p.id = t.accepted_post_id \
+               AND p.thread_id = t.id \
+               AND p.id <> t.first_post_id \
+             FETCH FIRST 1 ROW ONLY",
+            Self::POST_COLS_P
+        );
+        let row = sqlx::query(&sql)
+            .bind(thread_id)
             .fetch_optional(&self.pool)
             .await?;
         row.as_ref().map(Self::post_from_row).transpose()
@@ -1637,6 +2307,7 @@ impl PgStore {
         &self,
         thread_id: &str,
         op_id: &str,
+        excluded_post_id: Option<&str>,
         anchor: &ReplyAnchor,
         limit: i64,
     ) -> Result<Vec<Post>, sqlx::Error> {
@@ -1647,12 +2318,14 @@ impl PgStore {
             ReplyAnchor::First => {
                 let sql = format!(
                     "SELECT {} FROM posts WHERE thread_id = $1 AND id <> $2 \
-                     ORDER BY created_at ASC, id ASC LIMIT $3",
+                     AND ($3 IS NULL OR id <> $3) \
+                     ORDER BY created_at ASC, id ASC LIMIT $4",
                     Self::POST_COLS
                 );
                 sqlx::query(&sql)
                     .bind(thread_id)
                     .bind(op_id)
+                    .bind(excluded_post_id)
                     .bind(limit)
                     .fetch_all(&self.pool)
                     .await?
@@ -1660,12 +2333,14 @@ impl PgStore {
             ReplyAnchor::Latest => {
                 let sql = format!(
                     "SELECT {} FROM posts WHERE thread_id = $1 AND id <> $2 \
-                     ORDER BY created_at DESC, id DESC LIMIT $3",
+                     AND ($3 IS NULL OR id <> $3) \
+                     ORDER BY created_at DESC, id DESC LIMIT $4",
                     Self::POST_COLS
                 );
                 sqlx::query(&sql)
                     .bind(thread_id)
                     .bind(op_id)
+                    .bind(excluded_post_id)
                     .bind(limit)
                     .fetch_all(&self.pool)
                     .await?
@@ -1673,13 +2348,15 @@ impl PgStore {
             ReplyAnchor::After(ts, id) => {
                 let sql = format!(
                     "SELECT {} FROM posts WHERE thread_id = $1 AND id <> $2 \
-                     AND (created_at > $3 OR (created_at = $3 AND id > $4)) \
-                     ORDER BY created_at ASC, id ASC LIMIT $5",
+                     AND ($3 IS NULL OR id <> $3) \
+                     AND (created_at > $4 OR (created_at = $4 AND id > $5)) \
+                     ORDER BY created_at ASC, id ASC LIMIT $6",
                     Self::POST_COLS
                 );
                 sqlx::query(&sql)
                     .bind(thread_id)
                     .bind(op_id)
+                    .bind(excluded_post_id)
                     .bind(ts)
                     .bind(id)
                     .bind(limit)
@@ -1689,13 +2366,15 @@ impl PgStore {
             ReplyAnchor::Before(ts, id) => {
                 let sql = format!(
                     "SELECT {} FROM posts WHERE thread_id = $1 AND id <> $2 \
-                     AND (created_at < $3 OR (created_at = $3 AND id < $4)) \
-                     ORDER BY created_at DESC, id DESC LIMIT $5",
+                     AND ($3 IS NULL OR id <> $3) \
+                     AND (created_at < $4 OR (created_at = $4 AND id < $5)) \
+                     ORDER BY created_at DESC, id DESC LIMIT $6",
                     Self::POST_COLS
                 );
                 sqlx::query(&sql)
                     .bind(thread_id)
                     .bind(op_id)
+                    .bind(excluded_post_id)
                     .bind(ts)
                     .bind(id)
                     .bind(limit)
@@ -1710,8 +2389,21 @@ impl PgStore {
         &self,
         thread: &Thread,
         first_post: &Post,
-    ) -> Result<(), sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+    ) -> Result<(), StoreError> {
+        if first_post.thread_id != thread.id {
+            return Err(StoreError::InvalidOperation(
+                "the original post must belong to the new thread".to_string(),
+            ));
+        }
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        sqlx::query_scalar::<_, String>(
+            "SELECT id FROM categories WHERE id = $1 FOR UPDATE",
+        )
+        .bind(&thread.category_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(backend)?
+        .ok_or_else(|| StoreError::NotFound("category not found".to_string()))?;
         sqlx::query(
             "INSERT INTO threads \
                  (id, category_id, title, author_sub, author_email, created_at, last_at, first_body_md, first_post_id, locked, pinned, accepted_post_id) \
@@ -1730,7 +2422,8 @@ impl PgStore {
         .bind(thread.pinned)
         .bind(&thread.accepted_post_id)
         .execute(&mut *tx)
-        .await?;
+        .await
+        .map_err(backend)?;
         sqlx::query(
             "INSERT INTO posts \
                  (id, thread_id, body_md, quoted_post_id, author_sub, author_email, created_at) \
@@ -1744,34 +2437,92 @@ impl PgStore {
         .bind(&first_post.author_email)
         .bind(first_post.created_at)
         .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
+        .await
+        .map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
         Ok(())
     }
 
-    async fn add_reply_async(&self, post: &Post) -> Result<(), sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            "INSERT INTO posts \
-                 (id, thread_id, body_md, quoted_post_id, author_sub, author_email, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
-        )
-        .bind(&post.id)
-        .bind(&post.thread_id)
-        .bind(&post.body_md)
-        .bind(&post.quoted_post_id)
-        .bind(&post.author_sub)
-        .bind(&post.author_email)
-        .bind(post.created_at)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("UPDATE threads SET last_at = $1 WHERE id = $2")
-            .bind(post.created_at)
+    async fn add_reply_async(&self, post: &Post) -> Result<(), StoreError> {
+        for _ in 0..4 {
+            let category_hint = sqlx::query_scalar::<_, String>(
+                "SELECT category_id FROM threads WHERE id = $1",
+            )
             .bind(&post.thread_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(backend)?
+            .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
+
+            let mut tx = self.pool.begin().await.map_err(backend)?;
+            sqlx::query_scalar::<_, String>(
+                "SELECT id FROM categories WHERE id = $1 FOR UPDATE",
+            )
+            .bind(&category_hint)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(backend)?
+            .ok_or_else(|| StoreError::NotFound("category not found".to_string()))?;
+            let thread = sqlx::query(
+                "SELECT category_id, locked FROM threads WHERE id = $1 FOR UPDATE",
+            )
+            .bind(&post.thread_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(backend)?;
+            let Some(thread) = thread else {
+                return Err(StoreError::NotFound("thread not found".to_string()));
+            };
+            let current_category: String = thread.try_get("category_id").map_err(backend)?;
+            if current_category != category_hint {
+                continue;
+            }
+            if thread.try_get::<bool, _>("locked").map_err(backend)? {
+                return Err(StoreError::InvalidOperation(
+                    "this thread is locked — no new replies".to_string(),
+                ));
+            }
+            if !post.quoted_post_id.is_empty() {
+                let quoted_thread = sqlx::query_scalar::<_, String>(
+                    "SELECT thread_id FROM posts WHERE id = $1 FOR UPDATE",
+                )
+                .bind(&post.quoted_post_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(backend)?;
+                if quoted_thread.as_deref() != Some(post.thread_id.as_str()) {
+                    return Err(StoreError::InvalidOperation(
+                        "quoted post must belong to this thread".to_string(),
+                    ));
+                }
+            }
+            sqlx::query(
+                "INSERT INTO posts \
+                     (id, thread_id, body_md, quoted_post_id, author_sub, author_email, created_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(&post.id)
+            .bind(&post.thread_id)
+            .bind(&post.body_md)
+            .bind(&post.quoted_post_id)
+            .bind(&post.author_sub)
+            .bind(&post.author_email)
+            .bind(post.created_at)
             .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok(())
+            .await
+            .map_err(backend)?;
+            sqlx::query("UPDATE threads SET last_at = $1 WHERE id = $2")
+                .bind(post.created_at)
+                .bind(&post.thread_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(backend)?;
+            tx.commit().await.map_err(backend)?;
+            return Ok(());
+        }
+        Err(StoreError::Backend(
+            "thread category changed repeatedly; retry the reply".to_string(),
+        ))
     }
 
     async fn replace_mentions_async(
@@ -1864,33 +2615,79 @@ impl PgStore {
         Ok(())
     }
 
-    async fn delete_thread_async(&self, thread_id: &str) -> Result<(), sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
-        // Drop reactions on every post in the thread (subquery over the doomed posts) first.
-        sqlx::query(
-            "DELETE FROM post_reactions WHERE post_id IN (SELECT id FROM posts WHERE thread_id = $1)",
-        )
-        .bind(thread_id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("DELETE FROM post_mentions WHERE thread_id = $1")
+    async fn delete_thread_async(&self, thread_id: &str) -> Result<(), StoreError> {
+        for _ in 0..4 {
+            let category_hint = sqlx::query_scalar::<_, String>(
+                "SELECT category_id FROM threads WHERE id = $1",
+            )
+            .bind(thread_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(backend)?;
+            let Some(category_hint) = category_hint else {
+                return Ok(());
+            };
+            let mut tx = self.pool.begin().await.map_err(backend)?;
+            sqlx::query("SELECT id FROM categories WHERE id = $1 FOR UPDATE")
+                .bind(&category_hint)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(backend)?;
+            let current_category = sqlx::query_scalar::<_, String>(
+                "SELECT category_id FROM threads WHERE id = $1 FOR UPDATE",
+            )
+            .bind(thread_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(backend)?;
+            let Some(current_category) = current_category else {
+                tx.commit().await.map_err(backend)?;
+                return Ok(());
+            };
+            if current_category != category_hint {
+                continue;
+            }
+            sqlx::query(
+                "SELECT id FROM posts WHERE thread_id = $1 ORDER BY id FOR UPDATE",
+            )
+            .bind(thread_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(backend)?;
+            sqlx::query(
+                "DELETE FROM post_reactions \
+                 WHERE post_id IN (SELECT id FROM posts WHERE thread_id = $1)",
+            )
             .bind(thread_id)
             .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM thread_subscriptions WHERE thread_id = $1")
-            .bind(thread_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM posts WHERE thread_id = $1")
-            .bind(thread_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM threads WHERE id = $1")
-            .bind(thread_id)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok(())
+            .await
+            .map_err(backend)?;
+            sqlx::query("DELETE FROM post_mentions WHERE thread_id = $1")
+                .bind(thread_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(backend)?;
+            sqlx::query("DELETE FROM thread_subscriptions WHERE thread_id = $1")
+                .bind(thread_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(backend)?;
+            sqlx::query("DELETE FROM posts WHERE thread_id = $1")
+                .bind(thread_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(backend)?;
+            sqlx::query("DELETE FROM threads WHERE id = $1")
+                .bind(thread_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(backend)?;
+            tx.commit().await.map_err(backend)?;
+            return Ok(());
+        }
+        Err(StoreError::Backend(
+            "thread category changed repeatedly; retry the thread delete".to_string(),
+        ))
     }
 
     async fn update_post_async(&self, post_id: &str, body_md: &str) -> Result<(), sqlx::Error> {
@@ -1905,78 +2702,117 @@ impl PgStore {
     /// Delete a reply transactionally. Returns `false` without mutating when `post_id` is the OP;
     /// callers surface that as a product-level invalid operation instead of silently promoting a
     /// reply owned by another author.
-    async fn delete_post_async(&self, post_id: &str) -> Result<bool, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
-        let thread_id: Option<String> =
-            sqlx::query_scalar("SELECT thread_id FROM posts WHERE id = $1")
+    async fn delete_post_async(&self, post_id: &str) -> Result<bool, StoreError> {
+        for _ in 0..4 {
+            let thread_hint = sqlx::query_scalar::<_, String>(
+                "SELECT thread_id FROM posts WHERE id = $1",
+            )
+            .bind(post_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(backend)?;
+            let Some(thread_hint) = thread_hint else {
+                return Ok(true);
+            };
+            let category_hint = sqlx::query_scalar::<_, String>(
+                "SELECT category_id FROM threads WHERE id = $1",
+            )
+            .bind(&thread_hint)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(backend)?
+            .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
+
+            let mut tx = self.pool.begin().await.map_err(backend)?;
+            sqlx::query("SELECT id FROM categories WHERE id = $1 FOR UPDATE")
+                .bind(&category_hint)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(backend)?;
+            let thread_sql = format!(
+                "SELECT {}, first_post_id FROM threads WHERE id = $1 FOR UPDATE",
+                Self::THREAD_COLS
+            );
+            let thread_row = sqlx::query(&thread_sql)
+                .bind(&thread_hint)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(backend)?
+                .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
+            let mut thread = Self::thread_from_row(&thread_row).map_err(backend)?;
+            let first_post_id: String = thread_row.try_get("first_post_id").map_err(backend)?;
+            if thread.category_id != category_hint {
+                continue;
+            }
+            let post_sql = format!(
+                "SELECT {} FROM posts WHERE id = $1 FOR UPDATE",
+                Self::POST_COLS
+            );
+            let post_row = sqlx::query(&post_sql)
                 .bind(post_id)
                 .fetch_optional(&mut *tx)
-                .await?;
-        if let Some(thread_id) = thread_id.as_deref() {
-            let op_id: Option<String> =
-                sqlx::query_scalar("SELECT first_post_id FROM threads WHERE id = $1")
-                    .bind(thread_id)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-            if op_id.as_deref() == Some(post_id) {
+                .await
+                .map_err(backend)?;
+            let Some(post_row) = post_row else {
+                tx.commit().await.map_err(backend)?;
+                return Ok(true);
+            };
+            let post = Self::post_from_row(&post_row).map_err(backend)?;
+            if post.thread_id != thread_hint {
+                continue;
+            }
+            if post.id == first_post_id {
                 return Ok(false);
             }
-        }
-        sqlx::query("DELETE FROM post_reactions WHERE post_id = $1")
-            .bind(post_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM post_mentions WHERE post_id = $1")
-            .bind(post_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("UPDATE posts SET quoted_post_id = '' WHERE quoted_post_id = $1")
-            .bind(post_id)
-            .execute(&mut *tx)
-            .await?;
-        // Clear it wherever it was the accepted answer, so no thread points at a gone post.
-        sqlx::query("UPDATE threads SET accepted_post_id = '' WHERE accepted_post_id = $1")
-            .bind(post_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM posts WHERE id = $1")
-            .bind(post_id)
-            .execute(&mut *tx)
-            .await?;
-        if let Some(thread_id) = thread_id {
-            let new_op = sqlx::query(
-                "SELECT id, body_md FROM posts \
-                 WHERE thread_id = $1 \
-                   AND id = (SELECT first_post_id FROM threads WHERE id = $1) \
-                 FETCH FIRST 1 ROW ONLY",
-            )
-            .bind(&thread_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if let Some(row) = new_op {
-                let op_id: String = row.try_get("id")?;
-                let first_body_md: String = row.try_get("body_md")?;
-                let newest_at: Option<i64> =
-                    sqlx::query_scalar("SELECT MAX(created_at) FROM posts WHERE thread_id = $1")
-                        .bind(&thread_id)
-                        .fetch_one(&mut *tx)
-                        .await?;
-                sqlx::query(
-                    "UPDATE threads \
-                     SET first_body_md = $1, last_at = $2, \
-                         accepted_post_id = CASE WHEN accepted_post_id = $3 THEN '' ELSE accepted_post_id END \
-                     WHERE id = $4",
-                )
-                .bind(first_body_md)
-                .bind(newest_at.expect("OP-preserving delete leaves at least one post"))
-                .bind(op_id)
-                .bind(&thread_id)
+
+            sqlx::query("DELETE FROM post_reactions WHERE post_id = $1")
+                .bind(post_id)
                 .execute(&mut *tx)
-                .await?;
+                .await
+                .map_err(backend)?;
+            sqlx::query("DELETE FROM post_mentions WHERE post_id = $1")
+                .bind(post_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(backend)?;
+            sqlx::query("UPDATE posts SET quoted_post_id = '' WHERE quoted_post_id = $1")
+                .bind(post_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(backend)?;
+            sqlx::query("DELETE FROM posts WHERE id = $1")
+                .bind(post_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(backend)?;
+            let newest_at: Option<i64> = sqlx::query_scalar(
+                "SELECT MAX(created_at) FROM posts WHERE thread_id = $1",
+            )
+            .bind(&thread_hint)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(backend)?;
+            let newest_at = newest_at.ok_or_else(|| {
+                StoreError::Backend("thread has no original post after reply deletion".to_string())
+            })?;
+            if thread.accepted_post_id == post_id || thread.accepted_post_id == first_post_id {
+                thread.accepted_post_id.clear();
             }
+            sqlx::query(
+                "UPDATE threads SET last_at = $1, accepted_post_id = $2 WHERE id = $3",
+            )
+            .bind(newest_at)
+            .bind(&thread.accepted_post_id)
+            .bind(&thread_hint)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+            tx.commit().await.map_err(backend)?;
+            return Ok(true);
         }
-        tx.commit().await?;
-        Ok(true)
+        Err(StoreError::Backend(
+            "thread category changed repeatedly; retry the post delete".to_string(),
+        ))
     }
 
     async fn set_thread_locked_async(
@@ -2005,30 +2841,197 @@ impl PgStore {
         Ok(())
     }
 
-    async fn move_thread_async(
+    async fn move_thread_to_category_async(
         &self,
         thread_id: &str,
         category_id: &str,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE threads SET category_id = $1 WHERE id = $2")
-            .bind(category_id)
+    ) -> Result<(), StoreError> {
+        for _ in 0..4 {
+            let source_hint = sqlx::query_scalar::<_, String>(
+                "SELECT category_id FROM threads WHERE id = $1",
+            )
             .bind(thread_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(backend)?
+            .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
+            let mut tx = self.pool.begin().await.map_err(backend)?;
+            let mut category_ids = vec![source_hint.clone(), category_id.to_string()];
+            category_ids.sort();
+            category_ids.dedup();
+            let mut formats = HashMap::new();
+            for locked_id in category_ids {
+                let format = sqlx::query_scalar::<_, String>(
+                    "SELECT format FROM categories WHERE id = $1 FOR UPDATE",
+                )
+                .bind(&locked_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(backend)?;
+                if let Some(format) = format {
+                    formats.insert(locked_id, format);
+                }
+            }
+            if !formats.contains_key(&source_hint) {
+                return Err(StoreError::NotFound("source category not found".to_string()));
+            }
+            let target_format = formats
+                .get(category_id)
+                .and_then(|format| CategoryFormat::parse(format))
+                .ok_or_else(|| StoreError::InvalidOperation("unknown category".to_string()))?;
+            let thread_sql = format!(
+                "SELECT {}, first_post_id FROM threads WHERE id = $1 FOR UPDATE",
+                Self::THREAD_COLS
+            );
+            let row = sqlx::query(&thread_sql)
+                .bind(thread_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(backend)?
+                .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
+            let mut thread = Self::thread_from_row(&row).map_err(backend)?;
+            let first_post_id: String = row.try_get("first_post_id").map_err(backend)?;
+            if thread.category_id != source_hint {
+                continue;
+            }
+            let accepted_thread = if thread.accepted_post_id.trim().is_empty() {
+                None
+            } else {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT thread_id FROM posts WHERE id = $1 FOR UPDATE",
+                )
+                .bind(&thread.accepted_post_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(backend)?
+            };
+            let valid_solution = thread.accepted_post_id != first_post_id
+                && accepted_thread.as_deref() == Some(thread_id);
+            if thread.category_id != category_id
+                && valid_solution
+                && !target_format.is_question()
+            {
+                return Err(StoreError::InvalidOperation(
+                    "unmark the accepted answer before moving this thread to a discussion category"
+                        .to_string(),
+                ));
+            }
+            if !valid_solution {
+                thread.accepted_post_id.clear();
+            }
+            sqlx::query(
+                "UPDATE threads SET category_id = $1, accepted_post_id = $2 WHERE id = $3",
+            )
+            .bind(category_id)
+            .bind(&thread.accepted_post_id)
+            .bind(thread_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+            tx.commit().await.map_err(backend)?;
+            return Ok(());
+        }
+        Err(StoreError::Backend(
+            "thread category changed repeatedly; retry the move".to_string(),
+        ))
     }
 
-    async fn set_accepted_post_async(
+    async fn mutate_accepted_answer_async(
         &self,
         thread_id: &str,
-        post_id: &str,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE threads SET accepted_post_id = $1 WHERE id = $2")
-            .bind(post_id)
+        action: AcceptedAnswerAction,
+    ) -> Result<AcceptedAnswerMutation, StoreError> {
+        for _ in 0..4 {
+            let category_hint = sqlx::query_scalar::<_, String>(
+                "SELECT category_id FROM threads WHERE id = $1",
+            )
             .bind(thread_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(backend)?
+            .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
+            let mut tx = self.pool.begin().await.map_err(backend)?;
+            let category_format = sqlx::query_scalar::<_, String>(
+                "SELECT format FROM categories WHERE id = $1 FOR UPDATE",
+            )
+            .bind(&category_hint)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(backend)?
+            .ok_or_else(|| StoreError::NotFound("category not found".to_string()))?;
+            let thread_sql = format!(
+                "SELECT {}, first_post_id FROM threads WHERE id = $1 FOR UPDATE",
+                Self::THREAD_COLS
+            );
+            let row = sqlx::query(&thread_sql)
+                .bind(thread_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(backend)?
+                .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
+            let mut thread = Self::thread_from_row(&row).map_err(backend)?;
+            let first_post_id: String = row.try_get("first_post_id").map_err(backend)?;
+            if thread.category_id != category_hint {
+                continue;
+            }
+
+            let (accepted_post, next_id) = match &action {
+                AcceptedAnswerAction::Clear => (None, String::new()),
+                AcceptedAnswerAction::Accept { post_id } => {
+                    if CategoryFormat::parse(&category_format).unwrap_or_default()
+                        != CategoryFormat::Question
+                    {
+                        return Err(StoreError::InvalidOperation(
+                            "accepted answers are available only in question categories"
+                                .to_string(),
+                        ));
+                    }
+                    let post_id = post_id.trim();
+                    if post_id.is_empty() {
+                        return Err(StoreError::InvalidOperation(
+                            "reply is required when accepting an answer".to_string(),
+                        ));
+                    }
+                    if post_id == first_post_id {
+                        return Err(StoreError::InvalidOperation(
+                            "the original post cannot be the accepted answer".to_string(),
+                        ));
+                    }
+                    let post_sql = format!(
+                        "SELECT {} FROM posts WHERE id = $1 FOR UPDATE",
+                        Self::POST_COLS
+                    );
+                    let post_row = sqlx::query(&post_sql)
+                        .bind(post_id)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(backend)?
+                        .ok_or_else(|| StoreError::NotFound("reply not found".to_string()))?;
+                    let post = Self::post_from_row(&post_row).map_err(backend)?;
+                    if post.thread_id != thread_id {
+                        return Err(StoreError::NotFound("reply not found".to_string()));
+                    }
+                    (Some(post), post_id.to_string())
+                }
+            };
+            let changed = thread.accepted_post_id != next_id;
+            sqlx::query("UPDATE threads SET accepted_post_id = $1 WHERE id = $2")
+                .bind(&next_id)
+                .bind(thread_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(backend)?;
+            thread.accepted_post_id = next_id;
+            tx.commit().await.map_err(backend)?;
+            return Ok(AcceptedAnswerMutation {
+                thread,
+                accepted_post,
+                changed,
+            });
+        }
+        Err(StoreError::Backend(
+            "thread category changed repeatedly; retry the answer mutation".to_string(),
+        ))
     }
 
     async fn toggle_thread_subscription_async(
@@ -2218,6 +3221,14 @@ impl Store for PgStore {
         self.rename_category_async(id, name).await.map_err(backend)
     }
 
+    async fn transition_category_format(
+        &self,
+        id: &str,
+        format: CategoryFormat,
+    ) -> Result<(), StoreError> {
+        self.transition_category_format_async(id, format).await
+    }
+
     async fn set_category_order(&self, id: &str, sort_order: i64) -> Result<(), StoreError> {
         self.set_category_order_async(id, sort_order)
             .await
@@ -2225,7 +3236,7 @@ impl Store for PgStore {
     }
 
     async fn delete_category(&self, id: &str) -> Result<(), StoreError> {
-        self.delete_category_async(id).await.map_err(backend)
+        self.delete_category_async(id).await
     }
 
     async fn recent_threads(&self, limit: i64) -> Result<Vec<Thread>, StoreError> {
@@ -2247,10 +3258,11 @@ impl Store for PgStore {
         category_id: Option<&str>,
         sort: ThreadSort,
         subscribed_sub: Option<&str>,
+        status: ThreadStatusFilter,
         limit: i64,
         now: i64,
     ) -> Result<Vec<Thread>, StoreError> {
-        self.list_threads_async(category_id, sort, subscribed_sub, limit, now)
+        self.list_threads_async(category_id, sort, subscribed_sub, status, limit, now)
             .await
             .map_err(backend)
     }
@@ -2259,9 +3271,10 @@ impl Store for PgStore {
         &self,
         query: &str,
         category_id: Option<&str>,
+        status: ThreadStatusFilter,
         limit: i64,
     ) -> Result<Vec<ThreadSearchHit>, StoreError> {
-        self.search_threads_async(query, category_id, limit)
+        self.search_threads_async(query, category_id, status, limit)
             .await
             .map_err(backend)
     }
@@ -2282,6 +3295,15 @@ impl Store for PgStore {
         self.get_post_async(id).await.map_err(backend)
     }
 
+    async fn get_valid_accepted_post(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<Post>, StoreError> {
+        self.get_valid_accepted_post_async(thread_id)
+            .await
+            .map_err(backend)
+    }
+
     async fn posts_in_thread(&self, thread_id: &str) -> Result<Vec<Post>, StoreError> {
         self.posts_in_thread_async(thread_id).await.map_err(backend)
     }
@@ -2296,22 +3318,21 @@ impl Store for PgStore {
         &self,
         thread_id: &str,
         op_id: &str,
+        excluded_post_id: Option<&str>,
         anchor: &ReplyAnchor,
         limit: i64,
     ) -> Result<Vec<Post>, StoreError> {
-        self.replies_page_async(thread_id, op_id, anchor, limit)
+        self.replies_page_async(thread_id, op_id, excluded_post_id, anchor, limit)
             .await
             .map_err(backend)
     }
 
     async fn create_thread(&self, thread: &Thread, first_post: &Post) -> Result<(), StoreError> {
-        self.create_thread_async(thread, first_post)
-            .await
-            .map_err(backend)
+        self.create_thread_async(thread, first_post).await
     }
 
     async fn add_reply(&self, post: &Post) -> Result<(), StoreError> {
-        self.add_reply_async(post).await.map_err(backend)
+        self.add_reply_async(post).await
     }
 
     async fn replace_mentions(
@@ -2355,7 +3376,7 @@ impl Store for PgStore {
     }
 
     async fn delete_thread(&self, thread_id: &str) -> Result<(), StoreError> {
-        self.delete_thread_async(thread_id).await.map_err(backend)
+        self.delete_thread_async(thread_id).await
     }
 
     async fn update_post(&self, post_id: &str, body_md: &str) -> Result<(), StoreError> {
@@ -2365,7 +3386,7 @@ impl Store for PgStore {
     }
 
     async fn delete_post(&self, post_id: &str) -> Result<(), StoreError> {
-        match self.delete_post_async(post_id).await.map_err(backend)? {
+        match self.delete_post_async(post_id).await? {
             true => Ok(()),
             false => Err(StoreError::InvalidOperation(
                 "the original post cannot be deleted separately; delete the thread".to_string(),
@@ -2385,16 +3406,21 @@ impl Store for PgStore {
             .map_err(backend)
     }
 
-    async fn move_thread(&self, thread_id: &str, category_id: &str) -> Result<(), StoreError> {
-        self.move_thread_async(thread_id, category_id)
+    async fn move_thread_to_category(
+        &self,
+        thread_id: &str,
+        category_id: &str,
+    ) -> Result<(), StoreError> {
+        self.move_thread_to_category_async(thread_id, category_id)
             .await
-            .map_err(backend)
     }
 
-    async fn set_accepted_post(&self, thread_id: &str, post_id: &str) -> Result<(), StoreError> {
-        self.set_accepted_post_async(thread_id, post_id)
-            .await
-            .map_err(backend)
+    async fn mutate_accepted_answer(
+        &self,
+        thread_id: &str,
+        action: AcceptedAnswerAction,
+    ) -> Result<AcceptedAnswerMutation, StoreError> {
+        self.mutate_accepted_answer_async(thread_id, action).await
     }
 
     async fn toggle_thread_subscription(
@@ -2465,6 +3491,9 @@ fn backend(e: sqlx::Error) -> StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use tokio::sync::Barrier;
 
     fn thread(id: &str, title: &str, created_at: i64) -> Thread {
         Thread {
@@ -2500,9 +3529,30 @@ mod tests {
     }
 
     async fn seed_thread(store: &InMemoryStore, id: &str, title: &str, created_at: i64) {
+        store
+            .create_category(&Category {
+                id: "general".to_string(),
+                name: "General".to_string(),
+                sort_order: 0,
+                format: CategoryFormat::Discussion,
+            })
+            .await
+            .unwrap();
         let t = thread(id, title, created_at);
         let first = post(&format!("p_{id}_op"), id, "OP", "", created_at);
         store.create_thread(&t, &first).await.unwrap();
+    }
+
+    async fn seed_category(store: &InMemoryStore, id: &str, format: CategoryFormat) {
+        store
+            .create_category(&Category {
+                id: id.to_string(),
+                name: id.to_string(),
+                sort_order: 0,
+                format,
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -2566,7 +3616,14 @@ mod tests {
             .await
             .unwrap());
         let subscribed = store
-            .list_threads(None, ThreadSort::Latest, Some("u_alice"), 10, 400)
+            .list_threads(
+                None,
+                ThreadSort::Latest,
+                Some("u_alice"),
+                ThreadStatusFilter::Any,
+                10,
+                400,
+            )
             .await
             .unwrap();
         assert_eq!(subscribed.len(), 1);
@@ -2581,7 +3638,14 @@ mod tests {
             .await
             .unwrap());
         assert!(store
-            .list_threads(None, ThreadSort::Latest, Some("u_alice"), 10, 400)
+            .list_threads(
+                None,
+                ThreadSort::Latest,
+                Some("u_alice"),
+                ThreadStatusFilter::Any,
+                10,
+                400,
+            )
             .await
             .unwrap()
             .is_empty());
@@ -2620,15 +3684,553 @@ mod tests {
         }
 
         let top = store
-            .list_threads(None, ThreadSort::Top, None, 10, now)
+            .list_threads(None, ThreadSort::Top, None, ThreadStatusFilter::Any, 10, now)
             .await
             .unwrap();
         assert_eq!(top[0].id, "t_old_busy", "top sorts by reply count");
 
         let hot = store
-            .list_threads(None, ThreadSort::Hot, None, 10, now)
+            .list_threads(None, ThreadSort::Hot, None, ThreadStatusFilter::Any, 10, now)
             .await
             .unwrap();
         assert_eq!(hot[0].id, "t_recent_small", "hot decays older reply volume");
+    }
+
+    #[tokio::test]
+    async fn in_memory_reply_pages_share_all_four_composite_anchor_semantics() {
+        let store = InMemoryStore::new();
+        seed_category(&store, "support", CategoryFormat::Question).await;
+        let mut t = thread("t_pages", "Pages", 100);
+        t.category_id = "support".to_string();
+        let op = post("p_op", &t.id, "OP", "", 100);
+        store.create_thread(&t, &op).await.unwrap();
+        for id in ["p_e", "p_c", "p_a", "p_d", "p_b"] {
+            store
+                .add_reply(&post(id, &t.id, id, "", 200))
+                .await
+                .unwrap();
+        }
+        store
+            .mutate_accepted_answer(
+                &t.id,
+                AcceptedAnswerAction::Accept {
+                    post_id: "p_c".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let ids = |posts: Vec<Post>| posts.into_iter().map(|post| post.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(store
+                .replies_page(&t.id, &op.id, Some("p_c"), &ReplyAnchor::First, 2)
+                .await
+                .unwrap()),
+            ["p_a", "p_b"]
+        );
+        assert_eq!(
+            ids(store
+                .replies_page(
+                    &t.id,
+                    &op.id,
+                    Some("p_c"),
+                    &ReplyAnchor::After(200, "p_b".to_string()),
+                    2,
+                )
+                .await
+                .unwrap()),
+            ["p_d", "p_e"]
+        );
+        assert_eq!(
+            ids(store
+                .replies_page(
+                    &t.id,
+                    &op.id,
+                    Some("p_c"),
+                    &ReplyAnchor::Before(200, "p_e".to_string()),
+                    2,
+                )
+                .await
+                .unwrap()),
+            ["p_d", "p_b"]
+        );
+        assert_eq!(
+            ids(store
+                .replies_page(&t.id, &op.id, Some("p_c"), &ReplyAnchor::Latest, 2)
+                .await
+                .unwrap()),
+            ["p_e", "p_d"]
+        );
+        assert!(store
+            .replies_page(&t.id, &op.id, Some("p_c"), &ReplyAnchor::First, 0)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn in_memory_invalid_answers_are_not_public_status_or_search_solutions() {
+        let store = InMemoryStore::new();
+        seed_category(&store, "questions", CategoryFormat::Question).await;
+        seed_category(&store, "discussion", CategoryFormat::Discussion).await;
+
+        let mut target = thread("t_target", "Target", 100);
+        target.category_id = "questions".to_string();
+        let target_op = post("p_target_op", &target.id, "Target OP", "", 100);
+        store.create_thread(&target, &target_op).await.unwrap();
+        let target_reply = post(
+            "p_target_reply",
+            &target.id,
+            "CROSS SOLUTION SECRET",
+            "",
+            101,
+        );
+        store.add_reply(&target_reply).await.unwrap();
+
+        let mut missing = thread("t_missing", "Missing pointer", 200);
+        missing.category_id = "questions".to_string();
+        missing.accepted_post_id = "p_does_not_exist".to_string();
+        let missing_op = post("p_missing_op", &missing.id, "Missing OP", "", 200);
+        store.create_thread(&missing, &missing_op).await.unwrap();
+
+        let mut original = thread("t_original", "Original pointer", 300);
+        original.category_id = "questions".to_string();
+        original.accepted_post_id = "p_original_op".to_string();
+        let original_op = post("p_original_op", &original.id, "Original OP", "", 300);
+        store.create_thread(&original, &original_op).await.unwrap();
+
+        let mut cross = thread("t_cross", "Cross pointer", 400);
+        cross.category_id = "questions".to_string();
+        cross.accepted_post_id = target_reply.id.clone();
+        let cross_op = post("p_cross_op", &cross.id, "Cross OP", "", 400);
+        store.create_thread(&cross, &cross_op).await.unwrap();
+
+        let answered = store
+            .list_threads(
+                None,
+                ThreadSort::Latest,
+                None,
+                ThreadStatusFilter::Answered,
+                20,
+                500,
+            )
+            .await
+            .unwrap();
+        assert!(answered.is_empty());
+        let unanswered = store
+            .list_threads(
+                None,
+                ThreadSort::Latest,
+                None,
+                ThreadStatusFilter::Unanswered,
+                20,
+                500,
+            )
+            .await
+            .unwrap();
+        let unanswered_ids: HashSet<_> = unanswered.iter().map(|thread| thread.id.as_str()).collect();
+        for expected in ["t_target", "t_missing", "t_original", "t_cross"] {
+            assert!(unanswered_ids.contains(expected));
+        }
+        assert!(unanswered
+            .iter()
+            .all(|thread| thread.accepted_post_id.is_empty()));
+        assert!(store
+            .search_threads(
+                "  cross solution secret  ",
+                None,
+                ThreadStatusFilter::Any,
+                20,
+            )
+            .await
+            .unwrap()
+            .is_empty());
+        for invalid in ["t_missing", "t_original", "t_cross"] {
+            assert!(store
+                .get_valid_accepted_post(invalid)
+                .await
+                .unwrap()
+                .is_none());
+        }
+        let first_clear = store
+            .mutate_accepted_answer("t_missing", AcceptedAnswerAction::Clear)
+            .await
+            .unwrap();
+        assert!(first_clear.changed);
+        assert!(first_clear.accepted_post.is_none());
+        let second_clear = store
+            .mutate_accepted_answer("t_missing", AcceptedAnswerAction::Clear)
+            .await
+            .unwrap();
+        assert!(!second_clear.changed, "clear is idempotent and needs no target post");
+
+        let mut historical = thread("t_historical", "Historical", 600);
+        historical.category_id = "discussion".to_string();
+        historical.accepted_post_id = "p_historical_reply".to_string();
+        let historical_op = post("p_historical_op", &historical.id, "Historical OP", "", 600);
+        store
+            .create_thread(&historical, &historical_op)
+            .await
+            .unwrap();
+        store
+            .add_reply(&post(
+                "p_historical_reply",
+                &historical.id,
+                "LEGACY SOLUTION ONLY",
+                "",
+                601,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_valid_accepted_post(&historical.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "p_historical_reply"
+        );
+        let public = store
+            .list_threads(
+                None,
+                ThreadSort::Latest,
+                None,
+                ThreadStatusFilter::Any,
+                20,
+                700,
+            )
+            .await
+            .unwrap();
+        assert!(public
+            .iter()
+            .find(|thread| thread.id == historical.id)
+            .unwrap()
+            .accepted_post_id
+            .is_empty());
+        assert!(store
+            .search_threads(
+                "legacy solution only",
+                None,
+                ThreadStatusFilter::Any,
+                20,
+            )
+            .await
+            .unwrap()
+            .is_empty());
+        store
+            .mutate_accepted_answer(&historical.id, AcceptedAnswerAction::Clear)
+            .await
+            .unwrap();
+        assert!(store
+            .get_thread(&historical.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .accepted_post_id
+            .is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn in_memory_guarded_commands_preserve_cross_operation_invariants() {
+        let store = Arc::new(InMemoryStore::new());
+        for id in [
+            "q_accept_format",
+            "q_accept_delete",
+            "q_move_source",
+            "q_move_target",
+            "q_reply_delete",
+            "q_reply_lock",
+            "q_create_delete",
+        ] {
+            seed_category(&store, id, CategoryFormat::Question).await;
+        }
+
+        let mut accept_format = thread("t_accept_format", "Accept format", 100);
+        accept_format.category_id = "q_accept_format".to_string();
+        let accept_format_op = post("p_accept_format_op", &accept_format.id, "OP", "", 100);
+        let accept_format_reply = post(
+            "p_accept_format_reply",
+            &accept_format.id,
+            "answer",
+            "",
+            101,
+        );
+        store
+            .create_thread(&accept_format, &accept_format_op)
+            .await
+            .unwrap();
+        store.add_reply(&accept_format_reply).await.unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let accept_task = {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            let thread_id = accept_format.id.clone();
+            let post_id = accept_format_reply.id.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .mutate_accepted_answer(&thread_id, AcceptedAnswerAction::Accept { post_id })
+                    .await
+            })
+        };
+        let format_task = {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .transition_category_format(
+                        "q_accept_format",
+                        CategoryFormat::Discussion,
+                    )
+                    .await
+            })
+        };
+        barrier.wait().await;
+        let _ = accept_task.await.unwrap();
+        let _ = format_task.await.unwrap();
+        let category = store
+            .get_category("q_accept_format")
+            .await
+            .unwrap()
+            .unwrap();
+        let raw = store
+            .get_thread(&accept_format.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(category.format.is_question() || raw.accepted_post_id.is_empty());
+
+        let mut accept_delete = thread("t_accept_delete", "Accept delete", 200);
+        accept_delete.category_id = "q_accept_delete".to_string();
+        let accept_delete_op = post("p_accept_delete_op", &accept_delete.id, "OP", "", 200);
+        let accept_delete_reply = post(
+            "p_accept_delete_reply",
+            &accept_delete.id,
+            "answer",
+            "",
+            201,
+        );
+        store
+            .create_thread(&accept_delete, &accept_delete_op)
+            .await
+            .unwrap();
+        store.add_reply(&accept_delete_reply).await.unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let accept_task = {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            let thread_id = accept_delete.id.clone();
+            let post_id = accept_delete_reply.id.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .mutate_accepted_answer(&thread_id, AcceptedAnswerAction::Accept { post_id })
+                    .await
+            })
+        };
+        let delete_task = {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            let post_id = accept_delete_reply.id.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store.delete_post(&post_id).await
+            })
+        };
+        barrier.wait().await;
+        let _ = accept_task.await.unwrap();
+        delete_task.await.unwrap().unwrap();
+        assert!(store
+            .get_post(&accept_delete_reply.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_thread(&accept_delete.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .accepted_post_id
+            .is_empty());
+
+        let mut moving = thread("t_move_format", "Move format", 300);
+        moving.category_id = "q_move_source".to_string();
+        let moving_op = post("p_move_format_op", &moving.id, "OP", "", 300);
+        let moving_reply = post("p_move_format_reply", &moving.id, "answer", "", 301);
+        store.create_thread(&moving, &moving_op).await.unwrap();
+        store.add_reply(&moving_reply).await.unwrap();
+        store
+            .mutate_accepted_answer(
+                &moving.id,
+                AcceptedAnswerAction::Accept {
+                    post_id: moving_reply.id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let move_task = {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            let thread_id = moving.id.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .move_thread_to_category(&thread_id, "q_move_target")
+                    .await
+            })
+        };
+        let format_task = {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .transition_category_format("q_move_target", CategoryFormat::Discussion)
+                    .await
+            })
+        };
+        barrier.wait().await;
+        let _ = move_task.await.unwrap();
+        let _ = format_task.await.unwrap();
+        let moved = store.get_thread(&moving.id).await.unwrap().unwrap();
+        let target = store
+            .get_category("q_move_target")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            moved.category_id != "q_move_target"
+                || target.format.is_question()
+                || moved.accepted_post_id.is_empty()
+        );
+
+        let mut reply_delete = thread("t_reply_delete", "Reply delete", 400);
+        reply_delete.category_id = "q_reply_delete".to_string();
+        let reply_delete_op = post("p_reply_delete_op", &reply_delete.id, "OP", "", 400);
+        store
+            .create_thread(&reply_delete, &reply_delete_op)
+            .await
+            .unwrap();
+        let concurrent_reply = post(
+            "p_reply_delete_race",
+            &reply_delete.id,
+            "reply",
+            "",
+            401,
+        );
+        let barrier = Arc::new(Barrier::new(3));
+        let reply_task = {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            let reply = concurrent_reply.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store.add_reply(&reply).await
+            })
+        };
+        let delete_task = {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            let thread_id = reply_delete.id.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store.delete_thread(&thread_id).await
+            })
+        };
+        barrier.wait().await;
+        let _ = reply_task.await.unwrap();
+        delete_task.await.unwrap().unwrap();
+        assert!(store.get_thread(&reply_delete.id).await.unwrap().is_none());
+        assert!(store
+            .get_post(&concurrent_reply.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        let mut reply_lock = thread("t_reply_lock", "Reply lock", 500);
+        reply_lock.category_id = "q_reply_lock".to_string();
+        let reply_lock_op = post("p_reply_lock_op", &reply_lock.id, "OP", "", 500);
+        store.create_thread(&reply_lock, &reply_lock_op).await.unwrap();
+        let lock_race_reply = post("p_reply_lock_race", &reply_lock.id, "reply", "", 501);
+        let barrier = Arc::new(Barrier::new(3));
+        let reply_task = {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            let reply = lock_race_reply.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store.add_reply(&reply).await
+            })
+        };
+        let lock_task = {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            let thread_id = reply_lock.id.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store.set_thread_locked(&thread_id, true).await
+            })
+        };
+        barrier.wait().await;
+        let reply_result = reply_task.await.unwrap();
+        lock_task.await.unwrap().unwrap();
+        assert_eq!(
+            reply_result.is_ok(),
+            store
+                .get_post(&lock_race_reply.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(store
+            .add_reply(&post(
+                "p_reply_after_lock",
+                &reply_lock.id,
+                "late",
+                "",
+                502,
+            ))
+            .await
+            .is_err());
+
+        let mut create_race = thread("t_create_delete", "Create delete", 600);
+        create_race.category_id = "q_create_delete".to_string();
+        let create_race_op = post("p_create_delete_op", &create_race.id, "OP", "", 600);
+        let barrier = Arc::new(Barrier::new(3));
+        let create_task = {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            let thread = create_race.clone();
+            let op = create_race_op.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store.create_thread(&thread, &op).await
+            })
+        };
+        let category_delete_task = {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store.delete_category("q_create_delete").await
+            })
+        };
+        barrier.wait().await;
+        let _ = create_task.await.unwrap();
+        let _ = category_delete_task.await.unwrap();
+        let category_exists = store
+            .get_category("q_create_delete")
+            .await
+            .unwrap()
+            .is_some();
+        let thread_exists = store
+            .get_thread(&create_race.id)
+            .await
+            .unwrap()
+            .is_some();
+        assert_eq!(category_exists, thread_exists, "thread and category cannot orphan");
     }
 }

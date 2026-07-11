@@ -18,7 +18,7 @@ use serde::Deserialize;
 
 use crate::auth;
 use crate::error::AppError;
-use crate::handlers::{esc, fmt_date, page_shell};
+use crate::handlers::{esc, fmt_date, page_shell, PageShell};
 use crate::index::{self, Scored};
 use crate::AppState;
 
@@ -74,16 +74,17 @@ pub async fn search_page(
     let fragment = SEARCH_HTML
         .replace("{{QUERY}}", &esc(&query))
         .replace("{{RESULTS}}", &results_html);
-    let page = page_shell(
-        "Search · Inkwell",
-        "page-console",
-        false,
-        "Search",
-        &email,
+    let page = page_shell(PageShell {
+        head_title: "Search · Inkwell",
+        body_class: "page-console",
+        rss: false,
+        nav_title: "Search",
+        email: &email,
         is_admin,
         theme,
-        &fragment,
-    );
+        fragment: &fragment,
+        metadata: None,
+    });
     Ok(Html(page).into_response())
 }
 

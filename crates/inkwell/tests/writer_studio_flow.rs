@@ -253,6 +253,91 @@ async fn explicit_intents_publish_schedule_and_preserve_edit_state() {
 }
 
 #[tokio::test]
+async fn old_draft_publish_now_uses_actual_publication_chronology() {
+    let state = build_dev_state();
+    let now = now_secs();
+    let old_draft = Post {
+        id: "old_draft_id".to_string(),
+        slug: "old-draft".to_string(),
+        title: "Old Draft".to_string(),
+        body_md: "written long ago".to_string(),
+        author_sub: "u_writer".to_string(),
+        author_email: "writer@hf".to_string(),
+        created_at: now - 86_400,
+        updated_at: now - 86_400,
+        published: false,
+        publish_at: 0,
+        featured: false,
+        pinned: false,
+        tags: String::new(),
+        cover_url: String::new(),
+        custom_excerpt: String::new(),
+        meta_title: String::new(),
+        meta_description: String::new(),
+        canonical_url: String::new(),
+        social_title: String::new(),
+        social_description: String::new(),
+        social_image: String::new(),
+    };
+    let recent = Post {
+        id: "recent_public_id".to_string(),
+        slug: "recent-public".to_string(),
+        title: "Recent Public".to_string(),
+        body_md: "already public".to_string(),
+        created_at: now - 60,
+        updated_at: now - 60,
+        published: true,
+        ..old_draft.clone()
+    };
+    state.store.create_post(&old_draft).await.unwrap();
+    state.store.create_post(&recent).await.unwrap();
+
+    let publish = form(&[
+        ("title", "Old Draft"),
+        ("body", "published today"),
+        ("intent", "publish_now"),
+        ("csrf_token", CSRF),
+    ]);
+    let before_publish = now_secs();
+    let (status, _, _) = call(&state, post_json("/edit/old-draft", &publish)).await;
+    assert_eq!(status, StatusCode::OK);
+    let published = state.store.get_post("old-draft").await.unwrap();
+    assert!(published.published);
+    assert!(published.publish_at >= before_publish);
+    assert!(published.publish_at <= now_secs());
+
+    let feed = state.store.feed_posts(now_secs()).await.unwrap();
+    let old_pos = feed
+        .iter()
+        .position(|post| post.slug == "old-draft")
+        .unwrap();
+    let recent_pos = feed
+        .iter()
+        .position(|post| post.slug == "recent-public")
+        .unwrap();
+    assert!(
+        old_pos < recent_pos,
+        "a draft published today ranks by publication, not its old creation time"
+    );
+    let (_, _, rss) = call(&state, get("/feed.xml")).await;
+    assert!(rss.find("Old Draft").unwrap() < rss.find("Recent Public").unwrap());
+
+    let publication_at = published.publish_at;
+    let preserve = form(&[
+        ("title", "Old Draft preserved"),
+        ("body", "saved without a state transition"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, _, _) = call(&state, post_json("/edit/old-draft", &preserve)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        state.store.get_post("old-draft").await.unwrap().publish_at,
+        publication_at,
+        "Save changes preserves the authoritative publication instant"
+    );
+}
+
+#[tokio::test]
 async fn same_second_edit_rejects_old_body_chunks_by_monotonic_version() {
     let state = build_dev_state();
     let create = form(&[
@@ -326,6 +411,13 @@ async fn incremental_public_index_refresh_and_reads_are_bounded() {
             pinned: false,
             tags: String::new(),
             cover_url: String::new(),
+            custom_excerpt: String::new(),
+            meta_title: String::new(),
+            meta_description: String::new(),
+            canonical_url: String::new(),
+            social_title: String::new(),
+            social_description: String::new(),
+            social_image: String::new(),
         };
         state.store.create_post(&post).await.unwrap();
     }

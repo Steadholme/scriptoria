@@ -26,7 +26,8 @@ Agora 跑在 Sluice 的 `auth=sso` 路由后面：网关负责对接 Keystone �
 - `X-Auth-Email` — 用户邮箱（顶栏「signed in as」+ 作者展示）
 - `X-Auth-Scope` — 授权范围
 
-因为 Agora 是内网专属（never publicly reachable），所以它**信任**这些头作为已认证用户。退出登录链接指向网关：
+Agora 的产品入口位于公网域名，但应用端口只在服务网络中可达；所有浏览器请求必须先经过 Sluice 的
+`auth=sso` 路由。Agora 仅信任网关剥离并重新注入、且在生产中由 HMAC 签名的身份头。退出登录链接指向网关：
 `https://id.w33d.xyz/_gw/auth/logout`。
 
 状态变更类的 POST（发主题、回帖）额外加了 **CSRF 双提交（double-submit）** 防护：一个可被 JS 读取的
@@ -38,11 +39,15 @@ Agora 跑在 Sluice 的 `auth=sso` 路由后面：网关负责对接 Keystone �
 |------------------------|-----------------------------------------------------------|
 | `GET  /healthz`        | 存活探针（容器 HEALTHCHECK 使用），返回 `200 ok`          |
 | `GET  /`               | 分类列表（含主题数）+ 最近活跃主题                        |
+| `GET  /questions`      | 跨 Question 分类的 Answer Desk，可筛 Answered/Unanswered |
 | `GET  /c/{id}`         | 某分类下的主题列表                                        |
 | `GET  /t/{id}`         | 某主题：原帖 + 回复（Markdown 渲染）+ 回复表单            |
 | `GET  /new?cat=`       | 发新主题的表单（可用 `cat` 预选分类，含「相似主题」实时提示） |
 | `POST /new`            | 创建主题（CSRF + 身份校验）                               |
 | `POST /t/{id}/reply`   | 发表回复（CSRF + 身份校验）                               |
+| `POST /t/{id}/accept`  | Question 分类中由主题作者或管理员采纳/取消采纳回答        |
+| `GET  /search`         | 搜索标题、原帖及 accepted solution，可筛分类与回答状态    |
+| `GET  /api/search/suggest` | 同源快捷搜索建议（含 solution 命中来源）              |
 | `POST /api/similar`    | （CSRF + 身份校验）按草稿 `{title,body}` 返回最相似的 3 个现有主题（JSON），编辑时去重 |
 | `GET  /api/thread/{id}/summary` | 某主题的抽取式摘要（top 句子，本地确定性算法，无外部 LLM），JSON |
 
@@ -58,7 +63,8 @@ FusionDB（over pgwire）上。
 CREATE TABLE categories (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
-    sort_order BIGINT NOT NULL DEFAULT 0
+    sort_order BIGINT NOT NULL DEFAULT 0,
+    format TEXT NOT NULL DEFAULT 'discussion'
 );
 CREATE TABLE threads (
     id TEXT PRIMARY KEY,
@@ -67,20 +73,34 @@ CREATE TABLE threads (
     author_sub TEXT NOT NULL,
     author_email TEXT NOT NULL,
     created_at BIGINT NOT NULL,
-    last_at BIGINT NOT NULL
+    last_at BIGINT NOT NULL,
+    first_body_md TEXT NOT NULL DEFAULT '',
+    first_post_id TEXT NOT NULL DEFAULT '',
+    locked BOOLEAN NOT NULL DEFAULT FALSE,
+    pinned BOOLEAN NOT NULL DEFAULT FALSE,
+    accepted_post_id TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE posts (
     id TEXT PRIMARY KEY,
     thread_id TEXT NOT NULL,
     body_md TEXT NOT NULL,
+    quoted_post_id TEXT NOT NULL DEFAULT '',
     author_sub TEXT NOT NULL,
     author_email TEXT NOT NULL,
     created_at BIGINT NOT NULL
 );
 ```
 
-启动时执行幂等的 `CREATE TABLE IF NOT EXISTS` 迁移；若分类表为空，则种入默认分类
-（Announcements / General Discussion / Support）。
+启动时执行幂等迁移；旧分类仅在 `format IS NULL` 时一次性回填，之后重启不会覆盖管理员选择。若分类表为空，
+则种入默认分类：Announcements / General Discussion 为 `discussion`，Support 为 `question`。
+
+## Q&A Answer Desk
+
+- Category format 是持久化产品语义，不是 CSS 标签：`discussion` 保持开放讨论；`question` 才能采纳回答。
+- `status=answered|unanswered` 在全局列表和搜索中都隐式限定为 Question 分类，避免把普通讨论误判为待回答。
+- Accepted solution 固定展示在原帖下方，并在分页查询执行 `LIMIT` 前排除，因此不会因为自然位置落在第 2 页而消失或重复。
+- 搜索同时覆盖标题、原帖与 accepted solution；solution 命中会返回对应 excerpt，而不是误展示原帖摘要。
+- 将含 accepted solution 的 Question 分类改为 Discussion，或把 answered thread 移入 Discussion，都会被后端拒绝；必须先取消采纳。
 
 ## 存储后端（async-trait Store）
 

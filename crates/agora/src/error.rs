@@ -62,6 +62,7 @@ impl From<crate::store::StoreError> for AppError {
             crate::store::StoreError::InvalidOperation(message) => {
                 AppError::InvalidRequest(message)
             }
+            crate::store::StoreError::NotFound(message) => AppError::NotFound(message),
             crate::store::StoreError::Backend(message) => {
                 AppError::Internal(format!("store error: {message}"))
             }

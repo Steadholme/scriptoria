@@ -125,10 +125,7 @@ fn extract_attr(tag: &str, name: &str) -> Option<String> {
         }
         // Optional spaces, then '='.
         let after = &hay[i + name.len()..];
-        let eq_off = match after.find(|c: char| !c.is_whitespace()) {
-            Some(o) => o,
-            None => return None,
-        };
+        let eq_off = after.find(|c: char| !c.is_whitespace())?;
         if after.as_bytes()[eq_off] != b'=' {
             continue;
         }

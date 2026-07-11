@@ -85,6 +85,59 @@
           </div>
         </div>
       </section>
+      <details class="card ink-settings-disclosure ink-publish-details">
+        <summary><span>Discoverability</span><small>Excerpt, search, canonical</small></summary>
+        <div class="card__body">
+          <div class="field">
+            <label for="custom_excerpt">Custom excerpt</label>
+            <textarea id="custom_excerpt" name="custom_excerpt" maxlength="500" rows="3" placeholder="A concise introduction for cards and feeds.">{{CUSTOM_EXCERPT_VALUE}}</textarea>
+            <p class="field__hint muted">Up to 500 characters. Blank uses an excerpt from the article body.</p>
+          </div>
+          <div class="field">
+            <label for="meta_title">Search title</label>
+            <input type="text" id="meta_title" name="meta_title" maxlength="200" value="{{META_TITLE_VALUE}}" placeholder="Blank uses the post title">
+            <p class="field__hint muted">Up to 200 characters. Used in search metadata, not the article heading.</p>
+          </div>
+          <div class="field">
+            <label for="meta_description">Search description</label>
+            <textarea id="meta_description" name="meta_description" maxlength="500" rows="3" placeholder="Blank uses the custom excerpt.">{{META_DESCRIPTION_VALUE}}</textarea>
+            <p class="field__hint muted">Up to 500 characters. HTML is never accepted here.</p>
+          </div>
+          <div class="field">
+            <label for="canonical_url">Canonical URL</label>
+            <input type="url" id="canonical_url" name="canonical_url" maxlength="2048" value="{{CANONICAL_URL_VALUE}}" placeholder="https://example.com/original-post">
+            <p class="field__hint muted">Optional absolute HTTP(S) source URL. Blank uses this Blog post URL.</p>
+          </div>
+        </div>
+      </details>
+      <details class="card ink-settings-disclosure ink-social-settings">
+        <summary><span>Social card</span><small>Share title, summary, image</small></summary>
+        <div class="card__body">
+          <div class="field">
+            <label for="social_title">Social title</label>
+            <input type="text" id="social_title" name="social_title" maxlength="200" value="{{SOCIAL_TITLE_VALUE}}" placeholder="Blank uses the search or post title">
+            <p class="field__hint muted">Up to 200 characters.</p>
+          </div>
+          <div class="field">
+            <label for="social_description">Social description</label>
+            <textarea id="social_description" name="social_description" maxlength="500" rows="3" placeholder="Blank uses the search description or excerpt.">{{SOCIAL_DESCRIPTION_VALUE}}</textarea>
+            <p class="field__hint muted">Up to 500 characters.</p>
+          </div>
+          <div class="field">
+            <label for="social_image">Social image <span class="muted">(Aperture share URL)</span></label>
+            <input type="url" id="social_image" name="social_image" maxlength="600" value="{{SOCIAL_IMAGE_VALUE}}" placeholder="https://drive.w33d.xyz/s/&hellip;">
+            <p class="field__hint muted">Optional. Blank reuses the cover; only trusted Drive share URLs are accepted.</p>
+          </div>
+          <div class="ink-social-preview" id="socialPreview" aria-label="Social card preview">
+            <img class="ink-social-preview__image" id="socialPreviewImage" alt="" hidden>
+            <div class="ink-social-preview__body">
+              <span class="ink-social-preview__host">blog.w33d.xyz</span>
+              <strong id="socialPreviewTitle">Untitled post</strong>
+              <span id="socialPreviewDescription">Add an excerpt or description to preview the shared card.</span>
+            </div>
+          </div>
+        </div>
+      </details>
     </aside>
   </form>
   {{DELETE}}
@@ -118,6 +171,16 @@
     var tagsEl = document.getElementById('tags');
     var coverEl = document.getElementById('cover_url');
     var coverPreview = document.getElementById('coverPreview');
+    var customExcerptEl = document.getElementById('custom_excerpt');
+    var metaTitleEl = document.getElementById('meta_title');
+    var metaDescriptionEl = document.getElementById('meta_description');
+    var canonicalUrlEl = document.getElementById('canonical_url');
+    var socialTitleEl = document.getElementById('social_title');
+    var socialDescriptionEl = document.getElementById('social_description');
+    var socialImageEl = document.getElementById('social_image');
+    var socialPreviewImage = document.getElementById('socialPreviewImage');
+    var socialPreviewTitle = document.getElementById('socialPreviewTitle');
+    var socialPreviewDescription = document.getElementById('socialPreviewDescription');
     var csrfEl = form.querySelector('input[name="csrf_token"]');
     var action = form.getAttribute('action') || '';
     var statusEl = document.getElementById('writerStatus');
@@ -149,6 +212,45 @@
       coverEl.addEventListener('input', syncCover);
       syncCover();
     }
+
+    function trustedApertureUrl(value) {
+      try {
+        var parsed = new URL(value);
+        return parsed.protocol === 'https:' && parsed.hostname.toLowerCase() === 'drive.w33d.xyz' && !parsed.username && !parsed.password && !parsed.port;
+      } catch (e) { return false; }
+    }
+    function socialFallbackDescription() {
+      var body = bodyEl ? bodyEl.value.replace(/\s+/g, ' ').trim() : '';
+      return body.length > 180 ? body.slice(0, 180).trimEnd() + '\u2026' : body;
+    }
+    function syncSocialPreview() {
+      if (socialPreviewTitle) {
+        socialPreviewTitle.textContent = (socialTitleEl && socialTitleEl.value.trim()) ||
+          (metaTitleEl && metaTitleEl.value.trim()) || (titleEl && titleEl.value.trim()) || 'Untitled post';
+      }
+      if (socialPreviewDescription) {
+        socialPreviewDescription.textContent = (socialDescriptionEl && socialDescriptionEl.value.trim()) ||
+          (metaDescriptionEl && metaDescriptionEl.value.trim()) ||
+          (customExcerptEl && customExcerptEl.value.trim()) || socialFallbackDescription() ||
+          'Add an excerpt or description to preview the shared card.';
+      }
+      if (socialPreviewImage) {
+        var explicitImage = socialImageEl && socialImageEl.value.trim();
+        var coverImage = coverEl && coverEl.value.trim();
+        var image = trustedApertureUrl(explicitImage) ? explicitImage : (trustedApertureUrl(coverImage) ? coverImage : '');
+        if (image) {
+          socialPreviewImage.src = image;
+          socialPreviewImage.hidden = false;
+        } else {
+          socialPreviewImage.removeAttribute('src');
+          socialPreviewImage.hidden = true;
+        }
+      }
+    }
+    [titleEl, bodyEl, customExcerptEl, metaTitleEl, metaDescriptionEl, socialTitleEl, socialDescriptionEl, socialImageEl, coverEl].forEach(function (el) {
+      if (el) { el.addEventListener('input', syncSocialPreview); }
+    });
+    syncSocialPreview();
 
     // ---- Title character counter -----------------------------------------
     var counter = document.getElementById('titleCount');
@@ -317,6 +419,13 @@
     function snapshot() {
       return { title: titleEl ? titleEl.value : '', body: bodyEl ? bodyEl.value : '',
                tags: tagsEl ? tagsEl.value : '', cover: coverEl ? coverEl.value : '',
+               customExcerpt: customExcerptEl ? customExcerptEl.value : '',
+               metaTitle: metaTitleEl ? metaTitleEl.value : '',
+               metaDescription: metaDescriptionEl ? metaDescriptionEl.value : '',
+               canonicalUrl: canonicalUrlEl ? canonicalUrlEl.value : '',
+               socialTitle: socialTitleEl ? socialTitleEl.value : '',
+               socialDescription: socialDescriptionEl ? socialDescriptionEl.value : '',
+               socialImage: socialImageEl ? socialImageEl.value : '',
                publishAt: document.getElementById('publish_at') ? document.getElementById('publish_at').value : '',
                pinned: !!(form.querySelector('input[name="pinned"]') && form.querySelector('input[name="pinned"]').checked),
                ts: Date.now() };
@@ -326,6 +435,15 @@
       if (bodyEl && typeof d.body === 'string') { bodyEl.value = d.body; }
       if (tagsEl && typeof d.tags === 'string') { tagsEl.value = d.tags; }
       if (coverEl && typeof d.cover === 'string') { coverEl.value = d.cover; }
+      if (customExcerptEl && typeof d.customExcerpt === 'string') { customExcerptEl.value = d.customExcerpt; }
+      if (metaTitleEl && typeof d.metaTitle === 'string') { metaTitleEl.value = d.metaTitle; }
+      if (metaDescriptionEl && typeof d.metaDescription === 'string') { metaDescriptionEl.value = d.metaDescription; }
+      if (canonicalUrlEl && typeof d.canonicalUrl === 'string') { canonicalUrlEl.value = d.canonicalUrl; }
+      if (socialTitleEl && typeof d.socialTitle === 'string') { socialTitleEl.value = d.socialTitle; }
+      if (socialDescriptionEl && typeof d.socialDescription === 'string') { socialDescriptionEl.value = d.socialDescription; }
+      if (socialImageEl && typeof d.socialImage === 'string') { socialImageEl.value = d.socialImage; }
+      syncCover();
+      syncSocialPreview();
       var publishAtEl = document.getElementById('publish_at');
       if (publishAtEl && typeof d.publishAt === 'string') { publishAtEl.value = d.publishAt; publishAtEl.dispatchEvent(new Event('input')); }
       var pinnedEl = form.querySelector('input[name="pinned"]');
@@ -338,6 +456,13 @@
         (bodyEl && d.body !== bodyEl.value) ||
         (tagsEl && d.tags !== tagsEl.value) ||
         (coverEl && d.cover !== coverEl.value) ||
+        (customExcerptEl && d.customExcerpt !== customExcerptEl.value) ||
+        (metaTitleEl && d.metaTitle !== metaTitleEl.value) ||
+        (metaDescriptionEl && d.metaDescription !== metaDescriptionEl.value) ||
+        (canonicalUrlEl && d.canonicalUrl !== canonicalUrlEl.value) ||
+        (socialTitleEl && d.socialTitle !== socialTitleEl.value) ||
+        (socialDescriptionEl && d.socialDescription !== socialDescriptionEl.value) ||
+        (socialImageEl && d.socialImage !== socialImageEl.value) ||
         (publishAtEl && d.publishAt !== publishAtEl.value) ||
         (pinnedEl && d.pinned !== pinnedEl.checked);
     }
@@ -359,7 +484,10 @@
         persistRecovery(draftKey, RECOVERY_TTL);
       }, 600);
     }
-    [titleEl, bodyEl, tagsEl, coverEl, publishAtEl].forEach(function (el) { if (el) { el.addEventListener('input', scheduleAutosave); } });
+    [titleEl, bodyEl, tagsEl, coverEl, customExcerptEl, metaTitleEl, metaDescriptionEl, canonicalUrlEl,
+     socialTitleEl, socialDescriptionEl, socialImageEl, publishAtEl].forEach(function (el) {
+      if (el) { el.addEventListener('input', scheduleAutosave); }
+    });
     var pinnedEl = form.querySelector('input[name="pinned"]');
     if (pinnedEl) { pinnedEl.addEventListener('change', scheduleAutosave); }
 

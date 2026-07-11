@@ -20,7 +20,7 @@ use serde::Deserialize;
 
 use crate::auth;
 use crate::error::AppError;
-use crate::handlers::{esc, fmt_date, page_shell};
+use crate::handlers::{esc, fmt_date, page_shell, PageShell};
 use crate::index::{self, Scored};
 use crate::AppState;
 
@@ -135,16 +135,17 @@ fn render_console(
         .replace("{{CSRF}}", &esc(csrf))
         .replace("{{QUESTION}}", &esc(question))
         .replace("{{ANSWER}}", answer_html);
-    page_shell(
-        "Ask the blog · Inkwell",
-        "page-console",
-        false,
-        "Ask",
+    page_shell(PageShell {
+        head_title: "Ask the blog · Inkwell",
+        body_class: "page-console",
+        rss: false,
+        nav_title: "Ask",
         email,
         is_admin,
         theme,
-        &fragment,
-    )
+        fragment: &fragment,
+        metadata: None,
+    })
 }
 
 /// Render the extractive answer: the top passages stitched with `[n]` markers, then a linked list

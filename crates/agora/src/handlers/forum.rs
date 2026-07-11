@@ -22,7 +22,7 @@ use crate::handlers::{
     ag_initial, ag_tone, email_display, esc, fmt_ts, rel_time, render_page, replies_label,
 };
 use crate::model::{Post, ReactionCount, Thread};
-use crate::store::{ReplyAnchor, ThreadSort};
+use crate::store::{AcceptedAnswerAction, ReplyAnchor, ThreadSort, ThreadStatusFilter};
 use crate::{markdown, new_id, now_secs, AppState};
 
 /// Most-recent threads shown on the home page.
@@ -120,6 +120,8 @@ pub struct ThreadListQuery {
     pub sort: Option<String>,
     #[serde(default)]
     pub filter: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
 }
 
 impl ThreadListQuery {
@@ -142,6 +144,15 @@ impl ThreadListQuery {
     fn subscribed_only(&self) -> bool {
         self.filter.as_deref() == Some("subscribed")
     }
+
+    fn status(&self) -> ThreadStatusFilter {
+        match self.status.as_deref() {
+            Some("answered") => ThreadStatusFilter::Answered,
+            Some("unanswered") => ThreadStatusFilter::Unanswered,
+            _ => ThreadStatusFilter::Any,
+        }
+    }
+
 }
 
 pub async fn home(
@@ -161,6 +172,7 @@ pub async fn home(
                 None,
                 q.sort(),
                 subscribed_subject(&q, viewer_sub.as_deref()),
+                q.status(),
                 RECENT_LIMIT,
                 now,
             )
@@ -171,6 +183,11 @@ pub async fn home(
     let cat_names: HashMap<&str, &str> = categories
         .iter()
         .map(|c| (c.id.as_str(), c.name.as_str()))
+        .collect();
+    let question_categories: HashSet<&str> = categories
+        .iter()
+        .filter(|category| category.format.is_question())
+        .map(|category| category.id.as_str())
         .collect();
     let mut reply_counts = HashMap::new();
     for t in &recent {
@@ -196,9 +213,21 @@ pub async fn home(
         cats_html = r#"<div class="empty">No categories yet.</div>"#.to_string();
     }
 
-    let recent_html = render_thread_rows(&recent, now, Some(&cat_names), Some(&reply_counts));
+    let recent_html = render_thread_rows(
+        &recent,
+        now,
+        Some(&cat_names),
+        Some(&reply_counts),
+        &question_categories,
+    );
     let mentions_html = render_mentions_panel(&state, &headers).await?;
-    let thread_controls = render_thread_list_controls("/", &q, viewer_sub.is_some());
+    let thread_controls = render_thread_list_controls(
+        "/",
+        &q,
+        viewer_sub.is_some(),
+        true,
+        q.status(),
+    );
 
     let content = format!(
         r#"<div class="page-head">
@@ -212,6 +241,7 @@ pub async fn home(
     <a class="btn btn-primary ag-cta" href="/new">New thread</a>
     <nav class="ag-rail__nav" aria-label="Categories">
       <a class="ag-cat is-active" href="/"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span class="ag-cat__name">All threads</span></a>
+      <a class="ag-cat" href="/questions"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M9.1 9a3 3 0 1 1 5.8 1c0 2-3 2-3 4"/><path d="M12 18h.01"/></svg><span class="ag-cat__name">Questions</span></a>
       {cats}
     </nav>
     {mentions}
@@ -226,17 +256,99 @@ pub async fn home(
 </div>"#,
         cats = cats_html,
         mentions = mentions_html,
-        thread_title = if q.subscribed_only() {
-            "Following"
-        } else {
-            "Recent activity"
-        },
+        thread_title = thread_list_title(&q, "Recent activity"),
         controls = thread_controls,
         recent = recent_html,
     );
 
     Ok(Html(render_page(
         "Forum",
+        &email_display(&headers),
+        &content,
+    )))
+}
+
+// ===========================================================================
+// GET /questions — all question categories, with a stable answer-status filter
+// ===========================================================================
+
+pub async fn questions(
+    State(state): State<AppState>,
+    Query(q): Query<ThreadListQuery>,
+    headers: HeaderMap,
+) -> Result<Html<String>, AppError> {
+    let now = now_secs();
+    let categories = state.store.list_categories().await?;
+    let viewer_sub = auth::identity_subject(&headers);
+    let status = match q.status() {
+        ThreadStatusFilter::Any => ThreadStatusFilter::Questions,
+        filtered => filtered,
+    };
+    let threads = if q.subscribed_only() && viewer_sub.is_none() {
+        Vec::new()
+    } else {
+        state
+            .store
+            .list_threads(
+                None,
+                q.sort(),
+                subscribed_subject(&q, viewer_sub.as_deref()),
+                status,
+                CATEGORY_LIMIT,
+                now,
+            )
+            .await?
+    };
+    let category_names: HashMap<&str, &str> = categories
+        .iter()
+        .map(|category| (category.id.as_str(), category.name.as_str()))
+        .collect();
+    let question_categories: HashSet<&str> = categories
+        .iter()
+        .filter(|category| category.format.is_question())
+        .map(|category| category.id.as_str())
+        .collect();
+    let ask_href = categories
+        .iter()
+        .find(|category| category.format.is_question())
+        .map(|category| format!("/new?cat={}", esc(&category.id)))
+        .unwrap_or_else(|| "/new".to_string());
+    let list = render_thread_rows(
+        &threads,
+        now,
+        Some(&category_names),
+        None,
+        &question_categories,
+    );
+    let controls = render_thread_list_controls(
+        "/questions",
+        &q,
+        viewer_sub.is_some(),
+        true,
+        status,
+    );
+    let heading = match status {
+        ThreadStatusFilter::Answered => "Answered questions",
+        ThreadStatusFilter::Unanswered => "Questions that need an answer",
+        ThreadStatusFilter::Any | ThreadStatusFilter::Questions => "All questions",
+    };
+    let content = format!(
+        r#"<nav class="crumbs"><a href="/">Home</a><span class="crumbs__sep">/</span><span>Questions</span></nav>
+<div class="page-head ag-question-head">
+  <div><h1>{heading}</h1><p class="muted">A focused answer desk across every question category.</p></div>
+  <a class="btn btn-primary" href="{ask_href}">Ask question</a>
+</div>
+<section class="section">
+  {controls}
+  <div class="thread-list">{list}</div>
+</section>"#,
+        heading = heading,
+        ask_href = ask_href,
+        controls = controls,
+        list = list,
+    );
+    Ok(Html(render_page(
+        "Questions",
         &email_display(&headers),
         &content,
     )))
@@ -259,6 +371,11 @@ pub async fn category(
         .await?
         .ok_or_else(|| AppError::NotFound("category not found".to_string()))?;
     let viewer_sub = auth::identity_subject(&headers);
+    let status = if category.format.is_question() {
+        q.status()
+    } else {
+        ThreadStatusFilter::Any
+    };
     let threads = if q.subscribed_only() && viewer_sub.is_none() {
         Vec::new()
     } else {
@@ -268,6 +385,7 @@ pub async fn category(
                 Some(&id),
                 q.sort(),
                 subscribed_subject(&q, viewer_sub.as_deref()),
+                status,
                 CATEGORY_LIMIT,
                 now,
             )
@@ -278,11 +396,18 @@ pub async fn category(
         r#"<nav class="crumbs"><a href="/">Home</a><span class="crumbs__sep">/</span><span>{name}</span></nav>"#,
         name = esc(&category.name),
     );
-    let list = render_thread_rows(&threads, now, None, None);
+    let question_categories: HashSet<&str> = if category.format.is_question() {
+        std::iter::once(category.id.as_str()).collect()
+    } else {
+        HashSet::new()
+    };
+    let list = render_thread_rows(&threads, now, None, None, &question_categories);
     let controls = render_thread_list_controls(
         &format!("/c/{}", esc(&category.id)),
         &q,
         viewer_sub.is_some(),
+        category.format.is_question(),
+        status,
     );
 
     let content = format!(
@@ -290,9 +415,9 @@ pub async fn category(
 <div class="page-head">
   <div>
     <h1>{name}</h1>
-    <p class="muted">{count} {tw} in this category.</p>
+    <p class="muted">{count} {tw} in this {format_label} category.</p>
   </div>
-  <a class="btn btn-primary" href="/new?cat={id}">New thread</a>
+  <a class="btn btn-primary" href="/new?cat={id}">{new_label}</a>
 </div>
 <section class="section">
   {controls}
@@ -302,10 +427,12 @@ pub async fn category(
         name = esc(&category.name),
         count = threads.len(),
         tw = if threads.len() == 1 {
-            "thread"
+            if category.format.is_question() { "question" } else { "thread" }
         } else {
-            "threads"
+            if category.format.is_question() { "questions" } else { "threads" }
         },
+        format_label = if category.format.is_question() { "question" } else { "discussion" },
+        new_label = if category.format.is_question() { "Ask question" } else { "New thread" },
         id = esc(&category.id),
         controls = controls,
         list = list,
@@ -350,6 +477,10 @@ pub async fn thread(
         .await?
         .ok_or_else(|| AppError::NotFound("thread not found".to_string()))?;
     let category = state.store.get_category(&thread.category_id).await?;
+    let is_question = category
+        .as_ref()
+        .map(|category| category.format.is_question())
+        .unwrap_or(false);
 
     // Reply count (every post minus the original) — shown in the head + as the reply-list total.
     let post_count = state.store.count_posts(&id).await?;
@@ -361,10 +492,22 @@ pub async fn thread(
     // (oldest→newest) display order.
     let op = state.store.first_post_in_thread(&id).await?;
     let op_id = op.as_ref().map(|p| p.id.clone()).unwrap_or_default();
+    let accepted_post = state.store.get_valid_accepted_post(&id).await?;
+    let valid_accepted_id = accepted_post
+        .as_ref()
+        .map(|post| post.id.clone())
+        .unwrap_or_default();
+    let accepted_id = (!valid_accepted_id.is_empty()).then_some(valid_accepted_id.as_str());
     let anchor = resolve_anchor(&q);
     let mut fetched = state
         .store
-        .replies_page(&id, &op_id, &anchor, REPLIES_PER_PAGE + 1)
+        .replies_page(
+            &id,
+            &op_id,
+            accepted_id,
+            &anchor,
+            REPLIES_PER_PAGE + 1,
+        )
         .await?;
     let has_more = fetched.len() as i64 > REPLIES_PER_PAGE;
     fetched.truncate(REPLIES_PER_PAGE as usize);
@@ -402,10 +545,15 @@ pub async fn thread(
         has_newer,
     );
 
-    // Display list: the original post first, then this page of replies.
-    let mut posts: Vec<Post> = Vec::with_capacity(replies.len() + 1);
+    // Display list: original post, then the accepted solution fixed directly below it, then one
+    // full page of ordinary replies. The store excluded the solution before LIMIT, so it neither
+    // disappears on another page nor renders twice on its natural page.
+    let mut posts: Vec<Post> = Vec::with_capacity(replies.len() + 2);
     if let Some(op_post) = op {
         posts.push(op_post);
+    }
+    if let Some(solution) = accepted_post {
+        posts.push(solution);
     }
     posts.extend(replies);
 
@@ -452,8 +600,9 @@ pub async fn thread(
         title = esc(&thread.title),
     );
 
+    let can_manage_answer = viewer.as_deref() == Some(thread.author_sub.as_str()) || is_admin;
     // Thread-level controls (edit title + original post, delete whole thread) — author only.
-    let thread_actions = if viewer.as_deref() == Some(thread.author_sub.as_str()) {
+    let mut thread_actions = if viewer.as_deref() == Some(thread.author_sub.as_str()) {
         format!(
             r#"<div class="owner-actions">
   <a class="btn btn-secondary btn-sm" href="/t/{tid}/edit">Edit thread</a>
@@ -468,12 +617,26 @@ pub async fn thread(
     } else {
         String::new()
     };
+    if can_manage_answer
+        && !thread.accepted_post_id.trim().is_empty()
+        && valid_accepted_id.is_empty()
+    {
+        thread_actions.push_str(&format!(
+            r#"<form class="inline-form" method="post" action="/t/{tid}/accept">
+  <input type="hidden" name="csrf" value="{csrf}">
+  <input type="hidden" name="action" value="clear">
+  <button class="btn btn-secondary btn-sm" type="submit">Clear invalid solution</button>
+</form>"#,
+            tid = esc(&thread.id),
+            csrf = esc(&csrf),
+        ));
+    }
 
     let summary_html = render_summary(&posts);
 
     // Display order: the original post stays first, then the accepted reply (if any), then the
     // rest in their natural oldest-first order. Reordering a clone never touches storage.
-    let ordered = order_posts_accepted_first(&posts, &thread.accepted_post_id);
+    let ordered = order_posts_accepted_first(&posts, &valid_accepted_id);
     let quoted_posts = load_quoted_posts(&state, &thread.id, &ordered).await?;
 
     // Per-post reaction aggregates (counts + whether THIS viewer reacted), keyed by post id.
@@ -486,9 +649,6 @@ pub async fn thread(
         reactions.insert(p.id.clone(), counts);
     }
 
-    // The "mark accepted" control is gated to the THREAD AUTHOR and to admins.
-    let can_accept = viewer.as_deref() == Some(thread.author_sub.as_str()) || is_admin;
-
     let posts_html = render_posts(
         &ordered,
         now,
@@ -496,8 +656,9 @@ pub async fn thread(
         is_admin,
         &thread.id,
         &csrf,
-        &thread.accepted_post_id,
-        can_accept,
+        &valid_accepted_id,
+        can_manage_answer,
+        is_question,
         &reactions,
         &quoted_posts,
     );
@@ -511,8 +672,10 @@ pub async fn thread(
         let composer_head = render_composer_head(
             &headers,
             &format!(
-                r#"<b>Reply</b><span>replying to &quot;{}&quot;</span>"#,
-                esc(&thread.title)
+                r#"<b>{verb}</b><span>{context} &quot;{}&quot;</span>"#,
+                esc(&thread.title),
+                verb = if is_question { "Answer" } else { "Reply" },
+                context = if is_question { "answering" } else { "replying to" },
             ),
         );
         format!(
@@ -523,13 +686,13 @@ pub async fn thread(
     <div class="ag-composer__fields">
       {quote}
       <div class="field">
-        <label class="label" for="reply-body">Your reply <span class="muted">(Markdown supported)</span></label>
-        <textarea id="reply-body" name="body" rows="6" placeholder="Write a reply…" required></textarea>
+        <label class="label" for="reply-body">Your {reply_noun} <span class="muted">(Markdown supported)</span></label>
+        <textarea id="reply-body" name="body" rows="6" placeholder="Write {reply_article} {reply_noun}…" required></textarea>
       </div>
     </div>
     <div class="ag-composer__bar">
       {hint}
-      <div class="ag-composer__actions"><button class="btn btn-primary" type="submit">Post reply</button></div>
+      <div class="ag-composer__actions"><button class="btn btn-primary" type="submit">Post {reply_noun}</button></div>
     </div>
   </form>
 </section>"#,
@@ -538,6 +701,8 @@ pub async fn thread(
             head = composer_head,
             quote = quote_fields,
             hint = markdown_hint(),
+            reply_noun = if is_question { "answer" } else { "reply" },
+            reply_article = if is_question { "an" } else { "a" },
         )
     };
 
@@ -548,6 +713,13 @@ pub async fn thread(
     }
     if thread.locked {
         badges.push_str(r#" <span class="badge badge-op">Locked</span>"#);
+    }
+    if is_question {
+        if valid_accepted_id.is_empty() {
+            badges.push_str(r#" <span class="badge ag-answer-state ag-answer-state--open">Needs answer</span>"#);
+        } else {
+            badges.push_str(r#" <span class="badge badge-accepted ag-answer-state">Answered</span>"#);
+        }
     }
     let category_chip = category
         .as_ref()
@@ -624,7 +796,17 @@ pub async fn new_form(
 ) -> Result<Response, AppError> {
     let categories = state.store.list_categories().await?;
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
-    let selected = q.cat.unwrap_or_default();
+    let requested = q.cat.unwrap_or_default();
+    let selected_category = categories
+        .iter()
+        .find(|category| category.id == requested)
+        .or_else(|| categories.first());
+    let selected = selected_category
+        .map(|category| category.id.as_str())
+        .unwrap_or_default();
+    let is_question = selected_category
+        .map(|category| category.format.is_question())
+        .unwrap_or(false);
     let (_, _, viewer_email) = composer_identity(&headers);
 
     let mut options = String::new();
@@ -639,8 +821,8 @@ pub async fn new_form(
     }
 
     let content = format!(
-        r#"<nav class="crumbs"><a href="/">Home</a><span class="crumbs__sep">/</span><span>New thread</span></nav>
-<div class="page-head"><div><h1>New thread</h1></div></div>
+        r#"<nav class="crumbs"><a href="/">Home</a><span class="crumbs__sep">/</span><span>{page_title}</span></nav>
+<div class="page-head"><div><h1>{page_title}</h1><p class="muted">{page_note}</p></div></div>
 <section class="card ag-composer ag-composer--new">
   <form class="ag-form" method="post" action="/new">
     <input type="hidden" name="csrf" value="{csrf}">
@@ -670,13 +852,19 @@ pub async fn new_form(
       {hint}
       <div class="ag-composer__actions">
       <a class="btn btn-secondary" href="/">Cancel</a>
-      <button class="btn btn-primary" type="submit">Create thread</button>
+      <button class="btn btn-primary" type="submit">{submit_label}</button>
       </div>
     </div>
   </form>
 </section>
 {script}"#,
         csrf = esc(&csrf),
+        page_title = if is_question { "Ask a question" } else { "New thread" },
+        page_note = if is_question {
+            "Describe the problem clearly so the community can propose a reusable answer."
+        } else {
+            "Start an open discussion with the community."
+        },
         head = render_composer_head(
             &headers,
             &format!(r#"<b>{viewer_email}</b><span>posting a new thread</span>"#),
@@ -684,10 +872,15 @@ pub async fn new_form(
         options = options,
         maxt = MAX_TITLE,
         hint = markdown_hint(),
+        submit_label = if is_question { "Ask question" } else { "Create thread" },
         script = SIMILAR_SCRIPT,
     );
 
-    let html = render_page("New thread", &email_display(&headers), &content);
+    let html = render_page(
+        if is_question { "Ask a question" } else { "New thread" },
+        &email_display(&headers),
+        &content,
+    );
     Ok(html_response(html, set_cookie))
 }
 
@@ -1283,15 +1476,17 @@ pub async fn react(
 }
 
 // ===========================================================================
-// POST /t/{tid}/accept — mark/unmark a reply as the accepted answer
+// POST /t/{tid}/accept — explicitly accept or clear the accepted answer
 // ===========================================================================
 
-/// Form body for accepting an answer: the CSRF token + the reply's `post_id`. Authorisation
-/// (thread author or admin) is checked against the gateway identity, never the form.
+/// Explicit accepted-answer command. `accept` requires `post_id`; `clear` ignores it and is
+/// idempotent even when a legacy pointer references a post that no longer exists.
 #[derive(Debug, Deserialize)]
 pub struct AcceptForm {
     #[serde(default)]
     pub csrf: String,
+    #[serde(default)]
+    pub action: String,
     #[serde(default)]
     pub post_id: String,
 }
@@ -1318,29 +1513,20 @@ pub async fn accept_answer(
         ));
     }
 
-    // The target must be a REPLY in this thread — never the original post (index 0).
-    let posts = state.store.posts_in_thread(&tid).await?;
-    let target = form.post_id.trim();
-    if posts.first().map(|p| p.id == target).unwrap_or(false) {
-        return Err(AppError::InvalidRequest(
-            "the original post cannot be the accepted answer".to_string(),
-        ));
-    }
-    let target_post = posts
-        .iter()
-        .find(|p| p.id == target)
-        .cloned()
-        .ok_or_else(|| AppError::NotFound("reply not found".to_string()))?;
-
-    // Toggle: re-accepting the currently accepted reply clears it; otherwise set it. Idempotent
-    // (marking the same reply that is already accepted flips it off — a deliberate unmark).
-    let new_accepted = if thread.accepted_post_id == target {
-        ""
-    } else {
-        target
+    let action = match form.action.trim() {
+        "accept" => AcceptedAnswerAction::Accept {
+            post_id: form.post_id.trim().to_string(),
+        },
+        "clear" => AcceptedAnswerAction::Clear,
+        _ => {
+            return Err(AppError::InvalidRequest(
+                "answer action must be accept or clear".to_string(),
+            ));
+        }
     };
-    state.store.set_accepted_post(&tid, new_accepted).await?;
-    tracing::info!(thread = tid, accepted = new_accepted, "accepted answer set");
+    let mutation = state.store.mutate_accepted_answer(&tid, action).await?;
+    let new_accepted = mutation.thread.accepted_post_id.as_str();
+    tracing::info!(thread = tid, accepted = new_accepted, changed = mutation.changed, "accepted answer command applied");
 
     let actor = if author.email.is_empty() {
         &author.sub
@@ -1357,8 +1543,16 @@ pub async fn accept_answer(
             new_accepted
         },
     ));
-    if !new_accepted.is_empty() {
-        notify_accepted_answer(&state, &thread, &target_post, &author.sub, &author.email);
+    if mutation.changed {
+        if let Some(target_post) = mutation.accepted_post.as_ref() {
+            notify_accepted_answer(
+                &state,
+                &mutation.thread,
+                target_post,
+                &author.sub,
+                &author.email,
+            );
+        }
     }
 
     if wants_json(&headers) {
@@ -1445,21 +1639,30 @@ fn subscribed_subject<'a>(q: &ThreadListQuery, viewer_sub: Option<&'a str>) -> O
     }
 }
 
-fn render_thread_list_controls(action: &str, q: &ThreadListQuery, show_subscribed: bool) -> String {
+fn render_thread_list_controls(
+    action: &str,
+    q: &ThreadListQuery,
+    show_subscribed: bool,
+    show_answer_filters: bool,
+    effective_status: ThreadStatusFilter,
+) -> String {
     let sort = q.sort_key();
     let sub = q.subscribed_only();
-    let filter_q = if sub { "&filter=subscribed" } else { "" };
+    let status_key = match effective_status {
+        ThreadStatusFilter::Answered => Some("answered"),
+        ThreadStatusFilter::Unanswered => Some("unanswered"),
+        ThreadStatusFilter::Any | ThreadStatusFilter::Questions => None,
+    };
     // Sort as tabs: real links (no-JS navigates + keeps the `?sort=` contract); the enhancement
     // script intercepts a click, fetches the same URL and swaps the `.thread-list` in place.
     let tab = |key: &str, label: &str| {
         let active = sort == key;
         format!(
-            r#"<a class="tab{cls}" role="tab" aria-selected="{sel}" data-sort-tab="{key}" href="{action}?sort={key}{filter}">{label}</a>"#,
+            r#"<a class="tab{cls}" role="tab" aria-selected="{sel}" data-sort-tab="{key}" href="{href}">{label}</a>"#,
             cls = if active { " is-active" } else { "" },
             sel = if active { "true" } else { "false" },
-            action = esc(action),
             key = key,
-            filter = filter_q,
+            href = list_href(action, key, status_key, sub),
             label = label,
         )
     };
@@ -1468,13 +1671,13 @@ fn render_thread_list_controls(action: &str, q: &ThreadListQuery, show_subscribe
     let filter = if show_subscribed {
         let (href, label, cls) = if sub {
             (
-                format!("{}?sort={}", esc(action), sort),
+                list_href(action, sort, status_key, false),
                 "Show all",
                 "btn btn-secondary btn-sm",
             )
         } else {
             (
-                format!("{}?sort={}&filter=subscribed", esc(action), sort),
+                list_href(action, sort, status_key, true),
                 "Following",
                 "btn btn-ghost btn-sm",
             )
@@ -1488,16 +1691,67 @@ fn render_thread_list_controls(action: &str, q: &ThreadListQuery, show_subscribe
     } else {
         String::new()
     };
+    let answer_filters = if show_answer_filters {
+        let status_tab = |key: Option<&str>, label: &str| {
+            let active = status_key == key;
+            format!(
+                r#"<a class="tab{cls}" role="tab" aria-selected="{selected}" href="{href}">{label}</a>"#,
+                cls = if active { " is-active" } else { "" },
+                selected = if active { "true" } else { "false" },
+                href = list_href(action, sort, key, sub),
+                label = label,
+            )
+        };
+        format!(
+            r#"<nav class="tabs answer-tabs" role="tablist" aria-label="Filter by answer status">{all}{unanswered}{answered}</nav>"#,
+            all = status_tab(None, "All"),
+            unanswered = status_tab(Some("unanswered"), "Unanswered"),
+            answered = status_tab(Some("answered"), "Answered"),
+        )
+    } else {
+        String::new()
+    };
     format!(
         r#"<div class="thread-controls" data-thread-controls>
-  <nav class="tabs sort-tabs" role="tablist" aria-label="Sort threads">{latest}{top}{hot}</nav>
-  {filter}
+  <div class="thread-controls__tabs">
+    <nav class="tabs sort-tabs" role="tablist" aria-label="Sort threads">{latest}{top}{hot}</nav>
+    {answer_filters}
+  </div>
+  {following}
 </div>"#,
         latest = tab("latest", "Latest"),
         top = tab("top", "Top"),
         hot = tab("hot", "Hot"),
-        filter = filter,
+        answer_filters = answer_filters,
+        following = filter,
     )
+}
+
+fn list_href(
+    action: &str,
+    sort: &str,
+    status: Option<&str>,
+    subscribed: bool,
+) -> String {
+    let mut params = vec![format!("sort={sort}")];
+    if let Some(status) = status {
+        params.push(format!("status={status}"));
+    }
+    if subscribed {
+        params.push("filter=subscribed".to_string());
+    }
+    format!("{}?{}", esc(action), params.join("&amp;"))
+}
+
+fn thread_list_title(q: &ThreadListQuery, fallback: &'static str) -> &'static str {
+    match q.status() {
+        ThreadStatusFilter::Answered => "Answered questions",
+        ThreadStatusFilter::Unanswered => "Questions that need an answer",
+        ThreadStatusFilter::Any | ThreadStatusFilter::Questions if q.subscribed_only() => {
+            "Following"
+        }
+        ThreadStatusFilter::Any | ThreadStatusFilter::Questions => fallback,
+    }
 }
 
 async fn render_mentions_panel(state: &AppState, headers: &HeaderMap) -> Result<String, AppError> {
@@ -1898,12 +2152,14 @@ fn render_thread_rows(
     now: i64,
     cat_names: Option<&HashMap<&str, &str>>,
     counts: Option<&HashMap<String, i64>>,
+    question_categories: &HashSet<&str>,
 ) -> String {
     if threads.is_empty() {
         return r#"<div class="empty"><div class="empty__ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div><h3>No threads yet — start the conversation.</h3><p>Every thread supports Markdown, reactions and @mentions.</p><a class="btn btn-primary btn-sm" href="/new">New thread</a></div>"#.to_string();
     }
     let mut out = String::new();
     for t in threads {
+        let is_question = question_categories.contains(t.category_id.as_str());
         let cat_part = match cat_names {
             Some(map) => {
                 let name = map.get(t.category_id.as_str()).copied().unwrap_or("—");
@@ -1925,6 +2181,17 @@ fn render_thread_rows(
         if !t.accepted_post_id.is_empty() {
             glyphs.push_str(r#"<svg class="ag-glyph ag-glyph--answered" role="img" aria-label="Answered" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="m9 11 3 3L22 4"/></svg>"#);
         }
+        let answer_state = if is_question {
+            if t.accepted_post_id.is_empty() {
+                r#"<span class="ag-chip ag-answer-state ag-answer-state--open">Needs answer</span>"#
+                    .to_string()
+            } else {
+                r#"<span class="ag-chip ag-answer-state ag-answer-state--done">Answered</span>"#
+                    .to_string()
+            }
+        } else {
+            String::new()
+        };
         let replies = counts
             .and_then(|map| map.get(&t.id))
             .map(|count| {
@@ -1941,7 +2208,7 @@ fn render_thread_rows(
   <span class="avatar ag-avatar ag-tone-{tone}" aria-hidden="true">{initial}</span>
   <span class="thread-row__main">
     <span class="thread-row__title">{glyphs}<span class="ag-title">{title}</span></span>
-    <span class="thread-row__sub">{cat}<span class="ag-row__by">started by {author}</span></span>
+    <span class="thread-row__sub">{cat}{answer_state}<span class="ag-row__by">started by {author}</span></span>
   </span>
   <span class="ag-row__side">{replies}<span class="thread-row__time" title="{abs}">{when}</span></span>
 </a>"#,
@@ -1952,6 +2219,7 @@ fn render_thread_rows(
             glyphs = glyphs,
             title = esc(&t.title),
             cat = cat_part,
+            answer_state = answer_state,
             author = esc(&t.author_email),
             replies = replies,
             abs = esc(&fmt_ts(t.last_at)),
@@ -2139,7 +2407,8 @@ fn render_posts(
     thread_id: &str,
     csrf: &str,
     accepted_post_id: &str,
-    can_accept: bool,
+    can_manage_answer: bool,
+    is_question: bool,
     reactions: &HashMap<String, Vec<ReactionCount>>,
     quoted_posts: &HashMap<String, Post>,
 ) -> String {
@@ -2181,21 +2450,26 @@ fn render_posts(
             String::new()
         };
         // Mark/unmark accepted: replies only (i > 0), gated to the thread author + admin.
-        let accept_control = if i > 0 && can_accept {
+        // Question categories can accept any reply. A historical accepted answer in a discussion
+        // remains readable and removable, but the discussion cannot select a new one.
+        let accept_control = if i > 0 && can_manage_answer && (is_question || is_accepted) {
             let label = if is_accepted {
-                "Unmark accepted"
+                "Remove solution"
             } else {
-                "Mark accepted"
+                "Accept answer"
             };
+            let action = if is_accepted { "clear" } else { "accept" };
             format!(
                 r#"<form class="inline-form" method="post" action="/t/{tid}/accept">
     <input type="hidden" name="csrf" value="{csrf}">
+    <input type="hidden" name="action" value="{action}">
     <input type="hidden" name="post_id" value="{pid}">
     <button class="btn btn-secondary btn-sm" type="submit">{label}</button>
   </form>"#,
                 tid = esc(thread_id),
                 pid = esc(&p.id),
                 csrf = esc(csrf),
+                action = action,
                 label = label,
             )
         } else {

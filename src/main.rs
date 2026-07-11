@@ -305,6 +305,15 @@ async fn build_drive() -> Result<Router, String> {
         other => return Err(format!("unknown APERTURE_BLOBS={other} (use memory|s3)")),
     };
 
+    // Request Room reservations bridge PostgreSQL and Cairn. If a previous process stopped after
+    // reserving capacity (possibly after writing the blob) but before committing the file row,
+    // recover only after the durable blob backend exists: delete the orphan object first, then
+    // release the leased reservation/counters. A cleanup failure keeps the reservation for retry
+    // and fails startup rather than silently leaking storage or capacity.
+    aperture::recover_stale_request_uploads(&pg, blobs.as_ref())
+        .await
+        .map_err(|e| format!("recover uploads: {e}"))?;
+
     let audit = aperture::audit::AuditSink::start(
         env_truthy("AUDIT_ENABLED"),
         &std::env::var("WATCHTOWER_URL").unwrap_or_default(),
