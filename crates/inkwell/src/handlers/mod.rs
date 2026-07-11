@@ -175,6 +175,7 @@ pub fn page_shell(page: PageShell<'_>) -> String {
         r#"<!DOCTYPE html><html lang="en"{theme_attr}><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="{color_scheme}">
+<link rel="icon" href="data:,">
 <title>{title}</title>{rss_link}{head_meta}<style>{css}</style></head><body class="{body_class}">
 {topbar}{fragment}</body></html>"#,
         theme_attr = odyssey::html_theme_attr(page.theme),

@@ -10,14 +10,102 @@
 //! `PgStore` drives sqlx natively — there is NO `block_in_place` and NO sync-over-async bridge.
 
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::config::clamp_page;
 use crate::model::{
-    FileComment, FileRec, FolderRec, OwnerUsage, UploadRequestRec, UploadSubmission, VersionRec,
+    library_type_for, FileComment, FileRec, FolderRec, LibraryCursor, LibraryItem, LibraryItemKind,
+    LibraryPage, LibraryQuery, LibraryType, LibraryView, OwnerUsage, UploadRequestRec,
+    UploadSubmission, VersionRec,
 };
+
+fn mutation_time() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn next_mutation_time(previous: i64) -> i64 {
+    mutation_time().max(previous.saturating_add(1))
+}
+
+fn file_library_item(file: &FileRec, now: i64) -> LibraryItem {
+    LibraryItem {
+        kind: LibraryItemKind::File,
+        id: file.id.clone(),
+        parent_id: file.folder_id.clone(),
+        name: file.name.clone(),
+        content_type: Some(file.content_type.clone()),
+        size: Some(file.size),
+        created_at: file.created_at,
+        updated_at: file.updated_at,
+        shared: file.share_token.is_some(),
+        share_expired: file.share_token.is_some() && file.share_expired(now),
+        share_protected: file.share_token.is_some() && file.share_has_password(),
+    }
+}
+
+fn folder_library_item(folder: &FolderRec, now: i64) -> LibraryItem {
+    LibraryItem {
+        kind: LibraryItemKind::Folder,
+        id: folder.id.clone(),
+        parent_id: folder.parent_id.clone(),
+        name: folder.name.clone(),
+        content_type: None,
+        size: None,
+        created_at: folder.created_at,
+        updated_at: folder.updated_at,
+        shared: folder.share_token.is_some(),
+        share_expired: folder.share_token.is_some() && folder.share_expired(now),
+        share_protected: folder.share_token.is_some() && folder.share_has_password(),
+    }
+}
+
+fn library_item_before(item: &LibraryItem, cursor: &LibraryCursor) -> bool {
+    item.updated_at < cursor.updated_at
+        || (item.updated_at == cursor.updated_at
+            && (item.kind.rank() < cursor.kind.rank()
+                || (item.kind == cursor.kind && item.id < cursor.id)))
+}
+
+fn library_item_matches(item: &LibraryItem, query: &LibraryQuery) -> bool {
+    if query.view == LibraryView::Shared && !item.shared {
+        return false;
+    }
+    if let Some(needle) = query.query.as_deref() {
+        if !item.name.to_lowercase().contains(&needle.to_lowercase()) {
+            return false;
+        }
+    }
+    let item_type = match item.kind {
+        LibraryItemKind::Folder => LibraryType::Folder,
+        LibraryItemKind::File => library_type_for(item.content_type.as_deref().unwrap_or_default()),
+    };
+    (query.type_filter == LibraryType::All || query.type_filter == item_type)
+        && query
+            .before
+            .as_ref()
+            .is_none_or(|cursor| library_item_before(item, cursor))
+}
+
+fn finish_library_page(mut items: Vec<LibraryItem>, limit: i64) -> LibraryPage {
+    let limit = clamp_page(limit) as usize;
+    items.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| right.kind.rank().cmp(&left.kind.rank()))
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    let has_more = items.len() > limit;
+    items.truncate(limit);
+    let next = has_more.then(|| items.last().expect("non-empty bounded page").cursor());
+    LibraryPage { items, next }
+}
 
 /// Safe, finite defaults for a newly-created upload request. The per-file limit is additionally
 /// clamped to the runtime `MAX_UPLOAD` by the handler.
@@ -145,6 +233,14 @@ pub trait Store: Send + Sync {
         before: Option<(i64, String)>,
         limit: i64,
     ) -> Result<Vec<FileRec>, StoreError>;
+
+    /// Search/filter the owner's complete live library (files plus folders) using one stable
+    /// `(updated_at, kind, id)` keyset. The result projection intentionally omits capability tokens.
+    async fn query_library(
+        &self,
+        owner_sub: &str,
+        query: &LibraryQuery,
+    ) -> Result<LibraryPage, StoreError>;
 
     /// Hard-delete a file row only if it belongs to `owner_sub`. Returns `true` when a row was
     /// removed. Handler-level "Delete" uses [`Store::trash_file`]; this hard path is retained for
@@ -283,7 +379,7 @@ pub trait Store: Send + Sync {
         folder_id: Option<&str>,
     ) -> Result<Option<FileRec>, StoreError>;
 
-    /// Repoint a file's current blob (object key + size + content type) and bump `created_at`,
+    /// Repoint a file's current blob (object key + size + content type) and bump `updated_at`,
     /// ownership-scoped. Used by a re-upload (point at the new blob) and a version restore (point
     /// back at the snapshot). Returns `true` when the owner's row was updated.
     async fn update_file_blob(
@@ -293,7 +389,7 @@ pub trait Store: Send + Sync {
         object_key: &str,
         size: i64,
         content_type: &str,
-        created_at: i64,
+        updated_at: i64,
     ) -> Result<bool, StoreError>;
 
     /// Append a version snapshot row.
@@ -356,8 +452,9 @@ pub trait Store: Send + Sync {
     /// Fetch one comment by id.
     async fn get_comment(&self, comment_id: &str) -> Result<Option<FileComment>, StoreError>;
 
-    /// Delete one comment by id.
-    async fn delete_comment(&self, comment_id: &str) -> Result<bool, StoreError>;
+    /// Delete one comment scoped to its file. Successful add/delete operations also touch the
+    /// file's owner-visible activity timestamp atomically.
+    async fn delete_comment(&self, comment_id: &str, file_id: &str) -> Result<bool, StoreError>;
 
     /// Delete all comments for a file, used by hard purge.
     async fn delete_comments_for_file(&self, file_id: &str) -> Result<(), StoreError>;
@@ -581,6 +678,45 @@ impl Store for InMemoryStore {
         Ok(out)
     }
 
+    async fn query_library(
+        &self,
+        owner_sub: &str,
+        query: &LibraryQuery,
+    ) -> Result<LibraryPage, StoreError> {
+        let now = mutation_time();
+        // Snapshot each collection under its own lock. Folder deletion takes `folders` before
+        // `files`, so holding both here in the opposite order would allow an ABBA deadlock.
+        let files = self.files.lock().expect("files lock poisoned").clone();
+        let folders = self
+            .folders
+            .lock()
+            .expect("folders lock poisoned")
+            .clone();
+        let mut items: Vec<LibraryItem> = files
+            .iter()
+            .filter(|file| file.owner_sub == owner_sub && file.trashed_at == 0)
+            .map(|file| file_library_item(file, now))
+            .chain(
+                folders
+                    .iter()
+                    .filter(|folder| folder.owner_sub == owner_sub)
+                    .map(|folder| folder_library_item(folder, now)),
+            )
+            .filter(|item| library_item_matches(item, query))
+            .collect();
+        // Retain one look-ahead row so `next` is exact rather than guessed from a full page.
+        let read_cap = clamp_page(query.limit) as usize + 1;
+        items.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| right.kind.rank().cmp(&left.kind.rank()))
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        items.truncate(read_cap);
+        Ok(finish_library_page(items, query.limit))
+    }
+
     async fn delete(&self, id: &str, owner_sub: &str) -> Result<bool, StoreError> {
         let mut files = self.files.lock().expect("files lock poisoned");
         let before = files.len();
@@ -601,6 +737,7 @@ impl Store for InMemoryStore {
         {
             Some(f) => {
                 f.trashed_at = trashed_at.max(1);
+                f.updated_at = next_mutation_time(f.updated_at);
                 Ok(true)
             }
             None => Ok(false),
@@ -615,6 +752,7 @@ impl Store for InMemoryStore {
         {
             Some(f) => {
                 f.trashed_at = 0;
+                f.updated_at = next_mutation_time(f.updated_at);
                 Ok(true)
             }
             None => Ok(false),
@@ -629,6 +767,7 @@ impl Store for InMemoryStore {
         {
             Some(f) => {
                 f.name = name.to_string();
+                f.updated_at = next_mutation_time(f.updated_at);
                 Ok(true)
             }
             None => Ok(false),
@@ -667,6 +806,7 @@ impl Store for InMemoryStore {
                 f.share_token = share_token;
                 f.expires_at = expires_at;
                 f.share_password_hash = share_password_hash;
+                f.updated_at = next_mutation_time(f.updated_at);
                 Ok(true)
             }
             None => Ok(false),
@@ -739,6 +879,7 @@ impl Store for InMemoryStore {
         {
             Some(f) => {
                 f.name = name.to_string();
+                f.updated_at = next_mutation_time(f.updated_at);
                 Ok(true)
             }
             None => Ok(false),
@@ -762,6 +903,7 @@ impl Store for InMemoryStore {
                 f.share_token = share_token;
                 f.expires_at = expires_at;
                 f.share_password_hash = share_password_hash;
+                f.updated_at = next_mutation_time(f.updated_at);
                 Ok(true)
             }
             None => Ok(false),
@@ -781,6 +923,7 @@ impl Store for InMemoryStore {
         {
             Some(f) => {
                 f.upload_token = upload_token;
+                f.updated_at = next_mutation_time(f.updated_at);
                 Ok(true)
             }
             None => Ok(false),
@@ -890,6 +1033,7 @@ impl Store for InMemoryStore {
         {
             Some(f) => {
                 f.folder_id = folder_id.map(str::to_string);
+                f.updated_at = next_mutation_time(f.updated_at);
                 Ok(true)
             }
             None => Ok(false),
@@ -944,7 +1088,7 @@ impl Store for InMemoryStore {
         object_key: &str,
         size: i64,
         content_type: &str,
-        created_at: i64,
+        updated_at: i64,
     ) -> Result<bool, StoreError> {
         let mut files = self.files.lock().expect("files lock poisoned");
         match files
@@ -955,7 +1099,7 @@ impl Store for InMemoryStore {
                 f.object_key = object_key.to_string();
                 f.size = size;
                 f.content_type = content_type.to_string();
-                f.created_at = created_at;
+                f.updated_at = updated_at.max(f.updated_at.saturating_add(1));
                 Ok(true)
             }
             None => Ok(false),
@@ -1135,11 +1279,17 @@ impl Store for InMemoryStore {
     }
 
     async fn create_comment(&self, comment: &FileComment) -> Result<bool, StoreError> {
+        // Keep the global Memory lock order `files -> comments`, matching cascade deletion.
+        let mut files = self.files.lock().expect("files lock poisoned");
+        let Some(file) = files.iter_mut().find(|file| file.id == comment.file_id) else {
+            return Ok(false);
+        };
         let mut comments = self.comments.lock().expect("comments lock poisoned");
         if comments.iter().any(|c| c.id == comment.id) {
             return Ok(false);
         }
         comments.push(comment.clone());
+        file.updated_at = next_mutation_time(file.updated_at);
         Ok(true)
     }
 
@@ -1163,11 +1313,18 @@ impl Store for InMemoryStore {
         Ok(comments.iter().find(|c| c.id == comment_id).cloned())
     }
 
-    async fn delete_comment(&self, comment_id: &str) -> Result<bool, StoreError> {
+    async fn delete_comment(&self, comment_id: &str, file_id: &str) -> Result<bool, StoreError> {
+        let mut files = self.files.lock().expect("files lock poisoned");
         let mut comments = self.comments.lock().expect("comments lock poisoned");
         let before = comments.len();
-        comments.retain(|c| c.id != comment_id);
-        Ok(comments.len() != before)
+        comments.retain(|c| !(c.id == comment_id && c.file_id == file_id));
+        let deleted = comments.len() != before;
+        if deleted {
+            if let Some(file) = files.iter_mut().find(|file| file.id == file_id) {
+                file.updated_at = next_mutation_time(file.updated_at);
+            }
+        }
+        Ok(deleted)
     }
 
     async fn delete_comments_for_file(&self, file_id: &str) -> Result<(), StoreError> {
@@ -1672,15 +1829,76 @@ impl Store for InMemoryStore {
 // `block_in_place` and NO sync-over-async, so a query never blocks a worker thread.
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
-use sqlx::Row;
+use sqlx::{Postgres, QueryBuilder, Row};
+
+fn push_library_cursor(
+    query: &mut QueryBuilder<'_, Postgres>,
+    cursor: &LibraryCursor,
+    kind: LibraryItemKind,
+) {
+    use std::cmp::Ordering;
+
+    match kind.rank().cmp(&cursor.kind.rank()) {
+        Ordering::Less => {
+            query
+                .push(" AND updated_at <= ")
+                .push_bind(cursor.updated_at);
+        }
+        Ordering::Greater => {
+            query
+                .push(" AND updated_at < ")
+                .push_bind(cursor.updated_at);
+        }
+        Ordering::Equal => {
+            query
+                .push(" AND (updated_at < ")
+                .push_bind(cursor.updated_at)
+                .push(" OR (updated_at = ")
+                .push_bind(cursor.updated_at)
+                .push(" AND id < ")
+                .push_bind(cursor.id.clone())
+                .push("))");
+        }
+    }
+}
+
+const LIBRARY_FILE_TYPE_SQL: &str = "CASE \
+    WHEN LOWER(content_type) LIKE 'image/%' THEN 'image' \
+    WHEN LOWER(content_type) LIKE 'video/%' THEN 'video' \
+    WHEN LOWER(content_type) LIKE 'audio/%' THEN 'audio' \
+    WHEN LOWER(content_type) = 'application/pdf' THEN 'pdf' \
+    WHEN LOWER(content_type) LIKE 'text/%' OR LOWER(content_type) IN (\
+        'application/msword', \
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document', \
+        'application/vnd.oasis.opendocument.text', 'application/rtf'\
+    ) THEN 'document' \
+    WHEN LOWER(content_type) LIKE '%zip%' OR LOWER(content_type) LIKE '%tar%' \
+        OR LOWER(content_type) LIKE '%gzip%' OR LOWER(content_type) LIKE '%compress%' \
+        OR LOWER(content_type) LIKE '%x-7z%' OR LOWER(content_type) LIKE '%x-rar%' \
+        THEN 'archive' \
+    ELSE 'other' END";
+
+fn push_library_file_type(query: &mut QueryBuilder<'_, Postgres>, filter: LibraryType) {
+    match filter {
+        LibraryType::All => {}
+        LibraryType::Folder => unreachable!("folder filter skips the files query"),
+        selected => {
+            query
+                .push(" AND (")
+                .push(LIBRARY_FILE_TYPE_SQL)
+                .push(") = ")
+                .push_bind(selected.slug());
+        }
+    };
+}
 
 /// Column list shared by every SELECT, so the row decoder stays in lock-step with the query.
 const COLS: &str = "id, owner_sub, name, content_type, size, bucket, object_key, share_token, \
-     created_at, expires_at, share_password_hash, folder_id, trashed_at, view_count";
+     created_at, updated_at, expires_at, share_password_hash, folder_id, trashed_at, view_count";
 
 /// Column list shared by every folder SELECT.
 const FOLDER_COLS: &str =
-    "id, owner_sub, parent_id, name, created_at, share_token, expires_at, share_password_hash, \
+    "id, owner_sub, parent_id, name, created_at, updated_at, share_token, expires_at, share_password_hash, \
      upload_token";
 
 /// Column list shared by every version SELECT.
@@ -1753,6 +1971,19 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+        // Owner-library activity time. DEFAULT 0 keeps a rolled-back older binary able to insert;
+        // every current boot backfills those rows from immutable creation time before reading them.
+        sqlx::query("ALTER TABLE files ADD COLUMN IF NOT EXISTS updated_at BIGINT DEFAULT 0")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            "UPDATE files SET updated_at = created_at WHERE updated_at IS NULL OR updated_at = 0",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("ALTER TABLE files ALTER COLUMN updated_at SET NOT NULL")
+            .execute(&self.pool)
+            .await?;
         // Folders (albums). Additive + idempotent; pre-existing files default to NULL folder_id
         // (unfiled), preserving the flat all-files view. Portable standard SQL only.
         sqlx::query("ALTER TABLE files ADD COLUMN IF NOT EXISTS folder_id TEXT")
@@ -1778,6 +2009,17 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+        sqlx::query("ALTER TABLE folders ADD COLUMN IF NOT EXISTS updated_at BIGINT DEFAULT 0")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            "UPDATE folders SET updated_at = created_at WHERE updated_at IS NULL OR updated_at = 0",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("ALTER TABLE folders ALTER COLUMN updated_at SET NOT NULL")
+            .execute(&self.pool)
+            .await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_folders_owner_name \
              ON folders (owner_sub, name)",
@@ -1831,6 +2073,31 @@ impl PgStore {
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_files_owner_folder \
              ON files (owner_sub, folder_id, created_at)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_files_owner_updated_live \
+             ON files (owner_sub, updated_at DESC, id DESC) WHERE trashed_at = 0",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_files_owner_shared_updated \
+             ON files (owner_sub, updated_at DESC, id DESC) \
+             WHERE trashed_at = 0 AND share_token IS NOT NULL",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_folders_owner_updated \
+             ON folders (owner_sub, updated_at DESC, id DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_folders_owner_shared_updated \
+             ON folders (owner_sub, updated_at DESC, id DESC) WHERE share_token IS NOT NULL",
         )
         .execute(&self.pool)
         .await?;
@@ -2086,6 +2353,7 @@ impl PgStore {
             object_key: row.try_get("object_key")?,
             share_token: row.try_get("share_token")?,
             created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
             expires_at: row.try_get("expires_at")?,
             share_password_hash: row.try_get("share_password_hash")?,
             folder_id: row.try_get("folder_id")?,
@@ -2101,6 +2369,7 @@ impl PgStore {
             parent_id: row.try_get("parent_id")?,
             name: row.try_get("name")?,
             created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
             share_token: row.try_get("share_token")?,
             expires_at: row.try_get("expires_at")?,
             share_password_hash: row.try_get("share_password_hash")?,
@@ -2172,8 +2441,8 @@ impl PgStore {
         let result = sqlx::query(
             "INSERT INTO files \
                  (id, owner_sub, name, content_type, size, bucket, object_key, share_token, \
-                  created_at, expires_at, share_password_hash, folder_id, trashed_at, view_count) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+                  created_at, updated_at, expires_at, share_password_hash, folder_id, trashed_at, view_count) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
              ON CONFLICT DO NOTHING",
         )
         .bind(&file.id)
@@ -2185,6 +2454,7 @@ impl PgStore {
         .bind(&file.object_key)
         .bind(&file.share_token)
         .bind(file.created_at)
+        .bind(file.updated_at)
         .bind(file.expires_at)
         .bind(&file.share_password_hash)
         .bind(&file.folder_id)
@@ -2203,13 +2473,17 @@ impl PgStore {
         expires_at: Option<i64>,
         share_password_hash: Option<String>,
     ) -> Result<bool, sqlx::Error> {
+        let updated_at = mutation_time();
         let result = sqlx::query(
-            "UPDATE files SET share_token = $1, expires_at = $2, share_password_hash = $3 \
-             WHERE id = $4 AND owner_sub = $5",
+            "UPDATE files SET share_token = $1, expires_at = $2, share_password_hash = $3, \
+             updated_at = CASE WHEN updated_at = 9223372036854775807 THEN updated_at \
+                               WHEN updated_at >= $4 THEN updated_at + 1 ELSE $4 END \
+             WHERE id = $5 AND owner_sub = $6",
         )
         .bind(&share_token)
         .bind(expires_at)
         .bind(&share_password_hash)
+        .bind(updated_at)
         .bind(id)
         .bind(owner_sub)
         .execute(&self.pool)
@@ -2314,16 +2588,95 @@ impl PgStore {
         rows.iter().map(Self::file_from_row).collect()
     }
 
+    async fn query_library_async(
+        &self,
+        owner_sub: &str,
+        query: &LibraryQuery,
+    ) -> Result<LibraryPage, sqlx::Error> {
+        let now = mutation_time();
+        let fetch_limit = clamp_page(query.limit) + 1;
+        let needle = query.query.as_ref().map(|value| value.to_lowercase());
+        let mut items = Vec::with_capacity((fetch_limit * 2) as usize);
+
+        if query.type_filter != LibraryType::Folder {
+            let mut files = QueryBuilder::<Postgres>::new(format!(
+                "SELECT {COLS} FROM files WHERE owner_sub = "
+            ));
+            files.push_bind(owner_sub).push(" AND trashed_at = 0");
+            if query.view == LibraryView::Shared {
+                files.push(" AND share_token IS NOT NULL");
+            }
+            if let Some(needle) = needle.as_deref() {
+                files
+                    .push(" AND POSITION(")
+                    .push_bind(needle)
+                    .push(" IN LOWER(name)) > 0");
+            }
+            push_library_file_type(&mut files, query.type_filter);
+            if let Some(cursor) = query.before.as_ref() {
+                push_library_cursor(&mut files, cursor, LibraryItemKind::File);
+            }
+            files
+                .push(" ORDER BY updated_at DESC, id DESC LIMIT ")
+                .push_bind(fetch_limit);
+            let rows = files.build().fetch_all(&self.pool).await?;
+            let records: Vec<FileRec> = rows
+                .iter()
+                .map(Self::file_from_row)
+                .collect::<Result<_, _>>()?;
+            items.extend(records.iter().map(|file| file_library_item(file, now)));
+        }
+
+        if matches!(query.type_filter, LibraryType::All | LibraryType::Folder) {
+            let mut folders = QueryBuilder::<Postgres>::new(format!(
+                "SELECT {FOLDER_COLS} FROM folders WHERE owner_sub = "
+            ));
+            folders.push_bind(owner_sub);
+            if query.view == LibraryView::Shared {
+                folders.push(" AND share_token IS NOT NULL");
+            }
+            if let Some(needle) = needle.as_deref() {
+                folders
+                    .push(" AND POSITION(")
+                    .push_bind(needle)
+                    .push(" IN LOWER(name)) > 0");
+            }
+            if let Some(cursor) = query.before.as_ref() {
+                push_library_cursor(&mut folders, cursor, LibraryItemKind::Folder);
+            }
+            folders
+                .push(" ORDER BY updated_at DESC, id DESC LIMIT ")
+                .push_bind(fetch_limit);
+            let rows = folders.build().fetch_all(&self.pool).await?;
+            let records: Vec<FolderRec> = rows
+                .iter()
+                .map(Self::folder_from_row)
+                .collect::<Result<_, _>>()?;
+            items.extend(
+                records
+                    .iter()
+                    .map(|folder| folder_library_item(folder, now)),
+            );
+        }
+
+        Ok(finish_library_page(items, query.limit))
+    }
+
     async fn trash_file_async(
         &self,
         id: &str,
         owner_sub: &str,
         trashed_at: i64,
     ) -> Result<bool, sqlx::Error> {
+        let updated_at = mutation_time();
         let result = sqlx::query(
-            "UPDATE files SET trashed_at = $1 WHERE id = $2 AND owner_sub = $3 AND trashed_at = 0",
+            "UPDATE files SET trashed_at = $1, \
+             updated_at = CASE WHEN updated_at = 9223372036854775807 THEN updated_at \
+                               WHEN updated_at >= $2 THEN updated_at + 1 ELSE $2 END \
+             WHERE id = $3 AND owner_sub = $4 AND trashed_at = 0",
         )
         .bind(trashed_at.max(1))
+        .bind(updated_at)
         .bind(id)
         .bind(owner_sub)
         .execute(&self.pool)
@@ -2332,9 +2685,14 @@ impl PgStore {
     }
 
     async fn restore_file_async(&self, id: &str, owner_sub: &str) -> Result<bool, sqlx::Error> {
+        let updated_at = mutation_time();
         let result = sqlx::query(
-            "UPDATE files SET trashed_at = 0 WHERE id = $1 AND owner_sub = $2 AND trashed_at <> 0",
+            "UPDATE files SET trashed_at = 0, \
+             updated_at = CASE WHEN updated_at = 9223372036854775807 THEN updated_at \
+                               WHEN updated_at >= $1 THEN updated_at + 1 ELSE $1 END \
+             WHERE id = $2 AND owner_sub = $3 AND trashed_at <> 0",
         )
+        .bind(updated_at)
         .bind(id)
         .bind(owner_sub)
         .execute(&self.pool)
@@ -2348,10 +2706,15 @@ impl PgStore {
         owner_sub: &str,
         name: &str,
     ) -> Result<bool, sqlx::Error> {
+        let updated_at = mutation_time();
         let result = sqlx::query(
-            "UPDATE files SET name = $1 WHERE id = $2 AND owner_sub = $3 AND trashed_at = 0",
+            "UPDATE files SET name = $1, \
+             updated_at = CASE WHEN updated_at = 9223372036854775807 THEN updated_at \
+                               WHEN updated_at >= $2 THEN updated_at + 1 ELSE $2 END \
+             WHERE id = $3 AND owner_sub = $4 AND trashed_at = 0",
         )
         .bind(name)
+        .bind(updated_at)
         .bind(id)
         .bind(owner_sub)
         .execute(&self.pool)
@@ -2376,15 +2739,16 @@ impl PgStore {
     async fn create_folder_async(&self, folder: &FolderRec) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             "INSERT INTO folders \
-                 (id, owner_sub, parent_id, name, created_at, share_token, expires_at, \
+                 (id, owner_sub, parent_id, name, created_at, updated_at, share_token, expires_at, \
                   share_password_hash, upload_token) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT DO NOTHING",
         )
         .bind(&folder.id)
         .bind(&folder.owner_sub)
         .bind(&folder.parent_id)
         .bind(&folder.name)
         .bind(folder.created_at)
+        .bind(folder.updated_at)
         .bind(&folder.share_token)
         .bind(folder.expires_at)
         .bind(&folder.share_password_hash)
@@ -2452,12 +2816,19 @@ impl PgStore {
         owner_sub: &str,
         name: &str,
     ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query("UPDATE folders SET name = $1 WHERE id = $2 AND owner_sub = $3")
-            .bind(name)
-            .bind(id)
-            .bind(owner_sub)
-            .execute(&self.pool)
-            .await?;
+        let updated_at = mutation_time();
+        let result = sqlx::query(
+            "UPDATE folders SET name = $1, \
+             updated_at = CASE WHEN updated_at = 9223372036854775807 THEN updated_at \
+                               WHEN updated_at >= $2 THEN updated_at + 1 ELSE $2 END \
+             WHERE id = $3 AND owner_sub = $4",
+        )
+        .bind(name)
+        .bind(updated_at)
+        .bind(id)
+        .bind(owner_sub)
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -2469,13 +2840,17 @@ impl PgStore {
         expires_at: Option<i64>,
         share_password_hash: Option<String>,
     ) -> Result<bool, sqlx::Error> {
+        let updated_at = mutation_time();
         let result = sqlx::query(
-            "UPDATE folders SET share_token = $1, expires_at = $2, share_password_hash = $3 \
-             WHERE id = $4 AND owner_sub = $5",
+            "UPDATE folders SET share_token = $1, expires_at = $2, share_password_hash = $3, \
+             updated_at = CASE WHEN updated_at = 9223372036854775807 THEN updated_at \
+                               WHEN updated_at >= $4 THEN updated_at + 1 ELSE $4 END \
+             WHERE id = $5 AND owner_sub = $6",
         )
         .bind(&share_token)
         .bind(expires_at)
         .bind(&share_password_hash)
+        .bind(updated_at)
         .bind(id)
         .bind(owner_sub)
         .execute(&self.pool)
@@ -2489,13 +2864,19 @@ impl PgStore {
         owner_sub: &str,
         upload_token: Option<String>,
     ) -> Result<bool, sqlx::Error> {
-        let result =
-            sqlx::query("UPDATE folders SET upload_token = $1 WHERE id = $2 AND owner_sub = $3")
-                .bind(&upload_token)
-                .bind(id)
-                .bind(owner_sub)
-                .execute(&self.pool)
-                .await?;
+        let updated_at = mutation_time();
+        let result = sqlx::query(
+            "UPDATE folders SET upload_token = $1, \
+             updated_at = CASE WHEN updated_at = 9223372036854775807 THEN updated_at \
+                               WHEN updated_at >= $2 THEN updated_at + 1 ELSE $2 END \
+             WHERE id = $3 AND owner_sub = $4",
+        )
+        .bind(&upload_token)
+        .bind(updated_at)
+        .bind(id)
+        .bind(owner_sub)
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -2664,16 +3045,18 @@ impl PgStore {
         object_key: &str,
         size: i64,
         content_type: &str,
-        created_at: i64,
+        updated_at: i64,
     ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
-            "UPDATE files SET object_key = $1, size = $2, content_type = $3, created_at = $4 \
+            "UPDATE files SET object_key = $1, size = $2, content_type = $3, \
+             updated_at = CASE WHEN updated_at = 9223372036854775807 THEN updated_at \
+                               WHEN updated_at >= $4 THEN updated_at + 1 ELSE $4 END \
              WHERE id = $5 AND owner_sub = $6",
         )
         .bind(object_key)
         .bind(size)
         .bind(content_type)
-        .bind(created_at)
+        .bind(updated_at)
         .bind(id)
         .bind(owner_sub)
         .execute(&self.pool)
@@ -2776,13 +3159,19 @@ impl PgStore {
         owner_sub: &str,
         folder_id: Option<&str>,
     ) -> Result<bool, sqlx::Error> {
-        let result =
-            sqlx::query("UPDATE files SET folder_id = $1 WHERE id = $2 AND owner_sub = $3")
-                .bind(folder_id)
-                .bind(id)
-                .bind(owner_sub)
-                .execute(&self.pool)
-                .await?;
+        let updated_at = mutation_time();
+        let result = sqlx::query(
+            "UPDATE files SET folder_id = $1, \
+             updated_at = CASE WHEN updated_at = 9223372036854775807 THEN updated_at \
+                               WHEN updated_at >= $2 THEN updated_at + 1 ELSE $2 END \
+             WHERE id = $3 AND owner_sub = $4",
+        )
+        .bind(folder_id)
+        .bind(updated_at)
+        .bind(id)
+        .bind(owner_sub)
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -2905,6 +3294,7 @@ impl PgStore {
     }
 
     async fn create_comment_async(&self, comment: &FileComment) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             "INSERT INTO file_comments (id, file_id, author_sub, body, created_at) \
              VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
@@ -2914,9 +3304,28 @@ impl PgStore {
         .bind(&comment.author_sub)
         .bind(&comment.body)
         .bind(comment.created_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(result.rows_affected() == 1)
+        if result.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let updated_at = mutation_time();
+        let touched = sqlx::query(
+            "UPDATE files SET updated_at = CASE WHEN updated_at = 9223372036854775807 THEN updated_at \
+                                                 WHEN updated_at >= $1 THEN updated_at + 1 ELSE $1 END \
+             WHERE id = $2",
+        )
+        .bind(updated_at)
+        .bind(&comment.file_id)
+        .execute(&mut *tx)
+        .await?;
+        if touched.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        tx.commit().await?;
+        Ok(true)
     }
 
     async fn list_comments_async(&self, file_id: &str) -> Result<Vec<FileComment>, sqlx::Error> {
@@ -2943,12 +3352,33 @@ impl PgStore {
         row.as_ref().map(Self::comment_from_row).transpose()
     }
 
-    async fn delete_comment_async(&self, comment_id: &str) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query("DELETE FROM file_comments WHERE id = $1")
+    async fn delete_comment_async(
+        &self,
+        comment_id: &str,
+        file_id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query("DELETE FROM file_comments WHERE id = $1 AND file_id = $2")
             .bind(comment_id)
-            .execute(&self.pool)
+            .bind(file_id)
+            .execute(&mut *tx)
             .await?;
-        Ok(result.rows_affected() > 0)
+        if result.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let updated_at = mutation_time();
+        sqlx::query(
+            "UPDATE files SET updated_at = CASE WHEN updated_at = 9223372036854775807 THEN updated_at \
+                                                 WHEN updated_at >= $1 THEN updated_at + 1 ELSE $1 END \
+             WHERE id = $2",
+        )
+        .bind(updated_at)
+        .bind(file_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     async fn delete_comments_for_file_async(&self, file_id: &str) -> Result<(), sqlx::Error> {
@@ -3367,8 +3797,8 @@ impl PgStore {
         let inserted_file = sqlx::query(
             "INSERT INTO files \
                  (id, owner_sub, name, content_type, size, bucket, object_key, share_token, \
-                  created_at, expires_at, share_password_hash, folder_id, trashed_at, view_count) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+                  created_at, updated_at, expires_at, share_password_hash, folder_id, trashed_at, view_count) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
              ON CONFLICT DO NOTHING",
         )
         .bind(&file.id)
@@ -3380,6 +3810,7 @@ impl PgStore {
         .bind(&file.object_key)
         .bind(&file.share_token)
         .bind(file.created_at)
+        .bind(file.updated_at)
         .bind(file.expires_at)
         .bind(&file.share_password_hash)
         .bind(&file.folder_id)
@@ -3620,6 +4051,16 @@ impl Store for PgStore {
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
+    async fn query_library(
+        &self,
+        owner_sub: &str,
+        query: &LibraryQuery,
+    ) -> Result<LibraryPage, StoreError> {
+        self.query_library_async(owner_sub, query)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
     async fn get(&self, id: &str) -> Result<Option<FileRec>, StoreError> {
         self.get_async(id)
             .await
@@ -3831,9 +4272,9 @@ impl Store for PgStore {
         object_key: &str,
         size: i64,
         content_type: &str,
-        created_at: i64,
+        updated_at: i64,
     ) -> Result<bool, StoreError> {
-        self.update_file_blob_async(id, owner_sub, object_key, size, content_type, created_at)
+        self.update_file_blob_async(id, owner_sub, object_key, size, content_type, updated_at)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
@@ -3934,8 +4375,8 @@ impl Store for PgStore {
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
-    async fn delete_comment(&self, comment_id: &str) -> Result<bool, StoreError> {
-        self.delete_comment_async(comment_id)
+    async fn delete_comment(&self, comment_id: &str, file_id: &str) -> Result<bool, StoreError> {
+        self.delete_comment_async(comment_id, file_id)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
@@ -4095,6 +4536,11 @@ impl Store for PgStore {
 mod tests {
     use super::*;
 
+    #[test]
+    fn mutation_clock_saturates_without_overflow() {
+        assert_eq!(next_mutation_time(i64::MAX), i64::MAX);
+    }
+
     fn file(id: &str, owner: &str, token: &str, created_at: i64) -> FileRec {
         FileRec {
             id: id.into(),
@@ -4106,6 +4552,7 @@ mod tests {
             object_key: id.into(),
             share_token: Some(token.into()),
             created_at,
+            updated_at: created_at,
             expires_at: None,
             share_password_hash: None,
             folder_id: None,
@@ -4343,10 +4790,238 @@ mod tests {
             vec!["c1", "c2"]
         );
         assert_eq!(s.get_comment("c2").await.unwrap().unwrap().body, "second");
-        assert!(s.delete_comment("c1").await.unwrap());
+        assert!(s.delete_comment("c1", "a").await.unwrap());
         assert_eq!(s.list_comments("a").await.unwrap().len(), 1);
         s.delete_comments_for_file("a").await.unwrap();
         assert!(s.list_comments("a").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn library_query_is_owner_scoped_cross_tree_filterable_and_token_free() {
+        let s = InMemoryStore::new();
+        let mut nested = file("nested9", "alice", "secret-file-token", 30);
+        nested.name = "Quarterly Report.png".into();
+        nested.folder_id = Some("folder9".into());
+        nested.expires_at = Some(1);
+        nested.share_password_hash = Some("salt$hash".into());
+        s.create(&nested).await.unwrap();
+
+        let mut private = file("private9", "alice", "unused", 20);
+        private.name = "Quarterly notes.txt".into();
+        private.content_type = "text/plain".into();
+        private.share_token = None;
+        s.create(&private).await.unwrap();
+        let mut foreign = file("foreign9", "bob", "foreign-token", 99);
+        foreign.name = "Quarterly Report.png".into();
+        s.create(&foreign).await.unwrap();
+
+        let mut reports = folder("folder9", "alice", "Quarterly Reports", 40);
+        reports.share_token = Some("secret-folder-token".into());
+        reports.expires_at = Some(1);
+        s.create_folder(&reports).await.unwrap();
+
+        let search = LibraryQuery {
+            view: LibraryView::All,
+            query: Some("quarterly".into()),
+            type_filter: LibraryType::All,
+            before: None,
+            limit: 20,
+        };
+        let page = s.query_library("alice", &search).await.unwrap();
+        assert_eq!(
+            page.items.len(),
+            3,
+            "files and folders are searched globally"
+        );
+        assert!(page.items.iter().all(|item| item.id != "foreign9"));
+        assert!(page.items.iter().any(|item| item.id == "nested9"));
+        assert!(page.items.iter().any(|item| item.id == "folder9"));
+
+        let shared = s
+            .query_library(
+                "alice",
+                &LibraryQuery {
+                    view: LibraryView::Shared,
+                    query: None,
+                    type_filter: LibraryType::All,
+                    before: None,
+                    limit: 20,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(shared.items.len(), 2);
+        assert!(shared.items.iter().all(|item| item.shared));
+        assert!(shared.items.iter().all(|item| item.share_expired));
+        assert!(
+            shared
+                .items
+                .iter()
+                .find(|item| item.id == "nested9")
+                .unwrap()
+                .share_protected
+        );
+
+        let images = s
+            .query_library(
+                "alice",
+                &LibraryQuery {
+                    view: LibraryView::All,
+                    query: None,
+                    type_filter: LibraryType::Image,
+                    before: None,
+                    limit: 20,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(images.items.len(), 1);
+        assert_eq!(images.items[0].id, "nested9");
+    }
+
+    #[tokio::test]
+    async fn library_type_filters_use_one_priority_order() {
+        let s = InMemoryStore::new();
+        let mut text_tar = file("texttar9", "u", "unused-text-tar", 2);
+        text_tar.name = "Priority document".into();
+        text_tar.content_type = "text/x-tar".into();
+        text_tar.share_token = None;
+        s.create(&text_tar).await.unwrap();
+
+        let mut image_zip = file("imagezip9", "u", "unused-image-zip", 1);
+        image_zip.name = "Priority image".into();
+        image_zip.content_type = "image/x-zip".into();
+        image_zip.share_token = None;
+        s.create(&image_zip).await.unwrap();
+
+        let ids_for = |type_filter| LibraryQuery {
+            view: LibraryView::All,
+            query: Some("priority".into()),
+            type_filter,
+            before: None,
+            limit: 20,
+        };
+        let documents = s
+            .query_library("u", &ids_for(LibraryType::Document))
+            .await
+            .unwrap();
+        assert_eq!(documents.items[0].id, "texttar9");
+        assert_eq!(documents.items.len(), 1);
+
+        let images = s
+            .query_library("u", &ids_for(LibraryType::Image))
+            .await
+            .unwrap();
+        assert_eq!(images.items[0].id, "imagezip9");
+        assert_eq!(images.items.len(), 1);
+
+        let archives = s
+            .query_library("u", &ids_for(LibraryType::Archive))
+            .await
+            .unwrap();
+        assert!(archives.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn library_cursor_is_stable_across_file_and_folder_ties() {
+        let s = InMemoryStore::new();
+        s.create(&file("filea", "u", "tok-a", 10)).await.unwrap();
+        s.create(&file("fileb", "u", "tok-b", 10)).await.unwrap();
+        s.create_folder(&folder("folda", "u", "A", 10))
+            .await
+            .unwrap();
+        s.create_folder(&folder("foldb", "u", "B", 10))
+            .await
+            .unwrap();
+        let first_query = LibraryQuery {
+            view: LibraryView::Recent,
+            query: None,
+            type_filter: LibraryType::All,
+            before: None,
+            limit: 2,
+        };
+        let first = s.query_library("u", &first_query).await.unwrap();
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fileb", "filea"]
+        );
+        let second = s
+            .query_library(
+                "u",
+                &LibraryQuery {
+                    before: first.next.clone(),
+                    ..first_query
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["foldb", "folda"]
+        );
+        assert!(second.next.is_none());
+    }
+
+    #[tokio::test]
+    async fn owner_mutations_touch_activity_but_anonymous_views_do_not() {
+        let s = InMemoryStore::new();
+        let mut rec = file("activity", "u", "share-token", 1);
+        rec.updated_at = 1;
+        s.create(&rec).await.unwrap();
+        s.rename_file("activity", "u", "renamed.png").await.unwrap();
+        let after_rename = s.get("activity").await.unwrap().unwrap().updated_at;
+        assert!(after_rename > 1);
+        s.rename_file("activity", "u", "renamed-again.png")
+            .await
+            .unwrap();
+        let after_second_rename = s.get("activity").await.unwrap().unwrap().updated_at;
+        assert!(
+            after_second_rename > after_rename,
+            "two owner mutations in one wall-clock second remain observable"
+        );
+        s.bump_view_count("activity").await.unwrap();
+        let after_public_view = s.get("activity").await.unwrap().unwrap();
+        assert_eq!(after_public_view.updated_at, after_second_rename);
+        assert_eq!(after_public_view.view_count, 1);
+
+        let comment = FileComment {
+            id: "comment1".into(),
+            file_id: "activity".into(),
+            author_sub: "u".into(),
+            body: "note".into(),
+            created_at: mutation_time(),
+        };
+        assert!(s.create_comment(&comment).await.unwrap());
+        assert!(s.get("activity").await.unwrap().unwrap().updated_at > after_second_rename);
+
+        let mut folder = folder("activity-folder", "u", "Folder", 1);
+        folder.updated_at = 1;
+        s.create_folder(&folder).await.unwrap();
+        s.configure_folder_share(
+            "activity-folder",
+            "u",
+            Some("folder-token".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            s.get_folder("activity-folder", "u")
+                .await
+                .unwrap()
+                .unwrap()
+                .updated_at
+                > 1
+        );
     }
 
     fn folder(id: &str, owner: &str, name: &str, created_at: i64) -> FolderRec {
@@ -4356,6 +5031,7 @@ mod tests {
             parent_id: None,
             name: name.into(),
             created_at,
+            updated_at: created_at,
             share_token: None,
             expires_at: None,
             share_password_hash: None,
@@ -4371,6 +5047,7 @@ mod tests {
             parent_id: Some(parent.into()),
             name: name.into(),
             created_at: 0,
+            updated_at: 0,
             share_token: None,
             expires_at: None,
             share_password_hash: None,
@@ -4773,7 +5450,11 @@ mod tests {
         assert_eq!(got.object_key, "newkey");
         assert_eq!(got.size, 77);
         assert_eq!(got.content_type, "application/pdf");
-        assert_eq!(got.created_at, 999);
+        assert_eq!(got.created_at, 1, "creation time remains immutable");
+        assert_eq!(
+            got.updated_at, 999,
+            "content replacement is recent activity"
+        );
         // Owner-scoped.
         assert!(!s
             .update_file_blob("a", "intruder", "x", 1, "text/plain", 1)

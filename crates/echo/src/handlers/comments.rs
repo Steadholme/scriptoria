@@ -1061,6 +1061,7 @@ fn render_activity_item(
 
 /// Render a thread's comments as a one-level tree: top-level comments in order, each followed by
 /// its replies. `moderate` toggles the hide/unhide controls (on in the admin views, off in embed).
+#[allow(clippy::too_many_arguments)]
 fn render_comment_tree(
     comments: &[Comment],
     rx: &Reactions,

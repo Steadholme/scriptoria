@@ -164,14 +164,99 @@ Acceptance: metadata cannot inject HTML or unsafe URL schemes; Draft/Scheduled c
 through head tags, Tag, RSS, Sitemap, Search, or Ask; Memory/PostgreSQL metadata round-trip and
 derived-index visibility/version joins remain consistent.
 
+## Iteration 3: return, retrieve, recover
+
+### Forum: Durable Activity Inbox
+
+- Replace the home-only permanent Mentions list with an owner-scoped `/activity` inbox for mention,
+  direct reply/quote, followed-thread reply, and accepted-answer events.
+- Create reply/mention/follower activity in the same Store command as the post, and accepted-answer
+  activity in the same command as the solution mutation. Events carry target identity and actor,
+  never a stale copy of the post body.
+- Add stable All/Unread/reason URL filters, `(created_at,id)` keyset pagination, unread count, Open
+  and mark-read/mark-unread commands. Bulk triage is explicitly “Mark this page read”: the server
+  accepts at most the 30 event ids it just rendered and re-authorizes every id, so no request hides
+  an unbounded whole-stream transaction behind a “Mark all” label.
+- Replace subscription toggle writes with explicit idempotent Follow/Unfollow commands so retries
+  and concurrent tabs cannot invert state twice.
+- Resolve each mention alias to one stable gateway subject at event-write time. Alias mappings are
+  append-only; ambiguous aliases fail closed, and Activity reads/receipts never authorize through
+  a mutable email local-part. A thread accepts at most 256 followers and one post at most 32
+  distinct mentions; an over-cap reply fails before either post or activity is written.
+
+Acceptance: self-notifications and duplicate recipient reasons follow one documented precedence;
+delivery/receipt rows cascade with their event, so concurrent delete/read cannot leave an orphan;
+Memory/PostgreSQL ordering and read state agree; recipient fan-out is bounded and atomic; all owner
+actions retain subject identity, CSRF, and no-JavaScript form behavior.
+
+### Drive: Library Control Plane
+
+- Give the owner library URL-backed `q`, `view=recent|shared`, and
+  `type=folder|image|video|audio|pdf|document|archive|other` controls across the full tree.
+- Add authoritative `updated_at` semantics for files and folders. Upload, re-upload, rename, move,
+  restore, and share-policy changes advance it strictly even within one wall-clock second;
+  anonymous view counts do not reorder the library. The only non-strict boundary is an already
+  corrupted/synthetic `i64::MAX` value, which saturates instead of overflowing PostgreSQL BIGINT.
+- Return a unified owner-scoped File/Folder read model with stable `(sort_at,kind,id)` keyset
+  pagination. Search defaults to names, Recent orders by owner mutation, and Shared means
+  "shared by me" including expired/password-protected links that still need governance.
+- Never return capability tokens through the read model, URL, markup, logs, or filter state, and do
+  not add or widen `/s/` or `/u/` routes.
+
+Acceptance: every PostgreSQL query starts with owner/live scope and matches Memory behavior;
+backend errors propagate instead of rendering an empty library; filters compose and survive pager
+links; 390 px and 1440 px retain keyboard/no-JavaScript access with no horizontal page overflow.
+
+### Blog: Writer Durability
+
+- Add private server autosave for existing-post edit sessions. Session id + monotonic client
+  sequence reject stale/out-of-order requests; autosaves expire after seven days and never mutate
+  post visibility, publication metadata, or the public index.
+- Give authoritative posts an edit version. Explicit save/publish performs expected-version CAS,
+  also matches the stable post id, appends a full Writer snapshot, updates the post, and consumes
+  that session's autosave in one Store command. Delete/recreate of the same slug therefore cannot
+  turn a stale tab into an ABA overwrite of another post identity.
+- Add owner/admin revision history and atomic restore. Restore snapshots the current Writer state,
+  restores content and discoverability metadata, and deliberately preserves the current
+  Draft/Published/Scheduled, publish time, pin, and feature state.
+- Keep `/new` local recovery until the first explicit Save draft creates an authoritative post;
+  no-JavaScript save/publish remains the baseline, and a 409 conflict preserves submitted text as
+  a recovery copy rather than silently overwriting another tab.
+- Serve compose, editor/recovery, history, preview, autosave, and conflict responses as
+  `private, no-store`. Fresh revision/autosave tables cascade on post delete; if a single-active
+  rollback image writes without `edit_version`, the next candidate boot compares the same-version
+  snapshot, advances the version, and records a `forward-repair` revision before accepting writes.
+
+Acceptance: autosaves are readable only by their author (not an unrelated admin); revision and
+post writes are one Memory/PG atomic command; stale versions and client sequences fail closed;
+restore never changes public visibility implicitly; cleanup is bounded and public surfaces cannot
+read autosave or revision rows; a legacy open form receives a recoverable 409 rather than 404 or
+last-write-wins after the candidate deploys.
+
+### Candidate verification
+
+- The six public product crates pass 494/494 Rust tests; Writer recovery passes 3/3 browser-logic
+  tests; every crate and the composed Scriptoria binary pass strict Clippy, `git diff --check`, and
+  the release build.
+- A real PostgreSQL 18 matrix passes 10/10 migration/store checks: eight Forum Activity paths, one
+  Drive Library path, and one Blog Writer Durability path. FusionDB remains unavailable locally,
+  so the migrations deliberately use standard PostgreSQL SQL and do not claim a silent fallback.
+- A local release candidate passes 30/30 browser route probes across all six hosts with JavaScript
+  both enabled and disabled at 390 px: zero page overflow, console errors, or failed statuses;
+  Drive URL filters work as links without JavaScript and survive Back; Activity unread state,
+  shared-link governance badges, Writer history, and private `no-store` headers are visible.
+- Blog, Wiki, Comments, and Paste now use the same empty `data:` favicon contract already used by
+  the other public shells. This removes automatic `/favicon.ico` failures without adding a network
+  dependency or allowing Odyssey availability to gate a product task.
+
 ## Next iterations
 
-1. Forum: Activity Inbox with durable follower delivery and read state, personal bookmarks, report
-   and moderator review, then remaining list N+1 removal.
-2. Drive: signed-in command search, filter/sort chips, Recent/Shared views, multi-select inspector,
-   request-room passwords, and explicit trash/object-retention policy.
-3. Blog: server autosave and revisions/restore, a writer content library, Drive media picker, and a
-   separately-authorized shareable draft preview.
+1. Forum: personal bookmarks/reminders, report + moderator review queue, notification preferences,
+   external delivery receipts, then remaining list N+1 removal.
+2. Drive: multi-select inspector, request-room passwords/rate limits, signed-in/public quota guard
+   unification, periodic recovery, and explicit trash/object-retention policy.
+3. Blog: writer content library, Drive media picker, separately-authorized draft preview, and an
+   explicit multi-writer collaboration/locking model.
 
 ## Rollout gate
 

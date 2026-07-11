@@ -13,7 +13,9 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
-use crate::handlers::{ag_tone, email_display, esc, fmt_ts, rel_time, render_page};
+use crate::handlers::{
+    ag_tone, email_display, esc, fmt_ts, rel_time, render_page_with_activity, unread_activity_count,
+};
 use crate::model::{Category, CategoryFormat, ThreadSearchHit};
 use crate::store::ThreadStatusFilter;
 use crate::{now_secs, AppState};
@@ -97,10 +99,12 @@ pub async fn page(
         &hits,
         now_secs(),
     );
-    Ok(Html(render_page(
+    let unread = unread_activity_count(&state, &headers).await?;
+    Ok(Html(render_page_with_activity(
         "Search",
         &email_display(&headers),
         &content,
+        unread,
     )))
 }
 

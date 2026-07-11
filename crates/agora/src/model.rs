@@ -142,3 +142,130 @@ pub struct Mention {
     pub mentioned_username: String,
     pub created_at: i64,
 }
+
+/// One durable, immutable piece of Forum activity. The row deliberately stores only identities
+/// and authoritative content pointers: titles and bodies are always loaded from `threads` and
+/// `posts` when an inbox is read, so an edit or moderation delete can never leave stale content in
+/// a personal inbox.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ActivityEvent {
+    pub id: String,
+    pub kind: ActivityKind,
+    pub thread_id: String,
+    pub post_id: String,
+    pub actor_sub: String,
+    pub created_at: i64,
+}
+
+/// The mutation that produced an activity event. Delivery reasons live separately because one
+/// viewer can qualify through several paths (for example: thread author + explicit follower).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityKind {
+    PostCreated,
+    AnswerAccepted,
+}
+
+impl ActivityKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PostCreated => "post_created",
+            Self::AnswerAccepted => "answer_accepted",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "post_created" => Some(Self::PostCreated),
+            "answer_accepted" => Some(Self::AnswerAccepted),
+            _ => None,
+        }
+    }
+}
+
+/// Why a viewer received an event. Ordering is intentional: a direct mention is more useful than
+/// a generic reply/follow delivery when the same event reached the viewer through multiple paths.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ActivityReason {
+    Mention,
+    Reply,
+    Following,
+    Answer,
+}
+
+impl ActivityReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mention => "mention",
+            Self::Reply => "reply",
+            Self::Following => "following",
+            Self::Answer => "answer",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "mention" => Some(Self::Mention),
+            "reply" => Some(Self::Reply),
+            "following" => Some(Self::Following),
+            "answer" => Some(Self::Answer),
+            _ => None,
+        }
+    }
+
+    pub const fn priority(self) -> u8 {
+        match self {
+            Self::Mention => 0,
+            Self::Reply => 1,
+            Self::Answer => 2,
+            Self::Following => 3,
+        }
+    }
+}
+
+/// Recipient addressing preserves the gateway subject for known participants/followers and the
+/// existing normalised `@username` contract for mentions. A read receipt is still keyed by the
+/// actual gateway subject, so two delivery paths collapse to one viewer-owned read state.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ActivityRecipientKind {
+    Subject,
+    Username,
+}
+
+impl ActivityRecipientKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Subject => "subject",
+            Self::Username => "username",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "subject" => Some(Self::Subject),
+            "username" => Some(Self::Username),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ActivityDelivery {
+    pub recipient_kind: ActivityRecipientKind,
+    pub recipient_key: String,
+    pub reason: ActivityReason,
+}
+
+/// Authoritative read model returned by the Store. `thread_title`, `post_body_md`, and actor email
+/// are joined from live rows rather than copied into the activity tables.
+#[derive(Clone, Debug)]
+pub struct ActivityItem {
+    pub event: ActivityEvent,
+    pub reason: ActivityReason,
+    pub thread_title: String,
+    pub post_body_md: String,
+    pub post_created_at: i64,
+    pub actor_email: String,
+    pub read: bool,
+}

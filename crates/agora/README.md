@@ -46,6 +46,11 @@ Agora 的产品入口位于公网域名，但应用端口只在服务网络中�
 | `POST /new`            | 创建主题（CSRF + 身份校验）                               |
 | `POST /t/{id}/reply`   | 发表回复（CSRF + 身份校验）                               |
 | `POST /t/{id}/accept`  | Question 分类中由主题作者或管理员采纳/取消采纳回答        |
+| `POST /t/{id}/subscribe` | 明确关注或取消关注主题（CSRF + 身份校验）               |
+| `GET  /activity`       | 个人 Activity Inbox；支持未读与原因筛选、稳定游标分页     |
+| `POST /activity/{id}/open` | 将一条 Activity 标为已读，再 `303` 跳转到权威主题位置 |
+| `POST /activity/{id}/state` | 将一条 Activity 标为已读或未读（CSRF + 重新授权）     |
+| `POST /activity/read-page` | 将当前页最多 30 条 Activity 原子标为已读（CSRF + 逐条重新授权） |
 | `GET  /search`         | 搜索标题、原帖及 accepted solution，可筛分类与回答状态    |
 | `GET  /api/search/suggest` | 同源快捷搜索建议（含 solution 命中来源）              |
 | `POST /api/similar`    | （CSRF + 身份校验）按草稿 `{title,body}` 返回最相似的 3 个现有主题（JSON），编辑时去重 |
@@ -91,6 +96,11 @@ CREATE TABLE posts (
 );
 ```
 
+个人 Activity 由以下可移植表承载：`forum_activity_events` 只保存事件类型、主题/帖子与行为者等
+权威指针；`forum_activity_deliveries` 保存收件人与触发原因；`forum_activity_receipts` 保存每位用户的
+已读状态。主题标题与帖子正文不复制进事件表，读取时始终 JOIN 当前的 `threads` / `posts` 数据。显式关注关系
+保存在 `thread_subscriptions`，以上表与索引都通过幂等迁移创建。
+
 启动时执行幂等迁移；旧分类仅在 `format IS NULL` 时一次性回填，之后重启不会覆盖管理员选择。若分类表为空，
 则种入默认分类：Announcements / General Discussion 为 `discussion`，Support 为 `question`。
 
@@ -101,6 +111,18 @@ CREATE TABLE posts (
 - Accepted solution 固定展示在原帖下方，并在分页查询执行 `LIMIT` 前排除，因此不会因为自然位置落在第 2 页而消失或重复。
 - 搜索同时覆盖标题、原帖与 accepted solution；solution 命中会返回对应 excerpt，而不是误展示原帖摘要。
 - 将含 accepted solution 的 Question 分类改为 Discussion，或把 answered thread 移入 Discussion，都会被后端拒绝；必须先取消采纳。
+
+## Durable Activity Inbox
+
+- 发回复与生成 reply、mention、主题作者、引用作者和关注者的 Activity 在同一个 Store 命令中原子提交；
+  accepted answer 的变更与对应 Activity 同样原子提交。
+- 同一事件对同一收件人去重并抑制行为者本人；多个原因命中时使用稳定优先级，mention 优先于 reply / following。
+- Activity 支持 All / Unread 和 Mentions / Replies / Following / Answers 筛选，以及稳定 keyset 分页。
+- 单条操作和批量操作都会重新检查当前用户与权威主题/帖子；“Mark this page read”最多接受 30 个 ID，
+  任一 ID 不可访问时整批回滚。页面渲染后产生的新事件不会被误标为已读。
+- 打开一条 Activity 会先持久化已读状态，再跳转到包含目标回复的正确分页位置。Activity 的已读状态是个人
+  分诊状态，不等同于主题阅读进度。
+- 新建 Activity 表不会回填历史事件，避免部署后把全部历史回复变成未读；删除主题或帖子时会同步清理对应事件。
 
 ## 存储后端（async-trait Store）
 
@@ -131,7 +153,7 @@ cargo clippy --all-targets -- -D warnings
 docker run --rm -d --name agora-testpg -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=agora \
   -p 127.0.0.1:55461:5432 postgres:18-alpine
 TEST_DATABASE_URL=postgres://postgres:pw@127.0.0.1:55461/agora \
-  cargo test --test pg_store -- --nocapture
+  cargo test --test pg_store --test pg_search --test pg_activity -- --nocapture --test-threads=1
 docker rm -f agora-testpg
 
 # 容器镜像

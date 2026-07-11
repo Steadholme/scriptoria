@@ -72,6 +72,15 @@ pub fn app(state: AppState) -> Router {
             "/edit/{slug}",
             get(handlers::posts::edit_form).post(handlers::posts::update),
         )
+        .route("/edit/{slug}/history", get(handlers::posts::history))
+        .route(
+            "/edit/{slug}/history/{revision_id}/restore",
+            post(handlers::posts::restore_revision),
+        )
+        .route(
+            "/api/writer/autosave/{slug}",
+            post(handlers::posts::autosave),
+        )
         .route("/delete/{slug}", post(handlers::posts::delete))
         // Live Markdown preview for the editor (author-gated + CSRF, read-only JSON). Additive
         // progressive enhancement: the compose/edit form still POSTs and works without JS.

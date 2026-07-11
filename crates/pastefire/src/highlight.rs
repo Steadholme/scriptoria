@@ -234,12 +234,10 @@ fn is_keyword(syntax: &Syntax, word: &str) -> bool {
 }
 
 fn starts_with(chars: &[char], i: usize, needle: &str) -> bool {
-    let mut k = i;
-    for nc in needle.chars() {
+    for (k, nc) in (i..).zip(needle.chars()) {
         if k >= chars.len() || chars[k] != nc {
             return false;
         }
-        k += 1;
     }
     true
 }

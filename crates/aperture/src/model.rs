@@ -48,6 +48,9 @@ pub struct FileRec {
     pub share_token: Option<String>,
     /// Upload time, epoch seconds.
     pub created_at: i64,
+    /// Last owner-visible metadata/content mutation, epoch seconds. Unlike `view_count`, this is
+    /// never changed by anonymous share traffic; it is the authoritative ordering key for Recent.
+    pub updated_at: i64,
     /// Optional share-link expiry instant, epoch seconds. `None` = the share link never expires.
     /// Past this instant the public `/s/{token}` fetch returns `410 Gone` (the OWNER still has full
     /// SSO access via `/f/{id}`).
@@ -138,6 +141,9 @@ pub struct FolderRec {
     pub name: String,
     /// Creation time, epoch seconds.
     pub created_at: i64,
+    /// Last owner-visible folder mutation, epoch seconds. Child activity does not implicitly touch
+    /// the folder, so Recent never amplifies one upload into a whole ancestor chain.
+    pub updated_at: i64,
     /// Unguessable public share token (`/s/folder/{token}` lists this folder's files WITHOUT SSO). `None`
     /// once revoked (or never shared) — the folder then has NO public surface.
     pub share_token: Option<String>,
@@ -223,6 +229,179 @@ pub struct UploadSubmission {
     pub created_at: i64,
 }
 
+/// Owner-library view selected by the URL. `All` is the global search/filter result set;
+/// `Recent` has the same membership but communicates owner-activity ordering; `Shared` includes
+/// owner-created file/folder read links, including expired or password-protected links.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LibraryView {
+    #[default]
+    All,
+    Recent,
+    Shared,
+}
+
+impl LibraryView {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Recent => "recent",
+            Self::Shared => "shared",
+        }
+    }
+}
+
+/// Stable, product-level type groups for URL filters. These labels are discovery metadata only;
+/// inline/download security continues to use the stricter magic-derived content-type checks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LibraryType {
+    #[default]
+    All,
+    Folder,
+    Image,
+    Video,
+    Audio,
+    Pdf,
+    Document,
+    Archive,
+    Other,
+}
+
+impl LibraryType {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Folder => "folder",
+            Self::Image => "image",
+            Self::Video => "video",
+            Self::Audio => "audio",
+            Self::Pdf => "pdf",
+            Self::Document => "document",
+            Self::Archive => "archive",
+            Self::Other => "other",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All types",
+            Self::Folder => "Folders",
+            Self::Image => "Images",
+            Self::Video => "Videos",
+            Self::Audio => "Audio",
+            Self::Pdf => "PDFs",
+            Self::Document => "Documents",
+            Self::Archive => "Archives",
+            Self::Other => "Other",
+        }
+    }
+}
+
+/// Classify a stored file for owner-facing filters. This intentionally has no bearing on whether a
+/// blob may render inline: [`is_inline_image`] remains the security authority for that decision.
+pub fn library_type_for(content_type: &str) -> LibraryType {
+    let ct = content_type.to_ascii_lowercase();
+    if ct.starts_with("image/") {
+        LibraryType::Image
+    } else if ct.starts_with("video/") {
+        LibraryType::Video
+    } else if ct.starts_with("audio/") {
+        LibraryType::Audio
+    } else if ct == "application/pdf" {
+        LibraryType::Pdf
+    } else if ct.starts_with("text/")
+        || matches!(
+            ct.as_str(),
+            "application/msword"
+                | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                | "application/vnd.oasis.opendocument.text"
+                | "application/rtf"
+        )
+    {
+        LibraryType::Document
+    } else if ct.contains("zip")
+        || ct.contains("tar")
+        || ct.contains("gzip")
+        || ct.contains("compress")
+        || ct.contains("x-7z")
+        || ct.contains("x-rar")
+    {
+        LibraryType::Archive
+    } else {
+        LibraryType::Other
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LibraryItemKind {
+    Folder,
+    File,
+}
+
+impl LibraryItemKind {
+    /// Files sort before folders when their update timestamps collide. The rank is part of the
+    /// cursor so pagination stays stable across the two independently queried tables.
+    pub fn rank(self) -> i8 {
+        match self {
+            Self::Folder => 0,
+            Self::File => 1,
+        }
+    }
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Folder => "folder",
+            Self::File => "file",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LibraryCursor {
+    pub updated_at: i64,
+    pub kind: LibraryItemKind,
+    pub id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LibraryQuery {
+    pub view: LibraryView,
+    pub query: Option<String>,
+    pub type_filter: LibraryType,
+    pub before: Option<LibraryCursor>,
+    pub limit: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LibraryItem {
+    pub kind: LibraryItemKind,
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub name: String,
+    pub content_type: Option<String>,
+    pub size: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub shared: bool,
+    pub share_expired: bool,
+    pub share_protected: bool,
+}
+
+impl LibraryItem {
+    pub fn cursor(&self) -> LibraryCursor {
+        LibraryCursor {
+            updated_at: self.updated_at,
+            kind: self.kind,
+            id: self.id.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LibraryPage {
+    pub items: Vec<LibraryItem>,
+    pub next: Option<LibraryCursor>,
+}
+
 impl FileRec {
     /// True when this file is a raster image we render inline.
     pub fn is_image(&self) -> bool {
@@ -293,6 +472,21 @@ mod tests {
         assert!(!is_streamable_media("application/javascript"));
     }
 
+    #[test]
+    fn library_type_groups_are_stable_and_not_inline_authority() {
+        assert_eq!(library_type_for("image/svg+xml"), LibraryType::Image);
+        assert!(!is_inline_image("image/svg+xml"));
+        assert_eq!(library_type_for("video/mp4"), LibraryType::Video);
+        assert_eq!(library_type_for("audio/mpeg"), LibraryType::Audio);
+        assert_eq!(library_type_for("application/pdf"), LibraryType::Pdf);
+        assert_eq!(library_type_for("text/markdown"), LibraryType::Document);
+        assert_eq!(library_type_for("application/zip"), LibraryType::Archive);
+        assert_eq!(
+            library_type_for("application/octet-stream"),
+            LibraryType::Other
+        );
+    }
+
     fn rec(expires_at: Option<i64>) -> FileRec {
         FileRec {
             id: "x".into(),
@@ -304,6 +498,7 @@ mod tests {
             object_key: "x".into(),
             share_token: Some("tok".into()),
             created_at: 0,
+            updated_at: 0,
             expires_at,
             share_password_hash: None,
             folder_id: None,
@@ -320,6 +515,7 @@ mod tests {
             parent_id: None,
             name: "F".into(),
             created_at: 0,
+            updated_at: 0,
             share_token: Some("t".into()),
             expires_at: Some(1000),
             share_password_hash: None,

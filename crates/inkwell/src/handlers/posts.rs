@@ -19,7 +19,9 @@ use crate::auth;
 use crate::error::AppError;
 use crate::handlers::{esc, fmt_date, page_shell, post_excerpt, tag_chips, PageMeta, PageShell};
 use crate::markdown;
-use crate::store::{Post, PostCursor};
+use crate::store::{
+    AutosaveOutcome, Post, PostCursor, SavePostCommand, SavePostOutcome, WriterAutosave,
+};
 use crate::{now_nanos, now_secs, unique_slug, AppState};
 
 const LIST_HTML: &str = include_str!("../../templates/list.html");
@@ -33,6 +35,7 @@ pub const CANONICAL_URL_MAX: usize = 2_048;
 pub const SOCIAL_TITLE_MAX: usize = 200;
 pub const SOCIAL_DESCRIPTION_MAX: usize = 500;
 pub const SOCIAL_IMAGE_MAX: usize = 600;
+const JS_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 
 /// Form body shared by compose + edit. Publication changes require an explicit [`PublishIntent`];
 /// identity is NEVER taken from the form — only from the gateway headers.
@@ -80,6 +83,18 @@ pub struct PostForm {
     /// A missing value means Draft on create and "preserve current publication state" on edit.
     #[serde(default)]
     pub intent: String,
+    /// Optimistic-concurrency token rendered by the edit page. Missing/stale values never fall back
+    /// to last-write-wins; the submitted text is retained as a private recovery copy.
+    #[serde(default)]
+    pub expected_version: String,
+    #[serde(default)]
+    pub expected_post_id: String,
+    /// Random edit-session id. It scopes server autosave ownership and is consumed on a successful
+    /// authoritative save.
+    #[serde(default)]
+    pub autosave_session: String,
+    #[serde(default)]
+    pub client_seq: String,
     #[serde(default)]
     pub csrf_token: String,
 }
@@ -146,6 +161,33 @@ pub struct IndexQuery {
 pub struct EditorQuery {
     #[serde(default)]
     pub studio_saved: Option<String>,
+    #[serde(default)]
+    pub recover: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RestoreForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub expected_version: String,
+    #[serde(default)]
+    pub expected_post_id: String,
+}
+
+#[derive(Serialize)]
+struct AutosaveResponse {
+    ok: bool,
+    client_seq: i64,
+    base_version: i64,
+}
+
+#[derive(Serialize)]
+struct SaveConflictResponse {
+    ok: bool,
+    conflict: bool,
+    current_version: i64,
+    recover: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -611,6 +653,13 @@ pub async fn new_form(State(_state): State<AppState>, headers: HeaderMap) -> Res
         heading: "New post",
         subhead: "Compose a post in Markdown. You are the author.",
         action: "/new",
+        autosave_url: "",
+        autosave_session: "",
+        expected_version: 0,
+        expected_post_id: "",
+        client_seq: 0,
+        history_href: "",
+        recovery_notice: "",
         recovery_scope: &recovery_scope,
         csrf: &csrf,
         title_value: "",
@@ -629,7 +678,7 @@ pub async fn new_form(State(_state): State<AppState>, headers: HeaderMap) -> Res
         cancel_href: "/",
         delete_slug: None,
     });
-    html_with_cookie(page, set_cookie)
+    private_no_store(html_with_cookie(page, set_cookie))
 }
 
 /// `POST /new` — create a post: author from the injected `X-Auth-*`, slug from the title.
@@ -663,6 +712,7 @@ pub async fn create(
         author_email: email,
         created_at: now,
         updated_at: now,
+        edit_version: 1,
         published,
         publish_at,
         featured: false,
@@ -729,7 +779,9 @@ pub async fn preview(
     auth::require_author(&headers)?;
     auth::verify_csrf(&headers, &form.csrf_token)?;
     let html = markdown::render_html(form.body.trim());
-    Ok(axum::Json(PreviewResponse { html }).into_response())
+    Ok(private_no_store(
+        axum::Json(PreviewResponse { html }).into_response(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -747,8 +799,8 @@ pub async fn edit_form(
     let is_admin = auth::is_admin(&headers);
     let post = state
         .store
-        .get_post(&slug)
-        .await
+        .get_post_authoritative(&slug)
+        .await?
         .ok_or_else(|| AppError::NotFound("no such post".to_string()))?;
     // Own posts, or ANY post for an admin (the admin panel edits every author's posts).
     if post.author_sub != sub && !auth::is_admin(&headers) {
@@ -760,6 +812,44 @@ pub async fn edit_form(
     let state_label = publication_detail(&post, now_secs());
     let saved = query.studio_saved.as_deref() == Some(state_label);
     let recovery_scope = recovery_scope(&sub);
+    let autosave_session = query
+        .recover
+        .as_deref()
+        .filter(|session| valid_autosave_session(session))
+        .map(str::to_string)
+        .unwrap_or_else(auth::new_csrf_token);
+    let recovered = state
+        .store
+        .get_writer_autosave(&autosave_session, &sub, now_secs())
+        .await?
+        .filter(|autosave| autosave.post_id == post.id);
+    let mut editor_post = post.clone();
+    let mut publish_at_value = format_publish_at_value(post.publish_at);
+    let recovery_notice = if let Some(autosave) = &recovered {
+        editor_post.title = autosave.title.clone();
+        editor_post.body_md = autosave.body_md.clone();
+        editor_post.tags = autosave.tags.clone();
+        editor_post.cover_url = autosave.cover_url.clone();
+        editor_post.custom_excerpt = autosave.custom_excerpt.clone();
+        editor_post.meta_title = autosave.meta_title.clone();
+        editor_post.meta_description = autosave.meta_description.clone();
+        editor_post.canonical_url = autosave.canonical_url.clone();
+        editor_post.social_title = autosave.social_title.clone();
+        editor_post.social_description = autosave.social_description.clone();
+        editor_post.social_image = autosave.social_image.clone();
+        editor_post.pinned = autosave.pinned;
+        publish_at_value = autosave.publish_at.clone();
+        format!(
+            r#"<div class="draftbar server-recovery"><span>Private conflict recovery copy loaded · review it against current server version {} before saving.</span></div>"#,
+            autosave.base_version
+        )
+    } else {
+        String::new()
+    };
+    let client_seq = recovered
+        .as_ref()
+        .map(|autosave| autosave.client_seq)
+        .unwrap_or(0);
     let theme = odyssey::resolve_theme(
         headers
             .get(axum::http::header::COOKIE)
@@ -775,25 +865,32 @@ pub async fn edit_form(
         heading: "Edit post",
         subhead: "Update the title, body, or publication state.",
         action: &format!("/edit/{}", esc(&post.slug)),
+        autosave_url: &format!("/api/writer/autosave/{}", esc(&post.slug)),
+        autosave_session: &autosave_session,
+        expected_version: post.edit_version,
+        expected_post_id: &post.id,
+        client_seq,
+        history_href: &format!("/edit/{}/history", esc(&post.slug)),
+        recovery_notice: &recovery_notice,
         recovery_scope: &recovery_scope,
         csrf: &csrf,
-        title_value: &post.title,
-        body_value: &post.body_md,
-        tags_value: &post.tags,
-        cover_value: &post.cover_url,
-        custom_excerpt_value: &post.custom_excerpt,
-        meta_title_value: &post.meta_title,
-        meta_description_value: &post.meta_description,
-        canonical_url_value: &post.canonical_url,
-        social_title_value: &post.social_title,
-        social_description_value: &post.social_description,
-        social_image_value: &post.social_image,
-        publish_at_value: &format_publish_at_value(post.publish_at),
-        pinned: post.pinned,
+        title_value: &editor_post.title,
+        body_value: &editor_post.body_md,
+        tags_value: &editor_post.tags,
+        cover_value: &editor_post.cover_url,
+        custom_excerpt_value: &editor_post.custom_excerpt,
+        meta_title_value: &editor_post.meta_title,
+        meta_description_value: &editor_post.meta_description,
+        canonical_url_value: &editor_post.canonical_url,
+        social_title_value: &editor_post.social_title,
+        social_description_value: &editor_post.social_description,
+        social_image_value: &editor_post.social_image,
+        publish_at_value: &publish_at_value,
+        pinned: editor_post.pinned,
         cancel_href: &format!("/p/{}", esc(&post.slug)),
         delete_slug: Some(&post.slug),
     });
-    Ok(html_with_cookie(page, set_cookie))
+    Ok(private_no_store(html_with_cookie(page, set_cookie)))
 }
 
 /// `POST /edit/{slug}` — update an own post (slug stays stable so existing links never break).
@@ -803,19 +900,28 @@ pub async fn update(
     Path(slug): Path<String>,
     Form(form): Form<PostForm>,
 ) -> Result<Response, AppError> {
-    let (sub, _email) = auth::require_author(&headers)?;
+    let (sub, email) = auth::require_author(&headers)?;
     auth::verify_csrf(&headers, &form.csrf_token)?;
 
     let mut post = state
         .store
-        .get_post(&slug)
-        .await
+        .get_post_authoritative(&slug)
+        .await?
         .ok_or_else(|| AppError::NotFound("no such post".to_string()))?;
+    let submitted_post_id = form.expected_post_id.trim();
+    let legacy_form = submitted_post_id.is_empty();
+    // A modern form is bound to the immutable post id. Handle a replaced identity before
+    // author comparison: the authenticated caller gets only their own submitted body back, while
+    // no replacement owner or content is disclosed and no recovery copy is attached to it.
+    if !legacy_form && submitted_post_id != post.id {
+        return Ok(identity_conflict_response(&headers, &form.body));
+    }
     if post.author_sub != sub && !auth::is_admin(&headers) {
         return Err(AppError::Forbidden(
             "you can only edit your own posts".to_string(),
         ));
     }
+    let loaded_post_id = post.id.clone();
 
     let title = form.title.trim();
     if title.is_empty() {
@@ -840,8 +946,56 @@ pub async fn update(
     post.publish_at = publish_at;
     post.published = published;
     post.pinned = form.pinned.is_some();
-    post.bump_updated_at(now);
-    state.store.update_post(&post).await?;
+    post.updated_at = now;
+    // Forms opened before `expected_post_id` shipped must never become last-write-wins even when
+    // they happen to carry a currently valid version. Force the normal CAS-conflict recovery path.
+    let expected_version = if legacy_form {
+        -1
+    } else {
+        form.expected_version.trim().parse::<i64>().unwrap_or(-1)
+    };
+    let autosave_session = form.autosave_session.trim().to_string();
+    let consume_autosave_session =
+        valid_autosave_session(&autosave_session).then_some(autosave_session.clone());
+    let outcome = state
+        .store
+        .save_post(SavePostCommand {
+            post,
+            expected_version,
+            editor_sub: sub.clone(),
+            editor_email: email.clone(),
+            source: "update".to_string(),
+            restored_from: None,
+            consume_autosave_session,
+        })
+        .await?;
+    let post = match outcome {
+        SavePostOutcome::Saved(post) => *post,
+        SavePostOutcome::Conflict { current_version } => {
+            let recovery_session = retain_conflicting_submission(
+                &state,
+                &sub,
+                &slug,
+                &loaded_post_id,
+                &form,
+                &autosave_session,
+            )
+            .await?;
+            return Ok(match recovery_session {
+                Some(recovery_session) => save_conflict_response(
+                    &headers,
+                    &slug,
+                    current_version,
+                    &recovery_session,
+                    &form.body,
+                ),
+                None => identity_conflict_response(&headers, &form.body),
+            });
+        }
+        SavePostOutcome::NotFound => {
+            return Ok(identity_conflict_response(&headers, &form.body));
+        }
+    };
     tracing::info!(slug = %slug, "post updated");
 
     let actor = if post.author_email.is_empty() {
@@ -862,6 +1016,251 @@ pub async fn update(
     Ok(save_response(&headers, &post))
 }
 
+/// `POST /api/writer/autosave/{slug}` — private server recovery for an existing edit session.
+/// It never mutates publication state or the public index. Both post version and client sequence
+/// are compare-and-swapped, so a stale tab or late network response cannot overwrite newer work.
+pub async fn autosave(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+    Form(form): Form<PostForm>,
+) -> Result<Response, AppError> {
+    let (sub, _email) = auth::require_author(&headers)?;
+    auth::verify_csrf(&headers, &form.csrf_token)?;
+    if !valid_autosave_session(&form.autosave_session) {
+        return Err(AppError::InvalidRequest(
+            "autosave_session must be a server-issued session id".to_string(),
+        ));
+    }
+    let post = state
+        .store
+        .get_post_authoritative(&slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound("no such post".to_string()))?;
+    if post.author_sub != sub && !auth::is_admin(&headers) {
+        return Err(AppError::Forbidden(
+            "you can only autosave a post you may edit".to_string(),
+        ));
+    }
+    if form.expected_post_id != post.id {
+        return Err(AppError::NotFound(
+            "the autosaved post identity no longer exists".to_string(),
+        ));
+    }
+    let base_version = form.expected_version.trim().parse::<i64>().unwrap_or(-1);
+    let client_seq = form.client_seq.trim().parse::<i64>().unwrap_or(0);
+    if !(1..=JS_MAX_SAFE_INTEGER).contains(&client_seq) {
+        return Err(AppError::InvalidRequest(
+            "client_seq must be a positive JavaScript-safe integer".to_string(),
+        ));
+    }
+    let now = now_secs();
+    let autosave = writer_autosave_from_form(
+        &form.autosave_session,
+        &post,
+        &sub,
+        base_version,
+        client_seq,
+        &form,
+        now,
+    );
+    let mut response = match state.store.put_writer_autosave(autosave, now).await? {
+        AutosaveOutcome::Saved(saved) => Json(AutosaveResponse {
+            ok: true,
+            client_seq: saved.client_seq,
+            base_version: saved.base_version,
+        })
+        .into_response(),
+        AutosaveOutcome::Stale { stored_client_seq } => (
+            StatusCode::CONFLICT,
+            Json(SaveConflictResponse {
+                ok: false,
+                conflict: true,
+                current_version: base_version,
+                recover: format!("stale-client-seq:{stored_client_seq}"),
+            }),
+        )
+            .into_response(),
+        AutosaveOutcome::Conflict { current_version } => (
+            StatusCode::CONFLICT,
+            Json(SaveConflictResponse {
+                ok: false,
+                conflict: true,
+                current_version,
+                recover: format!("/edit/{slug}"),
+            }),
+        )
+            .into_response(),
+        AutosaveOutcome::NotFound => {
+            return Err(AppError::NotFound("no such post".to_string()));
+        }
+    };
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    Ok(response)
+}
+
+/// `GET /edit/{slug}/history` — owner/admin-only immutable history summaries.
+pub async fn history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+) -> Result<Response, AppError> {
+    let (sub, email) = auth::require_author(&headers)?;
+    let is_admin = auth::is_admin(&headers);
+    let post = state
+        .store
+        .get_post_authoritative(&slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound("no such post".to_string()))?;
+    if post.author_sub != sub && !is_admin {
+        return Err(AppError::Forbidden(
+            "you can only view history for your own posts".to_string(),
+        ));
+    }
+    let revisions = state
+        .store
+        .list_post_revisions(&post.id, crate::config::REVISION_PAGE_LIMIT)
+        .await?;
+    let (csrf, set_cookie) = auth::ensure_csrf(&headers);
+    let rows = revisions
+        .iter()
+        .map(|revision| {
+            let action = if revision.edit_version == post.edit_version {
+                r#"<span class="badge">current</span>"#.to_string()
+            } else {
+                format!(
+                    r#"<form class="inline-form" method="post" action="/edit/{slug}/history/{revision_id}/restore">
+  <input type="hidden" name="csrf_token" value="{csrf}">
+  <input type="hidden" name="expected_version" value="{version}">
+  <input type="hidden" name="expected_post_id" value="{post_id}">
+  <button class="btn btn-secondary btn-sm" type="submit">Restore content</button>
+</form>"#,
+                    slug = esc(&slug),
+                    revision_id = esc(&revision.id),
+                    csrf = esc(&csrf),
+                    version = post.edit_version,
+                    post_id = esc(&post.id),
+                )
+            };
+            format!(
+                r#"<tr><td>v{version}</td><td>{title}</td><td>{editor}</td><td>{source}</td><td>{chars}</td><td>{action}</td></tr>"#,
+                version = revision.edit_version,
+                title = esc(&revision.title),
+                editor = esc(&revision.editor_email),
+                source = esc(&revision.source),
+                chars = revision.body_chars,
+            )
+        })
+        .collect::<String>();
+    let fragment = format!(
+        r#"<main class="console console--narrow"><div class="console__head"><h1>Post history</h1><p class="sub">{title}</p></div>
+<p><a class="btn btn-ghost" href="/edit/{slug}">Back to editor</a></p>
+<section class="card"><div class="card__body"><p class="muted">Restoring recovers content and metadata while preserving the current Draft, Scheduled, or Published state, publication time, pin, and feature flags.</p>
+<div class="table-wrap"><table class="history"><thead><tr><th>Version</th><th>Title</th><th>Editor</th><th>Source</th><th>Chars</th><th>Action</th></tr></thead><tbody>{rows}</tbody></table></div></div></section></main>"#,
+        title = esc(&post.title),
+        slug = esc(&slug),
+    );
+    let theme = odyssey::resolve_theme(
+        headers
+            .get(axum::http::header::COOKIE)
+            .and_then(|value| value.to_str().ok()),
+    );
+    let page = page_shell(PageShell {
+        head_title: "Post history · Inkwell",
+        body_class: "page-console",
+        rss: false,
+        nav_title: "Post history",
+        email: &email,
+        is_admin,
+        theme,
+        fragment: &fragment,
+        metadata: None,
+    });
+    Ok(private_no_store(html_with_cookie(page, set_cookie)))
+}
+
+/// Restore one immutable revision as a new authoritative version. Publication and administrative
+/// state remain exactly as they are on the current row; only authoring content/metadata is copied.
+pub async fn restore_revision(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((slug, revision_id)): Path<(String, String)>,
+    Form(form): Form<RestoreForm>,
+) -> Result<Response, AppError> {
+    let (sub, email) = auth::require_author(&headers)?;
+    auth::verify_csrf(&headers, &form.csrf_token)?;
+    let mut current = state
+        .store
+        .get_post_authoritative(&slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound("no such post".to_string()))?;
+    if current.author_sub != sub && !auth::is_admin(&headers) {
+        return Err(AppError::Forbidden(
+            "you can only restore your own posts".to_string(),
+        ));
+    }
+    if form.expected_post_id != current.id {
+        return Err(AppError::NotFound(
+            "the restored post identity no longer exists".to_string(),
+        ));
+    }
+    let revision = state
+        .store
+        .get_post_revision(&current.id, &revision_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("no such revision for this post".to_string()))?;
+    let expected_version = form.expected_version.trim().parse::<i64>().unwrap_or(-1);
+
+    current.title = revision.title;
+    current.body_md = revision.body_md;
+    current.tags = revision.tags;
+    current.cover_url = revision.cover_url;
+    current.custom_excerpt = revision.custom_excerpt;
+    current.meta_title = revision.meta_title;
+    current.meta_description = revision.meta_description;
+    current.canonical_url = revision.canonical_url;
+    current.social_title = revision.social_title;
+    current.social_description = revision.social_description;
+    current.social_image = revision.social_image;
+    current.updated_at = now_secs();
+    let outcome = state
+        .store
+        .save_post(SavePostCommand {
+            post: current,
+            expected_version,
+            editor_sub: sub.clone(),
+            editor_email: email.clone(),
+            source: "restore".to_string(),
+            restored_from: Some(revision_id.clone()),
+            consume_autosave_session: None,
+        })
+        .await?;
+    let saved = match outcome {
+        SavePostOutcome::Saved(post) => *post,
+        SavePostOutcome::Conflict { current_version } => {
+            return Ok(simple_conflict_response(
+                &slug,
+                current_version,
+                "The post changed before restore. Reload history and review the newer version.",
+            ));
+        }
+        SavePostOutcome::NotFound => {
+            return Err(AppError::NotFound("no such post".to_string()));
+        }
+    };
+    crate::reindex_post(state.store.as_ref(), &saved).await;
+    state.audit.emit(AuditEvent::notice(
+        "post.revision.restore",
+        if email.is_empty() { &sub } else { &email },
+        &slug,
+        &format!("restore {revision_id} as v{}", saved.edit_version),
+    ));
+    Ok(redirect(&format!("/edit/{slug}/history")))
+}
+
 // ---------------------------------------------------------------------------
 // Delete
 // ---------------------------------------------------------------------------
@@ -878,8 +1277,8 @@ pub async fn delete(
 
     let post = state
         .store
-        .get_post(&slug)
-        .await
+        .get_post_authoritative(&slug)
+        .await?
         .ok_or_else(|| AppError::NotFound("no such post".to_string()))?;
     if post.author_sub != sub && !auth::is_admin(&headers) {
         return Err(AppError::Forbidden(
@@ -916,6 +1315,204 @@ struct PublicationMetadata {
     social_title: String,
     social_description: String,
     social_image: String,
+}
+
+fn valid_autosave_session(raw: &str) -> bool {
+    raw.len() == 64 && raw.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn raw_bounded(raw: &str, max_chars: usize) -> String {
+    raw.chars().take(max_chars).collect()
+}
+
+fn writer_autosave_from_form(
+    session_id: &str,
+    post: &Post,
+    owner_sub: &str,
+    base_version: i64,
+    client_seq: i64,
+    form: &PostForm,
+    now: i64,
+) -> WriterAutosave {
+    WriterAutosave {
+        session_id: session_id.to_string(),
+        post_id: post.id.clone(),
+        owner_sub: owner_sub.to_string(),
+        base_version,
+        client_seq,
+        title: raw_bounded(&form.title, 200),
+        body_md: raw_bounded(&form.body, 1_000_000),
+        tags: raw_bounded(&form.tags, 800),
+        cover_url: raw_bounded(&form.cover_url, 600),
+        custom_excerpt: raw_bounded(&form.custom_excerpt, CUSTOM_EXCERPT_MAX),
+        meta_title: raw_bounded(&form.meta_title, META_TITLE_MAX),
+        meta_description: raw_bounded(&form.meta_description, META_DESCRIPTION_MAX),
+        canonical_url: raw_bounded(&form.canonical_url, CANONICAL_URL_MAX),
+        social_title: raw_bounded(&form.social_title, SOCIAL_TITLE_MAX),
+        social_description: raw_bounded(&form.social_description, SOCIAL_DESCRIPTION_MAX),
+        social_image: raw_bounded(&form.social_image, SOCIAL_IMAGE_MAX),
+        publish_at: raw_bounded(&form.publish_at, 64),
+        pinned: form.pinned.is_some(),
+        updated_at: now,
+        expires_at: now.saturating_add(crate::config::AUTOSAVE_TTL_SECS),
+    }
+}
+
+async fn retain_conflicting_submission(
+    state: &AppState,
+    owner_sub: &str,
+    slug: &str,
+    expected_post_id: &str,
+    form: &PostForm,
+    submitted_session: &str,
+) -> Result<Option<String>, AppError> {
+    let session = if valid_autosave_session(submitted_session) {
+        submitted_session.to_string()
+    } else {
+        auth::new_csrf_token()
+    };
+    let mut client_seq = form
+        .client_seq
+        .trim()
+        .parse::<i64>()
+        .unwrap_or(0)
+        .saturating_add(1)
+        .clamp(1, JS_MAX_SAFE_INTEGER);
+    for _ in 0..3 {
+        let current = state
+            .store
+            .get_post_authoritative(slug)
+            .await?;
+        let Some(current) = current else {
+            return Ok(None);
+        };
+        if current.id != expected_post_id {
+            return Ok(None);
+        }
+        let now = now_secs();
+        let autosave = writer_autosave_from_form(
+            &session,
+            &current,
+            owner_sub,
+            current.edit_version,
+            client_seq,
+            form,
+            now,
+        );
+        match state.store.put_writer_autosave(autosave, now).await? {
+            AutosaveOutcome::Saved(_) => return Ok(Some(session)),
+            AutosaveOutcome::Stale { stored_client_seq } => {
+                if stored_client_seq >= JS_MAX_SAFE_INTEGER {
+                    return Err(AppError::Conflict(
+                        "autosave sequence exhausted; reload the editor for a new session"
+                            .to_string(),
+                    ));
+                }
+                client_seq = stored_client_seq + 1;
+            }
+            AutosaveOutcome::Conflict { .. } => continue,
+            AutosaveOutcome::NotFound => {
+                return Ok(None);
+            }
+        }
+    }
+    Err(AppError::Conflict(
+        "post kept changing while retaining the recovery copy; your browser copy remains available"
+            .to_string(),
+    ))
+}
+
+fn save_conflict_response(
+    headers: &HeaderMap,
+    slug: &str,
+    current_version: i64,
+    recovery_session: &str,
+    submitted_body: &str,
+) -> Response {
+    let recover = format!("/edit/{slug}?recover={recovery_session}");
+    let accepts_json = headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|part| part.trim() == "application/json")
+        });
+    let mut response = if accepts_json {
+        (
+            StatusCode::CONFLICT,
+            Json(SaveConflictResponse {
+                ok: false,
+                conflict: true,
+                current_version,
+                recover,
+            }),
+        )
+            .into_response()
+    } else {
+        let html = format!(
+            r#"<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Edit conflict · Inkwell</title><body><main><h1>A newer version was saved</h1><p>Your submitted text is preserved below and as a private server recovery copy.</p><p><a href="{recover}">Review recovery against version {version}</a></p><label for="conflict-body">Your submitted body</label><textarea id="conflict-body" rows="24" readonly>{body}</textarea></main></body></html>"#,
+            recover = esc(&recover),
+            version = current_version,
+            body = esc(submitted_body),
+        );
+        (StatusCode::CONFLICT, Html(html)).into_response()
+    };
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response
+}
+
+/// A stale form can outlive deletion and slug reuse. Return only caller-supplied text: unlike an
+/// ordinary version conflict there is deliberately no recovery URL, because attaching that copy
+/// to the replacement post would cross an immutable identity boundary.
+fn identity_conflict_response(headers: &HeaderMap, submitted_body: &str) -> Response {
+    let accepts_json = headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|part| part.trim() == "application/json")
+        });
+    let mut response = if accepts_json {
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "conflict": true
+            })),
+        )
+            .into_response()
+    } else {
+        let html = format!(
+            r#"<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Edit conflict · Inkwell</title><body><main><h1>This post changed identity</h1><p>The post opened by this form no longer exists. Your submitted text was not attached to the current post.</p><label for="conflict-body">Your submitted body</label><textarea id="conflict-body" rows="24" readonly>{body}</textarea></main></body></html>"#,
+            body = esc(submitted_body),
+        );
+        (StatusCode::CONFLICT, Html(html)).into_response()
+    };
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response
+}
+
+fn simple_conflict_response(slug: &str, current_version: i64, message: &str) -> Response {
+    let html = format!(
+        r#"<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Edit conflict · Inkwell</title><body><main><h1>Edit conflict</h1><p>{message}</p><p>Current version: {version}</p><a href="/edit/{slug}/history">Reload history</a></main></body></html>"#,
+        message = esc(message),
+        version = current_version,
+        slug = esc(slug),
+    );
+    let mut response = (StatusCode::CONFLICT, Html(html)).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response
 }
 
 /// Normalize the optional publication fields at the server boundary. Text is character-truncated
@@ -1400,6 +1997,13 @@ struct EditorView<'a> {
     heading: &'a str,
     subhead: &'a str,
     action: &'a str,
+    autosave_url: &'a str,
+    autosave_session: &'a str,
+    expected_version: i64,
+    expected_post_id: &'a str,
+    client_seq: i64,
+    history_href: &'a str,
+    recovery_notice: &'a str,
     recovery_scope: &'a str,
     csrf: &'a str,
     title_value: &'a str,
@@ -1441,6 +2045,14 @@ fn render_editor(v: EditorView<'_>) -> String {
     } else {
         ""
     };
+    let history_action = if v.history_href.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<a class="btn btn-ghost" href="{}">History</a>"#,
+            esc(v.history_href)
+        )
+    };
     let delete_block = match v.delete_slug {
         Some(slug) => format!(
             r#"<div class="danger-zone">
@@ -1460,6 +2072,13 @@ fn render_editor(v: EditorView<'_>) -> String {
         .replace("{{HEADING}}", &esc(v.heading))
         .replace("{{SUBHEAD}}", &esc(v.subhead))
         .replace("{{ACTION}}", v.action)
+        .replace("{{AUTOSAVE_URL}}", &esc(v.autosave_url))
+        .replace("{{AUTOSAVE_SESSION}}", &esc(v.autosave_session))
+        .replace("{{EXPECTED_VERSION}}", &v.expected_version.to_string())
+        .replace("{{EXPECTED_POST_ID}}", &esc(v.expected_post_id))
+        .replace("{{CLIENT_SEQ}}", &v.client_seq.to_string())
+        .replace("{{HISTORY_ACTION}}", &history_action)
+        .replace("{{SERVER_RECOVERY_NOTICE}}", v.recovery_notice)
         .replace("{{RECOVERY_SCOPE}}", &esc(v.recovery_scope))
         .replace("{{CSRF}}", &esc(v.csrf))
         .replace("{{TITLE_VALUE}}", &esc(v.title_value))
@@ -1518,4 +2137,12 @@ fn html_with_cookie(body: String, set_cookie: Option<String>) -> Response {
         }
     }
     resp
+}
+
+fn private_no_store(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response
 }

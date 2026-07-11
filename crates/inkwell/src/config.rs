@@ -28,6 +28,13 @@ pub const SITEMAP_POST_LIMIT: usize = 49_999;
 /// Keeping this separate from the sitemap ceiling prevents a single tag page from materialising or
 /// examining tens of thousands of posts while still making the full archive reachable.
 pub const TAG_SCAN_POST_LIMIT: usize = 2_000;
+/// Writer history is intentionally bounded per post. The newest snapshots are retained; restore
+/// always appends a fresh snapshot before pruning, so the pre-restore current state remains undoable.
+pub const REVISION_KEEP_LIMIT: usize = 100;
+/// One history page only carries lightweight summaries. Full bodies are fetched on demand.
+pub const REVISION_PAGE_LIMIT: i64 = 50;
+/// Server-side edit autosaves are private recovery data, retained for seven days.
+pub const AUTOSAVE_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// Clamp a requested page size into `1..=MAX_PAGE`, falling back to [`DEFAULT_PAGE`] when the
 /// request omits `?limit=` or passes a non-positive value.

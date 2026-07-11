@@ -1289,6 +1289,127 @@ async fn gallery_paginates_backward_with_before_cursor() {
     );
 }
 
+#[tokio::test]
+async fn library_control_plane_is_url_backed_cross_tree_and_owner_scoped() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let (root_id, csrf) = upload_file(
+        &app,
+        "alice",
+        "Quarterly Report.png",
+        "image/png",
+        &png_bytes(),
+    )
+    .await;
+    let made = send(
+        &app,
+        post_form(
+            "/folders",
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&name=Quarterly+Intake"),
+        ),
+    )
+    .await;
+    assert_eq!(made.status, StatusCode::FOUND);
+    let folder_id = folder_from_location(&made.location());
+    let nested = send(
+        &app,
+        upload_req_folder(
+            &csrf,
+            &csrf,
+            "alice",
+            &folder_id,
+            "Quarterly Report detail.png",
+            "image/png",
+            &png_bytes(),
+        ),
+    )
+    .await;
+    assert_eq!(nested.status, StatusCode::FOUND, "{}", nested.text());
+
+    let search = send(
+        &app,
+        get("/?q=Quarterly%20Report&type=image&limit=1", Some("alice")),
+    )
+    .await;
+    assert_eq!(search.status, StatusCode::OK);
+    let search_html = search.text();
+    assert!(search_html.contains("role=\"search\""));
+    assert!(search_html.contains("method=\"get\" action=\"/\""));
+    assert!(search_html.contains("value=\"Quarterly Report\""));
+    assert!(search_html.contains("Search results"));
+    assert!(search_html.contains("Quarterly Report"));
+    assert!(search_html.contains("q=Quarterly%20Report&amp;type=image&amp;before="));
+    assert!(search_html.contains("&amp;limit=1"));
+
+    let folders = send(&app, get("/?q=Quarterly&type=folder", Some("alice"))).await;
+    assert_eq!(folders.status, StatusCode::OK);
+    assert!(folders.text().contains("Quarterly Intake"));
+
+    let bob = send(&app, get("/?q=Quarterly&type=all", Some("bob"))).await;
+    assert_eq!(bob.status, StatusCode::OK);
+    assert!(!bob.text().contains("Quarterly Report"));
+    assert!(!bob.text().contains("Quarterly Intake"));
+
+    // Store-level capability values drive governance status but are never projected into the URL
+    // or owner-library HTML.
+    let file_token = "do-not-leak-file-token";
+    assert!(store
+        .configure_share(
+            &root_id,
+            "alice",
+            Some(file_token.into()),
+            Some(1),
+            Some("salt$hash".into()),
+        )
+        .await
+        .unwrap());
+    let folder_token = "do-not-leak-folder-token";
+    assert!(store
+        .configure_folder_share(
+            &folder_id,
+            "alice",
+            Some(folder_token.into()),
+            Some(1),
+            Some("salt$hash".into()),
+        )
+        .await
+        .unwrap());
+    let shared = send(&app, get("/?view=shared", Some("alice"))).await;
+    assert_eq!(shared.status, StatusCode::OK);
+    let shared_html = shared.text();
+    assert!(shared_html.contains("Shared by me"));
+    assert!(shared_html.contains("Expired"));
+    assert!(shared_html.contains("Password"));
+    assert!(shared_html.contains("Quarterly Report.png"));
+    assert!(shared_html.contains("Quarterly Intake"));
+    assert!(!shared_html.contains(file_token));
+    assert!(!shared_html.contains(folder_token));
+
+    let recent = send(&app, get("/?view=recent", Some("alice"))).await;
+    assert_eq!(recent.status, StatusCode::OK);
+    assert!(recent.text().contains("Quarterly Report detail.png"));
+    assert!(recent.text().contains("Quarterly Intake"));
+}
+
+#[tokio::test]
+async fn library_control_plane_rejects_ambiguous_urls() {
+    let app = app(build_dev_state());
+    for uri in [
+        "/?view=unknown",
+        "/?type=executable",
+        "/?view=recent&before=broken",
+    ] {
+        let response = send(&app, get(uri, Some("alice"))).await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST, "{uri}");
+    }
+    let too_long = format!("/?q={}", "x".repeat(129));
+    let response = send(&app, get(&too_long, Some("alice"))).await;
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+}
+
 /// Extract the folder id from a `302 /?folder={id}` create/rename redirect Location.
 fn folder_from_location(loc: &str) -> String {
     loc.trim_start_matches("/?folder=").to_string()

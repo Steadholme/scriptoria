@@ -3,14 +3,20 @@
     <h1>{{HEADING}}</h1>
     <p class="sub">{{SUBHEAD}}</p>
   </div>
-  <form class="editor ink-editor" method="post" action="{{ACTION}}" data-writer-studio data-initial-state="{{STATE_KEY}}" data-recovery-scope="{{RECOVERY_SCOPE}}">
+  <form class="editor ink-editor" method="post" action="{{ACTION}}" data-writer-studio data-initial-state="{{STATE_KEY}}" data-recovery-scope="{{RECOVERY_SCOPE}}" data-autosave-url="{{AUTOSAVE_URL}}">
     <input type="hidden" name="csrf_token" value="{{CSRF}}">
+    <input type="hidden" name="expected_version" value="{{EXPECTED_VERSION}}">
+    <input type="hidden" name="expected_post_id" value="{{EXPECTED_POST_ID}}">
+    <input type="hidden" name="autosave_session" value="{{AUTOSAVE_SESSION}}">
+    <input type="hidden" name="client_seq" value="{{CLIENT_SEQ}}">
     <div class="ink-editor__canvas">
+      {{SERVER_RECOVERY_NOTICE}}
       <div class="draftbar" id="draftbar" hidden>
         <span id="draftbar-msg">A local recovery copy is available. Writer Studio deletes it after 24 hours while open, or on your next Writer Studio visit.</span>
         <span class="draftbar__spacer"></span>
         <button type="button" class="btn btn-ghost btn-sm" id="draftRestore">Restore</button>
         <button type="button" class="btn btn-subtle btn-sm" id="draftDiscard">Discard</button>
+        <a class="btn btn-ghost btn-sm" id="serverRecoveryLink" href="/" hidden>Open server recovery</a>
       </div>
       <div class="field">
         <div class="field__labelrow">
@@ -39,6 +45,7 @@
         {{STATE_PILL}}
         <span class="spacer"></span>
         <a class="btn btn-ghost" href="{{CANCEL_HREF}}">Cancel</a>
+        {{HISTORY_ACTION}}
         {{PRESERVE_ACTION}}
         <button class="btn btn-secondary" type="submit" name="intent" value="save_draft" data-final-state="draft">Save draft</button>
         <button class="btn btn-secondary" type="submit" name="intent" value="schedule" data-final-state="scheduled">Schedule</button>
@@ -183,8 +190,11 @@
     var socialPreviewDescription = document.getElementById('socialPreviewDescription');
     var csrfEl = form.querySelector('input[name="csrf_token"]');
     var action = form.getAttribute('action') || '';
+    var autosaveUrl = form.getAttribute('data-autosave-url') || '';
+    var clientSeqEl = form.querySelector('input[name="client_seq"]');
     var statusEl = document.getElementById('writerStatus');
     var statusText = document.getElementById('writerStatusText');
+    var serverRecoveryLink = document.getElementById('serverRecoveryLink');
     var initialState = form.getAttribute('data-initial-state') || 'draft';
     function stateLabel(state) {
       return state === 'published' ? 'Published' : (state === 'scheduled' ? 'Scheduled' : (state === 'saving' ? 'Saving\u2026' : (state === 'error' ? 'Error \u00b7 Not saved' : 'Draft')));
@@ -196,6 +206,23 @@
       statusText.textContent = text || stateLabel(state);
     }
     setStatus(initialState, statusText && statusText.textContent ? statusText.textContent : null);
+    function showServerRecoveryLink(url) {
+      if (!serverRecoveryLink || typeof url !== 'string' || url.indexOf('/edit/') !== 0) { return; }
+      serverRecoveryLink.setAttribute('href', url);
+      serverRecoveryLink.hidden = false;
+      var recoveryBar = document.getElementById('draftbar');
+      var recoveryMessage = document.getElementById('draftbar-msg');
+      if (recoveryMessage) { recoveryMessage.textContent = 'A private server recovery copy is available after this conflict.'; }
+      if (recoveryBar) { recoveryBar.hidden = false; }
+    }
+    function conflictErrorFromResponse(response, label) {
+      return response.json().catch(function () { return {}; }).then(function (data) {
+        var conflict = new Error(label);
+        conflict.conflict = true;
+        conflict.recover = data && data.recover;
+        throw conflict;
+      });
+    }
 
     function syncCover() {
       if (!coverEl || !coverPreview) { return; }
@@ -467,6 +494,9 @@
         (pinnedEl && d.pinned !== pinnedEl.checked);
     }
     var autosaveTimer = null;
+    var serverAutosaveTimer = null;
+    var initialClientSeq = clientSeqEl ? Number(clientSeqEl.value) : 0;
+    var serverClientSeq = Number.isSafeInteger(initialClientSeq) && initialClientSeq >= 0 ? initialClientSeq : 0;
     function persistRecovery(key, ttl) {
       try {
         var saved = snapshot();
@@ -476,6 +506,35 @@
     }
     function cancelAutosave() {
       if (autosaveTimer) { clearTimeout(autosaveTimer); autosaveTimer = null; }
+      if (serverAutosaveTimer) { clearTimeout(serverAutosaveTimer); serverAutosaveTimer = null; }
+    }
+    function persistServerAutosave() {
+      if (!autosaveUrl || !window.fetch) { return; }
+      serverClientSeq += 1;
+      if (clientSeqEl) { clientSeqEl.value = String(serverClientSeq); }
+      var params = new URLSearchParams();
+      new FormData(form).forEach(function (value, key) { params.append(key, value); });
+      params.set('client_seq', String(serverClientSeq));
+      fetch(autosaveUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+        credentials: 'same-origin',
+        body: params.toString()
+      }).then(function (response) {
+        if (response.status === 409) {
+          return conflictErrorFromResponse(response, 'autosave conflict');
+        }
+        if (!response.ok) { throw new Error('autosave failed with HTTP ' + response.status); }
+        return response.json();
+      }).then(function (data) {
+        if (!data || !data.ok) { throw new Error('invalid autosave response'); }
+      }).catch(function (error) {
+        if (error && error.conflict) {
+          showServerRecoveryLink(error.recover);
+          setStatus('error', 'Conflict \u00b7 Newer server version');
+          hfToast('Server autosave paused \u2014 reload to review newer work', 'err');
+        }
+      });
     }
     function scheduleAutosave() {
       cancelAutosave();
@@ -483,6 +542,12 @@
         autosaveTimer = null;
         persistRecovery(draftKey, RECOVERY_TTL);
       }, 600);
+      if (autosaveUrl) {
+        serverAutosaveTimer = setTimeout(function () {
+          serverAutosaveTimer = null;
+          persistServerAutosave();
+        }, 1500);
+      }
     }
     [titleEl, bodyEl, tagsEl, coverEl, customExcerptEl, metaTitleEl, metaDescriptionEl, canonicalUrlEl,
      socialTitleEl, socialDescriptionEl, socialImageEl, publishAtEl].forEach(function (el) {
@@ -632,6 +697,9 @@
         credentials: 'same-origin',
         body: params.toString()
       }).then(function (response) {
+        if (response.status === 409) {
+          return conflictErrorFromResponse(response, 'save conflict');
+        }
         if (!response.ok) { throw new Error('save failed with HTTP ' + response.status); }
         return response.json();
       }).then(function (data) {
@@ -641,11 +709,16 @@
         forgetRecovery(bakKey);
         setStatus(data.state, 'Saved \u00b7 ' + stateLabel(data.state));
         setTimeout(function () { window.location.assign(data.redirect); }, 220);
-      }).catch(function () {
+      }).catch(function (error) {
         persistRecovery(draftKey, RECOVERY_TTL);
         setStatus('error');
         buttons.forEach(function (button) { button.disabled = false; });
-        hfToast('Save failed \u2014 your local recovery copy is still on this browser', 'err');
+        if (error && error.conflict) {
+          showServerRecoveryLink(error.recover);
+          hfToast('Save conflict \u2014 open the preserved server recovery copy', 'err');
+        } else {
+          hfToast('Save failed \u2014 your local recovery copy is still on this browser', 'err');
+        }
       });
     });
   })();

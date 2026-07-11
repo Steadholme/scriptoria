@@ -5,6 +5,7 @@
 //! embedded (via `include_str!`) and inlined into every page, matching the HOLDFAST
 //! enterprise brand: brand gradient app-bar, indigo accent, cards, pills.
 
+pub mod activity;
 pub mod admin;
 pub mod forum;
 pub mod health;
@@ -70,15 +71,31 @@ pub(crate) fn ag_initial(s: &str) -> String {
 /// Render a full page: fill the shell with the inlined CSS, the (raw) title, the Odyssey v2
 /// app-bar (brand tile + forum nav + avatar user-menu), and the already-built content HTML.
 pub fn render_page(title: &str, email_display: &str, content: &str) -> String {
+    render_page_with_activity(title, email_display, content, None)
+}
+
+/// Render a page with the personal Activity control hydrated server-side. `None` is used only by
+/// identity-free error/dev surfaces; authenticated product pages pass the authoritative unread
+/// count so the return-loop badge also works without JavaScript.
+pub fn render_page_with_activity(
+    title: &str,
+    email_display: &str,
+    content: &str,
+    unread_activity: Option<i64>,
+) -> String {
     let active = match title {
         "New thread" => "new",
         "Search" => "search",
+        "Activity" => "activity",
         _ => "home",
     };
     SHELL
         .replace("{{STYLE}}", app_css())
         .replace("{{DYNAMIC}}", dynamic_js())
-        .replace("{{APPBAR}}", &app_bar(active, email_display))
+        .replace(
+            "{{APPBAR}}",
+            &app_bar_with_activity(active, email_display, unread_activity),
+        )
         .replace("{{TITLE}}", &esc(title))
         .replace("{{CONTENT}}", content)
 }
@@ -90,6 +107,14 @@ pub const APP_ICON: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="curr
 /// `.is-active`), then the "All apps" waffle and the avatar user-menu. `email_display` is the
 /// already-escaped signed-in identity ("" → a minimal, no-identity avatar).
 pub fn app_bar(active: &str, email_display: &str) -> String {
+    app_bar_with_activity(active, email_display, None)
+}
+
+pub fn app_bar_with_activity(
+    active: &str,
+    email_display: &str,
+    unread_activity: Option<i64>,
+) -> String {
     let nav = format!(
         concat!(
             r#"<nav class="appbar__nav" aria-label="Agora">"#,
@@ -109,6 +134,7 @@ pub fn app_bar(active: &str, email_display: &str) -> String {
 </form>"#,
         active = if active == "search" { " is-active" } else { "" },
     );
+    let activity = activity_button(active == "activity", unread_activity);
     format!(
         r#"<header class="appbar">
   <a class="appbar__brand" href="/" aria-label="HOLDFAST Agora home">
@@ -118,12 +144,42 @@ pub fn app_bar(active: &str, email_display: &str) -> String {
   {nav}
   {quick_search}
   <span class="appbar__spacer"></span>
-  <div class="appbar__right">{right}</div>
+  <div class="appbar__right">{activity}{right}</div>
 </header>"#,
         icon = APP_ICON,
         nav = nav,
         quick_search = quick_search,
+        activity = activity,
         right = user_menu(email_display),
+    )
+}
+
+fn activity_button(active: bool, unread_activity: Option<i64>) -> String {
+    let count = unread_activity.unwrap_or(0).max(0);
+    let badge = if count > 0 {
+        format!(
+            r#"<span class="ag-activity-badge" aria-hidden="true">{}</span>"#,
+            if count > 99 {
+                "99+".to_string()
+            } else {
+                count.to_string()
+            }
+        )
+    } else {
+        String::new()
+    };
+    let label = if count == 0 {
+        "Activity".to_string()
+    } else if count == 1 {
+        "Activity, 1 unread".to_string()
+    } else {
+        format!("Activity, {count} unread")
+    };
+    format!(
+        r#"<a class="iconbtn ag-activity-button{active}" href="/activity" title="Activity" aria-label="{label}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>{badge}</a>"#,
+        active = if active { " is-active" } else { "" },
+        label = esc(&label),
+        badge = badge,
     )
 }
 
@@ -198,6 +254,18 @@ pub fn email_display(headers: &HeaderMap) -> String {
         Some(e) => esc(&e),
         None => String::new(),
     }
+}
+
+/// Authoritative unread Activity count for the current gateway identity. Public/dev requests with
+/// no identity keep the activity link but render no personalised badge.
+pub async fn unread_activity_count(
+    state: &crate::AppState,
+    headers: &HeaderMap,
+) -> Result<Option<i64>, crate::error::AppError> {
+    let Some(subject) = crate::auth::identity_subject(headers) else {
+        return Ok(None);
+    };
+    Ok(Some(state.store.unread_activity_count(&subject).await?))
 }
 
 /// Compact "N ago" relative time from `ts` to `now` (both epoch seconds).

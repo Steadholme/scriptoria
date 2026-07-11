@@ -19,10 +19,14 @@ use crate::auth;
 use crate::error::AppError;
 use crate::handlers::insight::thread_summary;
 use crate::handlers::{
-    ag_initial, ag_tone, email_display, esc, fmt_ts, rel_time, render_page, replies_label,
+    ag_initial, ag_tone, email_display, esc, fmt_ts, rel_time, render_page_with_activity,
+    replies_label, unread_activity_count,
 };
 use crate::model::{Post, ReactionCount, Thread};
-use crate::store::{AcceptedAnswerAction, ReplyAnchor, ThreadSort, ThreadStatusFilter};
+use crate::store::{
+    AcceptedAnswerAction, ReplyAnchor, ThreadSort, ThreadStatusFilter,
+    MAX_KLAXON_RECIPIENTS_PER_REPLY,
+};
 use crate::{markdown, new_id, now_secs, AppState};
 
 /// Most-recent threads shown on the home page.
@@ -32,8 +36,6 @@ const RECENT_LIMIT: i64 = 20;
 pub const REPLIES_PER_PAGE: i64 = 20;
 /// Threads listed on a category page.
 const CATEGORY_LIMIT: i64 = 200;
-/// Recent mentions shown on the home page for the signed-in viewer.
-const MENTION_LIMIT: i64 = 5;
 /// Caps on user input (defense against absurd payloads; the store columns are TEXT).
 const MAX_TITLE: usize = 200;
 const MAX_BODY: usize = 20_000;
@@ -152,7 +154,6 @@ impl ThreadListQuery {
             _ => ThreadStatusFilter::Any,
         }
     }
-
 }
 
 pub async fn home(
@@ -220,14 +221,8 @@ pub async fn home(
         Some(&reply_counts),
         &question_categories,
     );
-    let mentions_html = render_mentions_panel(&state, &headers).await?;
-    let thread_controls = render_thread_list_controls(
-        "/",
-        &q,
-        viewer_sub.is_some(),
-        true,
-        q.status(),
-    );
+    let thread_controls =
+        render_thread_list_controls("/", &q, viewer_sub.is_some(), true, q.status());
 
     let content = format!(
         r#"<div class="page-head">
@@ -242,9 +237,9 @@ pub async fn home(
     <nav class="ag-rail__nav" aria-label="Categories">
       <a class="ag-cat is-active" href="/"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span class="ag-cat__name">All threads</span></a>
       <a class="ag-cat" href="/questions"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M9.1 9a3 3 0 1 1 5.8 1c0 2-3 2-3 4"/><path d="M12 18h.01"/></svg><span class="ag-cat__name">Questions</span></a>
+      <a class="ag-cat" href="/activity"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg><span class="ag-cat__name">Activity</span></a>
       {cats}
     </nav>
-    {mentions}
   </aside>
   <div class="ag-feed">
     <section class="section">
@@ -255,16 +250,17 @@ pub async fn home(
   </div>
 </div>"#,
         cats = cats_html,
-        mentions = mentions_html,
         thread_title = thread_list_title(&q, "Recent activity"),
         controls = thread_controls,
         recent = recent_html,
     );
 
-    Ok(Html(render_page(
+    let unread = unread_activity_count(&state, &headers).await?;
+    Ok(Html(render_page_with_activity(
         "Forum",
         &email_display(&headers),
         &content,
+        unread,
     )))
 }
 
@@ -320,13 +316,8 @@ pub async fn questions(
         None,
         &question_categories,
     );
-    let controls = render_thread_list_controls(
-        "/questions",
-        &q,
-        viewer_sub.is_some(),
-        true,
-        status,
-    );
+    let controls =
+        render_thread_list_controls("/questions", &q, viewer_sub.is_some(), true, status);
     let heading = match status {
         ThreadStatusFilter::Answered => "Answered questions",
         ThreadStatusFilter::Unanswered => "Questions that need an answer",
@@ -347,10 +338,12 @@ pub async fn questions(
         controls = controls,
         list = list,
     );
-    Ok(Html(render_page(
+    let unread = unread_activity_count(&state, &headers).await?;
+    Ok(Html(render_page_with_activity(
         "Questions",
         &email_display(&headers),
         &content,
+        unread,
     )))
 }
 
@@ -427,21 +420,39 @@ pub async fn category(
         name = esc(&category.name),
         count = threads.len(),
         tw = if threads.len() == 1 {
-            if category.format.is_question() { "question" } else { "thread" }
+            if category.format.is_question() {
+                "question"
+            } else {
+                "thread"
+            }
         } else {
-            if category.format.is_question() { "questions" } else { "threads" }
+            if category.format.is_question() {
+                "questions"
+            } else {
+                "threads"
+            }
         },
-        format_label = if category.format.is_question() { "question" } else { "discussion" },
-        new_label = if category.format.is_question() { "Ask question" } else { "New thread" },
+        format_label = if category.format.is_question() {
+            "question"
+        } else {
+            "discussion"
+        },
+        new_label = if category.format.is_question() {
+            "Ask question"
+        } else {
+            "New thread"
+        },
         id = esc(&category.id),
         controls = controls,
         list = list,
     );
 
-    Ok(Html(render_page(
+    let unread = unread_activity_count(&state, &headers).await?;
+    Ok(Html(render_page_with_activity(
         &category.name,
         &email_display(&headers),
         &content,
+        unread,
     )))
 }
 
@@ -451,7 +462,8 @@ pub async fn category(
 
 /// Keyset cursor + page anchor for the thread view's reply list. All optional; a bare
 /// `GET /t/{id}` shows the first (oldest) page. `?before=<created_at>_<id>` pages to older
-/// replies, `?after=<created_at>_<id>` to newer, and `?latest=1` jumps to the newest page.
+/// replies, `?after=<created_at>_<id>` to newer, `?around=<created_at>_<id>` includes an activity
+/// target, and `?latest=1` jumps to the newest page.
 #[derive(Debug, Deserialize, Default)]
 pub struct ThreadQuery {
     #[serde(default)]
@@ -460,6 +472,8 @@ pub struct ThreadQuery {
     pub after: Option<String>,
     #[serde(default)]
     pub latest: Option<String>,
+    #[serde(default)]
+    pub around: Option<String>,
     #[serde(default)]
     pub quote: Option<String>,
 }
@@ -501,14 +515,23 @@ pub async fn thread(
     let anchor = resolve_anchor(&q);
     let mut fetched = state
         .store
-        .replies_page(
-            &id,
-            &op_id,
-            accepted_id,
-            &anchor,
-            REPLIES_PER_PAGE + 1,
-        )
+        .replies_page(&id, &op_id, accepted_id, &anchor, REPLIES_PER_PAGE + 1)
         .await?;
+    let around_has_newer = if let ReplyAnchor::Around(ts, post_id) = &anchor {
+        !state
+            .store
+            .replies_page(
+                &id,
+                &op_id,
+                accepted_id,
+                &ReplyAnchor::After(*ts, post_id.clone()),
+                1,
+            )
+            .await?
+            .is_empty()
+    } else {
+        false
+    };
     let has_more = fetched.len() as i64 > REPLIES_PER_PAGE;
     fetched.truncate(REPLIES_PER_PAGE as usize);
     let (replies, has_older, has_newer) = match anchor {
@@ -525,6 +548,10 @@ pub async fn thread(
         ReplyAnchor::Latest => {
             fetched.reverse();
             (fetched, has_more, false)
+        }
+        ReplyAnchor::Around(..) => {
+            fetched.reverse();
+            (fetched, has_more, around_has_newer)
         }
     };
     // Cursors come from the visible page bounds (ascending: first = oldest, last = newest).
@@ -675,7 +702,11 @@ pub async fn thread(
                 r#"<b>{verb}</b><span>{context} &quot;{}&quot;</span>"#,
                 esc(&thread.title),
                 verb = if is_question { "Answer" } else { "Reply" },
-                context = if is_question { "answering" } else { "replying to" },
+                context = if is_question {
+                    "answering"
+                } else {
+                    "replying to"
+                },
             ),
         );
         format!(
@@ -716,9 +747,12 @@ pub async fn thread(
     }
     if is_question {
         if valid_accepted_id.is_empty() {
-            badges.push_str(r#" <span class="badge ag-answer-state ag-answer-state--open">Needs answer</span>"#);
+            badges.push_str(
+                r#" <span class="badge ag-answer-state ag-answer-state--open">Needs answer</span>"#,
+            );
         } else {
-            badges.push_str(r#" <span class="badge badge-accepted ag-answer-state">Answered</span>"#);
+            badges
+                .push_str(r#" <span class="badge badge-accepted ag-answer-state">Answered</span>"#);
         }
     }
     let category_chip = category
@@ -775,7 +809,8 @@ pub async fn thread(
         reply = reply_form,
     );
 
-    let html = render_page(&thread.title, &email_display(&headers), &content);
+    let unread = unread_activity_count(&state, &headers).await?;
+    let html = render_page_with_activity(&thread.title, &email_display(&headers), &content, unread);
     Ok(html_response(html, set_cookie))
 }
 
@@ -859,7 +894,11 @@ pub async fn new_form(
 </section>
 {script}"#,
         csrf = esc(&csrf),
-        page_title = if is_question { "Ask a question" } else { "New thread" },
+        page_title = if is_question {
+            "Ask a question"
+        } else {
+            "New thread"
+        },
         page_note = if is_question {
             "Describe the problem clearly so the community can propose a reusable answer."
         } else {
@@ -872,14 +911,24 @@ pub async fn new_form(
         options = options,
         maxt = MAX_TITLE,
         hint = markdown_hint(),
-        submit_label = if is_question { "Ask question" } else { "Create thread" },
+        submit_label = if is_question {
+            "Ask question"
+        } else {
+            "Create thread"
+        },
         script = SIMILAR_SCRIPT,
     );
 
-    let html = render_page(
-        if is_question { "Ask a question" } else { "New thread" },
+    let unread = unread_activity_count(&state, &headers).await?;
+    let html = render_page_with_activity(
+        if is_question {
+            "Ask a question"
+        } else {
+            "New thread"
+        },
         &email_display(&headers),
         &content,
+        unread,
     );
     Ok(html_response(html, set_cookie))
 }
@@ -962,15 +1011,10 @@ pub async fn create(
         author_email: author.email,
         created_at: now,
     };
-    state.store.create_thread(&thread, &first_post).await?;
+    let mentions = extract_mentions(&first_post.body_md);
     state
         .store
-        .replace_mentions(
-            &first_post.id,
-            &thread.id,
-            &extract_mentions(&first_post.body_md),
-            first_post.created_at,
-        )
+        .create_thread_with_activity(&thread, &first_post, &mentions, &new_id("a"))
         .await?;
     tracing::info!(
         thread = thread.id,
@@ -1071,15 +1115,10 @@ pub async fn reply(
         author_email: author.email,
         created_at: now,
     };
-    state.store.add_reply(&post).await?;
-    state
+    let mentions = extract_mentions(&post.body_md);
+    let activity = state
         .store
-        .replace_mentions(
-            &post.id,
-            &id,
-            &extract_mentions(&post.body_md),
-            post.created_at,
-        )
+        .add_reply_with_activity(&post, &mentions, &new_id("a"))
         .await?;
     tracing::info!(thread = id, author = post.author_email, "reply posted");
 
@@ -1091,7 +1130,7 @@ pub async fn reply(
     state
         .audit
         .emit(AuditEvent::info("reply.create", actor, &post.id, &id));
-    notify_reply(&state, &thread, quoted_post.as_ref(), &post);
+    notify_reply(&state, &thread, &post, &activity.delivery_subjects);
 
     Ok(redirect_to(&format!("/t/{id}")))
 }
@@ -1148,7 +1187,8 @@ pub async fn edit_thread_form(
         &format!("/t/{}", esc(&thread.id)),
         &headers,
     );
-    let html = render_page("Edit thread", &email_display(&headers), &content);
+    let unread = unread_activity_count(&state, &headers).await?;
+    let html = render_page_with_activity("Edit thread", &email_display(&headers), &content, unread);
     Ok(html_response(html, set_cookie))
 }
 
@@ -1318,7 +1358,8 @@ pub async fn edit_reply_form(
         &format!("/t/{}", esc(&tid)),
         &headers,
     );
-    let html = render_page("Edit reply", &email_display(&headers), &content);
+    let unread = unread_activity_count(&state, &headers).await?;
+    let html = render_page_with_activity("Edit reply", &email_display(&headers), &content, unread);
     Ok(html_response(html, set_cookie))
 }
 
@@ -1524,9 +1565,17 @@ pub async fn accept_answer(
             ));
         }
     };
-    let mutation = state.store.mutate_accepted_answer(&tid, action).await?;
+    let mutation = state
+        .store
+        .mutate_accepted_answer_with_activity(&tid, action, &new_id("a"), &author.sub, now_secs())
+        .await?;
     let new_accepted = mutation.thread.accepted_post_id.as_str();
-    tracing::info!(thread = tid, accepted = new_accepted, changed = mutation.changed, "accepted answer command applied");
+    tracing::info!(
+        thread = tid,
+        accepted = new_accepted,
+        changed = mutation.changed,
+        "accepted answer command applied"
+    );
 
     let actor = if author.email.is_empty() {
         &author.sub
@@ -1568,13 +1617,15 @@ pub async fn accept_answer(
 }
 
 // ===========================================================================
-// POST /t/{id}/subscribe — toggle current user's thread subscription
+// POST /t/{id}/subscribe — explicitly follow/unfollow a thread
 // ===========================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct SubscribeForm {
     #[serde(default)]
     pub csrf: String,
+    #[serde(default)]
+    pub action: String,
 }
 
 pub async fn toggle_subscription(
@@ -1591,9 +1642,18 @@ pub async fn toggle_subscription(
         .await?
         .ok_or_else(|| AppError::NotFound("thread not found".to_string()))?;
 
-    let subscribed = state
+    let subscribed = match form.action.trim() {
+        "follow" => true,
+        "unfollow" => false,
+        _ => {
+            return Err(AppError::InvalidRequest(
+                "follow action must be follow or unfollow".to_string(),
+            ));
+        }
+    };
+    state
         .store
-        .toggle_thread_subscription(&tid, &author.sub, now_secs())
+        .set_thread_subscription(&tid, &author.sub, subscribed, now_secs())
         .await?;
     let actor = if author.email.is_empty() {
         &author.sub
@@ -1727,12 +1787,7 @@ fn render_thread_list_controls(
     )
 }
 
-fn list_href(
-    action: &str,
-    sort: &str,
-    status: Option<&str>,
-    subscribed: bool,
-) -> String {
+fn list_href(action: &str, sort: &str, status: Option<&str>, subscribed: bool) -> String {
     let mut params = vec![format!("sort={sort}")];
     if let Some(status) = status {
         params.push(format!("status={status}"));
@@ -1754,50 +1809,6 @@ fn thread_list_title(q: &ThreadListQuery, fallback: &'static str) -> &'static st
     }
 }
 
-async fn render_mentions_panel(state: &AppState, headers: &HeaderMap) -> Result<String, AppError> {
-    let Some(username) = mention_username_from_headers(headers) else {
-        return Ok(String::new());
-    };
-    let count = state.store.count_mentions_for_user(&username).await?;
-    if count == 0 {
-        return Ok(String::new());
-    }
-    let mentions = state
-        .store
-        .mentions_for_user(&username, MENTION_LIMIT)
-        .await?;
-    let mut rows = String::new();
-    for mention in mentions {
-        if let Some(thread) = state.store.get_thread(&mention.thread_id).await? {
-            rows.push_str(&format!(
-                r##"<a class="thread-row" href="/t/{tid}#post-{pid}">
-  <span class="thread-row__main">
-    <span class="thread-row__title">{title}</span>
-    <span class="thread-row__sub">@{user} mentioned you</span>
-  </span>
-  <span class="thread-row__time">{when}</span>
-</a>"##,
-                tid = esc(&mention.thread_id),
-                pid = esc(&mention.post_id),
-                title = esc(&thread.title),
-                user = esc(&mention.mentioned_username),
-                when = esc(&fmt_ts(mention.created_at)),
-            ));
-        }
-    }
-    if rows.is_empty() {
-        return Ok(String::new());
-    }
-    Ok(format!(
-        r#"<section class="section mentions">
-  <h2 class="section__title mentions__title">Mentions <span class="badge mention-badge">@{count}</span></h2>
-  <div class="ag-mentions-list">{rows}</div>
-</section>"#,
-        count = count,
-        rows = rows,
-    ))
-}
-
 fn render_subscription_form(thread_id: &str, csrf: &str, subscribed: bool) -> String {
     let label = if subscribed { "Unfollow" } else { "Follow" };
     let class = if subscribed {
@@ -1805,13 +1816,16 @@ fn render_subscription_form(thread_id: &str, csrf: &str, subscribed: bool) -> St
     } else {
         "btn btn-ghost btn-sm"
     };
+    let action = if subscribed { "unfollow" } else { "follow" };
     format!(
         r#"<form class="inline-form subscription-form" method="post" action="/t/{tid}/subscribe" data-wire data-wire-target=".subscription-form" data-wire-err="Could not update your subscription">
   <input type="hidden" name="csrf" value="{csrf}">
+  <input type="hidden" name="action" value="{action}">
   <button class="{class}" type="submit">{label}</button>
 </form>"#,
         tid = esc(thread_id),
         csrf = esc(csrf),
+        action = action,
         class = class,
         label = label,
     )
@@ -1908,12 +1922,6 @@ fn render_quote_block(post: &Post, quoted_posts: &HashMap<String, Post>) -> Stri
     )
 }
 
-fn mention_username_from_headers(headers: &HeaderMap) -> Option<String> {
-    auth::identity_email(headers)
-        .and_then(|email| email.split('@').next().and_then(normalize_mention_name))
-        .or_else(|| auth::identity_subject(headers).and_then(|sub| normalize_mention_name(&sub)))
-}
-
 fn extract_mentions(body: &str) -> Vec<String> {
     let bytes = body.as_bytes();
     let mut out = Vec::new();
@@ -1944,13 +1952,7 @@ fn extract_mentions(body: &str) -> Vec<String> {
     out
 }
 
-fn notify_reply(state: &AppState, thread: &Thread, quoted_post: Option<&Post>, post: &Post) {
-    let recipient_sub = quoted_post
-        .map(|p| p.author_sub.as_str())
-        .unwrap_or(thread.author_sub.as_str());
-    if recipient_sub == post.author_sub {
-        return;
-    }
+fn notify_reply(state: &AppState, thread: &Thread, post: &Post, recipient_subjects: &[String]) {
     let Some(klaxon) = &state.klaxon else {
         return;
     };
@@ -1959,7 +1961,12 @@ fn notify_reply(state: &AppState, thread: &Thread, quoted_post: Option<&Post>, p
     let title = format!("{actor} 回复了「{}」", truncate_chars(&thread.title, 80));
     let body = compact_snippet(&post.body_md, 180);
     let url = forum_thread_url(&thread.id);
-    klaxon.notify("agora", recipient_sub, &title, &body, &url);
+    for recipient_sub in recipient_subjects
+        .iter()
+        .take(MAX_KLAXON_RECIPIENTS_PER_REPLY)
+    {
+        klaxon.notify("agora", recipient_sub, &title, &body, &url);
+    }
 }
 
 fn notify_accepted_answer(
@@ -2014,22 +2021,7 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 }
 
 fn normalize_mention_name(raw: &str) -> Option<String> {
-    let s = raw.trim().trim_start_matches('@');
-    if s.is_empty() || s.len() > 64 {
-        return None;
-    }
-    if !s
-        .bytes()
-        .next()
-        .map(|b| b.is_ascii_alphanumeric())
-        .unwrap_or(false)
-    {
-        return None;
-    }
-    if !s.bytes().all(is_mention_char) {
-        return None;
-    }
-    Some(s.to_ascii_lowercase())
+    crate::store::normalize_activity_alias(raw)
 }
 
 fn is_mention_char(b: u8) -> bool {
@@ -2282,9 +2274,8 @@ pub(crate) fn order_posts_accepted_first(posts: &[Post], accepted_post_id: &str)
     ordered
 }
 
-/// Resolve the requested reply page from the query cursors. `latest` wins, then `before` (older),
-/// then `after` (newer); a missing/malformed cursor falls back to the first (oldest) page — the
-/// default view, so a bare `GET /t/{id}` is unchanged.
+/// Resolve the requested reply page from the query cursors. `latest` wins, then the exact activity
+/// target (`around`), then `before`/`after`; malformed cursors fall back to the oldest page.
 fn resolve_anchor(q: &ThreadQuery) -> ReplyAnchor {
     if q.latest
         .as_deref()
@@ -2292,6 +2283,9 @@ fn resolve_anchor(q: &ThreadQuery) -> ReplyAnchor {
         .unwrap_or(false)
     {
         return ReplyAnchor::Latest;
+    }
+    if let Some((ts, id)) = parse_cursor(q.around.as_deref()) {
+        return ReplyAnchor::Around(ts, id);
     }
     if let Some((ts, id)) = parse_cursor(q.before.as_deref()) {
         return ReplyAnchor::Before(ts, id);

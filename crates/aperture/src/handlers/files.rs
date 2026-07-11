@@ -27,7 +27,8 @@ use crate::handlers::{
     share_room_html_with_csrf, sniff_verified_upload_type, userbox, FILE_SVG, SHIELD_SVG,
 };
 use crate::model::{
-    FileComment, FileRec, FolderRec, UploadRequestRec, UploadSubmission, VersionRec,
+    library_type_for, FileComment, FileRec, FolderRec, LibraryCursor, LibraryItem, LibraryItemKind,
+    LibraryQuery, LibraryType, LibraryView, UploadRequestRec, UploadSubmission, VersionRec,
 };
 use crate::store::{
     FolderDelete, UploadReserve, UploadReserveInput, DEFAULT_REQUEST_ALLOWED_TYPES,
@@ -56,6 +57,9 @@ const MAX_NAME_CHARS: usize = 255;
 const MAX_COMMENT_CHARS: usize = 2000;
 /// Hard cap on a submitted share-link password (characters).
 const MAX_PASSWORD_CHARS: usize = 128;
+/// Search is metadata-only and owner-scoped; bounding the literal keeps URLs, SQL work and rendered
+/// controls predictable without inventing a separate search service.
+const MAX_LIBRARY_QUERY_CHARS: usize = 128;
 /// Hard cap on the byte prefix rendered inline for a text/markdown preview (256 KiB). Larger files
 /// still preview, but the tail is elided with a note.
 const MAX_TEXT_PREVIEW_BYTES: usize = 256 * 1024;
@@ -103,6 +107,12 @@ pub struct GalleryQuery {
     /// Optional view selector. `view=trash` renders the owner's recycle bin instead of live files.
     #[serde(default)]
     pub view: Option<String>,
+    /// Literal, case-insensitive file/folder name search across the signed-in owner's whole tree.
+    #[serde(default)]
+    pub q: Option<String>,
+    /// Stable owner-facing type group (`type` is kept in the URL for readable/shareable filters).
+    #[serde(default, rename = "type")]
+    pub type_filter: Option<String>,
 }
 
 /// `GET /` — render the upload dropzone (with a fresh CSRF token) and one keyset page of the
@@ -112,18 +122,16 @@ pub async fn gallery(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(q): Query<GalleryQuery>,
-) -> Response {
+) -> Result<Response, AppError> {
     let who = auth::identity(&headers);
     let csrf = auth::new_csrf_token();
-    let before = parse_cursor(q.before.as_deref());
     // Same clamp the store applies, so `files.len() == limit` below is an exact "page was full" test.
     let limit = clamp_page(q.limit.unwrap_or(0));
+    let search = clean_library_query(q.q.as_deref())?;
+    let type_filter = parse_library_type(q.type_filter.as_deref())?;
+    let library_view = parse_library_view(q.view.as_deref())?;
 
-    let folders = state
-        .store
-        .list_folders(&who.subject)
-        .await
-        .unwrap_or_default();
+    let folders = state.store.list_folders(&who.subject).await?;
     // The active folder must belong to the owner; an unknown/blank id falls back to all files.
     let active = q
         .folder
@@ -131,46 +139,60 @@ pub async fn gallery(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .and_then(|fid| folders.iter().find(|f| f.id == fid).cloned());
-    let folder_filter = active.as_ref().map(|f| f.id.as_str());
+    // The usage meter: total stored bytes vs. the effective quota (override else default).
+    let used = state.store.usage_for_owner(&who.subject).await?;
+    let quota = effective_quota(
+        state.store.get_quota(&who.subject).await?,
+        state.config.default_quota_bytes,
+    );
 
+    if q.view.as_deref().is_some_and(|view| view.trim() == "trash") {
+        let trashed = state.store.list_trashed_by_owner(&who.subject).await?;
+        let html =
+            render_trash_gallery(&state.config, &who, &csrf, &trashed, &folders, used, quota);
+        return Ok(html_with_csrf(StatusCode::OK, html, &csrf));
+    }
+
+    let library_mode =
+        library_view != LibraryView::All || search.is_some() || type_filter != LibraryType::All;
+    if library_mode {
+        let before = parse_library_cursor(q.before.as_deref())?;
+        let query = LibraryQuery {
+            view: library_view,
+            query: search,
+            type_filter,
+            before,
+            limit,
+        };
+        let page = state.store.query_library(&who.subject, &query).await?;
+        let html = render_library_gallery(LibraryRender {
+            config: &state.config,
+            who: &who,
+            csrf: &csrf,
+            items: &page.items,
+            next: page.next.as_ref(),
+            folders: &folders,
+            query: &query,
+            used,
+            quota,
+        });
+        return Ok(html_with_csrf(StatusCode::OK, html, &csrf));
+    }
+
+    let before = parse_cursor(q.before.as_deref());
+    let folder_filter = active.as_ref().map(|f| f.id.as_str());
     let files = state
         .store
         .list_by_owner(&who.subject, folder_filter, before, limit)
-        .await
-        .unwrap_or_default();
+        .await?;
 
-    // A FULL page means older rows may remain: the next cursor is the last (oldest) row shown.
+    // Legacy folder browsing keeps its existing cursor contract. Library views use an exact
+    // look-ahead page returned by Store.
     let next = if files.len() as i64 == limit {
         files.last().map(|f| (f.created_at, f.id.clone()))
     } else {
         None
     };
-
-    // The usage meter: total stored bytes vs. the effective quota (override else default).
-    let used = state
-        .store
-        .usage_for_owner(&who.subject)
-        .await
-        .unwrap_or_default();
-    let quota = effective_quota(
-        state
-            .store
-            .get_quota(&who.subject)
-            .await
-            .unwrap_or_default(),
-        state.config.default_quota_bytes,
-    );
-
-    if q.view.as_deref() == Some("trash") {
-        let trashed = state
-            .store
-            .list_trashed_by_owner(&who.subject)
-            .await
-            .unwrap_or_default();
-        let html =
-            render_trash_gallery(&state.config, &who, &csrf, &trashed, &folders, used, quota);
-        return html_with_csrf(StatusCode::OK, html, &csrf);
-    }
 
     let html = render_gallery(
         &state.config,
@@ -183,7 +205,71 @@ pub async fn gallery(
         used,
         quota,
     );
-    html_with_csrf(StatusCode::OK, html, &csrf)
+    Ok(html_with_csrf(StatusCode::OK, html, &csrf))
+}
+
+fn clean_library_query(raw: Option<&str>) -> Result<Option<String>, AppError> {
+    let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.chars().count() > MAX_LIBRARY_QUERY_CHARS || value.chars().any(char::is_control) {
+        return Err(AppError::BadRequest(format!(
+            "Search text must be at most {MAX_LIBRARY_QUERY_CHARS} characters."
+        )));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn parse_library_view(raw: Option<&str>) -> Result<LibraryView, AppError> {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some("all") | Some("trash") => Ok(LibraryView::All),
+        Some("recent") => Ok(LibraryView::Recent),
+        Some("shared") => Ok(LibraryView::Shared),
+        Some(_) => Err(AppError::BadRequest("Unknown library view.".to_string())),
+    }
+}
+
+fn parse_library_type(raw: Option<&str>) -> Result<LibraryType, AppError> {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some("all") => Ok(LibraryType::All),
+        Some("folder") => Ok(LibraryType::Folder),
+        Some("image") => Ok(LibraryType::Image),
+        Some("video") => Ok(LibraryType::Video),
+        Some("audio") => Ok(LibraryType::Audio),
+        Some("pdf") => Ok(LibraryType::Pdf),
+        Some("document") => Ok(LibraryType::Document),
+        Some("archive") => Ok(LibraryType::Archive),
+        Some("other") => Ok(LibraryType::Other),
+        Some(_) => Err(AppError::BadRequest(
+            "Unknown file type filter.".to_string(),
+        )),
+    }
+}
+
+fn parse_library_cursor(raw: Option<&str>) -> Result<Option<LibraryCursor>, AppError> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let mut parts = raw.splitn(3, '_');
+    let updated_at = parts.next().and_then(|part| part.parse::<i64>().ok());
+    let kind = match parts.next() {
+        Some("file") => Some(LibraryItemKind::File),
+        Some("folder") => Some(LibraryItemKind::Folder),
+        _ => None,
+    };
+    let id = parts.next().filter(|id| {
+        !id.is_empty() && id.len() <= 64 && id.chars().all(|ch| ch.is_ascii_alphanumeric())
+    });
+    match (updated_at, kind, id) {
+        (Some(updated_at), Some(kind), Some(id)) => Ok(Some(LibraryCursor {
+            updated_at,
+            kind,
+            id: id.to_string(),
+        })),
+        _ => Err(AppError::BadRequest(
+            "This result cursor is invalid. Start again from the first page.".to_string(),
+        )),
+    }
 }
 
 /// Parse a `?before=<created_at>_<id>` keyset cursor. Ids are alphanumeric (never contain `_`) and
@@ -347,6 +433,7 @@ pub async fn upload(
         // from the detail page.
         share_token: None,
         created_at: now,
+        updated_at: now,
         expires_at: None,
         share_password_hash: None,
         // A fresh upload lands at the level it was uploaded into (root when unset).
@@ -445,7 +532,7 @@ async fn reupload_as_version(
         return Err(e.into());
     }
 
-    // Repoint the file to the new blob (bumps created_at + content type to the new bytes').
+    // Repoint the file to the new blob (preserves creation time and bumps owner-visible activity).
     state
         .store
         .update_file_blob(
@@ -963,7 +1050,7 @@ pub async fn delete_comment(
             "Only the file owner or an admin can delete comments.".to_string(),
         ));
     }
-    state.store.delete_comment(&comment.id).await?;
+    state.store.delete_comment(&comment.id, &rec.id).await?;
     tracing::info!(
         id = rec.id,
         comment = comment.id,
@@ -1417,6 +1504,7 @@ async fn upload_inbox_submit_inner(
         // them. Possession of an upload capability never creates a read capability.
         share_token: None,
         created_at: now,
+        updated_at: now,
         expires_at: None,
         share_password_hash: None,
         folder_id: Some(request.folder_id.clone()),
@@ -1990,12 +2078,14 @@ pub async fn create_folder(
         }
     };
 
+    let now = now_secs();
     let mut rec = FolderRec {
         id: String::new(),
         owner_sub: actor.subject.clone(),
         parent_id,
         name,
-        created_at: now_secs(),
+        created_at: now,
+        updated_at: now,
         // A fresh folder has no public share link until the owner creates one.
         share_token: None,
         expires_at: None,
@@ -3023,6 +3113,287 @@ fn render_folder_tiles(children: &[&FolderRec], up_href: Option<&str>) -> String
     out
 }
 
+fn url_component(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
+fn library_href(query: &LibraryQuery, before: Option<&LibraryCursor>) -> String {
+    let mut params = Vec::new();
+    if query.view != LibraryView::All {
+        params.push(format!("view={}", query.view.slug()));
+    }
+    if let Some(value) = query.query.as_deref() {
+        params.push(format!("q={}", url_component(value)));
+    }
+    if query.type_filter != LibraryType::All {
+        params.push(format!("type={}", query.type_filter.slug()));
+    }
+    if let Some(cursor) = before {
+        params.push(format!(
+            "before={}_{}_{}",
+            cursor.updated_at,
+            cursor.kind.slug(),
+            cursor.id
+        ));
+        params.push(format!("limit={}", clamp_page(query.limit)));
+    }
+    if params.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/?{}", params.join("&"))
+    }
+}
+
+fn render_library_controls(query: &LibraryQuery) -> String {
+    const TYPES: &[LibraryType] = &[
+        LibraryType::All,
+        LibraryType::Folder,
+        LibraryType::Image,
+        LibraryType::Video,
+        LibraryType::Audio,
+        LibraryType::Pdf,
+        LibraryType::Document,
+        LibraryType::Archive,
+        LibraryType::Other,
+    ];
+    let options = TYPES
+        .iter()
+        .map(|value| {
+            let selected = if *value == query.type_filter {
+                " selected"
+            } else {
+                ""
+            };
+            format!(
+                "<option value=\"{}\"{}>{}</option>",
+                value.slug(),
+                selected,
+                value.label()
+            )
+        })
+        .collect::<String>();
+    let hidden_view = if query.view == LibraryView::All {
+        String::new()
+    } else {
+        format!(
+            "<input type=\"hidden\" name=\"view\" value=\"{}\">",
+            query.view.slug()
+        )
+    };
+    let clear = if query.query.is_some() || query.type_filter != LibraryType::All {
+        let base = LibraryQuery {
+            view: query.view,
+            query: None,
+            type_filter: LibraryType::All,
+            before: None,
+            limit: query.limit,
+        };
+        format!(
+            "<a class=\"btn btn-ghost btn-sm\" href=\"{}\">Clear</a>",
+            esc(&library_href(&base, None))
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "<form class=\"ap-library-search\" method=\"get\" action=\"/\" role=\"search\">\
+           {hidden_view}\
+           <label class=\"sr-only\" for=\"libraryQuery\">Search file and folder names</label>\
+           <div class=\"ap-library-search__field\">\
+             <svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" aria-hidden=\"true\"><circle cx=\"11\" cy=\"11\" r=\"7\"/><path d=\"m20 20-4-4\"/></svg>\
+             <input id=\"libraryQuery\" type=\"search\" name=\"q\" value=\"{value}\" maxlength=\"{max}\" placeholder=\"Search names across your drive\">\
+           </div>\
+           <label class=\"sr-only\" for=\"libraryType\">File type</label>\
+           <select id=\"libraryType\" name=\"type\">{options}</select>\
+           <button class=\"btn btn-primary btn-sm\" type=\"submit\">Search</button>\
+           {clear}\
+         </form>",
+        hidden_view = hidden_view,
+        value = esc(query.query.as_deref().unwrap_or_default()),
+        max = MAX_LIBRARY_QUERY_CHARS,
+        options = options,
+        clear = clear,
+    )
+}
+
+fn render_library_badges(item: &LibraryItem) -> String {
+    if !item.shared {
+        return "<span class=\"ap-badges\"></span>".to_string();
+    }
+    let mut badges = String::from(
+        "<span class=\"ap-badges\"><span class=\"ap-badge ap-badge--link\">Shared by me</span>",
+    );
+    if item.share_expired {
+        badges.push_str("<span class=\"ap-badge ap-badge--expired\">Expired</span>");
+    }
+    if item.share_protected {
+        badges.push_str("<span class=\"ap-badge ap-badge--lock\">Password</span>");
+    }
+    badges.push_str("</span>");
+    badges
+}
+
+fn render_library_cards(items: &[LibraryItem], folders: &[FolderRec]) -> String {
+    items
+        .iter()
+        .map(|item| {
+            let location = item
+                .parent_id
+                .as_deref()
+                .and_then(|id| folders.iter().find(|folder| folder.id == id))
+                .map(|folder| folder.name.as_str())
+                .unwrap_or("My Drive");
+            let updated = fmt_ts(item.updated_at);
+            let badges = render_library_badges(item);
+            match item.kind {
+                LibraryItemKind::Folder => format!(
+                    "<li class=\"file-card file-card--folder ap-library-item\">\
+                       <a class=\"file-card__link\" href=\"/?folder={id}\"><span class=\"thumb thumb--folder\">{folder_svg}</span></a>\
+                       <div class=\"file-card__body\">\
+                         <div class=\"ap-name-row\"><a class=\"file-card__name\" href=\"/?folder={id}\" title=\"{name}\">{name}</a></div>\
+                         <div class=\"file-card__meta\">{badges}<span class=\"ap-location\">In {location}</span><time class=\"ap-date\" data-spark-reltime data-ts=\"{ts}\" title=\"{updated}\">{updated}</time></div>\
+                       </div>\
+                     </li>",
+                    id = esc(&item.id),
+                    name = esc(&item.name),
+                    folder_svg = FOLDER_SVG,
+                    badges = badges,
+                    location = esc(location),
+                    ts = item.updated_at,
+                    updated = esc(&updated),
+                ),
+                LibraryItemKind::File => {
+                    let content_type = item.content_type.as_deref().unwrap_or_default();
+                    let tone = ap_tone_class(content_type);
+                    let file_type = library_type_for(content_type).slug();
+                    let thumb = if library_type_for(content_type) == LibraryType::Image {
+                        format!(
+                            "<span class=\"thumb thumb--image\"><img src=\"/d/{id}/thumb\" alt=\"{name}\" loading=\"lazy\"></span>",
+                            id = esc(&item.id),
+                            name = esc(&item.name),
+                        )
+                    } else {
+                        format!(
+                            "<span class=\"thumb thumb--file {tone}\"><span class=\"thumb__glyph\">{glyph}</span><span class=\"thumb__ext {tone}\">{ext}</span></span>",
+                            tone = tone,
+                            glyph = FILE_SVG,
+                            ext = esc(&ext_label(&item.name)),
+                        )
+                    };
+                    format!(
+                        "<li class=\"file-card file-card--{file_type} ap-library-item\" data-file-id=\"{id}\">\
+                           <a class=\"file-card__link\" href=\"/f/{id}\" data-wire-off>{thumb}</a>\
+                           <div class=\"file-card__body\">\
+                             <div class=\"ap-name-row\"><span class=\"ap-glyph {tone}\">{ext}</span><a class=\"file-card__name\" href=\"/f/{id}\" title=\"{name}\">{name}</a></div>\
+                             <div class=\"file-card__meta\">{badges}<span class=\"ap-size\">{size}</span><span class=\"ap-location\">In {location}</span><time class=\"ap-date\" data-spark-reltime data-ts=\"{ts}\" title=\"{updated}\">{updated}</time></div>\
+                           </div>\
+                         </li>",
+                        file_type = file_type,
+                        id = esc(&item.id),
+                        thumb = thumb,
+                        tone = tone,
+                        ext = esc(&ext_label(&item.name)),
+                        name = esc(&item.name),
+                        badges = badges,
+                        size = esc(&human_size(item.size.unwrap_or_default())),
+                        location = esc(location),
+                        ts = item.updated_at,
+                        updated = esc(&updated),
+                    )
+                }
+            }
+        })
+        .collect::<String>()
+}
+
+struct LibraryRender<'a> {
+    config: &'a Config,
+    who: &'a Identity,
+    csrf: &'a str,
+    items: &'a [LibraryItem],
+    next: Option<&'a LibraryCursor>,
+    folders: &'a [FolderRec],
+    query: &'a LibraryQuery,
+    used: i64,
+    quota: Option<i64>,
+}
+
+fn render_library_gallery(input: LibraryRender<'_>) -> String {
+    let heading = if input.query.query.is_some() {
+        "Search results"
+    } else {
+        match input.query.view {
+            LibraryView::Recent => "Recent",
+            LibraryView::Shared => "Shared by me",
+            LibraryView::All => "Filtered items",
+        }
+    };
+    let count = match input.items.len() {
+        0 => "No matches".to_string(),
+        1 => "1 item shown".to_string(),
+        value => format!("{value} items shown"),
+    };
+    let cards = if input.items.is_empty() {
+        "<li class=\"file-card file-card--empty ap-empty\"><div class=\"ap-empty__art\" aria-hidden=\"true\"></div><h3>No matching items.</h3><p>Try another name or clear a filter.</p></li>".to_string()
+    } else {
+        render_library_cards(input.items, input.folders)
+    };
+    let pager = input
+        .next
+        .map(|cursor| {
+            format!(
+                "<nav class=\"gallery-pager\" aria-label=\"Library results\"><a class=\"btn btn-ghost\" href=\"{}\">Load older</a></nav>",
+                esc(&library_href(input.query, Some(cursor)))
+            )
+        })
+        .unwrap_or_default();
+    let breadcrumb = format!(
+        "<nav class=\"breadcrumb\" aria-label=\"Library view\"><span class=\"breadcrumb__here\">{}</span></nav>",
+        esc(heading)
+    );
+    let upload = render_upload_form(input.csrf, "");
+
+    GALLERY_HTML
+        .replace("{{CSS}}", app_css())
+        .replace("{{DYNAMIC}}", dynamic_js())
+        .replace("{{SHIELD}}", SHIELD_SVG)
+        .replace("{{USERBOX}}", &userbox("Drive", Some(&input.who.email)))
+        .replace("{{USAGE}}", &render_usage_meter(input.used, input.quota))
+        .replace("{{UPLOAD}}", &upload)
+        .replace(
+            "{{SIDEBAR}}",
+            &render_sidebar(
+                input.config,
+                input.csrf,
+                input.folders,
+                None,
+                false,
+                Some(input.query.view),
+            ),
+        )
+        .replace(
+            "{{LIBRARY_CONTROLS}}",
+            &render_library_controls(input.query),
+        )
+        .replace("{{BREADCRUMB}}", &breadcrumb)
+        .replace("{{FOLDERS_SECTION}}", "")
+        .replace("{{ITEMS_LABEL}}", "Items")
+        .replace("{{COUNT}}", &esc(&count))
+        .replace("{{CARDS}}", &cards)
+        .replace("{{PAGER}}", &pager)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_gallery(
     config: &Config,
@@ -3094,6 +3465,13 @@ fn render_gallery(
     };
     let upload_folder = active.map(|a| a.id.clone()).unwrap_or_default();
     let upload = render_upload_form(csrf, &upload_folder);
+    let controls = LibraryQuery {
+        view: LibraryView::All,
+        query: None,
+        type_filter: LibraryType::All,
+        before: None,
+        limit: crate::config::DEFAULT_PAGE,
+    };
 
     GALLERY_HTML
         .replace("{{CSS}}", app_css())
@@ -3104,10 +3482,12 @@ fn render_gallery(
         .replace("{{UPLOAD}}", &upload)
         .replace(
             "{{SIDEBAR}}",
-            &render_sidebar(config, csrf, folders, active, false),
+            &render_sidebar(config, csrf, folders, active, false, None),
         )
+        .replace("{{LIBRARY_CONTROLS}}", &render_library_controls(&controls))
         .replace("{{BREADCRUMB}}", &breadcrumb)
         .replace("{{FOLDERS_SECTION}}", &folder_section)
+        .replace("{{ITEMS_LABEL}}", "Files")
         .replace("{{COUNT}}", &esc(&count))
         .replace("{{CARDS}}", &cards)
         .replace("{{PAGER}}", &pager)
@@ -3159,6 +3539,13 @@ fn render_trash_gallery(
     };
     let breadcrumb =
         "<nav class=\"breadcrumb\" aria-label=\"Folder path\"><a class=\"breadcrumb__crumb\" href=\"/\">My Drive</a><span class=\"breadcrumb__sep\" aria-hidden=\"true\">&rsaquo;</span><span class=\"breadcrumb__here\">Trash</span></nav>";
+    let controls = LibraryQuery {
+        view: LibraryView::All,
+        query: None,
+        type_filter: LibraryType::All,
+        before: None,
+        limit: crate::config::DEFAULT_PAGE,
+    };
     GALLERY_HTML
         .replace("{{CSS}}", app_css())
         .replace("{{DYNAMIC}}", dynamic_js())
@@ -3168,10 +3555,12 @@ fn render_trash_gallery(
         .replace("{{UPLOAD}}", "")
         .replace(
             "{{SIDEBAR}}",
-            &render_sidebar(config, csrf, folders, None, true),
+            &render_sidebar(config, csrf, folders, None, true, None),
         )
+        .replace("{{LIBRARY_CONTROLS}}", &render_library_controls(&controls))
         .replace("{{BREADCRUMB}}", breadcrumb)
         .replace("{{FOLDERS_SECTION}}", "")
+        .replace("{{ITEMS_LABEL}}", "Files")
         .replace("{{COUNT}}", &esc(&count))
         .replace("{{CARDS}}", &cards)
         .replace("{{PAGER}}", "")
@@ -3268,6 +3657,7 @@ fn render_sidebar(
     folders: &[FolderRec],
     active: Option<&FolderRec>,
     trash_active: bool,
+    library_active: Option<LibraryView>,
 ) -> String {
     // The new-folder form carries the current level as the hidden parent (empty = a root folder).
     let parent_id = active.map(|a| a.id.clone()).unwrap_or_default();
@@ -3331,12 +3721,22 @@ fn render_sidebar(
     };
     let chain = active.map(|a| folder_chain(folders, a)).unwrap_or_default();
     let tree = render_folder_tree(folders, active.map(|a| a.id.as_str()), &chain);
-    let all_active = if active.is_none() && !trash_active {
+    let all_active = if active.is_none() && !trash_active && library_active.is_none() {
         " is-active"
     } else {
         ""
     };
     let trash_active_class = if trash_active { " is-active" } else { "" };
+    let recent_active = if library_active == Some(LibraryView::Recent) {
+        " is-active"
+    } else {
+        ""
+    };
+    let shared_active = if library_active == Some(LibraryView::Shared) {
+        " is-active"
+    } else {
+        ""
+    };
     let foot = if trash_active {
         "<p class=\"ap-rail__foot trash-note\">Trashed files stay in storage and count toward quota until deleted forever.</p>"
     } else {
@@ -3351,6 +3751,14 @@ fn render_sidebar(
            </a>\
            {tree}\
            <div class=\"ap-rail__rule\" aria-hidden=\"true\"></div>\
+           <a class=\"ap-nav__row{recent_active}\" href=\"/?view=recent\">\
+             <svg class=\"ap-nav__ico\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><circle cx=\"12\" cy=\"12\" r=\"9\"/><path d=\"M12 7v5l3 2\"/></svg>\
+             <span class=\"ap-nav__name\">Recent</span>\
+           </a>\
+           <a class=\"ap-nav__row{shared_active}\" href=\"/?view=shared\">\
+             <svg class=\"ap-nav__ico\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7\"/><path d=\"M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7\"/></svg>\
+             <span class=\"ap-nav__name\">Shared by me</span>\
+           </a>\
            <a class=\"ap-nav__row{trash_active_class}\" href=\"/?view=trash\">\
              <svg class=\"ap-nav__ico\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M3 6h18\"/><path d=\"M8 6V4h8v2\"/><path d=\"m19 6-1 14H6L5 6\"/></svg>\
              <span class=\"ap-nav__name\">Trash</span>\
@@ -3360,6 +3768,8 @@ fn render_sidebar(
         new_folder = new_folder,
         all_active = all_active,
         tree = tree,
+        recent_active = recent_active,
+        shared_active = shared_active,
         trash_active_class = trash_active_class,
         settings = settings,
         foot = foot,
@@ -3509,7 +3919,7 @@ fn render_cards(files: &[FileRec], csrf: &str) -> String {
         .iter()
         .map(|f| {
             let tone = ap_tone_class(&f.content_type);
-            let date = fmt_ts(f.created_at);
+            let date = fmt_ts(f.updated_at);
             let badges = render_card_badges(f);
             let kind = if f.is_video() {
                 "video"
@@ -3610,7 +4020,7 @@ fn render_cards(files: &[FileRec], csrf: &str) -> String {
                 badges = badges,
                 size = esc(&human_size(f.size)),
                 date = esc(&date),
-                created_ts = f.created_at,
+                created_ts = f.updated_at,
                 menu = menu,
             )
         })

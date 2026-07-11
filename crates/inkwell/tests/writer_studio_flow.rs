@@ -153,9 +153,12 @@ async fn explicit_intents_publish_schedule_and_preserve_edit_state() {
 
     // No intent on edit preserves the existing Published state; random legacy checkbox values do
     // not drive the transition.
+    let live_now_id = state.store.get_post("live-now").await.unwrap().id;
     let preserve = form(&[
         ("title", "Live Now Updated"),
         ("body", "updated"),
+        ("expected_version", "1"),
+        ("expected_post_id", &live_now_id),
         ("csrf_token", CSRF),
     ]);
     let (status, _, raw) = call(&state, post_json("/edit/live-now", &preserve)).await;
@@ -203,6 +206,8 @@ async fn explicit_intents_publish_schedule_and_preserve_edit_state() {
         ("title", "Later Post"),
         ("body", "retired future body"),
         ("intent", "save_draft"),
+        ("expected_version", "2"),
+        ("expected_post_id", &later.id),
         ("csrf_token", CSRF),
     ]);
     let (status, _, raw) = call(&state, post_json("/edit/later-post", &draft)).await;
@@ -265,6 +270,7 @@ async fn old_draft_publish_now_uses_actual_publication_chronology() {
         author_email: "writer@hf".to_string(),
         created_at: now - 86_400,
         updated_at: now - 86_400,
+        edit_version: 1,
         published: false,
         publish_at: 0,
         featured: false,
@@ -296,6 +302,8 @@ async fn old_draft_publish_now_uses_actual_publication_chronology() {
         ("title", "Old Draft"),
         ("body", "published today"),
         ("intent", "publish_now"),
+        ("expected_version", "1"),
+        ("expected_post_id", "old_draft_id"),
         ("csrf_token", CSRF),
     ]);
     let before_publish = now_secs();
@@ -326,6 +334,8 @@ async fn old_draft_publish_now_uses_actual_publication_chronology() {
     let preserve = form(&[
         ("title", "Old Draft preserved"),
         ("body", "saved without a state transition"),
+        ("expected_version", "2"),
+        ("expected_post_id", "old_draft_id"),
         ("csrf_token", CSRF),
     ]);
     let (status, _, _) = call(&state, post_json("/edit/old-draft", &preserve)).await;
@@ -369,6 +379,8 @@ async fn same_second_edit_rejects_old_body_chunks_by_monotonic_version() {
     let edit = form(&[
         ("title", "Versioned Post"),
         ("body", "current cache token"),
+        ("expected_version", "2"),
+        ("expected_post_id", &prior.id),
         ("csrf_token", CSRF),
     ]);
     let (status, _, _) = call(&state, post_json("/edit/versioned-post", &edit)).await;
@@ -405,6 +417,7 @@ async fn incremental_public_index_refresh_and_reads_are_bounded() {
             author_email: "writer@hf".to_string(),
             created_at: now - index,
             updated_at: now - index,
+            edit_version: 1,
             published: true,
             publish_at: 0,
             featured: false,
@@ -470,8 +483,12 @@ async fn no_js_utc_schedule_preview_and_tag_api_are_safe() {
         ),
         ("csrf_token", CSRF),
     ]);
-    let (status, _, raw) = call(&state, post_json("/api/preview", &preview)).await;
+    let (status, headers, raw) = call(&state, post_json("/api/preview", &preview)).await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get(header::CACHE_CONTROL).unwrap(),
+        "private, no-store"
+    );
     let rendered = serde_json::from_str::<Value>(&raw).unwrap()["html"]
         .as_str()
         .unwrap()

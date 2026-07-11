@@ -21,7 +21,7 @@ use crate::auth;
 use crate::config::MAX_PAGE;
 use crate::error::AppError;
 use crate::handlers::{esc, page_shell, PageShell};
-use crate::store::{Post, Settings};
+use crate::store::{Post, SavePostCommand, SavePostOutcome, Settings};
 use crate::{now_secs, AppState};
 
 const ADMIN_HTML: &str = include_str!("../../templates/admin.html");
@@ -218,7 +218,7 @@ pub async fn pin(
     let mut post = load(&state, &slug).await?;
     post.pinned = !post.pinned;
     post.bump_updated_at(now_secs());
-    state.store.update_post(&post).await?;
+    let post = save_admin_post(&state, &headers, post, "admin.pin").await?;
     tracing::info!(slug = %slug, pinned = post.pinned, "admin toggled pinned");
 
     state.audit.emit(AuditEvent::info(
@@ -244,7 +244,7 @@ pub async fn feature(
     let mut post = load(&state, &slug).await?;
     post.featured = !post.featured;
     post.bump_updated_at(now_secs());
-    state.store.update_post(&post).await?;
+    let post = save_admin_post(&state, &headers, post, "admin.feature").await?;
     tracing::info!(slug = %slug, featured = post.featured, "admin toggled featured");
 
     state.audit.emit(AuditEvent::info(
@@ -274,7 +274,7 @@ pub async fn unpublish(
     let mut post = load(&state, &slug).await?;
     post.published = false;
     post.bump_updated_at(now_secs());
-    state.store.update_post(&post).await?;
+    let post = save_admin_post(&state, &headers, post, "admin.unpublish").await?;
     tracing::info!(slug = %slug, "admin unpublished post");
 
     // A now-draft post is de-indexed from the ask index (best-effort).
@@ -346,10 +346,10 @@ pub async fn bulk(
     for slug in &slugs {
         match action.as_str() {
             "pin" | "unpin" => {
-                if let Some(mut post) = state.store.get_post(slug).await {
+                if let Some(mut post) = state.store.get_post_authoritative(slug).await? {
                     post.pinned = action == "pin";
                     post.bump_updated_at(now_secs());
-                    state.store.update_post(&post).await?;
+                    let post = save_admin_post(&state, &headers, post, "admin.pin").await?;
                     state.audit.emit(AuditEvent::info(
                         "admin.post.pin",
                         &actor,
@@ -359,10 +359,10 @@ pub async fn bulk(
                 }
             }
             "feature" | "unfeature" => {
-                if let Some(mut post) = state.store.get_post(slug).await {
+                if let Some(mut post) = state.store.get_post_authoritative(slug).await? {
                     post.featured = action == "feature";
                     post.bump_updated_at(now_secs());
-                    state.store.update_post(&post).await?;
+                    let post = save_admin_post(&state, &headers, post, "admin.feature").await?;
                     state.audit.emit(AuditEvent::info(
                         "admin.post.feature",
                         &actor,
@@ -376,10 +376,11 @@ pub async fn bulk(
                 }
             }
             "unpublish" => {
-                if let Some(mut post) = state.store.get_post(slug).await {
+                if let Some(mut post) = state.store.get_post_authoritative(slug).await? {
                     post.published = false;
                     post.bump_updated_at(now_secs());
-                    state.store.update_post(&post).await?;
+                    let post =
+                        save_admin_post(&state, &headers, post, "admin.unpublish").await?;
                     crate::reindex_post(state.store.as_ref(), &post).await;
                     state.audit.emit(AuditEvent::notice(
                         "admin.post.unpublish",
@@ -390,7 +391,7 @@ pub async fn bulk(
                 }
             }
             "delete" => {
-                if state.store.get_post(slug).await.is_some() {
+                if state.store.get_post_authoritative(slug).await?.is_some() {
                     state.store.delete_post(slug).await?;
                     crate::deindex_post(state.store.as_ref(), slug).await;
                     state.audit.emit(AuditEvent::notice(
@@ -421,9 +422,39 @@ pub async fn bulk(
 async fn load(state: &AppState, slug: &str) -> Result<Post, AppError> {
     state
         .store
-        .get_post(slug)
-        .await
+        .get_post_authoritative(slug)
+        .await?
         .ok_or_else(|| AppError::NotFound("no such post".to_string()))
+}
+
+async fn save_admin_post(
+    state: &AppState,
+    headers: &HeaderMap,
+    post: Post,
+    source: &str,
+) -> Result<Post, AppError> {
+    let expected_version = post.edit_version;
+    let editor_sub = auth::author_sub(headers).unwrap_or_else(|| "admin".to_string());
+    let editor_email = auth::author_email(headers).unwrap_or_default();
+    match state
+        .store
+        .save_post(SavePostCommand {
+            post,
+            expected_version,
+            editor_sub,
+            editor_email,
+            source: source.to_string(),
+            restored_from: None,
+            consume_autosave_session: None,
+        })
+        .await?
+    {
+        SavePostOutcome::Saved(post) => Ok(*post),
+        SavePostOutcome::Conflict { current_version } => Err(AppError::Conflict(format!(
+            "post changed before admin action (current version {current_version})"
+        ))),
+        SavePostOutcome::NotFound => Err(AppError::NotFound("no such post".to_string())),
+    }
 }
 
 /// The audit actor for an admin action: the gateway email, falling back to the subject.

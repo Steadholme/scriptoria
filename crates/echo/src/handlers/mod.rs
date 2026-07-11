@@ -171,6 +171,7 @@ pub fn error_page(status: StatusCode, message: &str) -> String {
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light">
+<link rel="icon" href="data:,">
 <title>{code} {reason} · Echo</title><style>{css}</style></head>
 <body class="page-reading">
 {topbar}

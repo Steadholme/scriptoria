@@ -20,7 +20,7 @@ use thiserror::Error;
 use crate::config::MAX_PAGE;
 
 /// A blog post (maps 1:1 to a `posts` row).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Post {
     pub id: String,
     pub slug: String,
@@ -30,6 +30,9 @@ pub struct Post {
     pub author_email: String,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Monotonic optimistic-concurrency token for authoritative mutations. Unlike `updated_at`,
+    /// this is never a wall-clock value and advances exactly once per committed post version.
+    pub edit_version: i64,
     pub published: bool,
     /// UTC epoch seconds when a published post becomes public. `0` preserves legacy immediate
     /// publication; a future value makes the post behave like a draft on public surfaces.
@@ -65,6 +68,98 @@ pub struct Post {
     pub social_description: String,
     /// Optional social-card image. It uses the same trusted Aperture URL policy as cover images.
     pub social_image: String,
+}
+
+/// An immutable full snapshot of one committed post version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PostRevision {
+    pub id: String,
+    pub post_id: String,
+    pub edit_version: i64,
+    pub title: String,
+    pub body_md: String,
+    pub published: bool,
+    pub publish_at: i64,
+    pub featured: bool,
+    pub pinned: bool,
+    pub tags: String,
+    pub cover_url: String,
+    pub custom_excerpt: String,
+    pub meta_title: String,
+    pub meta_description: String,
+    pub canonical_url: String,
+    pub social_title: String,
+    pub social_description: String,
+    pub social_image: String,
+    pub editor_sub: String,
+    pub editor_email: String,
+    pub source: String,
+    pub restored_from: Option<String>,
+    pub created_at: i64,
+}
+
+/// Lightweight history row; full bodies and metadata are fetched only for a selected revision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PostRevisionSummary {
+    pub id: String,
+    pub post_id: String,
+    pub edit_version: i64,
+    pub title: String,
+    pub body_chars: i64,
+    pub editor_email: String,
+    pub source: String,
+    pub created_at: i64,
+}
+
+/// Private, replace-in-place recovery copy for one existing-post editor session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WriterAutosave {
+    pub session_id: String,
+    pub post_id: String,
+    pub owner_sub: String,
+    pub base_version: i64,
+    pub client_seq: i64,
+    pub title: String,
+    pub body_md: String,
+    pub tags: String,
+    pub cover_url: String,
+    pub custom_excerpt: String,
+    pub meta_title: String,
+    pub meta_description: String,
+    pub canonical_url: String,
+    pub social_title: String,
+    pub social_description: String,
+    pub social_image: String,
+    pub publish_at: String,
+    pub pinned: bool,
+    pub updated_at: i64,
+    pub expires_at: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct SavePostCommand {
+    pub post: Post,
+    pub expected_version: i64,
+    pub editor_sub: String,
+    pub editor_email: String,
+    pub source: String,
+    pub restored_from: Option<String>,
+    pub consume_autosave_session: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SavePostOutcome {
+    Saved(Box<Post>),
+    Conflict { current_version: i64 },
+    NotFound,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AutosaveOutcome {
+    Saved(Box<WriterAutosave>),
+    Stale { stored_client_seq: i64 },
+    Conflict { current_version: i64 },
+    NotFound,
 }
 
 impl Post {
@@ -178,6 +273,8 @@ pub trait Store: Send + Sync {
     async fn list_posts(&self, before: Option<(i64, String)>, limit: i64) -> Vec<Post>;
     /// One post by its unique slug.
     async fn get_post(&self, slug: &str) -> Option<Post>;
+    /// Fail-closed post read for authoring commands; database errors must never look like a 404.
+    async fn get_post_authoritative(&self, slug: &str) -> Result<Option<Post>, StoreError>;
     /// Public/reader-visible keyset page (`pinned DESC, created_at DESC, id DESC`). Anonymous
     /// readers see only posts whose publish time has arrived; an author also sees their own drafts
     /// and scheduled posts.
@@ -213,6 +310,35 @@ pub trait Store: Send + Sync {
     async fn create_post(&self, post: &Post) -> Result<(), StoreError>;
     /// Update an existing post's mutable fields (title/body/published/updated_at) by slug.
     async fn update_post(&self, post: &Post) -> Result<(), StoreError>;
+    /// Compare-and-swap an authoritative post and append its resulting immutable revision in the
+    /// same store transaction. A consumed autosave is deleted only after the save succeeds.
+    async fn save_post(&self, command: SavePostCommand) -> Result<SavePostOutcome, StoreError>;
+    async fn list_post_revisions(
+        &self,
+        post_id: &str,
+        limit: i64,
+    ) -> Result<Vec<PostRevisionSummary>, StoreError>;
+    async fn get_post_revision(
+        &self,
+        post_id: &str,
+        revision_id: &str,
+    ) -> Result<Option<PostRevision>, StoreError>;
+    async fn put_writer_autosave(
+        &self,
+        autosave: WriterAutosave,
+        now: i64,
+    ) -> Result<AutosaveOutcome, StoreError>;
+    async fn get_writer_autosave(
+        &self,
+        session_id: &str,
+        owner_sub: &str,
+        now: i64,
+    ) -> Result<Option<WriterAutosave>, StoreError>;
+    async fn delete_writer_autosave(
+        &self,
+        session_id: &str,
+        owner_sub: &str,
+    ) -> Result<(), StoreError>;
     /// Delete a post by slug.
     async fn delete_post(&self, slug: &str) -> Result<(), StoreError>;
 
@@ -264,6 +390,11 @@ pub struct InMemoryStore {
     chunks: Mutex<Vec<Chunk>>,
     /// `None` until an admin saves settings; reads then fall back to [`Settings::default`].
     settings: Mutex<Option<Settings>>,
+    revisions: Mutex<Vec<PostRevision>>,
+    autosaves: Mutex<Vec<WriterAutosave>>,
+    /// Serializes multi-collection authoring commands. The post lock is held until the associated
+    /// revision/autosave work completes, so readers cannot observe half a command.
+    mutation_lock: Mutex<()>,
 }
 
 impl InMemoryStore {
@@ -302,6 +433,16 @@ impl Store for InMemoryStore {
             .iter()
             .find(|p| p.slug == slug)
             .cloned()
+    }
+
+    async fn get_post_authoritative(&self, slug: &str) -> Result<Option<Post>, StoreError> {
+        Ok(self
+            .posts
+            .lock()
+            .expect("posts lock poisoned")
+            .iter()
+            .find(|post| post.slug == slug)
+            .cloned())
     }
 
     async fn list_visible_posts(
@@ -344,10 +485,7 @@ impl Store for InMemoryStore {
 
     async fn feed_posts(&self, now: i64) -> Result<Vec<Post>, StoreError> {
         let posts = self.posts.lock().expect("posts lock poisoned");
-        let mut public: Vec<&Post> = posts
-            .iter()
-            .filter(|post| post.is_public_at(now))
-            .collect();
+        let mut public: Vec<&Post> = posts.iter().filter(|post| post.is_public_at(now)).collect();
         sort_feed_refs(&mut public);
         Ok(public
             .into_iter()
@@ -358,10 +496,7 @@ impl Store for InMemoryStore {
 
     async fn sitemap_entries(&self, now: i64) -> Result<Vec<SitemapEntry>, StoreError> {
         let posts = self.posts.lock().expect("posts lock poisoned");
-        let mut public: Vec<&Post> = posts
-            .iter()
-            .filter(|post| post.is_public_at(now))
-            .collect();
+        let mut public: Vec<&Post> = posts.iter().filter(|post| post.is_public_at(now)).collect();
         sort_feed_refs(&mut public);
         Ok(public
             .into_iter()
@@ -393,46 +528,226 @@ impl Store for InMemoryStore {
     }
 
     async fn create_post(&self, post: &Post) -> Result<(), StoreError> {
+        let _mutation = self.mutation_lock.lock().expect("mutation lock poisoned");
         let mut posts = self.posts.lock().expect("posts lock poisoned");
         if posts.iter().any(|p| p.slug == post.slug) {
             return Err(StoreError::Conflict(post.slug.clone()));
         }
-        posts.push(post.clone());
+        let mut stored = post.clone();
+        stored.edit_version = stored.edit_version.max(1);
+        let revision = revision_from_post(
+            &stored,
+            &stored.author_sub,
+            &stored.author_email,
+            "create",
+            None,
+        );
+        self.revisions
+            .lock()
+            .expect("revisions lock poisoned")
+            .push(revision);
+        posts.push(stored);
         Ok(())
     }
 
     async fn update_post(&self, post: &Post) -> Result<(), StoreError> {
-        let mut posts = self.posts.lock().expect("posts lock poisoned");
-        match posts.iter_mut().find(|p| p.slug == post.slug) {
-            Some(existing) => {
-                existing.title = post.title.clone();
-                existing.body_md = post.body_md.clone();
-                existing.published = post.published;
-                existing.publish_at = post.publish_at;
-                existing.updated_at = post.updated_at;
-                existing.featured = post.featured;
-                existing.pinned = post.pinned;
-                existing.tags = post.tags.clone();
-                existing.cover_url = post.cover_url.clone();
-                existing.custom_excerpt = post.custom_excerpt.clone();
-                existing.meta_title = post.meta_title.clone();
-                existing.meta_description = post.meta_description.clone();
-                existing.canonical_url = post.canonical_url.clone();
-                existing.social_title = post.social_title.clone();
-                existing.social_description = post.social_description.clone();
-                existing.social_image = post.social_image.clone();
-                Ok(())
-            }
-            None => Err(StoreError::Backend(format!(
+        match self
+            .save_post(SavePostCommand {
+                post: post.clone(),
+                expected_version: post.edit_version,
+                editor_sub: post.author_sub.clone(),
+                editor_email: post.author_email.clone(),
+                source: "legacy-update".to_string(),
+                restored_from: None,
+                consume_autosave_session: None,
+            })
+            .await?
+        {
+            SavePostOutcome::Saved(_) => Ok(()),
+            SavePostOutcome::Conflict { .. } => Err(StoreError::Conflict(post.slug.clone())),
+            SavePostOutcome::NotFound => Err(StoreError::Backend(format!(
                 "no post with slug {}",
                 post.slug
             ))),
         }
     }
 
-    async fn delete_post(&self, slug: &str) -> Result<(), StoreError> {
+    async fn save_post(&self, command: SavePostCommand) -> Result<SavePostOutcome, StoreError> {
+        let _mutation = self.mutation_lock.lock().expect("mutation lock poisoned");
         let mut posts = self.posts.lock().expect("posts lock poisoned");
+        let Some(index) = posts
+            .iter()
+            .position(|post| post.id == command.post.id && post.slug == command.post.slug)
+        else {
+            return Ok(SavePostOutcome::NotFound);
+        };
+        let current = posts[index].clone();
+        if current.edit_version != command.expected_version {
+            return Ok(SavePostOutcome::Conflict {
+                current_version: current.edit_version,
+            });
+        }
+
+        let mut revisions = self.revisions.lock().expect("revisions lock poisoned");
+        ensure_current_revision(
+            &mut revisions,
+            &current,
+            &command.editor_sub,
+            &command.editor_email,
+        );
+        let mut saved = command.post;
+        saved.id = current.id.clone();
+        saved.slug = current.slug.clone();
+        saved.author_sub = current.author_sub.clone();
+        saved.author_email = current.author_email.clone();
+        saved.created_at = current.created_at;
+        saved.edit_version = current.edit_version.saturating_add(1);
+        saved.updated_at = saved.updated_at.max(current.updated_at.saturating_add(1));
+        revisions.push(revision_from_post(
+            &saved,
+            &command.editor_sub,
+            &command.editor_email,
+            &command.source,
+            command.restored_from,
+        ));
+        prune_mem_revisions(&mut revisions, &saved.id);
+
+        let mut autosaves = self.autosaves.lock().expect("autosaves lock poisoned");
+        if let Some(session_id) = command.consume_autosave_session {
+            autosaves.retain(|autosave| {
+                !(autosave.session_id == session_id
+                    && autosave.owner_sub == command.editor_sub
+                    && autosave.post_id == saved.id)
+            });
+        }
+        posts[index] = saved.clone();
+        Ok(SavePostOutcome::Saved(Box::new(saved)))
+    }
+
+    async fn list_post_revisions(
+        &self,
+        post_id: &str,
+        limit: i64,
+    ) -> Result<Vec<PostRevisionSummary>, StoreError> {
+        let mut rows: Vec<PostRevisionSummary> = self
+            .revisions
+            .lock()
+            .expect("revisions lock poisoned")
+            .iter()
+            .filter(|revision| revision.post_id == post_id)
+            .map(revision_summary)
+            .collect();
+        rows.sort_by(|a, b| {
+            b.edit_version
+                .cmp(&a.edit_version)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        rows.truncate(limit.clamp(1, crate::config::REVISION_PAGE_LIMIT) as usize);
+        Ok(rows)
+    }
+
+    async fn get_post_revision(
+        &self,
+        post_id: &str,
+        revision_id: &str,
+    ) -> Result<Option<PostRevision>, StoreError> {
+        Ok(self
+            .revisions
+            .lock()
+            .expect("revisions lock poisoned")
+            .iter()
+            .find(|revision| revision.post_id == post_id && revision.id == revision_id)
+            .cloned())
+    }
+
+    async fn put_writer_autosave(
+        &self,
+        autosave: WriterAutosave,
+        now: i64,
+    ) -> Result<AutosaveOutcome, StoreError> {
+        let posts = self.posts.lock().expect("posts lock poisoned");
+        let Some(post) = posts.iter().find(|post| post.id == autosave.post_id) else {
+            return Ok(AutosaveOutcome::NotFound);
+        };
+        if post.edit_version != autosave.base_version {
+            return Ok(AutosaveOutcome::Conflict {
+                current_version: post.edit_version,
+            });
+        }
+        let mut rows = self.autosaves.lock().expect("autosaves lock poisoned");
+        // The target session is resolved before opportunistic cleanup. An expired high sequence
+        // must never reject a fresh session write with the same random id.
+        rows.retain(|row| {
+            !(row.session_id == autosave.session_id && row.expires_at <= now)
+        });
+        cleanup_expired_mem_autosaves(&mut rows, now);
+        if let Some(existing) = rows
+            .iter_mut()
+            .find(|row| row.session_id == autosave.session_id)
+        {
+            if existing.owner_sub != autosave.owner_sub || existing.post_id != autosave.post_id {
+                return Ok(AutosaveOutcome::NotFound);
+            }
+            if existing.client_seq >= autosave.client_seq {
+                return Ok(AutosaveOutcome::Stale {
+                    stored_client_seq: existing.client_seq,
+                });
+            }
+            *existing = autosave.clone();
+        } else {
+            rows.push(autosave.clone());
+        }
+        Ok(AutosaveOutcome::Saved(Box::new(autosave)))
+    }
+
+    async fn get_writer_autosave(
+        &self,
+        session_id: &str,
+        owner_sub: &str,
+        now: i64,
+    ) -> Result<Option<WriterAutosave>, StoreError> {
+        let mut rows = self.autosaves.lock().expect("autosaves lock poisoned");
+        cleanup_expired_mem_autosaves(&mut rows, now);
+        Ok(rows
+            .iter()
+            .find(|row| {
+                row.session_id == session_id
+                    && row.owner_sub == owner_sub
+                    && row.expires_at > now
+            })
+            .cloned())
+    }
+
+    async fn delete_writer_autosave(
+        &self,
+        session_id: &str,
+        owner_sub: &str,
+    ) -> Result<(), StoreError> {
+        self.autosaves
+            .lock()
+            .expect("autosaves lock poisoned")
+            .retain(|row| !(row.session_id == session_id && row.owner_sub == owner_sub));
+        Ok(())
+    }
+
+    async fn delete_post(&self, slug: &str) -> Result<(), StoreError> {
+        let _mutation = self.mutation_lock.lock().expect("mutation lock poisoned");
+        let mut posts = self.posts.lock().expect("posts lock poisoned");
+        let post_id = posts
+            .iter()
+            .find(|post| post.slug == slug)
+            .map(|post| post.id.clone());
         posts.retain(|p| p.slug != slug);
+        if let Some(post_id) = post_id {
+            self.revisions
+                .lock()
+                .expect("revisions lock poisoned")
+                .retain(|revision| revision.post_id != post_id);
+            self.autosaves
+                .lock()
+                .expect("autosaves lock poisoned")
+                .retain(|autosave| autosave.post_id != post_id);
+        }
         Ok(())
     }
 
@@ -631,6 +946,104 @@ fn rank_related_by_tags(candidates: Vec<Post>, slug: &str, tags: &str, limit: i6
     scored.into_iter().map(|(_, p)| p).collect()
 }
 
+fn revision_id(post_id: &str, edit_version: i64) -> String {
+    format!("rev_{post_id}_{edit_version}")
+}
+
+fn revision_from_post(
+    post: &Post,
+    editor_sub: &str,
+    editor_email: &str,
+    source: &str,
+    restored_from: Option<String>,
+) -> PostRevision {
+    PostRevision {
+        id: revision_id(&post.id, post.edit_version),
+        post_id: post.id.clone(),
+        edit_version: post.edit_version,
+        title: post.title.clone(),
+        body_md: post.body_md.clone(),
+        published: post.published,
+        publish_at: post.publish_at,
+        featured: post.featured,
+        pinned: post.pinned,
+        tags: post.tags.clone(),
+        cover_url: post.cover_url.clone(),
+        custom_excerpt: post.custom_excerpt.clone(),
+        meta_title: post.meta_title.clone(),
+        meta_description: post.meta_description.clone(),
+        canonical_url: post.canonical_url.clone(),
+        social_title: post.social_title.clone(),
+        social_description: post.social_description.clone(),
+        social_image: post.social_image.clone(),
+        editor_sub: editor_sub.to_string(),
+        editor_email: editor_email.to_string(),
+        source: source.to_string(),
+        restored_from,
+        created_at: post.updated_at,
+    }
+}
+
+fn revision_summary(revision: &PostRevision) -> PostRevisionSummary {
+    PostRevisionSummary {
+        id: revision.id.clone(),
+        post_id: revision.post_id.clone(),
+        edit_version: revision.edit_version,
+        title: revision.title.clone(),
+        body_chars: revision.body_md.chars().count() as i64,
+        editor_email: revision.editor_email.clone(),
+        source: revision.source.clone(),
+        created_at: revision.created_at,
+    }
+}
+
+fn ensure_current_revision(
+    revisions: &mut Vec<PostRevision>,
+    post: &Post,
+    editor_sub: &str,
+    editor_email: &str,
+) {
+    if !revisions
+        .iter()
+        .any(|revision| revision.post_id == post.id && revision.edit_version == post.edit_version)
+    {
+        revisions.push(revision_from_post(
+            post,
+            editor_sub,
+            editor_email,
+            "snapshot",
+            None,
+        ));
+    }
+}
+
+fn prune_mem_revisions(revisions: &mut Vec<PostRevision>, post_id: &str) {
+    let mut versions: Vec<i64> = revisions
+        .iter()
+        .filter(|revision| revision.post_id == post_id)
+        .map(|revision| revision.edit_version)
+        .collect();
+    versions.sort_unstable_by(|a, b| b.cmp(a));
+    if versions.len() <= crate::config::REVISION_KEEP_LIMIT {
+        return;
+    }
+    let oldest_kept = versions[crate::config::REVISION_KEEP_LIMIT - 1];
+    revisions
+        .retain(|revision| revision.post_id != post_id || revision.edit_version >= oldest_kept);
+}
+
+fn cleanup_expired_mem_autosaves(autosaves: &mut Vec<WriterAutosave>, now: i64) {
+    let mut removed = 0usize;
+    autosaves.retain(|autosave| {
+        if autosave.expires_at <= now && removed < 256 {
+            removed += 1;
+            false
+        } else {
+            true
+        }
+    });
+}
+
 // --------------------------------------------------------------------------------------
 // PostgreSQL-backed store (portable: standard SQL, runtime queries, no macros).
 // --------------------------------------------------------------------------------------
@@ -643,10 +1056,20 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
 
 const POST_COLS: &str = "SELECT id, slug, title, body_md, author_sub, author_email, \
-                         created_at, updated_at, published, publish_at, featured, pinned, \
+                         created_at, updated_at, edit_version, published, publish_at, featured, pinned, \
                          tags, cover_url, custom_excerpt, meta_title, meta_description, \
                          canonical_url, social_title, social_description, social_image \
                          FROM posts";
+const REVISION_COLS: &str = "SELECT id, post_id, edit_version, title, body_md, published, \
+                             publish_at, featured, pinned, tags, cover_url, custom_excerpt, \
+                             meta_title, meta_description, canonical_url, social_title, \
+                             social_description, social_image, editor_sub, editor_email, source, \
+                             restored_from, created_at FROM post_revisions";
+const AUTOSAVE_COLS: &str = "SELECT session_id, post_id, owner_sub, base_version, client_seq, \
+                             title, body_md, tags, cover_url, custom_excerpt, meta_title, \
+                             meta_description, canonical_url, social_title, social_description, \
+                             social_image, publish_at, pinned, updated_at, expires_at \
+                             FROM writer_autosaves";
 
 /// PostgreSQL-backed [`Store`]. Holds a `PgPool`; the async `Mutex` serializes index rebuilds so a
 /// full reindex and a per-post reindex never interleave their delete/insert.
@@ -697,6 +1120,11 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+        sqlx::query(
+            "ALTER TABLE posts ADD COLUMN IF NOT EXISTS edit_version BIGINT NOT NULL DEFAULT 1",
+        )
+        .execute(&self.pool)
+        .await?;
         // Additive scheduled-publish timestamp. `0` is the legacy immediate-publish behavior.
         sqlx::query(
             "ALTER TABLE posts ADD COLUMN IF NOT EXISTS publish_at BIGINT NOT NULL DEFAULT 0",
@@ -736,6 +1164,118 @@ impl PgStore {
             .execute(&self.pool)
             .await?;
         }
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS post_revisions (\
+                 id TEXT PRIMARY KEY, \
+                 post_id TEXT NOT NULL REFERENCES posts(id) ON DELETE CASCADE, \
+                 edit_version BIGINT NOT NULL, \
+                 title TEXT NOT NULL, body_md TEXT NOT NULL, \
+                 published BOOLEAN NOT NULL, publish_at BIGINT NOT NULL, \
+                 featured BOOLEAN NOT NULL, pinned BOOLEAN NOT NULL, \
+                 tags TEXT NOT NULL, cover_url TEXT NOT NULL, custom_excerpt TEXT NOT NULL, \
+                 meta_title TEXT NOT NULL, meta_description TEXT NOT NULL, canonical_url TEXT NOT NULL, \
+                 social_title TEXT NOT NULL, social_description TEXT NOT NULL, social_image TEXT NOT NULL, \
+                 editor_sub TEXT NOT NULL, editor_email TEXT NOT NULL, source TEXT NOT NULL, \
+                 restored_from TEXT, created_at BIGINT NOT NULL, \
+                 UNIQUE (post_id, edit_version)\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_post_revisions_post_version \
+             ON post_revisions (post_id, edit_version)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS writer_autosaves (\
+                 session_id TEXT PRIMARY KEY, \
+                 post_id TEXT NOT NULL REFERENCES posts(id) ON DELETE CASCADE, \
+                 owner_sub TEXT NOT NULL, \
+                 base_version BIGINT NOT NULL, client_seq BIGINT NOT NULL, \
+                 title TEXT NOT NULL, body_md TEXT NOT NULL, tags TEXT NOT NULL, cover_url TEXT NOT NULL, \
+                 custom_excerpt TEXT NOT NULL, meta_title TEXT NOT NULL, meta_description TEXT NOT NULL, \
+                 canonical_url TEXT NOT NULL, social_title TEXT NOT NULL, \
+                 social_description TEXT NOT NULL, social_image TEXT NOT NULL, \
+                 publish_at TEXT NOT NULL, pinned BOOLEAN NOT NULL, \
+                 updated_at BIGINT NOT NULL, expires_at BIGINT NOT NULL\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_writer_autosaves_owner_expiry \
+             ON writer_autosaves (owner_sub, expires_at)",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Forward repair is deliberately plain SQL. A rollback image can update a post without
+        // advancing `edit_version`; compare the authoritative row with its same-version snapshot,
+        // advance mismatches, then backfill the resulting current revision atomically. Legacy
+        // orphan rows (from tables created before the fresh-schema FKs) are removed first.
+        let mut repair = self.pool.begin().await?;
+        sqlx::query("SELECT id FROM posts ORDER BY id FOR UPDATE")
+            .fetch_all(&mut *repair)
+            .await?;
+        sqlx::query(
+            "DELETE FROM writer_autosaves WHERE NOT EXISTS (\
+                 SELECT 1 FROM posts WHERE posts.id = writer_autosaves.post_id\
+             )",
+        )
+        .execute(&mut *repair)
+        .await?;
+        sqlx::query(
+            "DELETE FROM post_revisions WHERE NOT EXISTS (\
+                 SELECT 1 FROM posts WHERE posts.id = post_revisions.post_id\
+             )",
+        )
+        .execute(&mut *repair)
+        .await?;
+        sqlx::query(
+            "UPDATE posts SET edit_version = posts.edit_version + 1 \
+             WHERE EXISTS (\
+                 SELECT 1 FROM post_revisions r \
+                 WHERE r.post_id = posts.id AND r.edit_version = posts.edit_version AND (\
+                     r.title IS DISTINCT FROM posts.title OR \
+                     r.body_md IS DISTINCT FROM posts.body_md OR \
+                     r.published IS DISTINCT FROM posts.published OR \
+                     r.publish_at IS DISTINCT FROM posts.publish_at OR \
+                     r.featured IS DISTINCT FROM posts.featured OR \
+                     r.pinned IS DISTINCT FROM posts.pinned OR \
+                     r.tags IS DISTINCT FROM COALESCE(posts.tags, '') OR \
+                     r.cover_url IS DISTINCT FROM COALESCE(posts.cover_url, '') OR \
+                     r.custom_excerpt IS DISTINCT FROM COALESCE(posts.custom_excerpt, '') OR \
+                     r.meta_title IS DISTINCT FROM COALESCE(posts.meta_title, '') OR \
+                     r.meta_description IS DISTINCT FROM COALESCE(posts.meta_description, '') OR \
+                     r.canonical_url IS DISTINCT FROM COALESCE(posts.canonical_url, '') OR \
+                     r.social_title IS DISTINCT FROM COALESCE(posts.social_title, '') OR \
+                     r.social_description IS DISTINCT FROM COALESCE(posts.social_description, '') OR \
+                     r.social_image IS DISTINCT FROM COALESCE(posts.social_image, '')\
+                 )\
+             )",
+        )
+        .execute(&mut *repair)
+        .await?;
+        sqlx::query(
+            "INSERT INTO post_revisions \
+                 (id, post_id, edit_version, title, body_md, published, publish_at, featured, pinned, \
+                  tags, cover_url, custom_excerpt, meta_title, meta_description, canonical_url, \
+                  social_title, social_description, social_image, editor_sub, editor_email, source, \
+                  restored_from, created_at) \
+             SELECT 'rev_' || id || '_' || edit_version, id, edit_version, title, body_md, published, \
+                    publish_at, featured, pinned, COALESCE(tags, ''), COALESCE(cover_url, ''), \
+                    COALESCE(custom_excerpt, ''), COALESCE(meta_title, ''), \
+                    COALESCE(meta_description, ''), COALESCE(canonical_url, ''), \
+                    COALESCE(social_title, ''), COALESCE(social_description, ''), \
+                    COALESCE(social_image, ''), author_sub, author_email, \
+                    CASE WHEN EXISTS (SELECT 1 FROM post_revisions prior WHERE prior.post_id = posts.id) \
+                         THEN 'forward-repair' ELSE 'baseline' END, NULL, updated_at \
+             FROM posts ON CONFLICT (post_id, edit_version) DO NOTHING",
+        )
+        .execute(&mut *repair)
+        .await?;
+        repair.commit().await?;
         // Backs the newest-first index scan.
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts (created_at)")
             .execute(&self.pool)
@@ -950,6 +1490,7 @@ impl PgStore {
             author_email: row.try_get("author_email")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
+            edit_version: row.try_get("edit_version")?,
             published: row.try_get("published")?,
             publish_at: row.try_get("publish_at")?,
             featured: row.try_get("featured")?,
@@ -983,6 +1524,59 @@ impl PgStore {
             social_image: row
                 .try_get::<Option<String>, _>("social_image")?
                 .unwrap_or_default(),
+        })
+    }
+
+    fn revision_from_row(row: &sqlx::postgres::PgRow) -> Result<PostRevision, sqlx::Error> {
+        Ok(PostRevision {
+            id: row.try_get("id")?,
+            post_id: row.try_get("post_id")?,
+            edit_version: row.try_get("edit_version")?,
+            title: row.try_get("title")?,
+            body_md: row.try_get("body_md")?,
+            published: row.try_get("published")?,
+            publish_at: row.try_get("publish_at")?,
+            featured: row.try_get("featured")?,
+            pinned: row.try_get("pinned")?,
+            tags: row.try_get("tags")?,
+            cover_url: row.try_get("cover_url")?,
+            custom_excerpt: row.try_get("custom_excerpt")?,
+            meta_title: row.try_get("meta_title")?,
+            meta_description: row.try_get("meta_description")?,
+            canonical_url: row.try_get("canonical_url")?,
+            social_title: row.try_get("social_title")?,
+            social_description: row.try_get("social_description")?,
+            social_image: row.try_get("social_image")?,
+            editor_sub: row.try_get("editor_sub")?,
+            editor_email: row.try_get("editor_email")?,
+            source: row.try_get("source")?,
+            restored_from: row.try_get("restored_from")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+
+    fn autosave_from_row(row: &sqlx::postgres::PgRow) -> Result<WriterAutosave, sqlx::Error> {
+        Ok(WriterAutosave {
+            session_id: row.try_get("session_id")?,
+            post_id: row.try_get("post_id")?,
+            owner_sub: row.try_get("owner_sub")?,
+            base_version: row.try_get("base_version")?,
+            client_seq: row.try_get("client_seq")?,
+            title: row.try_get("title")?,
+            body_md: row.try_get("body_md")?,
+            tags: row.try_get("tags")?,
+            cover_url: row.try_get("cover_url")?,
+            custom_excerpt: row.try_get("custom_excerpt")?,
+            meta_title: row.try_get("meta_title")?,
+            meta_description: row.try_get("meta_description")?,
+            canonical_url: row.try_get("canonical_url")?,
+            social_title: row.try_get("social_title")?,
+            social_description: row.try_get("social_description")?,
+            social_image: row.try_get("social_image")?,
+            publish_at: row.try_get("publish_at")?,
+            pinned: row.try_get("pinned")?,
+            updated_at: row.try_get("updated_at")?,
+            expires_at: row.try_get("expires_at")?,
         })
     }
 
@@ -1221,77 +1815,390 @@ impl PgStore {
     }
 
     async fn create_post_async(&self, p: &Post) -> Result<(), sqlx::Error> {
+        let mut stored = p.clone();
+        stored.edit_version = stored.edit_version.max(1);
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO posts \
-                 (id, slug, title, body_md, author_sub, author_email, created_at, updated_at, \
+                 (id, slug, title, body_md, author_sub, author_email, created_at, updated_at, edit_version, \
                   published, publish_at, featured, pinned, tags, cover_url, custom_excerpt, \
                   meta_title, meta_description, canonical_url, social_title, social_description, \
                   social_image) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
-                     $15, $16, $17, $18, $19, $20, $21)",
+                     $15, $16, $17, $18, $19, $20, $21, $22)",
         )
-        .bind(&p.id)
-        .bind(&p.slug)
-        .bind(&p.title)
-        .bind(&p.body_md)
-        .bind(&p.author_sub)
-        .bind(&p.author_email)
-        .bind(p.created_at)
-        .bind(p.updated_at)
-        .bind(p.published)
-        .bind(p.publish_at)
-        .bind(p.featured)
-        .bind(p.pinned)
-        .bind(&p.tags)
-        .bind(&p.cover_url)
-        .bind(&p.custom_excerpt)
-        .bind(&p.meta_title)
-        .bind(&p.meta_description)
-        .bind(&p.canonical_url)
-        .bind(&p.social_title)
-        .bind(&p.social_description)
-        .bind(&p.social_image)
+        .bind(&stored.id)
+        .bind(&stored.slug)
+        .bind(&stored.title)
+        .bind(&stored.body_md)
+        .bind(&stored.author_sub)
+        .bind(&stored.author_email)
+        .bind(stored.created_at)
+        .bind(stored.updated_at)
+        .bind(stored.edit_version)
+        .bind(stored.published)
+        .bind(stored.publish_at)
+        .bind(stored.featured)
+        .bind(stored.pinned)
+        .bind(&stored.tags)
+        .bind(&stored.cover_url)
+        .bind(&stored.custom_excerpt)
+        .bind(&stored.meta_title)
+        .bind(&stored.meta_description)
+        .bind(&stored.canonical_url)
+        .bind(&stored.social_title)
+        .bind(&stored.social_description)
+        .bind(&stored.social_image)
+        .execute(&mut *tx)
+        .await?;
+        let revision = revision_from_post(
+            &stored,
+            &stored.author_sub,
+            &stored.author_email,
+            "create",
+            None,
+        );
+        Self::insert_revision_tx(&mut tx, &revision).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn insert_revision_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        revision: &PostRevision,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO post_revisions \
+                 (id, post_id, edit_version, title, body_md, published, publish_at, featured, pinned, \
+                  tags, cover_url, custom_excerpt, meta_title, meta_description, canonical_url, \
+                  social_title, social_description, social_image, editor_sub, editor_email, source, \
+                  restored_from, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
+                     $15, $16, $17, $18, $19, $20, $21, $22, $23) \
+             ON CONFLICT (post_id, edit_version) DO NOTHING",
+        )
+        .bind(&revision.id)
+        .bind(&revision.post_id)
+        .bind(revision.edit_version)
+        .bind(&revision.title)
+        .bind(&revision.body_md)
+        .bind(revision.published)
+        .bind(revision.publish_at)
+        .bind(revision.featured)
+        .bind(revision.pinned)
+        .bind(&revision.tags)
+        .bind(&revision.cover_url)
+        .bind(&revision.custom_excerpt)
+        .bind(&revision.meta_title)
+        .bind(&revision.meta_description)
+        .bind(&revision.canonical_url)
+        .bind(&revision.social_title)
+        .bind(&revision.social_description)
+        .bind(&revision.social_image)
+        .bind(&revision.editor_sub)
+        .bind(&revision.editor_email)
+        .bind(&revision.source)
+        .bind(&revision.restored_from)
+        .bind(revision.created_at)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    async fn save_post_async(
+        &self,
+        command: SavePostCommand,
+    ) -> Result<SavePostOutcome, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(&format!(
+            "{POST_COLS} WHERE slug = $1 AND id = $2 FOR UPDATE"
+        ))
+            .bind(&command.post.slug)
+            .bind(&command.post.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(row) = row else {
+            return Ok(SavePostOutcome::NotFound);
+        };
+        let current = Self::post_from_row(&row)?;
+        if current.edit_version != command.expected_version {
+            return Ok(SavePostOutcome::Conflict {
+                current_version: current.edit_version,
+            });
+        }
+
+        let current_revision = revision_from_post(
+            &current,
+            &command.editor_sub,
+            &command.editor_email,
+            "snapshot",
+            None,
+        );
+        Self::insert_revision_tx(&mut tx, &current_revision).await?;
+
+        let mut saved = command.post;
+        saved.id = current.id.clone();
+        saved.slug = current.slug.clone();
+        saved.author_sub = current.author_sub.clone();
+        saved.author_email = current.author_email.clone();
+        saved.created_at = current.created_at;
+        saved.edit_version = current.edit_version.saturating_add(1);
+        saved.updated_at = saved.updated_at.max(current.updated_at.saturating_add(1));
+        let result = sqlx::query(
+            "UPDATE posts SET title = $1, body_md = $2, published = $3, updated_at = $4, \
+                    edit_version = $5, publish_at = $6, featured = $7, pinned = $8, tags = $9, \
+                    cover_url = $10, custom_excerpt = $11, meta_title = $12, \
+                    meta_description = $13, canonical_url = $14, social_title = $15, \
+                    social_description = $16, social_image = $17 \
+             WHERE id = $18 AND edit_version = $19",
+        )
+        .bind(&saved.title)
+        .bind(&saved.body_md)
+        .bind(saved.published)
+        .bind(saved.updated_at)
+        .bind(saved.edit_version)
+        .bind(saved.publish_at)
+        .bind(saved.featured)
+        .bind(saved.pinned)
+        .bind(&saved.tags)
+        .bind(&saved.cover_url)
+        .bind(&saved.custom_excerpt)
+        .bind(&saved.meta_title)
+        .bind(&saved.meta_description)
+        .bind(&saved.canonical_url)
+        .bind(&saved.social_title)
+        .bind(&saved.social_description)
+        .bind(&saved.social_image)
+        .bind(&saved.id)
+        .bind(command.expected_version)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Ok(SavePostOutcome::Conflict {
+                current_version: current.edit_version,
+            });
+        }
+
+        let revision = revision_from_post(
+            &saved,
+            &command.editor_sub,
+            &command.editor_email,
+            &command.source,
+            command.restored_from,
+        );
+        Self::insert_revision_tx(&mut tx, &revision).await?;
+        if let Some(session_id) = command.consume_autosave_session {
+            sqlx::query(
+                "DELETE FROM writer_autosaves \
+                 WHERE session_id = $1 AND owner_sub = $2 AND post_id = $3",
+            )
+            .bind(session_id)
+            .bind(&command.editor_sub)
+            .bind(&saved.id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query(
+            "DELETE FROM post_revisions WHERE post_id = $1 AND id IN (\
+                 SELECT id FROM post_revisions WHERE post_id = $1 \
+                 ORDER BY edit_version DESC, id DESC OFFSET $2\
+             )",
+        )
+        .bind(&saved.id)
+        .bind(crate::config::REVISION_KEEP_LIMIT as i64)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(SavePostOutcome::Saved(Box::new(saved)))
+    }
+
+    async fn list_post_revisions_async(
+        &self,
+        post_id: &str,
+        limit: i64,
+    ) -> Result<Vec<PostRevisionSummary>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT id, post_id, edit_version, title, CAST(char_length(body_md) AS BIGINT) AS body_chars, \
+                    editor_email, source, created_at FROM post_revisions \
+             WHERE post_id = $1 ORDER BY edit_version DESC, id DESC LIMIT $2",
+        )
+        .bind(post_id)
+        .bind(limit.clamp(1, crate::config::REVISION_PAGE_LIMIT))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(PostRevisionSummary {
+                    id: row.try_get("id")?,
+                    post_id: row.try_get("post_id")?,
+                    edit_version: row.try_get("edit_version")?,
+                    title: row.try_get("title")?,
+                    body_chars: row.try_get("body_chars")?,
+                    editor_email: row.try_get("editor_email")?,
+                    source: row.try_get("source")?,
+                    created_at: row.try_get("created_at")?,
+                })
+            })
+            .collect()
+    }
+
+    async fn get_post_revision_async(
+        &self,
+        post_id: &str,
+        revision_id: &str,
+    ) -> Result<Option<PostRevision>, sqlx::Error> {
+        let row = sqlx::query(&format!("{REVISION_COLS} WHERE post_id = $1 AND id = $2"))
+            .bind(post_id)
+            .bind(revision_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(Self::revision_from_row).transpose()
+    }
+
+    async fn put_writer_autosave_async(
+        &self,
+        autosave: &WriterAutosave,
+        now: i64,
+    ) -> Result<AutosaveOutcome, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let post = sqlx::query("SELECT edit_version FROM posts WHERE id = $1 FOR UPDATE")
+            .bind(&autosave.post_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(post) = post else {
+            return Ok(AutosaveOutcome::NotFound);
+        };
+        let current_version: i64 = post.try_get("edit_version")?;
+        if current_version != autosave.base_version {
+            return Ok(AutosaveOutcome::Conflict { current_version });
+        }
+        // Keep the global lock order `post -> autosave`. The exact target is removed first so an
+        // expired high client_seq cannot participate in the following CAS.
+        sqlx::query(
+            "DELETE FROM writer_autosaves WHERE session_id = $1 AND expires_at <= $2",
+        )
+        .bind(&autosave.session_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        if let Some(row) = sqlx::query(
+            "SELECT owner_sub, post_id, client_seq FROM writer_autosaves \
+             WHERE session_id = $1 FOR UPDATE",
+        )
+        .bind(&autosave.session_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            let owner_sub: String = row.try_get("owner_sub")?;
+            let post_id: String = row.try_get("post_id")?;
+            let client_seq: i64 = row.try_get("client_seq")?;
+            if owner_sub != autosave.owner_sub || post_id != autosave.post_id {
+                return Ok(AutosaveOutcome::NotFound);
+            }
+            if client_seq >= autosave.client_seq {
+                return Ok(AutosaveOutcome::Stale {
+                    stored_client_seq: client_seq,
+                });
+            }
+        }
+        sqlx::query(
+            "INSERT INTO writer_autosaves \
+                 (session_id, post_id, owner_sub, base_version, client_seq, title, body_md, tags, \
+                  cover_url, custom_excerpt, meta_title, meta_description, canonical_url, \
+                  social_title, social_description, social_image, publish_at, pinned, updated_at, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
+                     $16, $17, $18, $19, $20) \
+             ON CONFLICT (session_id) DO UPDATE SET \
+                 base_version = EXCLUDED.base_version, client_seq = EXCLUDED.client_seq, \
+                 title = EXCLUDED.title, body_md = EXCLUDED.body_md, tags = EXCLUDED.tags, \
+                 cover_url = EXCLUDED.cover_url, custom_excerpt = EXCLUDED.custom_excerpt, \
+                 meta_title = EXCLUDED.meta_title, meta_description = EXCLUDED.meta_description, \
+                 canonical_url = EXCLUDED.canonical_url, social_title = EXCLUDED.social_title, \
+                 social_description = EXCLUDED.social_description, social_image = EXCLUDED.social_image, \
+                 publish_at = EXCLUDED.publish_at, pinned = EXCLUDED.pinned, \
+                 updated_at = EXCLUDED.updated_at, expires_at = EXCLUDED.expires_at",
+        )
+        .bind(&autosave.session_id)
+        .bind(&autosave.post_id)
+        .bind(&autosave.owner_sub)
+        .bind(autosave.base_version)
+        .bind(autosave.client_seq)
+        .bind(&autosave.title)
+        .bind(&autosave.body_md)
+        .bind(&autosave.tags)
+        .bind(&autosave.cover_url)
+        .bind(&autosave.custom_excerpt)
+        .bind(&autosave.meta_title)
+        .bind(&autosave.meta_description)
+        .bind(&autosave.canonical_url)
+        .bind(&autosave.social_title)
+        .bind(&autosave.social_description)
+        .bind(&autosave.social_image)
+        .bind(&autosave.publish_at)
+        .bind(autosave.pinned)
+        .bind(autosave.updated_at)
+        .bind(autosave.expires_at)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        if let Err(error) = self.cleanup_expired_autosaves_async(now).await {
+            tracing::warn!(%error, "bounded writer autosave cleanup failed");
+        }
+        Ok(AutosaveOutcome::Saved(Box::new(autosave.clone())))
+    }
+
+    async fn cleanup_expired_autosaves_async(&self, now: i64) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "DELETE FROM writer_autosaves WHERE session_id IN (\
+                 SELECT session_id FROM writer_autosaves WHERE expires_at <= $1 \
+                 ORDER BY expires_at ASC, session_id ASC LIMIT 256\
+             )",
+        )
+        .bind(now)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    async fn update_post_async(&self, p: &Post) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "UPDATE posts SET title = $1, body_md = $2, published = $3, updated_at = $4, \
-                    publish_at = $5, featured = $6, pinned = $7, tags = $8, cover_url = $9, \
-                    custom_excerpt = $10, meta_title = $11, meta_description = $12, \
-                    canonical_url = $13, social_title = $14, social_description = $15, \
-                    social_image = $16 \
-             WHERE slug = $17",
-        )
-        .bind(&p.title)
-        .bind(&p.body_md)
-        .bind(p.published)
-        .bind(p.updated_at)
-        .bind(p.publish_at)
-        .bind(p.featured)
-        .bind(p.pinned)
-        .bind(&p.tags)
-        .bind(&p.cover_url)
-        .bind(&p.custom_excerpt)
-        .bind(&p.meta_title)
-        .bind(&p.meta_description)
-        .bind(&p.canonical_url)
-        .bind(&p.social_title)
-        .bind(&p.social_description)
-        .bind(&p.social_image)
-        .bind(&p.slug)
-        .execute(&self.pool)
+    async fn get_writer_autosave_async(
+        &self,
+        session_id: &str,
+        owner_sub: &str,
+        now: i64,
+    ) -> Result<Option<WriterAutosave>, sqlx::Error> {
+        let row = sqlx::query(&format!(
+            "{AUTOSAVE_COLS} WHERE session_id = $1 AND owner_sub = $2 AND expires_at > $3"
+        ))
+        .bind(session_id)
+        .bind(owner_sub)
+        .bind(now)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(())
+        row.as_ref().map(Self::autosave_from_row).transpose()
     }
 
     async fn delete_post_async(&self, slug: &str) -> Result<(), sqlx::Error> {
-        sqlx::query("DELETE FROM posts WHERE slug = $1")
+        let mut tx = self.pool.begin().await?;
+        if let Some(row) = sqlx::query("SELECT id FROM posts WHERE slug = $1 FOR UPDATE")
             .bind(slug)
-            .execute(&self.pool)
-            .await?;
+            .fetch_optional(&mut *tx)
+            .await?
+        {
+            let post_id: String = row.try_get("id")?;
+            sqlx::query("DELETE FROM writer_autosaves WHERE post_id = $1")
+                .bind(&post_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM post_revisions WHERE post_id = $1")
+                .bind(&post_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM posts WHERE id = $1")
+                .bind(&post_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 }
@@ -1317,6 +2224,12 @@ impl Store for PgStore {
             tracing::error!(error = %e, "pg get_post failed");
             None
         })
+    }
+
+    async fn get_post_authoritative(&self, slug: &str) -> Result<Option<Post>, StoreError> {
+        self.get_post_async(slug)
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))
     }
 
     async fn list_visible_posts(
@@ -1386,9 +2299,87 @@ impl Store for PgStore {
     }
 
     async fn update_post(&self, post: &Post) -> Result<(), StoreError> {
-        self.update_post_async(post)
+        match self
+            .save_post_async(SavePostCommand {
+                post: post.clone(),
+                expected_version: post.edit_version,
+                editor_sub: post.author_sub.clone(),
+                editor_email: post.author_email.clone(),
+                source: "legacy-update".to_string(),
+                restored_from: None,
+                consume_autosave_session: None,
+            })
             .await
-            .map_err(|e| StoreError::Backend(e.to_string()))
+            .map_err(|error| StoreError::Backend(error.to_string()))?
+        {
+            SavePostOutcome::Saved(_) => Ok(()),
+            SavePostOutcome::Conflict { .. } => Err(StoreError::Conflict(post.slug.clone())),
+            SavePostOutcome::NotFound => Err(StoreError::Backend(format!(
+                "no post with slug {}",
+                post.slug
+            ))),
+        }
+    }
+
+    async fn save_post(&self, command: SavePostCommand) -> Result<SavePostOutcome, StoreError> {
+        self.save_post_async(command)
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))
+    }
+
+    async fn list_post_revisions(
+        &self,
+        post_id: &str,
+        limit: i64,
+    ) -> Result<Vec<PostRevisionSummary>, StoreError> {
+        self.list_post_revisions_async(post_id, limit)
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))
+    }
+
+    async fn get_post_revision(
+        &self,
+        post_id: &str,
+        revision_id: &str,
+    ) -> Result<Option<PostRevision>, StoreError> {
+        self.get_post_revision_async(post_id, revision_id)
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))
+    }
+
+    async fn put_writer_autosave(
+        &self,
+        autosave: WriterAutosave,
+        now: i64,
+    ) -> Result<AutosaveOutcome, StoreError> {
+        self.put_writer_autosave_async(&autosave, now)
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))
+    }
+
+    async fn get_writer_autosave(
+        &self,
+        session_id: &str,
+        owner_sub: &str,
+        now: i64,
+    ) -> Result<Option<WriterAutosave>, StoreError> {
+        self.get_writer_autosave_async(session_id, owner_sub, now)
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))
+    }
+
+    async fn delete_writer_autosave(
+        &self,
+        session_id: &str,
+        owner_sub: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM writer_autosaves WHERE session_id = $1 AND owner_sub = $2")
+            .bind(session_id)
+            .bind(owner_sub)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|error| StoreError::Backend(error.to_string()))
     }
 
     async fn delete_post(&self, slug: &str) -> Result<(), StoreError> {
@@ -1472,6 +2463,7 @@ mod tests {
             author_email: "u@hf".to_string(),
             created_at,
             updated_at: created_at,
+            edit_version: 1,
             published: true,
             publish_at: 0,
             featured: false,
@@ -1757,5 +2749,127 @@ mod tests {
         }
         let page = store.list_posts(None, MAX_PAGE + 100).await;
         assert_eq!(page.len() as i64, MAX_PAGE, "limit clamped to MAX_PAGE");
+    }
+
+    #[tokio::test]
+    async fn save_cas_rejects_delete_recreate_same_slug_aba() {
+        let store = InMemoryStore::new();
+        let old = post("aba", 1);
+        store.create_post(&old).await.unwrap();
+        let mut stale = old.clone();
+        stale.body_md = "stale old identity".to_string();
+
+        store.delete_post("aba").await.unwrap();
+        let mut replacement = post("aba", 2);
+        replacement.id = "replacement-id".to_string();
+        replacement.body_md = "replacement content".to_string();
+        store.create_post(&replacement).await.unwrap();
+
+        for source in ["update", "restore"] {
+            let outcome = store
+                .save_post(SavePostCommand {
+                    post: stale.clone(),
+                    expected_version: 1,
+                    editor_sub: old.author_sub.clone(),
+                    editor_email: old.author_email.clone(),
+                    source: source.to_string(),
+                    restored_from: (source == "restore").then(|| "old-revision".to_string()),
+                    consume_autosave_session: Some("old-session".to_string()),
+                })
+                .await
+                .unwrap();
+            assert_eq!(outcome, SavePostOutcome::NotFound);
+        }
+        let current = store.get_post("aba").await.unwrap();
+        assert_eq!(current.id, "replacement-id");
+        assert_eq!(current.body_md, "replacement content");
+
+        let stale_autosave = WriterAutosave {
+            session_id: "old-session".to_string(),
+            post_id: old.id,
+            owner_sub: old.author_sub,
+            base_version: 1,
+            client_seq: 1,
+            title: "old".to_string(),
+            body_md: "must not attach to replacement".to_string(),
+            tags: String::new(),
+            cover_url: String::new(),
+            custom_excerpt: String::new(),
+            meta_title: String::new(),
+            meta_description: String::new(),
+            canonical_url: String::new(),
+            social_title: String::new(),
+            social_description: String::new(),
+            social_image: String::new(),
+            publish_at: String::new(),
+            pinned: false,
+            updated_at: 2,
+            expires_at: 100,
+        };
+        assert_eq!(
+            store.put_writer_autosave(stale_autosave, 2).await.unwrap(),
+            AutosaveOutcome::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_autosaves_are_invisible_and_do_not_win_sequence_cas() {
+        let store = InMemoryStore::new();
+        let post = post("ttl", 1);
+        store.create_post(&post).await.unwrap();
+        let make = |session_id: String, client_seq: i64, expires_at: i64| WriterAutosave {
+            session_id,
+            post_id: post.id.clone(),
+            owner_sub: post.author_sub.clone(),
+            base_version: 1,
+            client_seq,
+            title: post.title.clone(),
+            body_md: format!("seq {client_seq}"),
+            tags: String::new(),
+            cover_url: String::new(),
+            custom_excerpt: String::new(),
+            meta_title: String::new(),
+            meta_description: String::new(),
+            canonical_url: String::new(),
+            social_title: String::new(),
+            social_description: String::new(),
+            social_image: String::new(),
+            publish_at: String::new(),
+            pinned: false,
+            updated_at: 0,
+            expires_at,
+        };
+        for index in 0..256 {
+            store
+                .put_writer_autosave(make(format!("expired-{index:03}"), 1, 1), 0)
+                .await
+                .unwrap();
+        }
+        let target = "expired-target";
+        store
+            .put_writer_autosave(make(target.to_string(), 999, 1), 0)
+            .await
+            .unwrap();
+
+        assert!(store
+            .get_writer_autosave(target, &post.author_sub, 2)
+            .await
+            .unwrap()
+            .is_none(), "expired row beyond cleanup batch stays unreadable");
+        let fresh = make(target.to_string(), 1, 100);
+        assert!(matches!(
+            store.put_writer_autosave(fresh, 2).await.unwrap(),
+            AutosaveOutcome::Saved(_)
+        ));
+        assert_eq!(
+            store
+                .get_writer_autosave(target, &post.author_sub, 2)
+                .await
+                .unwrap()
+                .unwrap()
+                .client_seq,
+            1,
+            "expired high sequence never rejects the fresh write"
+        );
     }
 }

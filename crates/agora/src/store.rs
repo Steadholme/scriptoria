@@ -18,17 +18,24 @@
 //! - `posts(id TEXT PK, thread_id TEXT, body_md TEXT, quoted_post_id TEXT, author_sub TEXT,
 //!    author_email TEXT, created_at BIGINT)`
 //! - `post_mentions(post_id TEXT, thread_id TEXT, mentioned_username TEXT, created_at BIGINT)`
+//! - `forum_identity_aliases(alias TEXT, subject TEXT, created_at BIGINT)`
 //! - `thread_subscriptions(thread_id TEXT, subscriber_sub TEXT, created_at BIGINT)`
+//! - `forum_activity_events(id TEXT PK, kind TEXT, thread_id TEXT, post_id TEXT, actor_sub TEXT,
+//!    created_at BIGINT)`
+//! - `forum_activity_deliveries(activity_id TEXT, recipient_kind TEXT, recipient_key TEXT,
+//!    reason TEXT)`
+//! - `forum_activity_receipts(activity_id TEXT, viewer_sub TEXT, read_at BIGINT)`
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::model::{
-    BannedAuthor, Category, CategoryFormat, Mention, Post, ReactionCount, Thread, ThreadDigest,
-    ThreadSearchHit,
+    ActivityDelivery, ActivityEvent, ActivityItem, ActivityKind, ActivityReason,
+    ActivityRecipientKind, BannedAuthor, Category, CategoryFormat, Mention, Post, ReactionCount,
+    Thread, ThreadDigest, ThreadSearchHit,
 };
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
@@ -58,6 +65,9 @@ pub enum ReplyAnchor {
     After(i64, String),
     Before(i64, String),
     Latest,
+    /// A page that includes this exact reply and walks toward older replies. Activity links use it
+    /// so a notification never lands on a paginated thread page that omits its target.
+    Around(i64, String),
 }
 
 /// Sort mode for thread lists. `Latest` is the legacy/default ordering.
@@ -96,6 +106,143 @@ pub struct AcceptedAnswerMutation {
     pub thread: Thread,
     pub accepted_post: Option<Post>,
     pub changed: bool,
+    /// Stable gateway subjects that received the durable event and may receive best-effort Klaxon
+    /// push after the transaction commits. Username-addressed mentions are intentionally absent.
+    pub delivery_subjects: Vec<String>,
+}
+
+/// Result of an atomic post + mention + activity fan-out command.
+#[derive(Clone, Debug)]
+pub struct ActivityMutation {
+    pub delivery_subjects: Vec<String>,
+}
+
+/// Keyset cursor for the personal activity stream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivityCursor {
+    pub created_at: i64,
+    pub id: String,
+}
+
+/// Activity list filter. `All` keeps every reason; the others match the best reason visible to the
+/// current viewer after duplicate delivery paths have been collapsed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ActivityFilter {
+    #[default]
+    All,
+    Reason(ActivityReason),
+}
+
+/// Hard mutation bound shared by the UI and both Store implementations.
+pub const MAX_ACTIVITY_BATCH: usize = 30;
+/// A thread cannot accumulate an unbounded reply fan-out.
+pub const MAX_THREAD_FOLLOWERS: usize = 256;
+/// Parsed aliases are deduplicated before this per-post bound is enforced.
+pub const MAX_MENTIONS_PER_POST: usize = 32;
+/// OP + quoted author + followers + mentions. Klaxon is best-effort and never exceeds this bound.
+pub const MAX_KLAXON_RECIPIENTS_PER_REPLY: usize = MAX_THREAD_FOLLOWERS + MAX_MENTIONS_PER_POST + 2;
+
+fn subject_delivery(
+    recipient: &str,
+    actor_sub: &str,
+    reason: ActivityReason,
+) -> Option<ActivityDelivery> {
+    let recipient = recipient.trim();
+    if recipient.is_empty() || recipient == actor_sub {
+        return None;
+    }
+    Some(ActivityDelivery {
+        recipient_kind: ActivityRecipientKind::Subject,
+        recipient_key: recipient.to_string(),
+        reason,
+    })
+}
+
+pub(crate) fn normalize_activity_alias(raw: &str) -> Option<String> {
+    let alias = raw.trim().trim_start_matches('@');
+    if alias.is_empty() || alias.len() > 64 {
+        return None;
+    }
+    if !alias
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        || !alias
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return None;
+    }
+    Some(alias.to_ascii_lowercase())
+}
+
+fn identity_alias(subject: &str, email: &str) -> Option<String> {
+    email
+        .split('@')
+        .next()
+        .and_then(normalize_activity_alias)
+        .or_else(|| normalize_activity_alias(subject))
+}
+
+fn bounded_mention_aliases(mentioned_aliases: &[String]) -> Result<Vec<String>, StoreError> {
+    let mut seen = HashSet::new();
+    let mut aliases = Vec::new();
+    for raw in mentioned_aliases {
+        let Some(alias) = normalize_activity_alias(raw) else {
+            continue;
+        };
+        if seen.insert(alias.clone()) {
+            aliases.push(alias);
+        }
+    }
+    if aliases.len() > MAX_MENTIONS_PER_POST {
+        return Err(StoreError::InvalidOperation(format!(
+            "a post may mention at most {MAX_MENTIONS_PER_POST} aliases"
+        )));
+    }
+    Ok(aliases)
+}
+
+fn dedupe_deliveries(deliveries: &mut Vec<ActivityDelivery>) {
+    let mut seen = HashSet::new();
+    deliveries.retain(|delivery| {
+        seen.insert((
+            delivery.recipient_kind,
+            delivery.recipient_key.clone(),
+            delivery.reason,
+        ))
+    });
+}
+
+fn delivery_subjects(deliveries: &[ActivityDelivery]) -> Vec<String> {
+    let mut subjects: Vec<String> = deliveries
+        .iter()
+        .filter(|delivery| delivery.recipient_kind == ActivityRecipientKind::Subject)
+        .map(|delivery| delivery.recipient_key.clone())
+        .collect();
+    subjects.sort();
+    subjects.dedup();
+    subjects
+}
+
+fn delivery_matches_viewer(delivery: &ActivityDelivery, viewer_sub: &str) -> bool {
+    delivery.recipient_kind == ActivityRecipientKind::Subject
+        && delivery.recipient_key == viewer_sub
+}
+
+fn best_activity_reason(
+    deliveries: impl Iterator<Item = ActivityDelivery>,
+) -> Option<ActivityReason> {
+    deliveries
+        .map(|delivery| delivery.reason)
+        .min_by_key(|reason| reason.priority())
+}
+
+fn activity_filter_matches(filter: ActivityFilter, reason: ActivityReason) -> bool {
+    match filter {
+        ActivityFilter::All => true,
+        ActivityFilter::Reason(expected) => expected == reason,
+    }
 }
 
 /// Pluggable forum store. All methods are `async` and `.await`ed on the serving runtime.
@@ -170,10 +317,7 @@ pub trait Store: Send + Sync {
     /// The thread's accepted reply only when the pointer is valid: the post exists, belongs to the
     /// same thread and is not the recorded original post. Category format is deliberately not part
     /// of this predicate so a historical discussion solution remains readable on its detail page.
-    async fn get_valid_accepted_post(
-        &self,
-        thread_id: &str,
-    ) -> Result<Option<Post>, StoreError>;
+    async fn get_valid_accepted_post(&self, thread_id: &str) -> Result<Option<Post>, StoreError>;
     /// All posts in a thread, with its stable original post first, then replies oldest-first.
     async fn posts_in_thread(&self, thread_id: &str) -> Result<Vec<Post>, StoreError>;
 
@@ -198,9 +342,28 @@ pub trait Store: Send + Sync {
     /// Create a thread together with its original post, atomically, after locking and confirming
     /// its category still exists.
     async fn create_thread(&self, thread: &Thread, first_post: &Post) -> Result<(), StoreError>;
+    /// Browser create path: create the thread/original post, persist parsed mentions, and fan out a
+    /// durable mention event in the SAME command. No event row is written when every recipient is
+    /// the actor or the post contains no mentions.
+    async fn create_thread_with_activity(
+        &self,
+        thread: &Thread,
+        first_post: &Post,
+        mentioned_usernames: &[String],
+        activity_id: &str,
+    ) -> Result<ActivityMutation, StoreError>;
     /// Append a reply and bump the parent thread's `last_at` to the reply's timestamp. The Store
     /// locks category then thread and rechecks that the thread exists and is still unlocked.
     async fn add_reply(&self, post: &Post) -> Result<(), StoreError>;
+    /// Browser reply path: append the reply, replace parsed mentions, collect OP/quote/follower/
+    /// mention recipients, and persist one deduplicated durable event atomically. Self deliveries
+    /// are omitted; multiple reasons still collapse to one inbox item/read receipt per viewer.
+    async fn add_reply_with_activity(
+        &self,
+        post: &Post,
+        mentioned_usernames: &[String],
+        activity_id: &str,
+    ) -> Result<ActivityMutation, StoreError>;
 
     /// Replace the parsed mentions for one post with the supplied normalised usernames.
     async fn replace_mentions(
@@ -258,21 +421,62 @@ pub trait Store: Send + Sync {
         thread_id: &str,
         action: AcceptedAnswerAction,
     ) -> Result<AcceptedAnswerMutation, StoreError>;
+    /// Accepted-answer browser command: apply the answer state and, when it changed to an accepted
+    /// reply owned by someone else, insert its durable activity delivery in the same transaction.
+    async fn mutate_accepted_answer_with_activity(
+        &self,
+        thread_id: &str,
+        action: AcceptedAnswerAction,
+        activity_id: &str,
+        actor_sub: &str,
+        created_at: i64,
+    ) -> Result<AcceptedAnswerMutation, StoreError>;
 
-    /// Toggle one user's subscription to a thread. Returns `true` when subscribed, `false` when the
-    /// existing subscription was removed.
-    async fn toggle_thread_subscription(
+    /// Explicitly set one user's following state. The desired state makes retries and concurrent
+    /// duplicate form submissions idempotent; the Store also rechecks the thread under its guard.
+    async fn set_thread_subscription(
         &self,
         thread_id: &str,
         subscriber_sub: &str,
+        subscribed: bool,
         created_at: i64,
-    ) -> Result<bool, StoreError>;
+    ) -> Result<(), StoreError>;
     /// Whether a user is currently subscribed to a thread.
     async fn is_thread_subscribed(
         &self,
         thread_id: &str,
         subscriber_sub: &str,
     ) -> Result<bool, StoreError>;
+
+    /// One authoritative keyset page of activity for a gateway subject. Mention aliases are
+    /// resolved to a unique subject when the event is written; reads never authorise by email.
+    /// Content is joined from live thread/post rows and deleted targets are never returned.
+    async fn activity_page(
+        &self,
+        viewer_sub: &str,
+        filter: ActivityFilter,
+        unread_only: bool,
+        before: Option<&ActivityCursor>,
+        limit: i64,
+    ) -> Result<Vec<ActivityItem>, StoreError>;
+    async fn unread_activity_count(&self, viewer_sub: &str) -> Result<i64, StoreError>;
+    /// Mark one delivered activity read/unread. A caller cannot probe or mutate another viewer's
+    /// event: an inaccessible id is returned as `NotFound`.
+    async fn set_activity_read(
+        &self,
+        activity_id: &str,
+        viewer_sub: &str,
+        read: bool,
+        changed_at: i64,
+    ) -> Result<(), StoreError>;
+    /// Mark one rendered page read. The command rejects more than [`MAX_ACTIVITY_BATCH`] ids,
+    /// deduplicates them, and re-authorises each id against live delivery + thread/post rows.
+    async fn mark_activity_batch_read(
+        &self,
+        viewer_sub: &str,
+        activity_ids: &[String],
+        changed_at: i64,
+    ) -> Result<i64, StoreError>;
 
     /// Toggle one user's reaction of `kind` on a post. Idempotent per `(post_id, user_sub, kind)`:
     /// if the reaction already exists it is removed and `false` returned; otherwise it is inserted
@@ -320,7 +524,11 @@ pub struct InMemoryStore {
     /// cannot safely break same-second ties, so ownership must never be inferred from ordering.
     original_posts: Mutex<HashMap<String, String>>,
     mentions: Mutex<Vec<Mention>>,
+    identity_aliases: Mutex<Vec<IdentityAlias>>,
     subscriptions: Mutex<Vec<ThreadSubscription>>,
+    activity_events: Mutex<Vec<ActivityEvent>>,
+    activity_deliveries: Mutex<Vec<StoredActivityDelivery>>,
+    activity_receipts: Mutex<Vec<ActivityReceipt>>,
     banned: Mutex<Vec<BannedAuthor>>,
     /// One row per `(post_id, user_sub, kind)` — the in-memory mirror of `post_reactions`.
     reactions: Mutex<Vec<Reaction>>,
@@ -344,9 +552,79 @@ struct ThreadSubscription {
     _created_at: i64,
 }
 
+/// Append-only alias observation. Keeping every `(alias, subject)` pair makes collisions
+/// ambiguous forever instead of allowing the newest profile to steal existing mention routing.
+#[derive(Clone, Debug)]
+struct IdentityAlias {
+    alias: String,
+    subject: String,
+    _created_at: i64,
+}
+
+#[derive(Clone, Debug)]
+struct StoredActivityDelivery {
+    activity_id: String,
+    delivery: ActivityDelivery,
+}
+
+#[derive(Clone, Debug)]
+struct ActivityReceipt {
+    activity_id: String,
+    viewer_sub: String,
+    _read_at: i64,
+}
+
 impl InMemoryStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn register_identity_alias(&self, subject: &str, email: &str, created_at: i64) {
+        let Some(alias) = identity_alias(subject, email) else {
+            return;
+        };
+        let mut aliases = self
+            .identity_aliases
+            .lock()
+            .expect("identity_aliases lock poisoned");
+        if aliases
+            .iter()
+            .any(|row| row.alias == alias && row.subject == subject)
+        {
+            return;
+        }
+        aliases.push(IdentityAlias {
+            alias,
+            subject: subject.to_string(),
+            _created_at: created_at,
+        });
+    }
+
+    fn resolve_mention_deliveries(
+        &self,
+        mentioned_aliases: &[String],
+        actor_sub: &str,
+    ) -> Vec<ActivityDelivery> {
+        let aliases = self
+            .identity_aliases
+            .lock()
+            .expect("identity_aliases lock poisoned");
+        mentioned_aliases
+            .iter()
+            .filter_map(|alias| {
+                let subjects: HashSet<&str> = aliases
+                    .iter()
+                    .filter(|row| row.alias == *alias)
+                    .map(|row| row.subject.as_str())
+                    .collect();
+                (subjects.len() == 1)
+                    .then(|| subjects.into_iter().next())
+                    .flatten()
+                    .and_then(|subject| {
+                        subject_delivery(subject, actor_sub, ActivityReason::Mention)
+                    })
+            })
+            .collect()
     }
 }
 
@@ -537,12 +815,7 @@ impl Store for InMemoryStore {
                     .get(&thread.category_id)
                     .copied()
                     .unwrap_or_default();
-                let valid = has_valid_question_solution(
-                    thread,
-                    format,
-                    &original_posts,
-                    &posts,
-                );
+                let valid = has_valid_question_solution(thread, format, &original_posts, &posts);
                 thread_matches_status(valid, format.is_question(), status)
             })
             .filter(|t| {
@@ -621,12 +894,7 @@ impl Store for InMemoryStore {
                     .get(&thread.category_id)
                     .copied()
                     .unwrap_or_default();
-                let valid = has_valid_question_solution(
-                    thread,
-                    format,
-                    &original_posts,
-                    &posts,
-                );
+                let valid = has_valid_question_solution(thread, format, &original_posts, &posts);
                 thread_matches_status(valid, format.is_question(), status)
             })
             .filter_map(|thread| {
@@ -729,10 +997,7 @@ impl Store for InMemoryStore {
             .cloned())
     }
 
-    async fn get_valid_accepted_post(
-        &self,
-        thread_id: &str,
-    ) -> Result<Option<Post>, StoreError> {
+    async fn get_valid_accepted_post(&self, thread_id: &str) -> Result<Option<Post>, StoreError> {
         let _domain = self.qa_guard.lock().expect("qa guard poisoned");
         let thread = self
             .threads
@@ -831,6 +1096,11 @@ impl Store for InMemoryStore {
                     p.created_at < *ts || (p.created_at == *ts && p.id.as_str() < id.as_str())
                 });
             }
+            ReplyAnchor::Around(ts, id) => {
+                v.retain(|p| {
+                    p.created_at < *ts || (p.created_at == *ts && p.id.as_str() <= id.as_str())
+                });
+            }
         }
         // First/After walk ascending; Before/Latest walk descending — matching the SQL ORDER BY.
         match anchor {
@@ -841,7 +1111,7 @@ impl Store for InMemoryStore {
                         .then_with(|| a.id.cmp(&b.id))
                 });
             }
-            ReplyAnchor::Before(..) | ReplyAnchor::Latest => {
+            ReplyAnchor::Before(..) | ReplyAnchor::Latest | ReplyAnchor::Around(..) => {
                 v.sort_by(|a, b| {
                     b.created_at
                         .cmp(&a.created_at)
@@ -873,10 +1143,99 @@ impl Store for InMemoryStore {
             .lock()
             .expect("original_posts lock poisoned");
         let mut posts = self.posts.lock().expect("posts lock poisoned");
+        self.register_identity_alias(
+            &first_post.author_sub,
+            &first_post.author_email,
+            first_post.created_at,
+        );
         threads.push(thread.clone());
         original_posts.insert(thread.id.clone(), first_post.id.clone());
         posts.push(first_post.clone());
         Ok(())
+    }
+
+    async fn create_thread_with_activity(
+        &self,
+        thread: &Thread,
+        first_post: &Post,
+        mentioned_usernames: &[String],
+        activity_id: &str,
+    ) -> Result<ActivityMutation, StoreError> {
+        let mentioned_aliases = bounded_mention_aliases(mentioned_usernames)?;
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        if first_post.thread_id != thread.id {
+            return Err(StoreError::InvalidOperation(
+                "the original post must belong to the new thread".to_string(),
+            ));
+        }
+        let categories = self.categories.lock().expect("categories lock poisoned");
+        if categories
+            .iter()
+            .all(|category| category.id != thread.category_id)
+        {
+            return Err(StoreError::NotFound("category not found".to_string()));
+        }
+        let mut threads = self.threads.lock().expect("threads lock poisoned");
+        let mut original_posts = self
+            .original_posts
+            .lock()
+            .expect("original_posts lock poisoned");
+        let mut posts = self.posts.lock().expect("posts lock poisoned");
+        let mut mentions = self.mentions.lock().expect("mentions lock poisoned");
+
+        self.register_identity_alias(
+            &first_post.author_sub,
+            &first_post.author_email,
+            first_post.created_at,
+        );
+        let mut deliveries =
+            self.resolve_mention_deliveries(&mentioned_aliases, &first_post.author_sub);
+        dedupe_deliveries(&mut deliveries);
+
+        threads.push(thread.clone());
+        original_posts.insert(thread.id.clone(), first_post.id.clone());
+        posts.push(first_post.clone());
+        let mut seen = HashSet::new();
+        for name in &mentioned_aliases {
+            if seen.insert(name.as_str()) {
+                mentions.push(Mention {
+                    post_id: first_post.id.clone(),
+                    thread_id: thread.id.clone(),
+                    mentioned_username: name.clone(),
+                    created_at: first_post.created_at,
+                });
+            }
+        }
+
+        if !deliveries.is_empty() {
+            self.activity_events
+                .lock()
+                .expect("activity_events lock poisoned")
+                .push(ActivityEvent {
+                    id: activity_id.to_string(),
+                    kind: ActivityKind::PostCreated,
+                    thread_id: thread.id.clone(),
+                    post_id: first_post.id.clone(),
+                    actor_sub: first_post.author_sub.clone(),
+                    created_at: first_post.created_at,
+                });
+            let mut stored = self
+                .activity_deliveries
+                .lock()
+                .expect("activity_deliveries lock poisoned");
+            stored.extend(
+                deliveries
+                    .iter()
+                    .cloned()
+                    .map(|delivery| StoredActivityDelivery {
+                        activity_id: activity_id.to_string(),
+                        delivery,
+                    }),
+            );
+        }
+        Ok(ActivityMutation {
+            delivery_subjects: delivery_subjects(&deliveries),
+        })
     }
 
     async fn add_reply(&self, post: &Post) -> Result<(), StoreError> {
@@ -908,9 +1267,142 @@ impl Store for InMemoryStore {
                 "quoted post must belong to this thread".to_string(),
             ));
         }
+        self.register_identity_alias(&post.author_sub, &post.author_email, post.created_at);
         posts.push(post.clone());
         thread.last_at = post.created_at;
         Ok(())
+    }
+
+    async fn add_reply_with_activity(
+        &self,
+        post: &Post,
+        mentioned_usernames: &[String],
+        activity_id: &str,
+    ) -> Result<ActivityMutation, StoreError> {
+        let mentioned_aliases = bounded_mention_aliases(mentioned_usernames)?;
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        let categories = self.categories.lock().expect("categories lock poisoned");
+        let mut threads = self.threads.lock().expect("threads lock poisoned");
+        let thread = threads
+            .iter_mut()
+            .find(|thread| thread.id == post.thread_id)
+            .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
+        if categories
+            .iter()
+            .all(|category| category.id != thread.category_id)
+        {
+            return Err(StoreError::NotFound("category not found".to_string()));
+        }
+        if thread.locked {
+            return Err(StoreError::InvalidOperation(
+                "this thread is locked — no new replies".to_string(),
+            ));
+        }
+        let mut posts = self.posts.lock().expect("posts lock poisoned");
+        let quoted_author = if post.quoted_post_id.is_empty() {
+            None
+        } else {
+            Some(
+                posts
+                    .iter()
+                    .find(|quoted| {
+                        quoted.id == post.quoted_post_id && quoted.thread_id == post.thread_id
+                    })
+                    .ok_or_else(|| {
+                        StoreError::InvalidOperation(
+                            "quoted post must belong to this thread".to_string(),
+                        )
+                    })?
+                    .author_sub
+                    .clone(),
+            )
+        };
+        let subscriptions = self
+            .subscriptions
+            .lock()
+            .expect("subscriptions lock poisoned");
+        let follower_count = subscriptions
+            .iter()
+            .filter(|subscription| subscription.thread_id == post.thread_id)
+            .count();
+        if follower_count > MAX_THREAD_FOLLOWERS {
+            return Err(StoreError::InvalidOperation(format!(
+                "a thread may have at most {MAX_THREAD_FOLLOWERS} followers"
+            )));
+        }
+        let mut deliveries = Vec::new();
+        if let Some(delivery) =
+            subject_delivery(&thread.author_sub, &post.author_sub, ActivityReason::Reply)
+        {
+            deliveries.push(delivery);
+        }
+        if let Some(quoted_author) = quoted_author.as_deref() {
+            if let Some(delivery) =
+                subject_delivery(quoted_author, &post.author_sub, ActivityReason::Reply)
+            {
+                deliveries.push(delivery);
+            }
+        }
+        deliveries.extend(
+            subscriptions
+                .iter()
+                .filter(|subscription| subscription.thread_id == post.thread_id)
+                .filter_map(|subscription| {
+                    subject_delivery(
+                        &subscription.subscriber_sub,
+                        &post.author_sub,
+                        ActivityReason::Following,
+                    )
+                }),
+        );
+        self.register_identity_alias(&post.author_sub, &post.author_email, post.created_at);
+        deliveries.extend(self.resolve_mention_deliveries(&mentioned_aliases, &post.author_sub));
+        dedupe_deliveries(&mut deliveries);
+
+        posts.push(post.clone());
+        thread.last_at = post.created_at;
+        let mut mentions = self.mentions.lock().expect("mentions lock poisoned");
+        mentions.retain(|mention| mention.post_id != post.id);
+        let mut seen = HashSet::new();
+        for name in &mentioned_aliases {
+            if seen.insert(name.as_str()) {
+                mentions.push(Mention {
+                    post_id: post.id.clone(),
+                    thread_id: post.thread_id.clone(),
+                    mentioned_username: name.clone(),
+                    created_at: post.created_at,
+                });
+            }
+        }
+        if !deliveries.is_empty() {
+            self.activity_events
+                .lock()
+                .expect("activity_events lock poisoned")
+                .push(ActivityEvent {
+                    id: activity_id.to_string(),
+                    kind: ActivityKind::PostCreated,
+                    thread_id: post.thread_id.clone(),
+                    post_id: post.id.clone(),
+                    actor_sub: post.author_sub.clone(),
+                    created_at: post.created_at,
+                });
+            let mut stored = self
+                .activity_deliveries
+                .lock()
+                .expect("activity_deliveries lock poisoned");
+            stored.extend(
+                deliveries
+                    .iter()
+                    .cloned()
+                    .map(|delivery| StoredActivityDelivery {
+                        activity_id: activity_id.to_string(),
+                        delivery,
+                    }),
+            );
+        }
+        Ok(ActivityMutation {
+            delivery_subjects: delivery_subjects(&deliveries),
+        })
     }
 
     async fn replace_mentions(
@@ -1037,6 +1529,24 @@ impl Store for InMemoryStore {
             .lock()
             .expect("subscriptions lock poisoned");
         subscriptions.retain(|s| s.thread_id != thread_id);
+        let mut events = self
+            .activity_events
+            .lock()
+            .expect("activity_events lock poisoned");
+        let removed_activity_ids: HashSet<String> = events
+            .iter()
+            .filter(|event| event.thread_id == thread_id)
+            .map(|event| event.id.clone())
+            .collect();
+        events.retain(|event| event.thread_id != thread_id);
+        self.activity_deliveries
+            .lock()
+            .expect("activity_deliveries lock poisoned")
+            .retain(|stored| !removed_activity_ids.contains(&stored.activity_id));
+        self.activity_receipts
+            .lock()
+            .expect("activity_receipts lock poisoned")
+            .retain(|receipt| !removed_activity_ids.contains(&receipt.activity_id));
         Ok(())
     }
 
@@ -1090,7 +1600,10 @@ impl Store for InMemoryStore {
                 "the original post cannot be deleted separately; delete the thread".to_string(),
             ));
         }
-        for post in posts.iter_mut().filter(|post| post.quoted_post_id == post_id) {
+        for post in posts
+            .iter_mut()
+            .filter(|post| post.quoted_post_id == post_id)
+        {
             post.quoted_post_id.clear();
         }
         posts.retain(|post| post.id != post_id);
@@ -1120,6 +1633,24 @@ impl Store for InMemoryStore {
             .lock()
             .expect("mentions lock poisoned")
             .retain(|mention| mention.post_id != post_id);
+        let mut events = self
+            .activity_events
+            .lock()
+            .expect("activity_events lock poisoned");
+        let removed_activity_ids: HashSet<String> = events
+            .iter()
+            .filter(|event| event.post_id == post_id)
+            .map(|event| event.id.clone())
+            .collect();
+        events.retain(|event| event.post_id != post_id);
+        self.activity_deliveries
+            .lock()
+            .expect("activity_deliveries lock poisoned")
+            .retain(|stored| !removed_activity_ids.contains(&stored.activity_id));
+        self.activity_receipts
+            .lock()
+            .expect("activity_receipts lock poisoned")
+            .retain(|receipt| !removed_activity_ids.contains(&receipt.activity_id));
         Ok(())
     }
 
@@ -1156,7 +1687,9 @@ impl Store for InMemoryStore {
 
         let categories = self.categories.lock().expect("categories lock poisoned");
         if categories.iter().all(|category| category.id != source_hint) {
-            return Err(StoreError::NotFound("source category not found".to_string()));
+            return Err(StoreError::NotFound(
+                "source category not found".to_string(),
+            ));
         }
         let target = categories
             .iter()
@@ -1249,33 +1782,163 @@ impl Store for InMemoryStore {
             thread: thread.clone(),
             accepted_post,
             changed,
+            delivery_subjects: Vec::new(),
         })
     }
 
-    async fn toggle_thread_subscription(
+    async fn mutate_accepted_answer_with_activity(
+        &self,
+        thread_id: &str,
+        action: AcceptedAnswerAction,
+        activity_id: &str,
+        actor_sub: &str,
+        created_at: i64,
+    ) -> Result<AcceptedAnswerMutation, StoreError> {
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        let category_hint = self
+            .threads
+            .lock()
+            .expect("threads lock poisoned")
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .map(|thread| thread.category_id.clone())
+            .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
+        let categories = self.categories.lock().expect("categories lock poisoned");
+        let category = categories
+            .iter()
+            .find(|category| category.id == category_hint)
+            .ok_or_else(|| StoreError::NotFound("category not found".to_string()))?;
+        let mut threads = self.threads.lock().expect("threads lock poisoned");
+        let thread = threads
+            .iter_mut()
+            .find(|thread| thread.id == thread_id)
+            .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
+        let original_posts = self
+            .original_posts
+            .lock()
+            .expect("original_posts lock poisoned");
+        let posts = self.posts.lock().expect("posts lock poisoned");
+        let (accepted_post, next_id) = match action {
+            AcceptedAnswerAction::Clear => (None, String::new()),
+            AcceptedAnswerAction::Accept { post_id } => {
+                if !category.format.is_question() {
+                    return Err(StoreError::InvalidOperation(
+                        "accepted answers are available only in question categories".to_string(),
+                    ));
+                }
+                let post_id = post_id.trim();
+                if post_id.is_empty() {
+                    return Err(StoreError::InvalidOperation(
+                        "reply is required when accepting an answer".to_string(),
+                    ));
+                }
+                if original_posts.get(thread_id).map(String::as_str) == Some(post_id) {
+                    return Err(StoreError::InvalidOperation(
+                        "the original post cannot be the accepted answer".to_string(),
+                    ));
+                }
+                let post = posts
+                    .iter()
+                    .find(|post| post.id == post_id && post.thread_id == thread_id)
+                    .cloned()
+                    .ok_or_else(|| StoreError::NotFound("reply not found".to_string()))?;
+                (Some(post), post_id.to_string())
+            }
+        };
+        let changed = thread.accepted_post_id != next_id;
+        thread.accepted_post_id = next_id;
+        let mut deliveries = Vec::new();
+        if changed {
+            if let Some(post) = accepted_post.as_ref() {
+                if let Some(delivery) =
+                    subject_delivery(&post.author_sub, actor_sub, ActivityReason::Answer)
+                {
+                    deliveries.push(delivery);
+                }
+            }
+        }
+        if !deliveries.is_empty() {
+            self.activity_events
+                .lock()
+                .expect("activity_events lock poisoned")
+                .push(ActivityEvent {
+                    id: activity_id.to_string(),
+                    kind: ActivityKind::AnswerAccepted,
+                    thread_id: thread_id.to_string(),
+                    post_id: accepted_post
+                        .as_ref()
+                        .map(|post| post.id.clone())
+                        .unwrap_or_default(),
+                    actor_sub: actor_sub.to_string(),
+                    created_at,
+                });
+            let mut stored = self
+                .activity_deliveries
+                .lock()
+                .expect("activity_deliveries lock poisoned");
+            stored.extend(
+                deliveries
+                    .iter()
+                    .cloned()
+                    .map(|delivery| StoredActivityDelivery {
+                        activity_id: activity_id.to_string(),
+                        delivery,
+                    }),
+            );
+        }
+        Ok(AcceptedAnswerMutation {
+            thread: thread.clone(),
+            accepted_post,
+            changed,
+            delivery_subjects: delivery_subjects(&deliveries),
+        })
+    }
+
+    async fn set_thread_subscription(
         &self,
         thread_id: &str,
         subscriber_sub: &str,
+        subscribed: bool,
         created_at: i64,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<(), StoreError> {
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        if self
+            .threads
+            .lock()
+            .expect("threads lock poisoned")
+            .iter()
+            .all(|thread| thread.id != thread_id)
+        {
+            return Err(StoreError::NotFound("thread not found".to_string()));
+        }
         let mut subscriptions = self
             .subscriptions
             .lock()
             .expect("subscriptions lock poisoned");
-        if let Some(pos) = subscriptions
+        let existing = subscriptions
             .iter()
-            .position(|s| s.thread_id == thread_id && s.subscriber_sub == subscriber_sub)
-        {
-            subscriptions.remove(pos);
-            Ok(false)
-        } else {
+            .position(|s| s.thread_id == thread_id && s.subscriber_sub == subscriber_sub);
+        if subscribed && existing.is_none() {
+            let follower_count = subscriptions
+                .iter()
+                .filter(|row| row.thread_id == thread_id)
+                .count();
+            if follower_count >= MAX_THREAD_FOLLOWERS {
+                return Err(StoreError::InvalidOperation(format!(
+                    "a thread may have at most {MAX_THREAD_FOLLOWERS} followers"
+                )));
+            }
             subscriptions.push(ThreadSubscription {
                 thread_id: thread_id.to_string(),
                 subscriber_sub: subscriber_sub.to_string(),
                 _created_at: created_at,
             });
-            Ok(true)
+        } else if !subscribed {
+            if let Some(position) = existing {
+                subscriptions.remove(position);
+            }
         }
+        Ok(())
     }
 
     async fn is_thread_subscribed(
@@ -1289,6 +1952,254 @@ impl Store for InMemoryStore {
             .expect("subscriptions lock poisoned")
             .iter()
             .any(|s| s.thread_id == thread_id && s.subscriber_sub == subscriber_sub))
+    }
+
+    async fn activity_page(
+        &self,
+        viewer_sub: &str,
+        filter: ActivityFilter,
+        unread_only: bool,
+        before: Option<&ActivityCursor>,
+        limit: i64,
+    ) -> Result<Vec<ActivityItem>, StoreError> {
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        let threads = self.threads.lock().expect("threads lock poisoned").clone();
+        let posts = self.posts.lock().expect("posts lock poisoned").clone();
+        let events = self
+            .activity_events
+            .lock()
+            .expect("activity_events lock poisoned")
+            .clone();
+        let deliveries = self
+            .activity_deliveries
+            .lock()
+            .expect("activity_deliveries lock poisoned")
+            .clone();
+        let receipts = self
+            .activity_receipts
+            .lock()
+            .expect("activity_receipts lock poisoned")
+            .clone();
+
+        let mut items = Vec::new();
+        for event in events {
+            if before.is_some_and(|cursor| {
+                event.created_at > cursor.created_at
+                    || (event.created_at == cursor.created_at && event.id >= cursor.id)
+            }) {
+                continue;
+            }
+            let reason = best_activity_reason(
+                deliveries
+                    .iter()
+                    .filter(|stored| stored.activity_id == event.id)
+                    .map(|stored| stored.delivery.clone())
+                    .filter(|delivery| delivery_matches_viewer(delivery, viewer_sub)),
+            );
+            let Some(reason) = reason else {
+                continue;
+            };
+            if !activity_filter_matches(filter, reason) {
+                continue;
+            }
+            let read = receipts
+                .iter()
+                .any(|receipt| receipt.activity_id == event.id && receipt.viewer_sub == viewer_sub);
+            if unread_only && read {
+                continue;
+            }
+            let Some(thread) = threads.iter().find(|thread| thread.id == event.thread_id) else {
+                continue;
+            };
+            let Some(post) = posts
+                .iter()
+                .find(|post| post.id == event.post_id && post.thread_id == event.thread_id)
+            else {
+                continue;
+            };
+            let actor_email = match event.kind {
+                ActivityKind::PostCreated => post.author_email.clone(),
+                ActivityKind::AnswerAccepted => posts
+                    .iter()
+                    .filter(|candidate| candidate.author_sub == event.actor_sub)
+                    .max_by(|left, right| {
+                        left.created_at
+                            .cmp(&right.created_at)
+                            .then_with(|| left.id.cmp(&right.id))
+                    })
+                    .map(|candidate| candidate.author_email.clone())
+                    .or_else(|| {
+                        threads
+                            .iter()
+                            .filter(|candidate| candidate.author_sub == event.actor_sub)
+                            .max_by(|left, right| {
+                                left.created_at
+                                    .cmp(&right.created_at)
+                                    .then_with(|| left.id.cmp(&right.id))
+                            })
+                            .map(|candidate| candidate.author_email.clone())
+                    })
+                    .unwrap_or_default(),
+            };
+            items.push(ActivityItem {
+                event,
+                reason,
+                thread_title: thread.title.clone(),
+                post_body_md: post.body_md.clone(),
+                post_created_at: post.created_at,
+                actor_email,
+                read,
+            });
+        }
+        items.sort_by(|left, right| {
+            right
+                .event
+                .created_at
+                .cmp(&left.event.created_at)
+                .then_with(|| right.event.id.cmp(&left.event.id))
+        });
+        items.truncate(limit.max(0) as usize);
+        Ok(items)
+    }
+
+    async fn unread_activity_count(&self, viewer_sub: &str) -> Result<i64, StoreError> {
+        Ok(self
+            .activity_page(viewer_sub, ActivityFilter::All, true, None, i64::MAX)
+            .await?
+            .len() as i64)
+    }
+
+    async fn set_activity_read(
+        &self,
+        activity_id: &str,
+        viewer_sub: &str,
+        read: bool,
+        changed_at: i64,
+    ) -> Result<(), StoreError> {
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        let delivered = self
+            .activity_deliveries
+            .lock()
+            .expect("activity_deliveries lock poisoned")
+            .iter()
+            .any(|stored| {
+                stored.activity_id == activity_id
+                    && delivery_matches_viewer(&stored.delivery, viewer_sub)
+            });
+        let target = self
+            .activity_events
+            .lock()
+            .expect("activity_events lock poisoned")
+            .iter()
+            .find(|event| event.id == activity_id)
+            .cloned();
+        let authoritative = target.is_some_and(|event| {
+            self.threads
+                .lock()
+                .expect("threads lock poisoned")
+                .iter()
+                .any(|thread| thread.id == event.thread_id)
+                && self
+                    .posts
+                    .lock()
+                    .expect("posts lock poisoned")
+                    .iter()
+                    .any(|post| post.id == event.post_id && post.thread_id == event.thread_id)
+        });
+        if !delivered || !authoritative {
+            return Err(StoreError::NotFound("activity not found".to_string()));
+        }
+        let mut receipts = self
+            .activity_receipts
+            .lock()
+            .expect("activity_receipts lock poisoned");
+        receipts.retain(|receipt| {
+            receipt.activity_id != activity_id || receipt.viewer_sub != viewer_sub
+        });
+        if read {
+            receipts.push(ActivityReceipt {
+                activity_id: activity_id.to_string(),
+                viewer_sub: viewer_sub.to_string(),
+                _read_at: changed_at,
+            });
+        }
+        Ok(())
+    }
+
+    async fn mark_activity_batch_read(
+        &self,
+        viewer_sub: &str,
+        activity_ids: &[String],
+        changed_at: i64,
+    ) -> Result<i64, StoreError> {
+        if activity_ids.len() > MAX_ACTIVITY_BATCH {
+            return Err(StoreError::InvalidOperation(format!(
+                "activity batch may contain at most {MAX_ACTIVITY_BATCH} ids"
+            )));
+        }
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        let threads: HashSet<String> = self
+            .threads
+            .lock()
+            .expect("threads lock poisoned")
+            .iter()
+            .map(|thread| thread.id.clone())
+            .collect();
+        let posts: HashSet<(String, String)> = self
+            .posts
+            .lock()
+            .expect("posts lock poisoned")
+            .iter()
+            .map(|post| (post.thread_id.clone(), post.id.clone()))
+            .collect();
+        let events = self
+            .activity_events
+            .lock()
+            .expect("activity_events lock poisoned")
+            .clone();
+        let deliveries = self
+            .activity_deliveries
+            .lock()
+            .expect("activity_deliveries lock poisoned")
+            .clone();
+        let requested: HashSet<&str> = activity_ids.iter().map(String::as_str).collect();
+        let target_ids: Vec<String> = events
+            .iter()
+            .filter(|event| requested.contains(event.id.as_str()))
+            .filter(|event| {
+                threads.contains(&event.thread_id)
+                    && posts.contains(&(event.thread_id.clone(), event.post_id.clone()))
+            })
+            .filter(|event| {
+                deliveries.iter().any(|stored| {
+                    stored.activity_id == event.id
+                        && delivery_matches_viewer(&stored.delivery, viewer_sub)
+                })
+            })
+            .map(|event| event.id.clone())
+            .collect();
+        if target_ids.len() != requested.len() {
+            return Err(StoreError::NotFound("activity not found".to_string()));
+        }
+        let mut receipts = self
+            .activity_receipts
+            .lock()
+            .expect("activity_receipts lock poisoned");
+        let mut changed = 0_i64;
+        for activity_id in target_ids {
+            if receipts.iter().any(|receipt| {
+                receipt.activity_id == activity_id && receipt.viewer_sub == viewer_sub
+            }) {
+                continue;
+            }
+            receipts.push(ActivityReceipt {
+                activity_id,
+                viewer_sub: viewer_sub.to_string(),
+                _read_at: changed_at,
+            });
+            changed += 1;
+        }
+        Ok(changed)
     }
 
     async fn toggle_reaction(
@@ -1494,12 +2405,22 @@ fn like_contains_pattern(query: &str) -> String {
 // the database enforces the primary keys, so no in-process serializer is needed.
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
-use sqlx::Row;
+use sqlx::{Postgres, Row, Transaction};
 
 /// PostgreSQL-backed [`Store`]. Holds just a `PgPool`; the async trait methods drive sqlx
 /// natively, so no worker thread is ever blocked on a DB round-trip.
 pub struct PgStore {
     pool: PgPool,
+}
+
+/// Canonical lock key used by Activity receipt mutations. Ordering every batch by
+/// category -> thread -> post -> event matches moderation deletion and prevents deadlocks.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ActivityLockTarget {
+    category_id: String,
+    thread_id: String,
+    post_id: String,
+    activity_id: String,
 }
 
 impl PgStore {
@@ -1515,6 +2436,229 @@ impl PgStore {
     /// Construct from an existing pool (used by tests that share a pool).
     pub fn from_pool(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    async fn register_identity_alias_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        subject: &str,
+        email: &str,
+        created_at: i64,
+    ) -> Result<(), sqlx::Error> {
+        let Some(alias) = identity_alias(subject, email) else {
+            return Ok(());
+        };
+        sqlx::query(
+            "INSERT INTO forum_identity_aliases (alias, subject, created_at) \
+             VALUES ($1, $2, $3) ON CONFLICT (alias, subject) DO NOTHING",
+        )
+        .bind(alias)
+        .bind(subject)
+        .bind(created_at)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    async fn resolve_mention_deliveries_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        mentioned_aliases: &[String],
+        actor_sub: &str,
+    ) -> Result<Vec<ActivityDelivery>, sqlx::Error> {
+        let mut deliveries = Vec::new();
+        for alias in mentioned_aliases {
+            let subjects = sqlx::query_scalar::<_, String>(
+                "SELECT subject FROM forum_identity_aliases \
+                 WHERE alias = $1 ORDER BY subject LIMIT 2",
+            )
+            .bind(alias)
+            .fetch_all(&mut **tx)
+            .await?;
+            if subjects.len() == 1 {
+                if let Some(delivery) =
+                    subject_delivery(&subjects[0], actor_sub, ActivityReason::Mention)
+                {
+                    deliveries.push(delivery);
+                }
+            }
+        }
+        Ok(deliveries)
+    }
+
+    async fn activity_lock_targets(
+        &self,
+        activity_ids: &[&str],
+    ) -> Result<Vec<ActivityLockTarget>, StoreError> {
+        let mut targets = Vec::with_capacity(activity_ids.len());
+        for activity_id in activity_ids {
+            let row = sqlx::query(
+                "SELECT t.category_id, e.thread_id, e.post_id, e.id AS activity_id \
+                 FROM forum_activity_events AS e \
+                 JOIN threads AS t ON t.id = e.thread_id \
+                 WHERE e.id = $1",
+            )
+            .bind(activity_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(backend)?
+            .ok_or_else(|| StoreError::NotFound("activity not found".to_string()))?;
+            targets.push(ActivityLockTarget {
+                category_id: row.try_get("category_id").map_err(backend)?,
+                thread_id: row.try_get("thread_id").map_err(backend)?,
+                post_id: row.try_get("post_id").map_err(backend)?,
+                activity_id: row.try_get("activity_id").map_err(backend)?,
+            });
+        }
+        targets.sort();
+        Ok(targets)
+    }
+
+    async fn lock_activity_targets_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        viewer_sub: &str,
+        targets: &[ActivityLockTarget],
+    ) -> Result<(), StoreError> {
+        let categories: BTreeSet<&str> = targets
+            .iter()
+            .map(|target| target.category_id.as_str())
+            .collect();
+        for category_id in categories {
+            let exists = sqlx::query_scalar::<_, String>(
+                "SELECT id FROM categories WHERE id = $1 FOR UPDATE",
+            )
+            .bind(category_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(backend)?;
+            if exists.is_none() {
+                return Err(StoreError::NotFound("activity not found".to_string()));
+            }
+        }
+
+        let threads: BTreeSet<(&str, &str)> = targets
+            .iter()
+            .map(|target| (target.category_id.as_str(), target.thread_id.as_str()))
+            .collect();
+        for (category_id, thread_id) in threads {
+            let current_category = sqlx::query_scalar::<_, String>(
+                "SELECT category_id FROM threads WHERE id = $1 FOR UPDATE",
+            )
+            .bind(thread_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(backend)?;
+            if current_category.as_deref() != Some(category_id) {
+                return Err(StoreError::NotFound("activity not found".to_string()));
+            }
+        }
+
+        let posts: BTreeSet<(&str, &str)> = targets
+            .iter()
+            .map(|target| (target.thread_id.as_str(), target.post_id.as_str()))
+            .collect();
+        for (thread_id, post_id) in posts {
+            let current_thread = sqlx::query_scalar::<_, String>(
+                "SELECT thread_id FROM posts WHERE id = $1 FOR UPDATE",
+            )
+            .bind(post_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(backend)?;
+            if current_thread.as_deref() != Some(thread_id) {
+                return Err(StoreError::NotFound("activity not found".to_string()));
+            }
+        }
+
+        for target in targets {
+            let visible = sqlx::query_scalar::<_, String>(
+                "SELECT e.id FROM forum_activity_events AS e \
+                 WHERE e.id = $1 AND e.thread_id = $2 AND e.post_id = $3 \
+                   AND EXISTS (\
+                       SELECT 1 FROM forum_activity_deliveries AS d \
+                       WHERE d.activity_id = e.id AND d.recipient_kind = 'subject' \
+                         AND d.recipient_key = $4\
+                   ) \
+                 FOR UPDATE OF e",
+            )
+            .bind(&target.activity_id)
+            .bind(&target.thread_id)
+            .bind(&target.post_id)
+            .bind(viewer_sub)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(backend)?;
+            if visible.is_none() {
+                return Err(StoreError::NotFound("activity not found".to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    async fn insert_activity_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        event: &ActivityEvent,
+        deliveries: &[ActivityDelivery],
+    ) -> Result<(), sqlx::Error> {
+        if deliveries.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            "INSERT INTO forum_activity_events \
+                 (id, kind, thread_id, post_id, actor_sub, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(&event.id)
+        .bind(event.kind.as_str())
+        .bind(&event.thread_id)
+        .bind(&event.post_id)
+        .bind(&event.actor_sub)
+        .bind(event.created_at)
+        .execute(&mut **tx)
+        .await?;
+        for delivery in deliveries {
+            sqlx::query(
+                "INSERT INTO forum_activity_deliveries \
+                     (activity_id, recipient_kind, recipient_key, reason) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (activity_id, recipient_kind, recipient_key, reason) DO NOTHING",
+            )
+            .bind(&event.id)
+            .bind(delivery.recipient_kind.as_str())
+            .bind(&delivery.recipient_key)
+            .bind(delivery.reason.as_str())
+            .execute(&mut **tx)
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn replace_mentions_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        post_id: &str,
+        thread_id: &str,
+        mentioned_usernames: &[String],
+        created_at: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM post_mentions WHERE post_id = $1")
+            .bind(post_id)
+            .execute(&mut **tx)
+            .await?;
+        let mut seen = HashSet::new();
+        for name in mentioned_usernames {
+            if !seen.insert(name.as_str()) {
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO post_mentions (post_id, thread_id, mentioned_username, created_at) \
+                 VALUES ($1, $2, $3, $4) ON CONFLICT (post_id, mentioned_username) DO NOTHING",
+            )
+            .bind(post_id)
+            .bind(thread_id)
+            .bind(name)
+            .bind(created_at)
+            .execute(&mut **tx)
+            .await?;
+        }
+        Ok(())
     }
 
     /// Idempotent, portable migration. Standard SQL only — safe to run on every startup.
@@ -1690,6 +2834,43 @@ impl PgStore {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_mentions_thread ON post_mentions (thread_id)")
             .execute(&self.pool)
             .await?;
+        // Append-only identity aliases resolve @name to one stable gateway subject at event-write
+        // time. Multiple subjects may claim an alias; that alias then resolves to nobody.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS forum_identity_aliases (\
+                 alias TEXT NOT NULL, \
+                 subject TEXT NOT NULL, \
+                 created_at BIGINT NOT NULL, \
+                 PRIMARY KEY (alias, subject)\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_identity_aliases_subject \
+             ON forum_identity_aliases (subject)",
+        )
+        .execute(&self.pool)
+        .await?;
+        let historical_authors = sqlx::query(
+            "SELECT author_sub, author_email, MIN(created_at) AS created_at \
+             FROM (\
+                 SELECT author_sub, author_email, created_at FROM posts \
+                 UNION ALL \
+                 SELECT author_sub, author_email, created_at FROM threads\
+             ) AS authors \
+             GROUP BY author_sub, author_email",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut alias_tx = self.pool.begin().await?;
+        for row in historical_authors {
+            let subject: String = row.try_get("author_sub")?;
+            let email: String = row.try_get("author_email")?;
+            let created_at: i64 = row.try_get("created_at")?;
+            Self::register_identity_alias_tx(&mut alias_tx, &subject, &email, created_at).await?;
+        }
+        alias_tx.commit().await?;
         // Per-thread subscriptions. The composite primary key gives one subscription per user/thread.
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS thread_subscriptions (\
@@ -1704,6 +2885,169 @@ impl PgStore {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_subscriptions_user ON thread_subscriptions (subscriber_sub)")
             .execute(&self.pool)
             .await?;
+        // Durable personal activity. Event rows contain no title/body snapshot: every read joins
+        // through the live thread/post rows, and moderation deletes explicitly remove the event.
+        // Fresh tables intentionally begin empty; migration never turns historical lifetime
+        // mentions into a surprise wall of unread notifications.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS forum_activity_events (\
+                 id TEXT PRIMARY KEY, \
+                 kind TEXT NOT NULL, \
+                 thread_id TEXT NOT NULL, \
+                 post_id TEXT NOT NULL, \
+                 actor_sub TEXT NOT NULL, \
+                 created_at BIGINT NOT NULL\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_activity_events_order \
+             ON forum_activity_events (created_at, id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_activity_events_thread \
+             ON forum_activity_events (thread_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_activity_events_post \
+             ON forum_activity_events (post_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS forum_activity_deliveries (\
+                 activity_id TEXT NOT NULL, \
+                 recipient_kind TEXT NOT NULL, \
+                 recipient_key TEXT NOT NULL, \
+                 reason TEXT NOT NULL, \
+                 PRIMARY KEY (activity_id, recipient_kind, recipient_key, reason), \
+                 CONSTRAINT fk_activity_delivery_event FOREIGN KEY (activity_id) \
+                     REFERENCES forum_activity_events(id) ON DELETE CASCADE\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_activity_deliveries_recipient \
+             ON forum_activity_deliveries (recipient_kind, recipient_key, activity_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS forum_activity_receipts (\
+                 activity_id TEXT NOT NULL, \
+                 viewer_sub TEXT NOT NULL, \
+                 read_at BIGINT NOT NULL, \
+                 PRIMARY KEY (activity_id, viewer_sub), \
+                 CONSTRAINT fk_activity_receipt_event FOREIGN KEY (activity_id) \
+                     REFERENCES forum_activity_events(id) ON DELETE CASCADE\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_activity_receipts_viewer \
+             ON forum_activity_receipts (viewer_sub, activity_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Upgrade pre-FK deployments in the existing single-active/quiescent boot migration
+        // window. Legacy username deliveries are converted only when the alias has exactly one
+        // subject; unresolved or ambiguous aliases fail closed.
+        let mut activity_schema_tx = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM forum_activity_deliveries AS d \
+             WHERE NOT EXISTS (SELECT 1 FROM forum_activity_events AS e WHERE e.id = d.activity_id)",
+        )
+        .execute(&mut *activity_schema_tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM forum_activity_receipts AS r \
+             WHERE NOT EXISTS (SELECT 1 FROM forum_activity_events AS e WHERE e.id = r.activity_id)",
+        )
+        .execute(&mut *activity_schema_tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO forum_activity_deliveries \
+                 (activity_id, recipient_kind, recipient_key, reason) \
+             SELECT d.activity_id, 'subject', resolved.subject, d.reason \
+             FROM forum_activity_deliveries AS d \
+             JOIN (\
+                 SELECT alias, MIN(subject) AS subject \
+                 FROM forum_identity_aliases GROUP BY alias HAVING COUNT(*) = 1\
+             ) AS resolved ON resolved.alias = d.recipient_key \
+             WHERE d.recipient_kind = 'username' \
+             ON CONFLICT (activity_id, recipient_kind, recipient_key, reason) DO NOTHING",
+        )
+        .execute(&mut *activity_schema_tx)
+        .await?;
+        sqlx::query("DELETE FROM forum_activity_deliveries WHERE recipient_kind <> 'subject'")
+            .execute(&mut *activity_schema_tx)
+            .await?;
+        sqlx::query(
+            "DELETE FROM forum_activity_receipts AS r \
+             WHERE NOT EXISTS (\
+                 SELECT 1 FROM forum_activity_deliveries AS d \
+                 WHERE d.activity_id = r.activity_id \
+                   AND d.recipient_kind = 'subject' AND d.recipient_key = r.viewer_sub\
+             )",
+        )
+        .execute(&mut *activity_schema_tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM forum_activity_events AS e \
+             WHERE NOT EXISTS (\
+                 SELECT 1 FROM forum_activity_deliveries AS d WHERE d.activity_id = e.id\
+             )",
+        )
+        .execute(&mut *activity_schema_tx)
+        .await?;
+        let delivery_fk = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (\
+                 SELECT 1 FROM information_schema.table_constraints \
+                 WHERE constraint_schema = CURRENT_SCHEMA \
+                   AND table_name = 'forum_activity_deliveries' \
+                   AND constraint_name = 'fk_activity_delivery_event' \
+                   AND constraint_type = 'FOREIGN KEY'\
+             )",
+        )
+        .fetch_one(&mut *activity_schema_tx)
+        .await?;
+        if !delivery_fk {
+            sqlx::query(
+                "ALTER TABLE forum_activity_deliveries \
+                 ADD CONSTRAINT fk_activity_delivery_event FOREIGN KEY (activity_id) \
+                 REFERENCES forum_activity_events(id) ON DELETE CASCADE",
+            )
+            .execute(&mut *activity_schema_tx)
+            .await?;
+        }
+        let receipt_fk = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (\
+                 SELECT 1 FROM information_schema.table_constraints \
+                 WHERE constraint_schema = CURRENT_SCHEMA \
+                   AND table_name = 'forum_activity_receipts' \
+                   AND constraint_name = 'fk_activity_receipt_event' \
+                   AND constraint_type = 'FOREIGN KEY'\
+             )",
+        )
+        .fetch_one(&mut *activity_schema_tx)
+        .await?;
+        if !receipt_fk {
+            sqlx::query(
+                "ALTER TABLE forum_activity_receipts \
+                 ADD CONSTRAINT fk_activity_receipt_event FOREIGN KEY (activity_id) \
+                 REFERENCES forum_activity_events(id) ON DELETE CASCADE",
+            )
+            .execute(&mut *activity_schema_tx)
+            .await?;
+        }
+        activity_schema_tx.commit().await?;
         // Per-user post reactions. One row is one user's single reaction of a kind; the composite
         // PRIMARY KEY makes it unique + idempotent per (post, user, kind). Portable standard SQL.
         sqlx::query(
@@ -1944,24 +3288,22 @@ impl PgStore {
 
     async fn delete_category_async(&self, id: &str) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await.map_err(backend)?;
-        let category = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM categories WHERE id = $1 FOR UPDATE",
-        )
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(backend)?;
+        let category =
+            sqlx::query_scalar::<_, String>("SELECT id FROM categories WHERE id = $1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(backend)?;
         if category.is_none() {
             tx.commit().await.map_err(backend)?;
             return Ok(());
         }
-        let thread_count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM threads WHERE category_id = $1",
-        )
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(backend)?;
+        let thread_count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM threads WHERE category_id = $1")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(backend)?;
         if thread_count > 0 {
             return Err(StoreError::InvalidOperation(
                 "category still has threads — move or delete them first".to_string(),
@@ -2094,9 +3436,7 @@ impl PgStore {
                 sql.push_str("t.last_at DESC, t.created_at DESC, t.id DESC");
             }
             ThreadSort::Top => {
-                sql.push_str(
-                    "COUNT(p.id) DESC, t.last_at DESC, t.created_at DESC, t.id DESC",
-                );
+                sql.push_str("COUNT(p.id) DESC, t.last_at DESC, t.created_at DESC, t.id DESC");
             }
             ThreadSort::Hot => {
                 let now_param = hot_now_param.expect("hot sort has timestamp parameter");
@@ -2381,6 +3721,24 @@ impl PgStore {
                     .fetch_all(&self.pool)
                     .await?
             }
+            ReplyAnchor::Around(ts, id) => {
+                let sql = format!(
+                    "SELECT {} FROM posts WHERE thread_id = $1 AND id <> $2 \
+                     AND ($3 IS NULL OR id <> $3) \
+                     AND (created_at < $4 OR (created_at = $4 AND id <= $5)) \
+                     ORDER BY created_at DESC, id DESC LIMIT $6",
+                    Self::POST_COLS
+                );
+                sqlx::query(&sql)
+                    .bind(thread_id)
+                    .bind(op_id)
+                    .bind(excluded_post_id)
+                    .bind(ts)
+                    .bind(id)
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
         };
         rows.iter().map(Self::post_from_row).collect()
     }
@@ -2396,14 +3754,20 @@ impl PgStore {
             ));
         }
         let mut tx = self.pool.begin().await.map_err(backend)?;
-        sqlx::query_scalar::<_, String>(
-            "SELECT id FROM categories WHERE id = $1 FOR UPDATE",
+        sqlx::query_scalar::<_, String>("SELECT id FROM categories WHERE id = $1 FOR UPDATE")
+            .bind(&thread.category_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(backend)?
+            .ok_or_else(|| StoreError::NotFound("category not found".to_string()))?;
+        Self::register_identity_alias_tx(
+            &mut tx,
+            &first_post.author_sub,
+            &first_post.author_email,
+            first_post.created_at,
         )
-        .bind(&thread.category_id)
-        .fetch_optional(&mut *tx)
         .await
-        .map_err(backend)?
-        .ok_or_else(|| StoreError::NotFound("category not found".to_string()))?;
+        .map_err(backend)?;
         sqlx::query(
             "INSERT INTO threads \
                  (id, category_id, title, author_sub, author_email, created_at, last_at, first_body_md, first_post_id, locked, pinned, accepted_post_id) \
@@ -2443,33 +3807,129 @@ impl PgStore {
         Ok(())
     }
 
-    async fn add_reply_async(&self, post: &Post) -> Result<(), StoreError> {
-        for _ in 0..4 {
-            let category_hint = sqlx::query_scalar::<_, String>(
-                "SELECT category_id FROM threads WHERE id = $1",
-            )
-            .bind(&post.thread_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(backend)?
-            .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
-
-            let mut tx = self.pool.begin().await.map_err(backend)?;
-            sqlx::query_scalar::<_, String>(
-                "SELECT id FROM categories WHERE id = $1 FOR UPDATE",
-            )
-            .bind(&category_hint)
+    async fn create_thread_with_activity_async(
+        &self,
+        thread: &Thread,
+        first_post: &Post,
+        mentioned_usernames: &[String],
+        activity_id: &str,
+    ) -> Result<ActivityMutation, StoreError> {
+        let mentioned_aliases = bounded_mention_aliases(mentioned_usernames)?;
+        if first_post.thread_id != thread.id {
+            return Err(StoreError::InvalidOperation(
+                "the original post must belong to the new thread".to_string(),
+            ));
+        }
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        sqlx::query_scalar::<_, String>("SELECT id FROM categories WHERE id = $1 FOR UPDATE")
+            .bind(&thread.category_id)
             .fetch_optional(&mut *tx)
             .await
             .map_err(backend)?
             .ok_or_else(|| StoreError::NotFound("category not found".to_string()))?;
-            let thread = sqlx::query(
-                "SELECT category_id, locked FROM threads WHERE id = $1 FOR UPDATE",
-            )
-            .bind(&post.thread_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(backend)?;
+        Self::register_identity_alias_tx(
+            &mut tx,
+            &first_post.author_sub,
+            &first_post.author_email,
+            first_post.created_at,
+        )
+        .await
+        .map_err(backend)?;
+        let mut deliveries = Self::resolve_mention_deliveries_tx(
+            &mut tx,
+            &mentioned_aliases,
+            &first_post.author_sub,
+        )
+        .await
+        .map_err(backend)?;
+        dedupe_deliveries(&mut deliveries);
+        sqlx::query(
+            "INSERT INTO threads \
+                 (id, category_id, title, author_sub, author_email, created_at, last_at, first_body_md, first_post_id, locked, pinned, accepted_post_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+        )
+        .bind(&thread.id)
+        .bind(&thread.category_id)
+        .bind(&thread.title)
+        .bind(&thread.author_sub)
+        .bind(&thread.author_email)
+        .bind(thread.created_at)
+        .bind(thread.last_at)
+        .bind(&first_post.body_md)
+        .bind(&first_post.id)
+        .bind(thread.locked)
+        .bind(thread.pinned)
+        .bind(&thread.accepted_post_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        sqlx::query(
+            "INSERT INTO posts \
+                 (id, thread_id, body_md, quoted_post_id, author_sub, author_email, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(&first_post.id)
+        .bind(&first_post.thread_id)
+        .bind(&first_post.body_md)
+        .bind(&first_post.quoted_post_id)
+        .bind(&first_post.author_sub)
+        .bind(&first_post.author_email)
+        .bind(first_post.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        Self::replace_mentions_tx(
+            &mut tx,
+            &first_post.id,
+            &thread.id,
+            &mentioned_aliases,
+            first_post.created_at,
+        )
+        .await
+        .map_err(backend)?;
+        Self::insert_activity_tx(
+            &mut tx,
+            &ActivityEvent {
+                id: activity_id.to_string(),
+                kind: ActivityKind::PostCreated,
+                thread_id: thread.id.clone(),
+                post_id: first_post.id.clone(),
+                actor_sub: first_post.author_sub.clone(),
+                created_at: first_post.created_at,
+            },
+            &deliveries,
+        )
+        .await
+        .map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
+        Ok(ActivityMutation {
+            delivery_subjects: delivery_subjects(&deliveries),
+        })
+    }
+
+    async fn add_reply_async(&self, post: &Post) -> Result<(), StoreError> {
+        for _ in 0..4 {
+            let category_hint =
+                sqlx::query_scalar::<_, String>("SELECT category_id FROM threads WHERE id = $1")
+                    .bind(&post.thread_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(backend)?
+                    .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
+
+            let mut tx = self.pool.begin().await.map_err(backend)?;
+            sqlx::query_scalar::<_, String>("SELECT id FROM categories WHERE id = $1 FOR UPDATE")
+                .bind(&category_hint)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(backend)?
+                .ok_or_else(|| StoreError::NotFound("category not found".to_string()))?;
+            let thread =
+                sqlx::query("SELECT category_id, locked FROM threads WHERE id = $1 FOR UPDATE")
+                    .bind(&post.thread_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(backend)?;
             let Some(thread) = thread else {
                 return Err(StoreError::NotFound("thread not found".to_string()));
             };
@@ -2496,6 +3956,14 @@ impl PgStore {
                     ));
                 }
             }
+            Self::register_identity_alias_tx(
+                &mut tx,
+                &post.author_sub,
+                &post.author_email,
+                post.created_at,
+            )
+            .await
+            .map_err(backend)?;
             sqlx::query(
                 "INSERT INTO posts \
                      (id, thread_id, body_md, quoted_post_id, author_sub, author_email, created_at) \
@@ -2519,6 +3987,178 @@ impl PgStore {
                 .map_err(backend)?;
             tx.commit().await.map_err(backend)?;
             return Ok(());
+        }
+        Err(StoreError::Backend(
+            "thread category changed repeatedly; retry the reply".to_string(),
+        ))
+    }
+
+    async fn add_reply_with_activity_async(
+        &self,
+        post: &Post,
+        mentioned_usernames: &[String],
+        activity_id: &str,
+    ) -> Result<ActivityMutation, StoreError> {
+        let mentioned_aliases = bounded_mention_aliases(mentioned_usernames)?;
+        for _ in 0..4 {
+            let category_hint =
+                sqlx::query_scalar::<_, String>("SELECT category_id FROM threads WHERE id = $1")
+                    .bind(&post.thread_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(backend)?
+                    .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
+            let mut tx = self.pool.begin().await.map_err(backend)?;
+            sqlx::query_scalar::<_, String>("SELECT id FROM categories WHERE id = $1 FOR UPDATE")
+                .bind(&category_hint)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(backend)?
+                .ok_or_else(|| StoreError::NotFound("category not found".to_string()))?;
+            let thread_sql = format!(
+                "SELECT {} FROM threads WHERE id = $1 FOR UPDATE",
+                Self::THREAD_COLS
+            );
+            let thread_row = sqlx::query(&thread_sql)
+                .bind(&post.thread_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(backend)?;
+            let Some(thread_row) = thread_row else {
+                return Err(StoreError::NotFound("thread not found".to_string()));
+            };
+            let thread = Self::thread_from_row(&thread_row).map_err(backend)?;
+            if thread.category_id != category_hint {
+                continue;
+            }
+            if thread.locked {
+                return Err(StoreError::InvalidOperation(
+                    "this thread is locked — no new replies".to_string(),
+                ));
+            }
+            let quoted_author = if post.quoted_post_id.is_empty() {
+                None
+            } else {
+                let post_sql = format!(
+                    "SELECT {} FROM posts WHERE id = $1 FOR UPDATE",
+                    Self::POST_COLS
+                );
+                let quoted = sqlx::query(&post_sql)
+                    .bind(&post.quoted_post_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(backend)?
+                    .ok_or_else(|| {
+                        StoreError::InvalidOperation(
+                            "quoted post must belong to this thread".to_string(),
+                        )
+                    })?;
+                let quoted = Self::post_from_row(&quoted).map_err(backend)?;
+                if quoted.thread_id != post.thread_id {
+                    return Err(StoreError::InvalidOperation(
+                        "quoted post must belong to this thread".to_string(),
+                    ));
+                }
+                Some(quoted.author_sub)
+            };
+            let follower_rows = sqlx::query(
+                "SELECT subscriber_sub FROM thread_subscriptions \
+                 WHERE thread_id = $1 ORDER BY subscriber_sub LIMIT $2",
+            )
+            .bind(&post.thread_id)
+            .bind((MAX_THREAD_FOLLOWERS + 1) as i64)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(backend)?;
+            if follower_rows.len() > MAX_THREAD_FOLLOWERS {
+                return Err(StoreError::InvalidOperation(format!(
+                    "a thread may have at most {MAX_THREAD_FOLLOWERS} followers"
+                )));
+            }
+            Self::register_identity_alias_tx(
+                &mut tx,
+                &post.author_sub,
+                &post.author_email,
+                post.created_at,
+            )
+            .await
+            .map_err(backend)?;
+            let mut deliveries = Vec::new();
+            if let Some(delivery) =
+                subject_delivery(&thread.author_sub, &post.author_sub, ActivityReason::Reply)
+            {
+                deliveries.push(delivery);
+            }
+            if let Some(quoted_author) = quoted_author.as_deref() {
+                if let Some(delivery) =
+                    subject_delivery(quoted_author, &post.author_sub, ActivityReason::Reply)
+                {
+                    deliveries.push(delivery);
+                }
+            }
+            for row in follower_rows {
+                let subscriber_sub: String = row.try_get("subscriber_sub").map_err(backend)?;
+                if let Some(delivery) =
+                    subject_delivery(&subscriber_sub, &post.author_sub, ActivityReason::Following)
+                {
+                    deliveries.push(delivery);
+                }
+            }
+            deliveries.extend(
+                Self::resolve_mention_deliveries_tx(&mut tx, &mentioned_aliases, &post.author_sub)
+                    .await
+                    .map_err(backend)?,
+            );
+            dedupe_deliveries(&mut deliveries);
+
+            sqlx::query(
+                "INSERT INTO posts \
+                     (id, thread_id, body_md, quoted_post_id, author_sub, author_email, created_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(&post.id)
+            .bind(&post.thread_id)
+            .bind(&post.body_md)
+            .bind(&post.quoted_post_id)
+            .bind(&post.author_sub)
+            .bind(&post.author_email)
+            .bind(post.created_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+            sqlx::query("UPDATE threads SET last_at = $1 WHERE id = $2")
+                .bind(post.created_at)
+                .bind(&post.thread_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(backend)?;
+            Self::replace_mentions_tx(
+                &mut tx,
+                &post.id,
+                &post.thread_id,
+                &mentioned_aliases,
+                post.created_at,
+            )
+            .await
+            .map_err(backend)?;
+            Self::insert_activity_tx(
+                &mut tx,
+                &ActivityEvent {
+                    id: activity_id.to_string(),
+                    kind: ActivityKind::PostCreated,
+                    thread_id: post.thread_id.clone(),
+                    post_id: post.id.clone(),
+                    actor_sub: post.author_sub.clone(),
+                    created_at: post.created_at,
+                },
+                &deliveries,
+            )
+            .await
+            .map_err(backend)?;
+            tx.commit().await.map_err(backend)?;
+            return Ok(ActivityMutation {
+                delivery_subjects: delivery_subjects(&deliveries),
+            });
         }
         Err(StoreError::Backend(
             "thread category changed repeatedly; retry the reply".to_string(),
@@ -2617,13 +4257,12 @@ impl PgStore {
 
     async fn delete_thread_async(&self, thread_id: &str) -> Result<(), StoreError> {
         for _ in 0..4 {
-            let category_hint = sqlx::query_scalar::<_, String>(
-                "SELECT category_id FROM threads WHERE id = $1",
-            )
-            .bind(thread_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(backend)?;
+            let category_hint =
+                sqlx::query_scalar::<_, String>("SELECT category_id FROM threads WHERE id = $1")
+                    .bind(thread_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(backend)?;
             let Some(category_hint) = category_hint else {
                 return Ok(());
             };
@@ -2647,13 +4286,11 @@ impl PgStore {
             if current_category != category_hint {
                 continue;
             }
-            sqlx::query(
-                "SELECT id FROM posts WHERE thread_id = $1 ORDER BY id FOR UPDATE",
-            )
-            .bind(thread_id)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(backend)?;
+            sqlx::query("SELECT id FROM posts WHERE thread_id = $1 ORDER BY id FOR UPDATE")
+                .bind(thread_id)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(backend)?;
             sqlx::query(
                 "DELETE FROM post_reactions \
                  WHERE post_id IN (SELECT id FROM posts WHERE thread_id = $1)",
@@ -2668,6 +4305,19 @@ impl PgStore {
                 .await
                 .map_err(backend)?;
             sqlx::query("DELETE FROM thread_subscriptions WHERE thread_id = $1")
+                .bind(thread_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(backend)?;
+            sqlx::query(
+                "SELECT id FROM forum_activity_events \
+                 WHERE thread_id = $1 ORDER BY id FOR UPDATE",
+            )
+            .bind(thread_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(backend)?;
+            sqlx::query("DELETE FROM forum_activity_events WHERE thread_id = $1")
                 .bind(thread_id)
                 .execute(&mut *tx)
                 .await
@@ -2704,24 +4354,22 @@ impl PgStore {
     /// reply owned by another author.
     async fn delete_post_async(&self, post_id: &str) -> Result<bool, StoreError> {
         for _ in 0..4 {
-            let thread_hint = sqlx::query_scalar::<_, String>(
-                "SELECT thread_id FROM posts WHERE id = $1",
-            )
-            .bind(post_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(backend)?;
+            let thread_hint =
+                sqlx::query_scalar::<_, String>("SELECT thread_id FROM posts WHERE id = $1")
+                    .bind(post_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(backend)?;
             let Some(thread_hint) = thread_hint else {
                 return Ok(true);
             };
-            let category_hint = sqlx::query_scalar::<_, String>(
-                "SELECT category_id FROM threads WHERE id = $1",
-            )
-            .bind(&thread_hint)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(backend)?
-            .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
+            let category_hint =
+                sqlx::query_scalar::<_, String>("SELECT category_id FROM threads WHERE id = $1")
+                    .bind(&thread_hint)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(backend)?
+                    .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
 
             let mut tx = self.pool.begin().await.map_err(backend)?;
             sqlx::query("SELECT id FROM categories WHERE id = $1 FOR UPDATE")
@@ -2775,6 +4423,19 @@ impl PgStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(backend)?;
+            sqlx::query(
+                "SELECT id FROM forum_activity_events \
+                 WHERE post_id = $1 ORDER BY id FOR UPDATE",
+            )
+            .bind(post_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(backend)?;
+            sqlx::query("DELETE FROM forum_activity_events WHERE post_id = $1")
+                .bind(post_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(backend)?;
             sqlx::query("UPDATE posts SET quoted_post_id = '' WHERE quoted_post_id = $1")
                 .bind(post_id)
                 .execute(&mut *tx)
@@ -2785,28 +4446,25 @@ impl PgStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(backend)?;
-            let newest_at: Option<i64> = sqlx::query_scalar(
-                "SELECT MAX(created_at) FROM posts WHERE thread_id = $1",
-            )
-            .bind(&thread_hint)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(backend)?;
+            let newest_at: Option<i64> =
+                sqlx::query_scalar("SELECT MAX(created_at) FROM posts WHERE thread_id = $1")
+                    .bind(&thread_hint)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(backend)?;
             let newest_at = newest_at.ok_or_else(|| {
                 StoreError::Backend("thread has no original post after reply deletion".to_string())
             })?;
             if thread.accepted_post_id == post_id || thread.accepted_post_id == first_post_id {
                 thread.accepted_post_id.clear();
             }
-            sqlx::query(
-                "UPDATE threads SET last_at = $1, accepted_post_id = $2 WHERE id = $3",
-            )
-            .bind(newest_at)
-            .bind(&thread.accepted_post_id)
-            .bind(&thread_hint)
-            .execute(&mut *tx)
-            .await
-            .map_err(backend)?;
+            sqlx::query("UPDATE threads SET last_at = $1, accepted_post_id = $2 WHERE id = $3")
+                .bind(newest_at)
+                .bind(&thread.accepted_post_id)
+                .bind(&thread_hint)
+                .execute(&mut *tx)
+                .await
+                .map_err(backend)?;
             tx.commit().await.map_err(backend)?;
             return Ok(true);
         }
@@ -2847,14 +4505,13 @@ impl PgStore {
         category_id: &str,
     ) -> Result<(), StoreError> {
         for _ in 0..4 {
-            let source_hint = sqlx::query_scalar::<_, String>(
-                "SELECT category_id FROM threads WHERE id = $1",
-            )
-            .bind(thread_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(backend)?
-            .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
+            let source_hint =
+                sqlx::query_scalar::<_, String>("SELECT category_id FROM threads WHERE id = $1")
+                    .bind(thread_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(backend)?
+                    .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
             let mut tx = self.pool.begin().await.map_err(backend)?;
             let mut category_ids = vec![source_hint.clone(), category_id.to_string()];
             category_ids.sort();
@@ -2873,7 +4530,9 @@ impl PgStore {
                 }
             }
             if !formats.contains_key(&source_hint) {
-                return Err(StoreError::NotFound("source category not found".to_string()));
+                return Err(StoreError::NotFound(
+                    "source category not found".to_string(),
+                ));
             }
             let target_format = formats
                 .get(category_id)
@@ -2907,10 +4566,7 @@ impl PgStore {
             };
             let valid_solution = thread.accepted_post_id != first_post_id
                 && accepted_thread.as_deref() == Some(thread_id);
-            if thread.category_id != category_id
-                && valid_solution
-                && !target_format.is_question()
-            {
+            if thread.category_id != category_id && valid_solution && !target_format.is_question() {
                 return Err(StoreError::InvalidOperation(
                     "unmark the accepted answer before moving this thread to a discussion category"
                         .to_string(),
@@ -2919,15 +4575,13 @@ impl PgStore {
             if !valid_solution {
                 thread.accepted_post_id.clear();
             }
-            sqlx::query(
-                "UPDATE threads SET category_id = $1, accepted_post_id = $2 WHERE id = $3",
-            )
-            .bind(category_id)
-            .bind(&thread.accepted_post_id)
-            .bind(thread_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(backend)?;
+            sqlx::query("UPDATE threads SET category_id = $1, accepted_post_id = $2 WHERE id = $3")
+                .bind(category_id)
+                .bind(&thread.accepted_post_id)
+                .bind(thread_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(backend)?;
             tx.commit().await.map_err(backend)?;
             return Ok(());
         }
@@ -2940,16 +4594,16 @@ impl PgStore {
         &self,
         thread_id: &str,
         action: AcceptedAnswerAction,
+        activity: Option<(&str, &str, i64)>,
     ) -> Result<AcceptedAnswerMutation, StoreError> {
         for _ in 0..4 {
-            let category_hint = sqlx::query_scalar::<_, String>(
-                "SELECT category_id FROM threads WHERE id = $1",
-            )
-            .bind(thread_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(backend)?
-            .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
+            let category_hint =
+                sqlx::query_scalar::<_, String>("SELECT category_id FROM threads WHERE id = $1")
+                    .bind(thread_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(backend)?
+                    .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
             let mut tx = self.pool.begin().await.map_err(backend)?;
             let category_format = sqlx::query_scalar::<_, String>(
                 "SELECT format FROM categories WHERE id = $1 FOR UPDATE",
@@ -3022,11 +4676,38 @@ impl PgStore {
                 .await
                 .map_err(backend)?;
             thread.accepted_post_id = next_id;
+            let mut deliveries = Vec::new();
+            if changed {
+                if let (Some(post), Some((activity_id, actor_sub, created_at))) =
+                    (accepted_post.as_ref(), activity)
+                {
+                    if let Some(delivery) =
+                        subject_delivery(&post.author_sub, actor_sub, ActivityReason::Answer)
+                    {
+                        deliveries.push(delivery);
+                    }
+                    Self::insert_activity_tx(
+                        &mut tx,
+                        &ActivityEvent {
+                            id: activity_id.to_string(),
+                            kind: ActivityKind::AnswerAccepted,
+                            thread_id: thread_id.to_string(),
+                            post_id: post.id.clone(),
+                            actor_sub: actor_sub.to_string(),
+                            created_at,
+                        },
+                        &deliveries,
+                    )
+                    .await
+                    .map_err(backend)?;
+                }
+            }
             tx.commit().await.map_err(backend)?;
             return Ok(AcceptedAnswerMutation {
                 thread,
                 accepted_post,
                 changed,
+                delivery_subjects: delivery_subjects(&deliveries),
             });
         }
         Err(StoreError::Backend(
@@ -3034,33 +4715,95 @@ impl PgStore {
         ))
     }
 
-    async fn toggle_thread_subscription_async(
+    async fn set_thread_subscription_async(
         &self,
         thread_id: &str,
         subscriber_sub: &str,
+        subscribed: bool,
         created_at: i64,
-    ) -> Result<bool, sqlx::Error> {
-        let inserted = sqlx::query(
-            "INSERT INTO thread_subscriptions (thread_id, subscriber_sub, created_at) \
-             VALUES ($1, $2, $3) ON CONFLICT (thread_id, subscriber_sub) DO NOTHING",
-        )
-        .bind(thread_id)
-        .bind(subscriber_sub)
-        .bind(created_at)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        if inserted > 0 {
-            return Ok(true);
+    ) -> Result<(), StoreError> {
+        for _ in 0..4 {
+            let category_hint =
+                sqlx::query_scalar::<_, String>("SELECT category_id FROM threads WHERE id = $1")
+                    .bind(thread_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(backend)?
+                    .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
+            let mut tx = self.pool.begin().await.map_err(backend)?;
+            sqlx::query_scalar::<_, String>("SELECT id FROM categories WHERE id = $1 FOR UPDATE")
+                .bind(&category_hint)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(backend)?
+                .ok_or_else(|| StoreError::NotFound("category not found".to_string()))?;
+            let current_category = sqlx::query_scalar::<_, String>(
+                "SELECT category_id FROM threads WHERE id = $1 FOR UPDATE",
+            )
+            .bind(thread_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(backend)?
+            .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
+            if current_category != category_hint {
+                continue;
+            }
+            if subscribed {
+                let already_following = sqlx::query_scalar::<_, String>(
+                    "SELECT subscriber_sub FROM thread_subscriptions \
+                     WHERE thread_id = $1 AND subscriber_sub = $2",
+                )
+                .bind(thread_id)
+                .bind(subscriber_sub)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(backend)?
+                .is_some();
+                if already_following {
+                    tx.commit().await.map_err(backend)?;
+                    return Ok(());
+                }
+                let followers = sqlx::query_scalar::<_, String>(
+                    "SELECT subscriber_sub FROM thread_subscriptions \
+                     WHERE thread_id = $1 ORDER BY subscriber_sub LIMIT $2",
+                )
+                .bind(thread_id)
+                .bind((MAX_THREAD_FOLLOWERS + 1) as i64)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(backend)?;
+                if followers.len() >= MAX_THREAD_FOLLOWERS {
+                    return Err(StoreError::InvalidOperation(format!(
+                        "a thread may have at most {MAX_THREAD_FOLLOWERS} followers"
+                    )));
+                }
+                sqlx::query(
+                    "INSERT INTO thread_subscriptions (thread_id, subscriber_sub, created_at) \
+                     VALUES ($1, $2, $3) \
+                     ON CONFLICT (thread_id, subscriber_sub) DO NOTHING",
+                )
+                .bind(thread_id)
+                .bind(subscriber_sub)
+                .bind(created_at)
+                .execute(&mut *tx)
+                .await
+                .map_err(backend)?;
+            } else {
+                sqlx::query(
+                    "DELETE FROM thread_subscriptions WHERE thread_id = $1 AND subscriber_sub = $2",
+                )
+                .bind(thread_id)
+                .bind(subscriber_sub)
+                .execute(&mut *tx)
+                .await
+                .map_err(backend)?;
+            }
+            tx.commit().await.map_err(backend)?;
+            return Ok(());
         }
-        sqlx::query(
-            "DELETE FROM thread_subscriptions WHERE thread_id = $1 AND subscriber_sub = $2",
-        )
-        .bind(thread_id)
-        .bind(subscriber_sub)
-        .execute(&self.pool)
-        .await?;
-        Ok(false)
+        Err(StoreError::Backend(
+            "thread category changed repeatedly; retry the follow command".to_string(),
+        ))
     }
 
     async fn is_thread_subscribed_async(
@@ -3078,6 +4821,195 @@ impl PgStore {
         .await?;
         let n: i64 = row.try_get("n")?;
         Ok(n > 0)
+    }
+
+    async fn activity_page_async(
+        &self,
+        viewer_sub: &str,
+        filter: ActivityFilter,
+        unread_only: bool,
+        before: Option<&ActivityCursor>,
+        limit: i64,
+    ) -> Result<Vec<ActivityItem>, StoreError> {
+        let filter_key = match filter {
+            ActivityFilter::All => "all",
+            ActivityFilter::Reason(reason) => reason.as_str(),
+        };
+        let before_at = before.map(|cursor| cursor.created_at);
+        let before_id = before.map(|cursor| cursor.id.as_str()).unwrap_or_default();
+        let rows = sqlx::query(
+            "WITH visible AS (\
+                 SELECT e.id, e.kind, e.thread_id, e.post_id, e.actor_sub, e.created_at, \
+                        t.title AS thread_title, p.body_md AS post_body_md, \
+                        p.created_at AS post_created_at, \
+                        CASE WHEN e.kind = 'post_created' THEN p.author_email \
+                             ELSE COALESCE(\
+                                 (SELECT profile.author_email FROM posts AS profile \
+                                  WHERE profile.author_sub = e.actor_sub \
+                                    AND profile.author_email <> '' \
+                                  ORDER BY profile.created_at DESC, profile.id DESC LIMIT 1), \
+                                 (SELECT profile.author_email FROM threads AS profile \
+                                  WHERE profile.author_sub = e.actor_sub \
+                                    AND profile.author_email <> '' \
+                                  ORDER BY profile.created_at DESC, profile.id DESC LIMIT 1), \
+                                 ''\
+                             ) END AS actor_email, \
+                        CASE WHEN r.activity_id IS NULL THEN FALSE ELSE TRUE END AS is_read, \
+                        CASE \
+                          WHEN EXISTS (SELECT 1 FROM forum_activity_deliveries d \
+                               WHERE d.activity_id = e.id AND d.reason = 'mention' \
+                                 AND d.recipient_kind = 'subject' AND d.recipient_key = $1) \
+                            THEN 'mention' \
+                          WHEN EXISTS (SELECT 1 FROM forum_activity_deliveries d \
+                               WHERE d.activity_id = e.id AND d.reason = 'reply' \
+                                 AND d.recipient_kind = 'subject' AND d.recipient_key = $1) \
+                            THEN 'reply' \
+                          WHEN EXISTS (SELECT 1 FROM forum_activity_deliveries d \
+                               WHERE d.activity_id = e.id AND d.reason = 'answer' \
+                                 AND d.recipient_kind = 'subject' AND d.recipient_key = $1) \
+                            THEN 'answer' \
+                          ELSE 'following' END AS reason \
+                 FROM forum_activity_events e \
+                 JOIN threads t ON t.id = e.thread_id \
+                 JOIN posts p ON p.id = e.post_id AND p.thread_id = e.thread_id \
+                 LEFT JOIN forum_activity_receipts r \
+                   ON r.activity_id = e.id AND r.viewer_sub = $1 \
+                 WHERE EXISTS (SELECT 1 FROM forum_activity_deliveries d \
+                       WHERE d.activity_id = e.id \
+                         AND d.recipient_kind = 'subject' AND d.recipient_key = $1) \
+                   AND ($4::BIGINT IS NULL OR e.created_at < $4 \
+                        OR (e.created_at = $4 AND e.id < $5))\
+             ) \
+             SELECT id, kind, thread_id, post_id, actor_sub, created_at, thread_title, \
+                    post_body_md, post_created_at, actor_email, is_read, reason \
+             FROM visible \
+             WHERE ($2 = 'all' OR reason = $2) AND (NOT $3 OR NOT is_read) \
+             ORDER BY created_at DESC, id DESC LIMIT $6",
+        )
+        .bind(viewer_sub)
+        .bind(filter_key)
+        .bind(unread_only)
+        .bind(before_at)
+        .bind(before_id)
+        .bind(limit.max(0))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        rows.iter()
+            .map(|row| {
+                let kind: String = row.try_get("kind").map_err(backend)?;
+                let reason: String = row.try_get("reason").map_err(backend)?;
+                Ok(ActivityItem {
+                    event: ActivityEvent {
+                        id: row.try_get("id").map_err(backend)?,
+                        kind: ActivityKind::parse(&kind).ok_or_else(|| {
+                            StoreError::Backend(format!("unknown activity kind: {kind}"))
+                        })?,
+                        thread_id: row.try_get("thread_id").map_err(backend)?,
+                        post_id: row.try_get("post_id").map_err(backend)?,
+                        actor_sub: row.try_get("actor_sub").map_err(backend)?,
+                        created_at: row.try_get("created_at").map_err(backend)?,
+                    },
+                    reason: ActivityReason::parse(&reason).ok_or_else(|| {
+                        StoreError::Backend(format!("unknown activity reason: {reason}"))
+                    })?,
+                    thread_title: row.try_get("thread_title").map_err(backend)?,
+                    post_body_md: row.try_get("post_body_md").map_err(backend)?,
+                    post_created_at: row.try_get("post_created_at").map_err(backend)?,
+                    actor_email: row.try_get("actor_email").map_err(backend)?,
+                    read: row.try_get("is_read").map_err(backend)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn unread_activity_count_async(&self, viewer_sub: &str) -> Result<i64, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS n \
+             FROM forum_activity_events e \
+             JOIN threads t ON t.id = e.thread_id \
+             JOIN posts p ON p.id = e.post_id AND p.thread_id = e.thread_id \
+             WHERE EXISTS (SELECT 1 FROM forum_activity_deliveries d \
+                   WHERE d.activity_id = e.id \
+                     AND d.recipient_kind = 'subject' AND d.recipient_key = $1) \
+               AND NOT EXISTS (SELECT 1 FROM forum_activity_receipts r \
+                   WHERE r.activity_id = e.id AND r.viewer_sub = $1)",
+        )
+        .bind(viewer_sub)
+        .fetch_one(&self.pool)
+        .await?;
+        row.try_get("n")
+    }
+
+    async fn set_activity_read_async(
+        &self,
+        activity_id: &str,
+        viewer_sub: &str,
+        read: bool,
+        changed_at: i64,
+    ) -> Result<(), StoreError> {
+        let targets = self.activity_lock_targets(&[activity_id]).await?;
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        Self::lock_activity_targets_tx(&mut tx, viewer_sub, &targets).await?;
+        if read {
+            sqlx::query(
+                "INSERT INTO forum_activity_receipts (activity_id, viewer_sub, read_at) \
+                 VALUES ($1, $2, $3) \
+                 ON CONFLICT (activity_id, viewer_sub) DO UPDATE SET read_at = EXCLUDED.read_at",
+            )
+            .bind(activity_id)
+            .bind(viewer_sub)
+            .bind(changed_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+        } else {
+            sqlx::query(
+                "DELETE FROM forum_activity_receipts WHERE activity_id = $1 AND viewer_sub = $2",
+            )
+            .bind(activity_id)
+            .bind(viewer_sub)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+        }
+        tx.commit().await.map_err(backend)?;
+        Ok(())
+    }
+
+    async fn mark_activity_batch_read_async(
+        &self,
+        viewer_sub: &str,
+        activity_ids: &[String],
+        changed_at: i64,
+    ) -> Result<i64, StoreError> {
+        if activity_ids.len() > MAX_ACTIVITY_BATCH {
+            return Err(StoreError::InvalidOperation(format!(
+                "activity batch may contain at most {MAX_ACTIVITY_BATCH} ids"
+            )));
+        }
+        let unique: BTreeSet<&str> = activity_ids.iter().map(String::as_str).collect();
+        let unique_ids: Vec<&str> = unique.into_iter().collect();
+        let targets = self.activity_lock_targets(&unique_ids).await?;
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        Self::lock_activity_targets_tx(&mut tx, viewer_sub, &targets).await?;
+        let mut changed = 0_i64;
+        for target in &targets {
+            changed += sqlx::query(
+                "INSERT INTO forum_activity_receipts (activity_id, viewer_sub, read_at) \
+                 VALUES ($1, $2, $3) \
+                 ON CONFLICT (activity_id, viewer_sub) DO NOTHING",
+            )
+            .bind(&target.activity_id)
+            .bind(viewer_sub)
+            .bind(changed_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?
+            .rows_affected() as i64;
+        }
+        tx.commit().await.map_err(backend)?;
+        Ok(changed)
     }
 
     async fn toggle_reaction_async(
@@ -3295,10 +5227,7 @@ impl Store for PgStore {
         self.get_post_async(id).await.map_err(backend)
     }
 
-    async fn get_valid_accepted_post(
-        &self,
-        thread_id: &str,
-    ) -> Result<Option<Post>, StoreError> {
+    async fn get_valid_accepted_post(&self, thread_id: &str) -> Result<Option<Post>, StoreError> {
         self.get_valid_accepted_post_async(thread_id)
             .await
             .map_err(backend)
@@ -3331,8 +5260,29 @@ impl Store for PgStore {
         self.create_thread_async(thread, first_post).await
     }
 
+    async fn create_thread_with_activity(
+        &self,
+        thread: &Thread,
+        first_post: &Post,
+        mentioned_usernames: &[String],
+        activity_id: &str,
+    ) -> Result<ActivityMutation, StoreError> {
+        self.create_thread_with_activity_async(thread, first_post, mentioned_usernames, activity_id)
+            .await
+    }
+
     async fn add_reply(&self, post: &Post) -> Result<(), StoreError> {
         self.add_reply_async(post).await
+    }
+
+    async fn add_reply_with_activity(
+        &self,
+        post: &Post,
+        mentioned_usernames: &[String],
+        activity_id: &str,
+    ) -> Result<ActivityMutation, StoreError> {
+        self.add_reply_with_activity_async(post, mentioned_usernames, activity_id)
+            .await
     }
 
     async fn replace_mentions(
@@ -3420,18 +5370,35 @@ impl Store for PgStore {
         thread_id: &str,
         action: AcceptedAnswerAction,
     ) -> Result<AcceptedAnswerMutation, StoreError> {
-        self.mutate_accepted_answer_async(thread_id, action).await
+        self.mutate_accepted_answer_async(thread_id, action, None)
+            .await
     }
 
-    async fn toggle_thread_subscription(
+    async fn mutate_accepted_answer_with_activity(
+        &self,
+        thread_id: &str,
+        action: AcceptedAnswerAction,
+        activity_id: &str,
+        actor_sub: &str,
+        created_at: i64,
+    ) -> Result<AcceptedAnswerMutation, StoreError> {
+        self.mutate_accepted_answer_async(
+            thread_id,
+            action,
+            Some((activity_id, actor_sub, created_at)),
+        )
+        .await
+    }
+
+    async fn set_thread_subscription(
         &self,
         thread_id: &str,
         subscriber_sub: &str,
+        subscribed: bool,
         created_at: i64,
-    ) -> Result<bool, StoreError> {
-        self.toggle_thread_subscription_async(thread_id, subscriber_sub, created_at)
+    ) -> Result<(), StoreError> {
+        self.set_thread_subscription_async(thread_id, subscriber_sub, subscribed, created_at)
             .await
-            .map_err(backend)
     }
 
     async fn is_thread_subscribed(
@@ -3442,6 +5409,45 @@ impl Store for PgStore {
         self.is_thread_subscribed_async(thread_id, subscriber_sub)
             .await
             .map_err(backend)
+    }
+
+    async fn activity_page(
+        &self,
+        viewer_sub: &str,
+        filter: ActivityFilter,
+        unread_only: bool,
+        before: Option<&ActivityCursor>,
+        limit: i64,
+    ) -> Result<Vec<ActivityItem>, StoreError> {
+        self.activity_page_async(viewer_sub, filter, unread_only, before, limit)
+            .await
+    }
+
+    async fn unread_activity_count(&self, viewer_sub: &str) -> Result<i64, StoreError> {
+        self.unread_activity_count_async(viewer_sub)
+            .await
+            .map_err(backend)
+    }
+
+    async fn set_activity_read(
+        &self,
+        activity_id: &str,
+        viewer_sub: &str,
+        read: bool,
+        changed_at: i64,
+    ) -> Result<(), StoreError> {
+        self.set_activity_read_async(activity_id, viewer_sub, read, changed_at)
+            .await
+    }
+
+    async fn mark_activity_batch_read(
+        &self,
+        viewer_sub: &str,
+        activity_ids: &[String],
+        changed_at: i64,
+    ) -> Result<i64, StoreError> {
+        self.mark_activity_batch_read_async(viewer_sub, activity_ids, changed_at)
+            .await
     }
 
     async fn toggle_reaction(
@@ -3602,15 +5608,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn in_memory_subscriptions_toggle_and_filter() {
+    async fn in_memory_subscriptions_are_explicit_idempotent_and_filterable() {
         let store = InMemoryStore::new();
         seed_thread(&store, "t_one", "One", 100).await;
         seed_thread(&store, "t_two", "Two", 200).await;
 
-        assert!(store
-            .toggle_thread_subscription("t_one", "u_alice", 300)
+        store
+            .set_thread_subscription("t_one", "u_alice", true, 300)
             .await
-            .unwrap());
+            .unwrap();
+        store
+            .set_thread_subscription("t_one", "u_alice", true, 301)
+            .await
+            .unwrap();
         assert!(store
             .is_thread_subscribed("t_one", "u_alice")
             .await
@@ -3629,10 +5639,14 @@ mod tests {
         assert_eq!(subscribed.len(), 1);
         assert_eq!(subscribed[0].id, "t_one");
 
-        assert!(!store
-            .toggle_thread_subscription("t_one", "u_alice", 301)
+        store
+            .set_thread_subscription("t_one", "u_alice", false, 302)
             .await
-            .unwrap());
+            .unwrap();
+        store
+            .set_thread_subscription("t_one", "u_alice", false, 303)
+            .await
+            .unwrap();
         assert!(!store
             .is_thread_subscribed("t_one", "u_alice")
             .await
@@ -3684,13 +5698,27 @@ mod tests {
         }
 
         let top = store
-            .list_threads(None, ThreadSort::Top, None, ThreadStatusFilter::Any, 10, now)
+            .list_threads(
+                None,
+                ThreadSort::Top,
+                None,
+                ThreadStatusFilter::Any,
+                10,
+                now,
+            )
             .await
             .unwrap();
         assert_eq!(top[0].id, "t_old_busy", "top sorts by reply count");
 
         let hot = store
-            .list_threads(None, ThreadSort::Hot, None, ThreadStatusFilter::Any, 10, now)
+            .list_threads(
+                None,
+                ThreadSort::Hot,
+                None,
+                ThreadStatusFilter::Any,
+                10,
+                now,
+            )
             .await
             .unwrap();
         assert_eq!(hot[0].id, "t_recent_small", "hot decays older reply volume");
@@ -3828,7 +5856,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let unanswered_ids: HashSet<_> = unanswered.iter().map(|thread| thread.id.as_str()).collect();
+        let unanswered_ids: HashSet<_> =
+            unanswered.iter().map(|thread| thread.id.as_str()).collect();
         for expected in ["t_target", "t_missing", "t_original", "t_cross"] {
             assert!(unanswered_ids.contains(expected));
         }
@@ -3862,7 +5891,10 @@ mod tests {
             .mutate_accepted_answer("t_missing", AcceptedAnswerAction::Clear)
             .await
             .unwrap();
-        assert!(!second_clear.changed, "clear is idempotent and needs no target post");
+        assert!(
+            !second_clear.changed,
+            "clear is idempotent and needs no target post"
+        );
 
         let mut historical = thread("t_historical", "Historical", 600);
         historical.category_id = "discussion".to_string();
@@ -3909,12 +5941,7 @@ mod tests {
             .accepted_post_id
             .is_empty());
         assert!(store
-            .search_threads(
-                "legacy solution only",
-                None,
-                ThreadStatusFilter::Any,
-                20,
-            )
+            .search_threads("legacy solution only", None, ThreadStatusFilter::Any, 20,)
             .await
             .unwrap()
             .is_empty());
@@ -3980,10 +6007,7 @@ mod tests {
             tokio::spawn(async move {
                 barrier.wait().await;
                 store
-                    .transition_category_format(
-                        "q_accept_format",
-                        CategoryFormat::Discussion,
-                    )
+                    .transition_category_format("q_accept_format", CategoryFormat::Discussion)
                     .await
             })
         };
@@ -3995,11 +6019,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let raw = store
-            .get_thread(&accept_format.id)
-            .await
-            .unwrap()
-            .unwrap();
+        let raw = store.get_thread(&accept_format.id).await.unwrap().unwrap();
         assert!(category.format.is_question() || raw.accepted_post_id.is_empty());
 
         let mut accept_delete = thread("t_accept_delete", "Accept delete", 200);
@@ -4096,11 +6116,7 @@ mod tests {
         let _ = move_task.await.unwrap();
         let _ = format_task.await.unwrap();
         let moved = store.get_thread(&moving.id).await.unwrap().unwrap();
-        let target = store
-            .get_category("q_move_target")
-            .await
-            .unwrap()
-            .unwrap();
+        let target = store.get_category("q_move_target").await.unwrap().unwrap();
         assert!(
             moved.category_id != "q_move_target"
                 || target.format.is_question()
@@ -4114,13 +6130,7 @@ mod tests {
             .create_thread(&reply_delete, &reply_delete_op)
             .await
             .unwrap();
-        let concurrent_reply = post(
-            "p_reply_delete_race",
-            &reply_delete.id,
-            "reply",
-            "",
-            401,
-        );
+        let concurrent_reply = post("p_reply_delete_race", &reply_delete.id, "reply", "", 401);
         let barrier = Arc::new(Barrier::new(3));
         let reply_task = {
             let store = Arc::clone(&store);
@@ -4153,7 +6163,10 @@ mod tests {
         let mut reply_lock = thread("t_reply_lock", "Reply lock", 500);
         reply_lock.category_id = "q_reply_lock".to_string();
         let reply_lock_op = post("p_reply_lock_op", &reply_lock.id, "OP", "", 500);
-        store.create_thread(&reply_lock, &reply_lock_op).await.unwrap();
+        store
+            .create_thread(&reply_lock, &reply_lock_op)
+            .await
+            .unwrap();
         let lock_race_reply = post("p_reply_lock_race", &reply_lock.id, "reply", "", 501);
         let barrier = Arc::new(Barrier::new(3));
         let reply_task = {
@@ -4179,20 +6192,10 @@ mod tests {
         lock_task.await.unwrap().unwrap();
         assert_eq!(
             reply_result.is_ok(),
-            store
-                .get_post(&lock_race_reply.id)
-                .await
-                .unwrap()
-                .is_some()
+            store.get_post(&lock_race_reply.id).await.unwrap().is_some()
         );
         assert!(store
-            .add_reply(&post(
-                "p_reply_after_lock",
-                &reply_lock.id,
-                "late",
-                "",
-                502,
-            ))
+            .add_reply(&post("p_reply_after_lock", &reply_lock.id, "late", "", 502,))
             .await
             .is_err());
 
@@ -4226,11 +6229,10 @@ mod tests {
             .await
             .unwrap()
             .is_some();
-        let thread_exists = store
-            .get_thread(&create_race.id)
-            .await
-            .unwrap()
-            .is_some();
-        assert_eq!(category_exists, thread_exists, "thread and category cannot orphan");
+        let thread_exists = store.get_thread(&create_race.id).await.unwrap().is_some();
+        assert_eq!(
+            category_exists, thread_exists,
+            "thread and category cannot orphan"
+        );
     }
 }

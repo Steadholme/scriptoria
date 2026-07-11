@@ -215,6 +215,12 @@ async fn writer_fields_are_no_js_and_server_limits_and_url_policies_win() {
     assert_eq!(stored.social_title.chars().count(), 200);
     assert_eq!(stored.social_description.chars().count(), 500);
 
+    let post_id = state
+        .store
+        .get_post("truncated-metadata")
+        .await
+        .unwrap()
+        .id;
     let edit = form(&[
         ("title", "Truncated Metadata"),
         ("body", "updated body"),
@@ -225,6 +231,8 @@ async fn writer_fields_are_no_js_and_server_limits_and_url_policies_win() {
         ("social_title", "Updated social title"),
         ("social_description", "Updated social description"),
         ("social_image", "https://drive.w33d.xyz/s/updated-social"),
+        ("expected_version", "1"),
+        ("expected_post_id", &post_id),
         ("csrf_token", CSRF),
     ]);
     assert_eq!(

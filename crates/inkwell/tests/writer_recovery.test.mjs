@@ -12,6 +12,30 @@ function productionRecoveryFunctions() {
   return template.slice(start, end);
 }
 
+function productionServerAutosaveFunction() {
+  const start = template.indexOf('    function persistServerAutosave() {');
+  const end = template.indexOf('    function scheduleAutosave() {', start);
+  assert.notEqual(start, -1, 'production server autosave function exists');
+  assert.notEqual(end, -1, 'production server autosave boundary exists');
+  return template.slice(start, end);
+}
+
+function productionClientSequenceInitialization() {
+  const start = template.indexOf('    var initialClientSeq =');
+  const end = template.indexOf('    function persistRecovery(', start);
+  assert.notEqual(start, -1, 'production client sequence initialization exists');
+  assert.notEqual(end, -1, 'production client sequence boundary exists');
+  return template.slice(start, end);
+}
+
+function productionConflictFunctions() {
+  const start = template.indexOf('    function showServerRecoveryLink(');
+  const end = template.indexOf('    function syncCover()', start);
+  assert.notEqual(start, -1, 'production recovery-link function exists');
+  assert.notEqual(end, -1, 'production recovery-link boundary exists');
+  return template.slice(start, end);
+}
+
 function input(value = '') {
   return {
     value,
@@ -136,4 +160,152 @@ test('Writer recovery executes metadata snapshot then restores every field', () 
   assert.equal(fields.pinned.checked, true);
   assert.equal(coverSyncs, 1);
   assert.equal(socialSyncs, 1);
+});
+
+test('Writer server autosave emits monotonic client sequences and surfaces 409', async () => {
+  class TestFormData {
+    forEach(callback) {
+      callback('csrf', 'csrf_token');
+      callback('session', 'autosave_session');
+      callback('1', 'expected_version');
+    }
+  }
+  const build = new Function(
+    'autosaveUrl',
+    'window',
+    'clientSeqEl',
+    'URLSearchParams',
+    'FormData',
+    'form',
+    'fetch',
+    'setStatus',
+    'hfToast',
+    'initialServerClientSeq',
+    'conflictErrorFromResponse',
+    'showServerRecoveryLink',
+    `var serverClientSeq = initialServerClientSeq;\n${productionServerAutosaveFunction()}\nreturn persistServerAutosave;`,
+  );
+
+  const calls = [];
+  const clientSeqEl = { value: '0' };
+  const persist = build(
+    '/api/writer/autosave/post',
+    { fetch: true },
+    clientSeqEl,
+    URLSearchParams,
+    TestFormData,
+    {},
+    async (_url, options) => {
+      calls.push(new URLSearchParams(options.body).get('client_seq'));
+      return { status: 200, ok: true, async json() { return { ok: true }; } };
+    },
+    () => {},
+    () => {},
+    0,
+    (response, label) => response.json().then((data) => {
+      const error = new Error(label);
+      error.conflict = true;
+      error.recover = data.recover;
+      throw error;
+    }),
+    () => {},
+  );
+  persist();
+  persist();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls, ['1', '2']);
+  assert.equal(clientSeqEl.value, '2');
+
+  const states = [];
+  const toasts = [];
+  const conflict = build(
+    '/api/writer/autosave/post',
+    { fetch: true },
+    { value: '0' },
+    URLSearchParams,
+    TestFormData,
+    {},
+    async () => ({ status: 409, ok: false, async json() { return {}; } }),
+    (...args) => states.push(args),
+    (...args) => toasts.push(args),
+    0,
+    (response, label) => response.json().then((data) => {
+      const error = new Error(label);
+      error.conflict = true;
+      error.recover = data.recover;
+      throw error;
+    }),
+    () => {},
+  );
+  conflict();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(states, [['error', 'Conflict · Newer server version']]);
+  assert.equal(toasts.length, 1);
+
+  const resumedCalls = [];
+  const resumed = build(
+    '/api/writer/autosave/post',
+    { fetch: true },
+    { value: '7' },
+    URLSearchParams,
+    TestFormData,
+    {},
+    async (_url, options) => {
+      resumedCalls.push(new URLSearchParams(options.body).get('client_seq'));
+      return { status: 200, ok: true, async json() { return { ok: true }; } };
+    },
+    () => {},
+    () => {},
+    7,
+    () => {},
+    () => {},
+  );
+  resumed();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(resumedCalls, ['8'], 'recovered editor resumes after the persisted sequence');
+});
+
+test('Writer initializes recovered sequences safely and exposes a parsed 409 recovery URL', async () => {
+  const initialize = new Function(
+    'clientSeqEl',
+    `${productionClientSequenceInitialization()}\nreturn serverClientSeq;`,
+  );
+  assert.equal(initialize({ value: '7' }), 7);
+  assert.equal(initialize({ value: '-1' }), 0);
+  assert.equal(initialize({ value: '9007199254740992' }), 0);
+  assert.equal(initialize({ value: 'not-a-number' }), 0);
+
+  const link = {
+    hidden: true,
+    href: '',
+    setAttribute(name, value) { if (name === 'href') { this.href = value; } },
+  };
+  const bar = { hidden: true };
+  const message = { textContent: '' };
+  const document = {
+    getElementById(id) {
+      if (id === 'draftbar') { return bar; }
+      if (id === 'draftbar-msg') { return message; }
+      return null;
+    },
+  };
+  const build = new Function(
+    'serverRecoveryLink',
+    'document',
+    `${productionConflictFunctions()}\nreturn { showServerRecoveryLink, conflictErrorFromResponse };`,
+  );
+  const helpers = build(link, document);
+  const recover = '/edit/durable-story?recover=private-session';
+  const error = await helpers.conflictErrorFromResponse(
+    { async json() { return { recover }; } },
+    'save conflict',
+  ).catch((caught) => caught);
+  assert.equal(error.conflict, true);
+  assert.equal(error.recover, recover);
+
+  helpers.showServerRecoveryLink(error.recover);
+  assert.equal(link.href, recover);
+  assert.equal(link.hidden, false);
+  assert.equal(bar.hidden, false);
+  assert.match(message.textContent, /private server recovery copy/i);
 });

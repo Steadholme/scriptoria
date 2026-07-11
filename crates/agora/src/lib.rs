@@ -76,6 +76,16 @@ pub fn app(state: AppState) -> Router {
         .route("/healthz", get(handlers::health::healthz))
         .route("/", get(handlers::forum::home))
         .route("/questions", get(handlers::forum::questions))
+        .route("/activity", get(handlers::activity::page))
+        .route(
+            "/activity/read-page",
+            post(handlers::activity::mark_page_read),
+        )
+        .route("/activity/{id}/open", post(handlers::activity::open))
+        .route(
+            "/activity/{id}/state",
+            post(handlers::activity::set_read_state),
+        )
         .route("/c/{id}", get(handlers::forum::category))
         .route("/t/{id}", get(handlers::forum::thread))
         .route("/t/{id}/reply", post(handlers::forum::reply))
@@ -88,11 +98,20 @@ pub fn app(state: AppState) -> Router {
             "/t/{tid}/p/{pid}/edit",
             get(handlers::forum::edit_reply_form).post(handlers::forum::update_reply),
         )
-        .route("/t/{tid}/p/{pid}/delete", post(handlers::forum::delete_reply))
+        .route(
+            "/t/{tid}/p/{pid}/delete",
+            post(handlers::forum::delete_reply),
+        )
         .route("/t/{tid}/p/{pid}/react", post(handlers::forum::react))
         .route("/t/{id}/accept", post(handlers::forum::accept_answer))
-        .route("/t/{id}/subscribe", post(handlers::forum::toggle_subscription))
-        .route("/new", get(handlers::forum::new_form).post(handlers::forum::create))
+        .route(
+            "/t/{id}/subscribe",
+            post(handlers::forum::toggle_subscription),
+        )
+        .route(
+            "/new",
+            get(handlers::forum::new_form).post(handlers::forum::create),
+        )
         .route("/search", get(handlers::search::page))
         .route("/api/search/suggest", get(handlers::search::suggest))
         .route("/api/similar", post(handlers::insight::similar))
@@ -113,20 +132,44 @@ fn admin_router() -> Router<AppState> {
     Router::new()
         .route("/admin", get(handlers::admin::dashboard))
         .route("/admin/categories", post(handlers::admin::create_category))
-        .route("/admin/categories/{id}/rename", post(handlers::admin::rename_category))
+        .route(
+            "/admin/categories/{id}/rename",
+            post(handlers::admin::rename_category),
+        )
         .route(
             "/admin/categories/{id}/format",
             post(handlers::admin::set_category_format),
         )
-        .route("/admin/categories/{id}/reorder", post(handlers::admin::reorder_category))
-        .route("/admin/categories/{id}/delete", post(handlers::admin::delete_category))
-        .route("/admin/threads/{id}/lock", post(handlers::admin::lock_thread))
+        .route(
+            "/admin/categories/{id}/reorder",
+            post(handlers::admin::reorder_category),
+        )
+        .route(
+            "/admin/categories/{id}/delete",
+            post(handlers::admin::delete_category),
+        )
+        .route(
+            "/admin/threads/{id}/lock",
+            post(handlers::admin::lock_thread),
+        )
         .route("/admin/threads/{id}/pin", post(handlers::admin::pin_thread))
-        .route("/admin/threads/{id}/move", post(handlers::admin::move_thread))
-        .route("/admin/threads/{id}/delete", post(handlers::admin::delete_thread))
-        .route("/admin/posts/{id}/delete", post(handlers::admin::delete_post))
+        .route(
+            "/admin/threads/{id}/move",
+            post(handlers::admin::move_thread),
+        )
+        .route(
+            "/admin/threads/{id}/delete",
+            post(handlers::admin::delete_thread),
+        )
+        .route(
+            "/admin/posts/{id}/delete",
+            post(handlers::admin::delete_post),
+        )
         .route("/admin/bans", post(handlers::admin::add_ban))
-        .route("/admin/bans/{sub}/delete", post(handlers::admin::remove_ban))
+        .route(
+            "/admin/bans/{sub}/delete",
+            post(handlers::admin::remove_ban),
+        )
         .layer(axum::middleware::from_fn(require_admin_mw))
 }
 

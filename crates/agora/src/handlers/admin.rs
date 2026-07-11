@@ -17,7 +17,9 @@ use crate::audit::AuditEvent;
 use crate::auth;
 use crate::error::AppError;
 use crate::handlers::forum::{html_response, redirect_to, render_admin_thread_toolbar};
-use crate::handlers::{email_display, esc, fmt_ts, render_page};
+use crate::handlers::{
+    email_display, esc, fmt_ts, render_page_with_activity, unread_activity_count,
+};
 use crate::model::{BannedAuthor, Category, CategoryFormat};
 use crate::{now_secs, AppState};
 
@@ -199,7 +201,8 @@ pub async fn dashboard(
         add_ban = add_ban,
     );
 
-    let html = render_page("Admin", &email_display(&headers), &content);
+    let unread = unread_activity_count(&state, &headers).await?;
+    let html = render_page_with_activity("Admin", &email_display(&headers), &content, unread);
     Ok(html_response(html, set_cookie))
 }
 

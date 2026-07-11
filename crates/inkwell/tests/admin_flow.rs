@@ -141,6 +141,24 @@ async fn admin_can_pin_posts_to_top() {
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER, "admin pins older post");
+    let alpha = state.store.get_post("alpha").await.unwrap();
+    let revisions = state
+        .store
+        .list_post_revisions(&alpha.id, 50)
+        .await
+        .unwrap();
+    let pin_revision = revisions
+        .iter()
+        .find(|revision| revision.source == "admin.pin")
+        .expect("admin pin creates an immutable revision");
+    assert_eq!(pin_revision.editor_email, "admin@hf");
+    let pin_revision = state
+        .store
+        .get_post_revision(&alpha.id, &pin_revision.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pin_revision.editor_sub, "u_admin");
 
     let idx = index_body(&state).await;
     let alpha_pos = idx.find("Alpha").expect("pinned post rendered");
@@ -205,6 +223,7 @@ async fn admin_bulk_action_over_selected_slugs() {
 async fn admin_can_edit_and_delete_any_authors_post() {
     let state = build_dev_state();
     create_post(&state, "Alice Post", "u_alice", "alice@hf").await;
+    let post_id = state.store.get_post("alice-post").await.unwrap().id;
 
     // A non-owner NON-admin still cannot edit (the ownership gate holds).
     let body = form(&[("title", "Hijack"), ("body", "x"), ("csrf_token", CSRF)]);
@@ -220,6 +239,8 @@ async fn admin_can_edit_and_delete_any_authors_post() {
         ("title", "Edited By Admin"),
         ("body", "moderated"),
         ("intent", "publish_now"),
+        ("expected_version", "1"),
+        ("expected_post_id", &post_id),
         ("csrf_token", CSRF),
     ]);
     let (status, _) = call(

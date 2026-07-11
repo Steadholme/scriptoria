@@ -101,10 +101,13 @@ async fn full_blog_flow_in_memory() {
     assert_eq!(status, StatusCode::FORBIDDEN, "non-owner cannot edit");
 
     // --- edit: owner succeeds, slug stays stable ---------------------------
+    let post_id = state.store.get_post("hello-world").await.unwrap().id;
     let body = form(&[
         ("title", "Hello World (edited)"),
         ("body", "Updated body."),
         ("published", "on"),
+        ("expected_version", "1"),
+        ("expected_post_id", &post_id),
         ("csrf_token", CSRF),
     ]);
     let (status, _) = call(
@@ -225,11 +228,14 @@ async fn scheduled_posts_are_public_only_after_publish_at() {
     let (status, _) = call(&state, get_auth("/p/scheduled-post", "u_alice", "alice@hf")).await;
     assert_eq!(status, StatusCode::OK, "author can read own scheduled post");
 
+    let scheduled_id = state.store.get_post("scheduled-post").await.unwrap().id;
     let body = form(&[
         ("title", "Scheduled Post"),
         ("body", "now public"),
         ("publish_at", ""),
         ("published", "on"),
+        ("expected_version", "1"),
+        ("expected_post_id", &scheduled_id),
         ("csrf_token", CSRF),
     ]);
     let (status, _) = call(
@@ -262,11 +268,14 @@ async fn author_can_pin_post_to_top_from_editor() {
         assert_eq!(status, StatusCode::SEE_OTHER);
     }
 
+    let pinned_id = state.store.get_post("old-pinned").await.unwrap().id;
     let body = form(&[
         ("title", "Old Pinned"),
         ("body", "x"),
         ("published", "on"),
         ("pinned", "on"),
+        ("expected_version", "1"),
+        ("expected_post_id", &pinned_id),
         ("csrf_token", CSRF),
     ]);
     let (status, _) = call(

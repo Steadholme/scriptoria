@@ -16,7 +16,7 @@ const BOB_EMAIL: &str = "bob@holdfast.local";
 const TOK: &str = "csrftoken123";
 
 #[tokio::test]
-async fn quote_reply_renders_escaped_blockquote_and_mentions_home() {
+async fn quote_reply_renders_escaped_blockquote_and_deduplicated_activity() {
     let state = build_dev_state().await;
     let loc = create_thread(&state, "Quote and mention", "Original <unsafe> body.").await;
     let tid = loc.strip_prefix("/t/").unwrap().to_string();
@@ -54,12 +54,18 @@ async fn quote_reply_renders_escaped_blockquote_and_mentions_home() {
     assert!(quote_pos < reply_pos, "quote renders above reply body");
 
     let (_s, _h, home) = send(&state, get_as("/", ALICE_SUB, ALICE_EMAIL)).await;
-    assert!(home.contains("Mentions"), "alice sees a mentions panel");
-    assert!(home.contains(r#"<span class="badge mention-badge">@1</span>"#));
-    assert!(home.contains("Quote and mention"));
+    assert!(home.contains("Activity, 1 unread"));
+    let (_s, _h, activity) = send(&state, get_as("/activity", ALICE_SUB, ALICE_EMAIL)).await;
+    assert!(activity.contains("Quote and mention"));
+    assert!(activity.contains("Mention"));
+    assert_eq!(
+        activity.matches("ag-activity-row is-unread").count(),
+        1,
+        "OP + quote + @mention delivery paths collapse to one event"
+    );
 
-    let (_s, _h, bob_home) = send(&state, get_as("/", BOB_SUB, BOB_EMAIL)).await;
-    assert!(!bob_home.contains(r#"<span class="badge mention-badge">@1</span>"#));
+    let (_s, _h, bob_activity) = send(&state, get_as("/activity", BOB_SUB, BOB_EMAIL)).await;
+    assert!(bob_activity.contains("0 unread"), "the actor is never self-notified");
 }
 
 #[tokio::test]
@@ -76,7 +82,7 @@ async fn thread_subscription_toggle_and_filter() {
             TOK,
             ALICE_SUB,
             ALICE_EMAIL,
-            form(&[("csrf", TOK)]),
+            form(&[("csrf", TOK), ("action", "follow")]),
         ),
     )
     .await;
@@ -104,7 +110,7 @@ async fn thread_subscription_toggle_and_filter() {
             TOK,
             ALICE_SUB,
             ALICE_EMAIL,
-            form(&[("csrf", TOK)]),
+            form(&[("csrf", TOK), ("action", "unfollow")]),
         ),
     )
     .await;

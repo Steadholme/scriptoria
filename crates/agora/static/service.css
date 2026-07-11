@@ -1252,6 +1252,142 @@ a.ag-chip:hover {
 }
 .ag-search-empty { margin-top:var(--sp-5); }
 
+/* Durable Activity Inbox --------------------------------------------------- */
+.ag-activity-button { position:relative; }
+.ag-activity-button.is-active {
+  color:var(--brand-ink);
+  background:var(--brand-soft);
+}
+.ag-activity-badge {
+  position:absolute;
+  inset-block-start:-4px;
+  inset-inline-end:-5px;
+  min-width:17px;
+  height:17px;
+  padding-inline:4px;
+  display:grid;
+  place-items:center;
+  border:2px solid var(--surface);
+  border-radius:var(--r-pill);
+  color:#fff;
+  background:var(--down);
+  font-size:9px;
+  font-weight:var(--fw-bold);
+  line-height:1;
+}
+.ag-activity-head { align-items:center; }
+.ag-activity-total {
+  color:var(--ink-2);
+  font-size:var(--fs-sm);
+  font-variant-numeric:tabular-nums;
+}
+.ag-activity-controls {
+  display:flex;
+  align-items:flex-end;
+  justify-content:space-between;
+  gap:var(--sp-4);
+  margin-bottom:var(--sp-4);
+}
+.ag-activity-tabs {
+  min-width:0;
+  display:flex;
+  flex-direction:column;
+  gap:var(--sp-2);
+}
+.ag-activity-reasons {
+  max-width:100%;
+  overflow-x:auto;
+  scrollbar-width:none;
+}
+.ag-activity-list {
+  overflow:hidden;
+  border:1px solid var(--border);
+  border-radius:var(--r);
+  background:var(--surface);
+  box-shadow:var(--sh-xs);
+}
+.ag-activity-row {
+  position:relative;
+  display:grid;
+  grid-template-columns:minmax(0,1fr) auto;
+  align-items:center;
+  border-bottom:1px solid var(--hairline);
+}
+.ag-activity-row:last-child { border-bottom:0; }
+.ag-activity-row.is-unread { background:var(--brand-soft); }
+.ag-activity-row.is-unread::before {
+  content:"";
+  position:absolute;
+  inset-block:0;
+  inset-inline-start:0;
+  width:3px;
+  background:var(--brand);
+}
+.ag-activity-open { min-width:0; }
+.ag-activity-open > button {
+  width:100%;
+  min-width:0;
+  display:grid;
+  grid-template-columns:8px minmax(0,1fr) auto;
+  align-items:center;
+  gap:var(--sp-3);
+  padding:var(--sp-4) var(--sp-5);
+  border:0;
+  color:var(--ink);
+  background:transparent;
+  font:inherit;
+  text-align:left;
+  cursor:pointer;
+}
+.ag-activity-open > button:hover { background:color-mix(in srgb,var(--surface-2) 72%,transparent); }
+.ag-activity-open > button:focus-visible {
+  outline:none;
+  box-shadow:inset 0 0 0 2px var(--ring);
+}
+.ag-activity-dot {
+  width:7px;
+  height:7px;
+  border-radius:50%;
+  background:var(--border-2);
+}
+.is-unread .ag-activity-dot { background:var(--brand); }
+.ag-activity-main {
+  min-width:0;
+  display:flex;
+  flex-direction:column;
+  gap:3px;
+}
+.ag-activity-title {
+  overflow:hidden;
+  color:var(--ink);
+  font-weight:var(--fw-semibold);
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+.ag-activity-copy,
+.ag-activity-snippet {
+  overflow-wrap:anywhere;
+  color:var(--ink-3);
+  font-size:var(--fs-sm);
+}
+.ag-activity-copy strong { color:var(--ink-2); }
+.ag-activity-snippet {
+  display:-webkit-box;
+  overflow:hidden;
+  -webkit-box-orient:vertical;
+  -webkit-line-clamp:2;
+}
+.ag-activity-meta {
+  display:flex;
+  align-items:flex-end;
+  flex-direction:column;
+  gap:var(--sp-2);
+  color:var(--ink-3);
+  font-size:var(--fs-xs);
+  white-space:nowrap;
+}
+.ag-activity-state { padding-inline-end:var(--sp-4); }
+
 /* ag S11 responsive and type scale */
 .page-head h1 {
   font-size:var(--fs-h1);
@@ -1304,6 +1440,26 @@ a.ag-chip:hover {
   .ag-search-form .btn { width:100%; }
 }
 @media (max-width:640px) {
+  .ag-activity-controls {
+    align-items:stretch;
+    flex-direction:column;
+  }
+  .ag-activity-controls > form .btn { width:100%; }
+  .ag-activity-row { grid-template-columns:minmax(0,1fr); }
+  .ag-activity-open > button {
+    grid-template-columns:7px minmax(0,1fr);
+    padding:var(--sp-4);
+  }
+  .ag-activity-meta {
+    grid-column:2;
+    align-items:flex-start;
+    flex-direction:row;
+    flex-wrap:wrap;
+    white-space:normal;
+  }
+  .ag-activity-state {
+    padding:0 var(--sp-4) var(--sp-4);
+  }
   .post {
     grid-template-columns:28px minmax(0,1fr);
     padding:var(--sp-4);

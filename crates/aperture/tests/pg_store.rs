@@ -20,7 +20,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aperture::blobs::{BlobError, Blobs, MemoryBlobs};
-use aperture::model::{FileRec, FolderRec, UploadRequestRec, UploadSubmission, VersionRec};
+use aperture::model::{
+    FileRec, FolderRec, LibraryQuery, LibraryType, LibraryView, UploadRequestRec, UploadSubmission,
+    VersionRec,
+};
 use aperture::store::{
     FolderDelete, PgStore, Store, UploadRecoveryClaim, UploadReserve, UploadReserveInput,
 };
@@ -74,6 +77,7 @@ fn file(id: &str, owner: &str, token: &str, created_at: i64) -> FileRec {
         object_key: id.to_string(),
         share_token: Some(token.to_string()),
         created_at,
+        updated_at: created_at,
         expires_at: None,
         share_password_hash: None,
         folder_id: None,
@@ -204,9 +208,11 @@ async fn pg_store_full_integration() {
     store.bump_view_count("aaaaaaaaaa").await.unwrap();
     store.bump_view_count("aaaaaaaaaa").await.unwrap();
     store.bump_view_count("missing").await.unwrap();
+    let viewed = store.get("aaaaaaaaaa").await.unwrap().unwrap();
+    assert_eq!(viewed.view_count, 2);
     assert_eq!(
-        store.get("aaaaaaaaaa").await.unwrap().unwrap().view_count,
-        2
+        viewed.updated_at, got.updated_at,
+        "anonymous public views never reorder owner Recent"
     );
 
     // --- share-link lifecycle: set expiry + password, then revoke ----------
@@ -223,6 +229,22 @@ async fn pg_store_full_integration() {
     let cfg = store.get("aaaaaaaaaa").await.unwrap().unwrap();
     assert_eq!(cfg.expires_at, Some(now + 3600));
     assert_eq!(cfg.share_password_hash.as_deref(), Some("salt$hash"));
+    assert!(cfg.updated_at > viewed.updated_at);
+    assert!(store
+        .configure_share(
+            "aaaaaaaaaa",
+            "alice",
+            Some("tok-aaaa".into()),
+            Some(now + 3600),
+            Some("salt$hash".into())
+        )
+        .await
+        .unwrap());
+    let cfg_again = store.get("aaaaaaaaaa").await.unwrap().unwrap();
+    assert!(
+        cfg_again.updated_at > cfg.updated_at,
+        "same-second PostgreSQL mutations advance the activity cursor"
+    );
     // Revoke clears the token to NULL; the public lookup misses and the row's token is None.
     assert!(store
         .configure_share("aaaaaaaaaa", "alice", None, None, None)
@@ -292,6 +314,7 @@ async fn pg_store_full_integration() {
         parent_id: None,
         name: name.to_string(),
         created_at: now,
+        updated_at: now,
         share_token: None,
         expires_at: None,
         share_password_hash: None,
@@ -373,6 +396,156 @@ async fn pg_store_full_integration() {
             .unwrap()
             .id,
         "cccccccccc"
+    );
+
+    // --- global owner library: Memory/Pg contract, literal search + cross-kind cursor ---------
+    // Classification is mutually exclusive and follows the Rust priority order. These two MIME
+    // strings intentionally contain archive-looking suffixes but are classified earlier.
+    let mut priority_document = file("texttar001", "alice", "priority-doc-token", now + 800);
+    priority_document.name = "Priority document".into();
+    priority_document.content_type = "text/x-tar".into();
+    priority_document.share_token = None;
+    assert!(store.create(&priority_document).await.unwrap());
+    let mut priority_image = file("imagezip01", "alice", "priority-image-token", now + 801);
+    priority_image.name = "Priority image".into();
+    priority_image.content_type = "image/x-zip".into();
+    priority_image.share_token = None;
+    assert!(store.create(&priority_image).await.unwrap());
+    let priority_query = |type_filter| LibraryQuery {
+        view: LibraryView::All,
+        query: Some("priority".into()),
+        type_filter,
+        before: None,
+        limit: 20,
+    };
+    let priority_documents = store
+        .query_library("alice", &priority_query(LibraryType::Document))
+        .await
+        .unwrap();
+    assert_eq!(priority_documents.items.len(), 1);
+    assert_eq!(priority_documents.items[0].id, "texttar001");
+    let priority_images = store
+        .query_library("alice", &priority_query(LibraryType::Image))
+        .await
+        .unwrap();
+    assert_eq!(priority_images.items.len(), 1);
+    assert_eq!(priority_images.items[0].id, "imagezip01");
+    assert!(store
+        .query_library("alice", &priority_query(LibraryType::Archive))
+        .await
+        .unwrap()
+        .items
+        .is_empty());
+    assert!(store.delete("texttar001", "alice").await.unwrap());
+    assert!(store.delete("imagezip01", "alice").await.unwrap());
+
+    let image_results = store
+        .query_library(
+            "alice",
+            &LibraryQuery {
+                view: LibraryView::All,
+                query: Some("CCCC".into()),
+                type_filter: LibraryType::Image,
+                before: None,
+                limit: 20,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(image_results.items.len(), 1);
+    assert_eq!(image_results.items[0].id, "cccccccccc");
+    assert_eq!(
+        image_results.items[0].parent_id.as_deref(),
+        Some("fold000001"),
+        "search crosses the folder tree"
+    );
+
+    let mut tie_file = file("tiefile001", "alice", "tie-file-token", now + 1000);
+    tie_file.name = "Tie Item".into();
+    assert!(store.create(&tie_file).await.unwrap());
+    let mut tie_folder = fld("tiefolder1", "alice", "Tie Item");
+    tie_folder.created_at = now + 1000;
+    tie_folder.updated_at = now + 1000;
+    assert!(store.create_folder(&tie_folder).await.unwrap());
+    let tie_query = LibraryQuery {
+        view: LibraryView::Recent,
+        query: Some("tie item".into()),
+        type_filter: LibraryType::All,
+        before: None,
+        limit: 1,
+    };
+    let tie_first = store.query_library("alice", &tie_query).await.unwrap();
+    assert_eq!(tie_first.items[0].id, "tiefile001");
+    let tie_second = store
+        .query_library(
+            "alice",
+            &LibraryQuery {
+                before: tie_first.next.clone(),
+                ..tie_query
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(tie_second.items[0].id, "tiefolder1");
+    assert!(tie_second.next.is_none());
+
+    assert!(store
+        .configure_share(
+            "tiefile001",
+            "alice",
+            Some("tie-file-token".into()),
+            Some(1),
+            Some("salt$hash".into()),
+        )
+        .await
+        .unwrap());
+    assert!(store
+        .configure_folder_share(
+            "tiefolder1",
+            "alice",
+            Some("tie-folder-token".into()),
+            Some(1),
+            Some("salt$hash".into()),
+        )
+        .await
+        .unwrap());
+    let shared_items = store
+        .query_library(
+            "alice",
+            &LibraryQuery {
+                view: LibraryView::Shared,
+                query: Some("tie item".into()),
+                type_filter: LibraryType::All,
+                before: None,
+                limit: 20,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(shared_items.items.len(), 2);
+    assert!(shared_items.items.iter().all(|item| item.share_expired));
+    assert!(shared_items.items.iter().all(|item| item.share_protected));
+    sqlx::query("UPDATE files SET updated_at = $1 WHERE id = 'tiefile001'")
+        .bind(i64::MAX)
+        .execute(&raw)
+        .await
+        .unwrap();
+    assert!(store
+        .rename_file("tiefile001", "alice", "Tie Item saturated")
+        .await
+        .unwrap());
+    assert_eq!(
+        store.get("tiefile001").await.unwrap().unwrap().updated_at,
+        i64::MAX,
+        "activity touch saturates instead of overflowing BIGINT"
+    );
+    assert!(store.delete("tiefile001", "alice").await.unwrap());
+    assert_eq!(
+        store
+            .delete_folder_if_empty("tiefolder1", "alice")
+            .await
+            .unwrap(),
+        FolderDelete::Deleted
     );
     // A non-owner cannot move the file or rename/delete the folder.
     assert!(!store
@@ -636,6 +809,7 @@ async fn pg_store_full_integration() {
         parent_id: None,
         name: "Conflicting intake".into(),
         created_at: now + 191,
+        updated_at: now + 191,
         share_token: None,
         expires_at: None,
         share_password_hash: None,
@@ -679,6 +853,7 @@ async fn pg_store_full_integration() {
         parent_id: None,
         name: "Racing legacy intake".into(),
         created_at: now + 195,
+        updated_at: now + 195,
         share_token: None,
         expires_at: None,
         share_password_hash: None,
@@ -830,6 +1005,7 @@ async fn pg_store_full_integration() {
         parent_id: None,
         name: "Legacy intake".into(),
         created_at: now + 200,
+        updated_at: now + 200,
         share_token: None,
         expires_at: None,
         share_password_hash: None,

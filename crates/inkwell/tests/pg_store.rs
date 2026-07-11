@@ -18,7 +18,9 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
-use inkwell::store::{PgStore, Post, Store};
+use inkwell::store::{
+    AutosaveOutcome, PgStore, Post, SavePostCommand, SavePostOutcome, Store, WriterAutosave,
+};
 use inkwell::{app, build_dev_state, now_secs, AppState};
 use tower::ServiceExt;
 
@@ -32,12 +34,37 @@ async fn pg_store_full_integration() {
         return;
     };
 
-    // --- connect / migrate (idempotent: run twice) -------------------------
+    // --- connect / migrate (fresh child schema + idempotent re-run) --------
     let pg = PgStore::connect(&url)
         .await
         .expect("connect TEST_DATABASE_URL");
+    let raw = sqlx::PgPool::connect(&url).await.expect("raw test pool");
+    sqlx::query("DROP TABLE IF EXISTS writer_autosaves, post_revisions")
+        .execute(&raw)
+        .await
+        .expect("reset child tables for a fresh-schema migration");
     pg.migrate().await.expect("migrate");
     pg.migrate().await.expect("migrate is idempotent");
+    for table in ["writer_autosaves", "post_revisions", "chunks", "posts"] {
+        sqlx::query(&format!("DELETE FROM {table}"))
+            .execute(&raw)
+            .await
+            .expect("clear isolated test table");
+    }
+    let cascading_foreign_keys: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint c \
+         JOIN pg_class child ON child.oid = c.conrelid \
+         WHERE c.contype = 'f' AND c.confdeltype = 'c' \
+           AND child.relname IN ('post_revisions', 'writer_autosaves') \
+           AND child.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema())",
+    )
+    .fetch_one(&raw)
+    .await
+    .expect("inspect fresh-schema foreign keys");
+    assert_eq!(
+        cascading_foreign_keys, 2,
+        "fresh revision and autosave tables both cascade with their post"
+    );
     let pg = Arc::new(pg);
 
     // --- direct Store-trait round-trip -------------------------------------
@@ -51,6 +78,7 @@ async fn pg_store_full_integration() {
         author_email: "alice@holdfast.local".to_string(),
         created_at: now - 100,
         updated_at: now - 100,
+        edit_version: 1,
         published: true,
         publish_at: 0,
         featured: false,
@@ -66,6 +94,99 @@ async fn pg_store_full_integration() {
         social_image: "https://drive.w33d.xyz/s/social_tok".to_string(),
     };
     pg.create_post(&post).await.expect("create");
+    let baseline = pg
+        .list_post_revisions(&post.id, 50)
+        .await
+        .expect("baseline revision");
+    assert_eq!(baseline.len(), 1);
+    assert_eq!(baseline[0].edit_version, 1);
+
+    let autosave_session = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let autosave = WriterAutosave {
+        session_id: autosave_session.to_string(),
+        post_id: post.id.clone(),
+        owner_sub: post.author_sub.clone(),
+        base_version: 1,
+        client_seq: 2,
+        title: post.title.clone(),
+        body_md: "pg private recovery".to_string(),
+        tags: post.tags.clone(),
+        cover_url: post.cover_url.clone(),
+        custom_excerpt: post.custom_excerpt.clone(),
+        meta_title: post.meta_title.clone(),
+        meta_description: post.meta_description.clone(),
+        canonical_url: post.canonical_url.clone(),
+        social_title: post.social_title.clone(),
+        social_description: post.social_description.clone(),
+        social_image: post.social_image.clone(),
+        publish_at: String::new(),
+        pinned: post.pinned,
+        updated_at: now,
+        expires_at: now + inkwell::config::AUTOSAVE_TTL_SECS,
+    };
+    assert!(matches!(
+        pg.put_writer_autosave(autosave.clone(), now).await.unwrap(),
+        AutosaveOutcome::Saved(_)
+    ));
+    let mut stale_sequence = autosave.clone();
+    stale_sequence.client_seq = 1;
+    stale_sequence.body_md = "must not replace".to_string();
+    assert!(matches!(
+        pg.put_writer_autosave(stale_sequence, now).await.unwrap(),
+        AutosaveOutcome::Stale {
+            stored_client_seq: 2
+        }
+    ));
+    assert_eq!(
+        pg.get_writer_autosave(autosave_session, "u_alice", now)
+            .await
+            .unwrap()
+            .unwrap()
+            .body_md,
+        "pg private recovery"
+    );
+    assert!(pg
+        .get_writer_autosave(autosave_session, "u_admin", now)
+        .await
+        .unwrap()
+        .is_none());
+
+    // Expiration is enforced on reads and before sequence CAS: an expired high sequence cannot
+    // block a fresh editor from restarting at a lower sequence for the same session.
+    let ttl_session = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    let mut expired_target = autosave.clone();
+    expired_target.session_id = ttl_session.to_string();
+    expired_target.client_seq = 999;
+    expired_target.expires_at = now + 1;
+    assert!(matches!(
+        pg.put_writer_autosave(expired_target, now).await.unwrap(),
+        AutosaveOutcome::Saved(_)
+    ));
+    assert!(pg
+        .get_writer_autosave(ttl_session, "u_alice", now + 2)
+        .await
+        .unwrap()
+        .is_none());
+    let mut fresh_target = autosave.clone();
+    fresh_target.session_id = ttl_session.to_string();
+    fresh_target.client_seq = 1;
+    fresh_target.body_md = "fresh after expiry".to_string();
+    fresh_target.updated_at = now + 2;
+    fresh_target.expires_at = now + 100;
+    assert!(matches!(
+        pg.put_writer_autosave(fresh_target, now + 2)
+            .await
+            .unwrap(),
+        AutosaveOutcome::Saved(_)
+    ));
+    assert_eq!(
+        pg.get_writer_autosave(ttl_session, "u_alice", now + 2)
+            .await
+            .unwrap()
+            .unwrap()
+            .client_seq,
+        1
+    );
 
     // Duplicate slug -> Conflict (the UNIQUE(slug) guard).
     let dup = Post {
@@ -90,6 +211,7 @@ async fn pg_store_full_integration() {
         author_email: "alice@holdfast.local".to_string(),
         created_at: now,
         updated_at: now,
+        edit_version: 1,
         published: true,
         publish_at: 0,
         featured: false,
@@ -105,6 +227,108 @@ async fn pg_store_full_integration() {
         social_image: String::new(),
     };
     pg.create_post(&post2).await.expect("create 2");
+
+    // Fresh-schema child rows are database-owned and cascade even when a post is deleted outside
+    // the Store implementation (for example by an operator or a rollback image).
+    let mut cascade_post = post2.clone();
+    cascade_post.id = "post_pg_cascade".to_string();
+    cascade_post.slug = "pg-cascade".to_string();
+    pg.create_post(&cascade_post)
+        .await
+        .expect("create cascade fixture");
+    let mut cascade_autosave = autosave.clone();
+    cascade_autosave.session_id =
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string();
+    cascade_autosave.post_id = cascade_post.id.clone();
+    cascade_autosave.base_version = cascade_post.edit_version;
+    assert!(matches!(
+        pg.put_writer_autosave(cascade_autosave, now)
+            .await
+            .unwrap(),
+        AutosaveOutcome::Saved(_)
+    ));
+    sqlx::query("DELETE FROM posts WHERE id = $1")
+        .bind(&cascade_post.id)
+        .execute(&raw)
+        .await
+        .expect("direct post delete cascades");
+    let cascade_children: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM post_revisions WHERE post_id = $1) + \
+                (SELECT count(*) FROM writer_autosaves WHERE post_id = $1)",
+    )
+    .bind(&cascade_post.id)
+    .fetch_one(&raw)
+    .await
+    .unwrap();
+    assert_eq!(cascade_children, 0, "database cascades both child tables");
+
+    // Slug reuse must not turn a stale tab into an ABA overwrite of a different post identity.
+    let mut old_aba = post2.clone();
+    old_aba.id = "post_pg_aba_old".to_string();
+    old_aba.slug = "pg-aba".to_string();
+    old_aba.body_md = "old identity".to_string();
+    old_aba.created_at = now - 500;
+    old_aba.updated_at = now - 500;
+    pg.create_post(&old_aba).await.expect("create old ABA post");
+    let mut stale_aba = old_aba.clone();
+    stale_aba.body_md = "stale tab must not win".to_string();
+    pg.delete_post(&old_aba.slug).await.expect("delete old ABA post");
+    let mut replacement = post2.clone();
+    replacement.id = "post_pg_aba_replacement".to_string();
+    replacement.slug = old_aba.slug.clone();
+    replacement.body_md = "replacement identity".to_string();
+    replacement.created_at = old_aba.created_at;
+    replacement.updated_at = old_aba.updated_at;
+    pg.create_post(&replacement)
+        .await
+        .expect("recreate same slug with a new id");
+    for source in ["update", "restore"] {
+        let outcome = pg
+            .save_post(SavePostCommand {
+                post: stale_aba.clone(),
+                expected_version: 1,
+                editor_sub: old_aba.author_sub.clone(),
+                editor_email: old_aba.author_email.clone(),
+                source: source.to_string(),
+                restored_from: (source == "restore").then(|| "old-revision".to_string()),
+                consume_autosave_session: Some("old-aba-session".to_string()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome, SavePostOutcome::NotFound);
+    }
+    let mut stale_aba_autosave = autosave.clone();
+    stale_aba_autosave.session_id = "old-aba-session".to_string();
+    stale_aba_autosave.post_id = old_aba.id.clone();
+    stale_aba_autosave.base_version = 1;
+    stale_aba_autosave.client_seq = 1;
+    stale_aba_autosave.body_md = "must not attach to replacement".to_string();
+    assert_eq!(
+        pg.put_writer_autosave(stale_aba_autosave, now)
+            .await
+            .unwrap(),
+        AutosaveOutcome::NotFound
+    );
+    let replacement_after = pg.get_post("pg-aba").await.unwrap();
+    assert_eq!(replacement_after.id, replacement.id);
+    assert_eq!(replacement_after.body_md, "replacement identity");
+    assert_eq!(
+        pg.list_post_revisions(&replacement.id, 50)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "stale save and restore append no replacement revision"
+    );
+    let old_aba_children: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM post_revisions WHERE post_id = $1) + \
+                (SELECT count(*) FROM writer_autosaves WHERE post_id = $1)",
+    )
+    .bind(&old_aba.id)
+    .fetch_one(&raw)
+    .await
+    .unwrap();
+    assert_eq!(old_aba_children, 0, "stale identity leaves no child pollution");
 
     let listed = pg.list_posts(None, inkwell::config::MAX_PAGE).await;
     assert!(listed.len() >= 2);
@@ -234,8 +458,28 @@ async fn pg_store_full_integration() {
     edited.social_image = String::new();
     edited.published = false;
     edited.updated_at = now;
-    pg.update_post(&edited).await.expect("update");
+    let saved = pg
+        .save_post(SavePostCommand {
+            post: edited.clone(),
+            expected_version: 1,
+            editor_sub: "u_alice".to_string(),
+            editor_email: "alice@holdfast.local".to_string(),
+            source: "update".to_string(),
+            restored_from: None,
+            consume_autosave_session: Some(autosave_session.to_string()),
+        })
+        .await
+        .expect("atomic update");
+    assert!(matches!(saved, SavePostOutcome::Saved(_)));
+    assert!(
+        pg.get_writer_autosave(autosave_session, "u_alice", now)
+            .await
+            .unwrap()
+            .is_none(),
+        "authoritative transaction consumed autosave"
+    );
     let after = pg.get_post("pg-hello").await.expect("refetch");
+    assert_eq!(after.edit_version, 2);
     assert_eq!(after.title, "PG Hello (edited)");
     assert_eq!(after.tags, "rust", "tags update persisted in pg");
     assert_eq!(after.cover_url, "", "cover_url cleared through pg update");
@@ -243,6 +487,85 @@ async fn pg_store_full_integration() {
     assert_eq!(after.meta_description, "Updated PG description");
     assert_eq!(after.social_image, "");
     assert!(!after.published);
+    let stale = pg
+        .save_post(SavePostCommand {
+            post: edited.clone(),
+            expected_version: 1,
+            editor_sub: "u_alice".to_string(),
+            editor_email: "alice@holdfast.local".to_string(),
+            source: "stale".to_string(),
+            restored_from: None,
+            consume_autosave_session: None,
+        })
+        .await
+        .expect("stale CAS outcome");
+    assert!(matches!(
+        stale,
+        SavePostOutcome::Conflict { current_version: 2 }
+    ));
+    assert_eq!(
+        pg.list_post_revisions(&post.id, 50).await.unwrap().len(),
+        2,
+        "conflict appends no revision"
+    );
+
+    // Opportunistic autosave cleanup is a bounded 256-row batch and never touches valid recovery
+    // rows or the independent revision history.
+    sqlx::query(
+        "INSERT INTO writer_autosaves \
+             (session_id, post_id, owner_sub, base_version, client_seq, title, body_md, tags, \
+              cover_url, custom_excerpt, meta_title, meta_description, canonical_url, social_title, \
+              social_description, social_image, publish_at, pinned, updated_at, expires_at) \
+         SELECT 'expired-' || lpad(g::text, 4, '0'), $1, 'expired-owner', $2, g, 't', 'b', '', \
+                '', '', '', '', '', '', '', '', '', FALSE, $3 - 100, $3 - 1 \
+         FROM generate_series(1, 300) AS g",
+    )
+    .bind(&post.id)
+    .bind(after.edit_version)
+    .bind(now)
+    .execute(&raw)
+    .await
+    .expect("seed expired autosaves");
+    let revisions_before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM post_revisions WHERE post_id = $1")
+            .bind(&post.id)
+            .fetch_one(&raw)
+            .await
+            .unwrap();
+    let cleanup_session = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let mut cleanup_trigger = autosave.clone();
+    cleanup_trigger.session_id = cleanup_session.to_string();
+    cleanup_trigger.base_version = after.edit_version;
+    cleanup_trigger.client_seq = 1;
+    cleanup_trigger.expires_at = now + inkwell::config::AUTOSAVE_TTL_SECS;
+    assert!(matches!(
+        pg.put_writer_autosave(cleanup_trigger, now).await.unwrap(),
+        AutosaveOutcome::Saved(_)
+    ));
+    let expired_left: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM writer_autosaves WHERE expires_at <= $1")
+            .bind(now)
+            .fetch_one(&raw)
+            .await
+            .unwrap();
+    assert_eq!(
+        expired_left, 44,
+        "one write cleans exactly one bounded batch"
+    );
+    assert!(
+        pg.get_writer_autosave(cleanup_session, "u_alice", now)
+            .await
+            .unwrap()
+            .is_some(),
+        "valid autosave survives cleanup"
+    );
+    let revisions_after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM post_revisions WHERE post_id = $1")
+            .bind(&post.id)
+            .fetch_one(&raw)
+            .await
+            .unwrap();
+    assert_eq!(revisions_after, revisions_before);
 
     // --- full HTTP flow through the PG-backed app --------------------------
     let mut state: AppState = build_dev_state();
@@ -378,6 +701,143 @@ async fn pg_store_full_integration() {
         "scheduled post joins an already non-empty cache at its instant"
     );
 
+    // Simulate an old rollback image writing every authoring field without advancing the new CAS
+    // token. The forward migration must preserve that row as a new immutable version, then become
+    // idempotent once its current snapshot matches.
+    let mut repair_post = post2.clone();
+    repair_post.id = "post_pg_forward_repair".to_string();
+    repair_post.slug = "pg-forward-repair".to_string();
+    repair_post.created_at = now - 700;
+    repair_post.updated_at = now - 700;
+    pg.create_post(&repair_post)
+        .await
+        .expect("create forward-repair fixture");
+    sqlx::query(
+        "UPDATE posts SET title = $2, body_md = $3, published = $4, publish_at = $5, \
+                featured = $6, pinned = $7, tags = $8, cover_url = $9, custom_excerpt = $10, \
+                meta_title = $11, meta_description = $12, canonical_url = $13, \
+                social_title = $14, social_description = $15, social_image = $16, updated_at = $17 \
+         WHERE id = $1",
+    )
+    .bind(&repair_post.id)
+    .bind("Rollback title")
+    .bind("rollback body and metadata")
+    .bind(false)
+    .bind(now + 7_200)
+    .bind(true)
+    .bind(true)
+    .bind("rollback, repair")
+    .bind("https://drive.w33d.xyz/s/rollback_cover")
+    .bind("Rollback excerpt")
+    .bind("Rollback meta title")
+    .bind("Rollback meta description")
+    .bind("https://example.com/rollback")
+    .bind("Rollback social title")
+    .bind("Rollback social description")
+    .bind("https://drive.w33d.xyz/s/rollback_social")
+    .bind(now + 1)
+    .execute(&raw)
+    .await
+    .expect("simulate old-image update without edit_version bump");
+    assert_eq!(
+        pg.get_post("pg-forward-repair").await.unwrap().edit_version,
+        1,
+        "rollback image left the CAS token stale"
+    );
+    pg.migrate().await.expect("forward repair rollback write");
+    let repaired_post = pg.get_post("pg-forward-repair").await.unwrap();
+    assert_eq!(repaired_post.edit_version, 2);
+    let repaired_revisions = pg
+        .list_post_revisions(&repaired_post.id, 50)
+        .await
+        .unwrap();
+    assert_eq!(repaired_revisions.len(), 2);
+    assert_eq!(repaired_revisions[0].source, "forward-repair");
+    let repaired_revision = pg
+        .get_post_revision(&repaired_post.id, &repaired_revisions[0].id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_revision_matches_post(&repaired_revision, &repaired_post);
+    pg.migrate()
+        .await
+        .expect("forward repair is idempotent after snapshot");
+    assert_eq!(
+        pg.get_post("pg-forward-repair")
+            .await
+            .unwrap()
+            .edit_version,
+        2
+    );
+    assert_eq!(
+        pg.list_post_revisions(&repaired_post.id, 50)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // Emulate legacy child tables without foreign keys, then delete through an old image. A
+    // re-upgrade must remove both orphan kinds and remain safe on repeated startup.
+    for (table, constraint) in [
+        ("post_revisions", "post_revisions_post_id_fkey"),
+        ("writer_autosaves", "writer_autosaves_post_id_fkey"),
+    ] {
+        sqlx::query(&format!(
+            "ALTER TABLE {table} DROP CONSTRAINT {constraint}"
+        ))
+        .execute(&raw)
+        .await
+        .expect("remove fresh FK to emulate a legacy table");
+    }
+    let mut legacy_post = post2.clone();
+    legacy_post.id = "post_pg_legacy_orphan".to_string();
+    legacy_post.slug = "pg-legacy-orphan".to_string();
+    legacy_post.created_at = now - 800;
+    legacy_post.updated_at = now - 800;
+    pg.create_post(&legacy_post)
+        .await
+        .expect("create legacy orphan fixture");
+    let mut legacy_autosave = autosave.clone();
+    legacy_autosave.session_id =
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string();
+    legacy_autosave.post_id = legacy_post.id.clone();
+    legacy_autosave.base_version = 1;
+    legacy_autosave.client_seq = 1;
+    assert!(matches!(
+        pg.put_writer_autosave(legacy_autosave, now)
+            .await
+            .unwrap(),
+        AutosaveOutcome::Saved(_)
+    ));
+    sqlx::query("DELETE FROM posts WHERE id = $1")
+        .bind(&legacy_post.id)
+        .execute(&raw)
+        .await
+        .expect("legacy image deletes parent only");
+    let legacy_children: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM post_revisions WHERE post_id = $1) + \
+                (SELECT count(*) FROM writer_autosaves WHERE post_id = $1)",
+    )
+    .bind(&legacy_post.id)
+    .fetch_one(&raw)
+    .await
+    .unwrap();
+    assert_eq!(legacy_children, 2, "legacy delete leaves both orphan kinds");
+    pg.migrate().await.expect("re-upgrade cleans legacy orphans");
+    pg.migrate()
+        .await
+        .expect("legacy orphan repair is idempotent");
+    let repaired_legacy_children: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM post_revisions WHERE post_id = $1) + \
+                (SELECT count(*) FROM writer_autosaves WHERE post_id = $1)",
+    )
+    .bind(&legacy_post.id)
+    .fetch_one(&raw)
+    .await
+    .unwrap();
+    assert_eq!(repaired_legacy_children, 0);
+
     println!(
         "PG STORE INTEGRATION OK: migrate (idempotent) + create/conflict/list/get/update/delete \
          round-trip + full new/read/delete HTTP flow against real Postgres"
@@ -396,4 +856,24 @@ async fn raw_call(state: &AppState, req: Request<Body>) -> (StatusCode, Vec<u8>)
 
 fn get(uri: &str) -> Request<Body> {
     Request::builder().uri(uri).body(Body::empty()).unwrap()
+}
+
+fn assert_revision_matches_post(revision: &inkwell::store::PostRevision, post: &Post) {
+    assert_eq!(revision.post_id, post.id);
+    assert_eq!(revision.edit_version, post.edit_version);
+    assert_eq!(revision.title, post.title);
+    assert_eq!(revision.body_md, post.body_md);
+    assert_eq!(revision.published, post.published);
+    assert_eq!(revision.publish_at, post.publish_at);
+    assert_eq!(revision.featured, post.featured);
+    assert_eq!(revision.pinned, post.pinned);
+    assert_eq!(revision.tags, post.tags);
+    assert_eq!(revision.cover_url, post.cover_url);
+    assert_eq!(revision.custom_excerpt, post.custom_excerpt);
+    assert_eq!(revision.meta_title, post.meta_title);
+    assert_eq!(revision.meta_description, post.meta_description);
+    assert_eq!(revision.canonical_url, post.canonical_url);
+    assert_eq!(revision.social_title, post.social_title);
+    assert_eq!(revision.social_description, post.social_description);
+    assert_eq!(revision.social_image, post.social_image);
 }

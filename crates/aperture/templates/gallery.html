@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
+  <link rel="icon" href="data:,">
   <title>Drive · Aperture · HOLDFAST</title>
   <style>{{CSS}}</style>
 </head>
@@ -30,6 +31,7 @@
       </aside>
 
       <div class="drive-content" id="ap-drive" data-spark="view:grid" data-spark-persist="view=aperture:view">
+        {{LIBRARY_CONTROLS}}
         <div class="ap-toolbar">
           <div class="ap-toolbar__main">{{BREADCRUMB}}</div>
           <div class="ap-toolbar__side">
@@ -45,7 +47,7 @@
 
         <section class="drive-section drive-section--files" aria-labelledby="filesLabel">
           <div class="drive-section__head">
-            <h2 class="drive-section__label" id="filesLabel">Files</h2>
+            <h2 class="drive-section__label" id="filesLabel">{{ITEMS_LABEL}}</h2>
           </div>
           <div class="ap-list-head" hidden data-spark-class="is-list:view=list" aria-hidden="true"><span></span><span>Name</span><span data-col="shared">Shared</span><span>Size</span><span data-col="modified">Modified</span><span></span></div>
           <ul class="gallery-grid" data-spark-class="is-list:view=list">

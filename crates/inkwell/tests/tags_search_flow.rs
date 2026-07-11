@@ -172,6 +172,7 @@ fn stored_post(slug: &str, title: &str, created_at: i64, published: bool, tags: 
         author_email: "alice@hf".to_string(),
         created_at,
         updated_at: created_at,
+        edit_version: 1,
         published,
         publish_at: 0,
         featured: false,

@@ -271,7 +271,7 @@ impl Store for InMemoryStore {
         // reversing first and then stable-sorting on ts keeps the later write ahead. (A random-id
         // tiebreak would make the head flap between same-ms revisions.)
         revs.reverse();
-        revs.sort_by(|a, b| b.ts.cmp(&a.ts));
+        revs.sort_by_key(|revision| std::cmp::Reverse(revision.ts));
         revs.truncate(HISTORY_LIMIT);
         Ok(revs)
     }
