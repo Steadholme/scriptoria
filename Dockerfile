@@ -15,13 +15,13 @@
 FROM rust:1.96-slim AS builder
 WORKDIR /build
 
-# Bring the whole self-contained crate (the binary + the three vendored surface crates under
+# Bring the whole self-contained crate (the binary + the six vendored surface crates under
 # crates/) and build the release binary. The surfaces' static/ + templates/ are needed at build
 # time for their include_str! embeds.
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY crates ./crates
-RUN cargo build --release --bin scriptoria \
+RUN cargo build --locked --release --bin scriptoria \
     && strip target/release/scriptoria
 
 FROM debian:trixie-slim AS runtime
