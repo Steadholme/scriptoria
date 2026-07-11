@@ -84,6 +84,15 @@ fn get(path: &str, subject: Option<&str>) -> Request<Body> {
     b.body(Body::empty()).unwrap()
 }
 
+fn get_with_cookie(path: &str, subject: Option<&str>, cookie: &str) -> Request<Body> {
+    let mut request = get(path, subject);
+    request.headers_mut().insert(
+        header::COOKIE,
+        format!("__Host-csrf={cookie}").parse().unwrap(),
+    );
+    request
+}
+
 fn get_range(path: &str, subject: Option<&str>, range: &str) -> Request<Body> {
     let mut b = Request::builder()
         .method("GET")
@@ -261,6 +270,115 @@ async fn upload_file(
 }
 
 #[tokio::test]
+async fn production_owner_routes_fail_closed_but_capabilities_remain_anonymous() {
+    let mut state = build_dev_state();
+    let mut config = (*state.config).clone();
+    config.allow_dev_identity = false;
+    state.config = Arc::new(config);
+    let locked = app(state);
+
+    // No gateway identity can no longer fall through to dev-user on an owner surface.
+    assert_eq!(
+        send(&locked, get("/", None)).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    // A claimed identity is not trusted when the production guard has no HMAC verifier. This is
+    // deliberately different from the unsigned dev seam.
+    assert_eq!(
+        send(&locked, get("/", Some("alice"))).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        send(&locked, get("/healthz", None)).await.status,
+        StatusCode::OK
+    );
+
+    // Existing capability namespaces stay anonymous and render the independent public error shell.
+    for path in ["/s/not-a-token", "/u/not-a-token"] {
+        let response = send(&locked, get(path, None)).await;
+        assert_eq!(response.status, StatusCode::NOT_FOUND);
+        let html = response.text();
+        assert!(html.contains("data-ap-share-room"));
+        assert!(html.contains("Share not found"));
+        assert!(!html.contains("GENERATED FROM odyssey"));
+    }
+
+    // Strict-CSP Share Room assets are also anonymous, read-only routes.
+    assert_eq!(
+        send(&locked, get("/s/share-room.css", None)).await.status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(&locked, get("/s/share-room.js", None)).await.status,
+        StatusCode::OK
+    );
+
+    // Explicit dev state preserves the local/test fallback.
+    assert_eq!(
+        send(&app(build_dev_state()), get("/", None)).await.status,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn public_file_share_room_is_product_owned_and_escapes_remote_names() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let (id, _) = upload_file(
+        &app,
+        "alice",
+        "proof<svg onload=alert(1)>.png",
+        "image/png",
+        &png_bytes(),
+    )
+    .await;
+    let token = store.get(&id).await.unwrap().unwrap().share_token.unwrap();
+
+    let page = send(&app, get(&format!("/s/{token}/view"), None)).await;
+    assert_eq!(page.status, StatusCode::OK);
+    let csp = page.header(header::CONTENT_SECURITY_POLICY);
+    assert!(csp.contains("default-src 'none'"));
+    assert!(csp.contains("style-src 'self'"));
+    assert!(csp.contains("script-src 'self'"));
+    assert!(csp.contains("connect-src 'self'"));
+    assert!(csp.contains("frame-ancestors 'none'"));
+    let html = page.text();
+    assert!(html.contains("data-ap-share-room"));
+    assert!(html.contains("PUBLIC SHARE ROOM"));
+    assert!(html.contains("href=\"/s/share-room.css\""));
+    assert!(html.contains("src=\"/s/share-room.js\""));
+    assert!(!html.contains("href=\"/share-room.css\""));
+    assert!(!html.contains("src=\"/share-room.js\""));
+    assert!(!html.contains("<style>"));
+    assert!(!html.contains("<script>"));
+    assert!(html.contains("proof&lt;svg onload=alert(1)&gt;.png"));
+    assert!(!html.contains("proof<svg onload=alert(1)>.png"));
+    assert!(!html.contains("GENERATED FROM odyssey"));
+    assert!(!html.contains("OdysseyWire"));
+    assert!(!html.contains("OdysseySpark"));
+
+    let css = send(&app, get("/s/share-room.css", None)).await;
+    assert_eq!(css.status, StatusCode::OK);
+    assert_eq!(css.header(header::CONTENT_TYPE), "text/css; charset=utf-8");
+    assert!(css.text().contains("--ap-ink"));
+    assert!(!css.text().contains("GENERATED FROM odyssey"));
+    assert!(!css.text().contains("OdysseyWire"));
+
+    let js = send(&app, get("/s/share-room.js", None)).await;
+    assert_eq!(js.status, StatusCode::OK);
+    assert_eq!(
+        js.header(header::CONTENT_TYPE),
+        "text/javascript; charset=utf-8"
+    );
+    assert!(js.text().contains("input.multiple = true"));
+    assert!(js.text().contains("new XMLHttpRequest"));
+    assert!(js.text().contains("Retry"));
+    assert!(!js.text().contains(".style"));
+    assert!(!js.text().contains("OdysseyWire"));
+}
+
+#[tokio::test]
 async fn share_expiry_returns_410_after_expiry() {
     let state = build_dev_state();
     let store: Arc<dyn Store> = state.store.clone();
@@ -292,6 +410,9 @@ async fn share_expiry_returns_410_after_expiry() {
         .unwrap();
     let gone = send(&app, get(&format!("/s/{token}"), None)).await;
     assert_eq!(gone.status, StatusCode::GONE);
+    assert!(gone.text().contains("data-ap-share-room"));
+    assert!(gone.text().contains("Share expired"));
+    assert!(!gone.text().contains("GENERATED FROM odyssey"));
     // The owner still reaches the file over SSO regardless of the share expiry.
     assert_eq!(
         send(&app, get(&format!("/f/{id}/raw"), Some("alice")))
@@ -326,6 +447,9 @@ async fn share_password_prompts_then_serves() {
     let prompt = send(&app, get(&format!("/s/{token}"), None)).await;
     assert_eq!(prompt.status, StatusCode::OK);
     assert!(prompt.text().contains("Password required"));
+    assert!(prompt.text().contains("Protected file"));
+    assert!(prompt.text().contains("No expiry"));
+    assert!(!prompt.text().contains("GENERATED FROM odyssey"));
     assert_ne!(prompt.body, png_bytes());
 
     // Wrong password -> 401 + prompt again.
@@ -2348,8 +2472,12 @@ async fn folder_share_public_index_and_gates() {
     // Public index (NO auth) lists the folder's file + a download link.
     let idx = send(&app, get(&format!("/s/folder/{token}"), None)).await;
     assert_eq!(idx.status, StatusCode::OK);
-    assert!(idx.text().contains("pic.png"));
-    assert!(idx.text().contains(&format!("/s/folder/{token}/f/{inid}")));
+    let idx_html = idx.text();
+    assert!(idx_html.contains("pic.png"));
+    assert!(idx_html.contains(&format!("/s/folder/{token}/f/{inid}")));
+    assert!(idx_html.contains("data-ap-share-room"));
+    assert!(idx_html.contains("data-share-preview="));
+    assert!(!idx_html.contains("GENERATED FROM odyssey"));
     // Public download returns the bytes.
     let dl = send(&app, get(&format!("/s/folder/{token}/f/{inid}"), None)).await;
     assert_eq!(dl.status, StatusCode::OK);
@@ -2447,6 +2575,7 @@ async fn folder_share_password_gate() {
     assert_eq!(prompt.status, StatusCode::OK);
     assert!(prompt.text().contains("Password required"));
     assert!(!prompt.text().contains("secret.png"));
+    assert!(!prompt.text().contains("GENERATED FROM odyssey"));
     // A direct GET download on a protected folder is refused (401), not served.
     let locked = send(&app, get(&format!("/s/folder/{token}/f/{inid}"), None)).await;
     assert_eq!(locked.status, StatusCode::UNAUTHORIZED);
@@ -2471,6 +2600,11 @@ async fn folder_share_password_gate() {
     .await;
     assert_eq!(ok.status, StatusCode::OK);
     assert!(ok.text().contains("secret.png"));
+    assert!(ok.text().contains("Password verified"));
+    assert!(
+        !ok.text().contains("data-share-preview="),
+        "protected folder keeps preview POST-gated"
+    );
     assert!(ok
         .text()
         .contains(&format!("action=\"/s/folder/{token}/f/{inid}\"")));
@@ -2551,12 +2685,90 @@ async fn public_upload_inbox_accepts_uploads_without_listing_files() {
 
     let page = send(&app, get(&format!("/u/{token}"), None)).await;
     assert_eq!(page.status, StatusCode::OK);
-    assert!(page.text().contains("Requests"));
+    let page_html = page.text();
+    assert!(page_html.contains("Requests"));
     assert!(
-        !page.text().contains("pic.png"),
+        !page_html.contains("pic.png"),
         "upload-only page does not list folder files"
     );
+    assert!(page_html.contains("data-ap-share-room"));
+    assert!(page_html.contains("data-upload-form"));
+    assert!(page_html.contains("data-upload-queue"));
+    assert!(page_html.contains("href=\"/s/share-room.css\""));
+    assert!(page_html.contains("src=\"/s/share-room.js\""));
+    assert!(page
+        .header(header::CONTENT_SECURITY_POLICY)
+        .contains("connect-src 'self'"));
+    assert!(page_html.contains("name=\"file\" required>"));
+    assert!(
+        !page_html.contains("name=\"file\" multiple"),
+        "SSR/no-JS input remains single-file; JS owns multi selection"
+    );
+    assert!(!page_html.contains("GENERATED FROM odyssey"));
     let public_csrf = page.csrf_cookie().unwrap();
+    assert!(page_html.contains(&format!("value=\"{public_csrf}\"")));
+
+    // A sibling tab reuses the existing cookie/token instead of rotating it underneath this page.
+    let sibling = send(
+        &app,
+        get_with_cookie(&format!("/u/{token}"), None, &public_csrf),
+    )
+    .await;
+    assert_eq!(sibling.status, StatusCode::OK);
+    assert_eq!(sibling.csrf_cookie().as_deref(), Some(public_csrf.as_str()));
+    assert!(sibling.text().contains(&format!("value=\"{public_csrf}\"")));
+
+    // Extractor failures are collapsed into the safe CSP shell, not Axum's multipart detail.
+    let malformed = send(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri(format!("/u/{token}"))
+            .header(header::CONTENT_TYPE, "multipart/form-data")
+            .header(header::COOKIE, format!("__Host-csrf={public_csrf}"))
+            .body(Body::from("broken envelope"))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(malformed.status, StatusCode::BAD_REQUEST);
+    assert!(malformed
+        .text()
+        .contains("Aperture could not accept this request"));
+    assert!(!malformed.text().contains("boundary"));
+    assert!(malformed
+        .header(header::CONTENT_SECURITY_POLICY)
+        .contains("default-src 'none'"));
+
+    // A failed POST does not mutate the cookie. Retrying with the page token still succeeds.
+    let rejected = send(
+        &app,
+        public_upload_req(
+            "wrong-token",
+            &public_csrf,
+            &token,
+            "retry.png",
+            "image/png",
+            &png_bytes_alt(),
+        ),
+    )
+    .await;
+    assert_eq!(rejected.status, StatusCode::BAD_REQUEST);
+    assert!(rejected.csrf_cookie().is_none());
+    assert!(!rejected.text().contains("session token"));
+    let retry = send(
+        &app,
+        public_upload_req(
+            &public_csrf,
+            &public_csrf,
+            &token,
+            "retry.png",
+            "image/png",
+            &png_bytes_alt(),
+        ),
+    )
+    .await;
+    assert_eq!(retry.status, StatusCode::OK, "{}", retry.text());
+    assert_eq!(retry.csrf_cookie().as_deref(), Some(public_csrf.as_str()));
 
     let up = send(
         &app,
@@ -2572,6 +2784,7 @@ async fn public_upload_inbox_accepts_uploads_without_listing_files() {
     .await;
     assert_eq!(up.status, StatusCode::OK, "{}", up.text());
     assert!(up.text().contains("Uploaded"));
+    assert_eq!(up.csrf_cookie().as_deref(), Some(public_csrf.as_str()));
     let files = store.list_files_in_folder(&fid, "alice").await.unwrap();
     let names: Vec<String> = files.iter().map(|f| f.name.clone()).collect();
     assert!(names.contains(&"pic.png".to_string()));
@@ -2582,8 +2795,13 @@ async fn public_upload_inbox_accepts_uploads_without_listing_files() {
 
     let used = store.usage_for_owner("alice").await.unwrap();
     store.set_quota("alice", Some(used)).await.unwrap();
-    let page2 = send(&app, get(&format!("/u/{token}"), None)).await;
+    let page2 = send(
+        &app,
+        get_with_cookie(&format!("/u/{token}"), None, &public_csrf),
+    )
+    .await;
     let csrf2 = page2.csrf_cookie().unwrap();
+    assert_eq!(csrf2, public_csrf);
     let over = send(
         &app,
         public_upload_req(
@@ -2597,6 +2815,9 @@ async fn public_upload_inbox_accepts_uploads_without_listing_files() {
     )
     .await;
     assert_eq!(over.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(over.text().contains("cannot accept that file right now"));
+    assert!(!over.text().contains("quota is free"));
+    assert!(!over.text().contains("of the owner's"));
 
     let revoked = send(
         &app,

@@ -82,9 +82,7 @@ async fn search_ranks_and_highlights_excluding_drafts() {
 
 async fn create(state: &AppState, title: &str, body: &str, tags: &str, published: bool) {
     let mut pairs = vec![("title", title), ("body", body), ("tags", tags), ("csrf_token", CSRF)];
-    if published {
-        pairs.push(("published", "on"));
-    }
+    pairs.push(("intent", if published { "publish_now" } else { "save_draft" }));
     let form = form(&pairs);
     let (status, _) = call(state, post_csrf("/new", &form, Some(("u_alice", "alice@hf")))).await;
     assert_eq!(status, StatusCode::SEE_OTHER, "seed post created");

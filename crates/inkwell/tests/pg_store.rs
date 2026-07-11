@@ -185,7 +185,7 @@ async fn pg_store_full_integration() {
     state.store = pg.clone();
 
     // Create through the SSO+CSRF authoring path.
-    let body = "title=Via+HTTP&body=hello+%23world&published=on&csrf_token=tok";
+    let body = "title=Via+HTTP&body=hello+%23world&intent=publish_now&csrf_token=tok";
     let resp = app(state.clone())
         .oneshot(
             Request::builder()
@@ -252,7 +252,7 @@ async fn pg_store_full_integration() {
     ])
     .await
     .expect("replace_all_chunks");
-    assert_eq!(pg.count_chunks().await, 2, "full index built");
+    assert_eq!(pg.count_chunks().await.unwrap(), 2, "full index built");
 
     // Per-post reindex replaces only that post's chunks.
     pg.replace_post_chunks(
@@ -268,11 +268,11 @@ async fn pg_store_full_integration() {
     .await
     .expect("replace_post_chunks");
     assert_eq!(
-        pg.count_chunks().await,
+        pg.count_chunks().await.unwrap(),
         2,
         "per-post reindex keeps the other post"
     );
-    let fetched = pg.fetch_chunks().await;
+    let fetched = pg.fetch_chunks().await.unwrap();
     assert!(
         fetched
             .iter()
@@ -284,7 +284,35 @@ async fn pg_store_full_integration() {
     pg.delete_post_chunks("pg-second")
         .await
         .expect("delete_post_chunks");
-    assert_eq!(pg.count_chunks().await, 1, "one post de-indexed");
+    assert_eq!(pg.count_chunks().await.unwrap(), 1, "one post de-indexed");
+
+    // Incremental repair starts from a non-empty/poisoned cache. The stale pg-hello chunk belongs
+    // to a Draft and must remain invisible even if physical cleanup failed; current public rows are
+    // repaired by version, and the scheduled row joins only once its instant arrives.
+    let repaired = pg
+        .refresh_public_chunks(now2, 10)
+        .await
+        .expect("incremental public refresh");
+    assert!(repaired >= 1);
+    let valid = pg
+        .fetch_public_chunks(now2, inkwell::config::INDEX_CHUNK_LIMIT)
+        .await
+        .expect("validated public chunks");
+    assert!(valid.iter().any(|chunk| chunk.post_id == "pg-second"));
+    assert!(valid.iter().all(|chunk| chunk.post_id != "pg-hello"));
+    assert!(valid.iter().all(|chunk| chunk.post_id != "pg-future"));
+
+    pg.refresh_public_chunks(now + 3_600, 10)
+        .await
+        .expect("scheduled post due refresh");
+    let due = pg
+        .fetch_public_chunks(now + 3_600, inkwell::config::INDEX_CHUNK_LIMIT)
+        .await
+        .expect("validated due chunks");
+    assert!(
+        due.iter().any(|chunk| chunk.post_id == "pg-future"),
+        "scheduled post joins an already non-empty cache at its instant"
+    );
 
     println!(
         "PG STORE INTEGRATION OK: migrate (idempotent) + create/conflict/list/get/update/delete \

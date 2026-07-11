@@ -1155,6 +1155,28 @@ body.page {
   margin-top:0;
 }
 
+.editor__workspace {
+  min-width:0;
+}
+
+.editor__workspace.is-split {
+  display:grid;
+  grid-template-columns:minmax(0,1fr) minmax(0,1fr);
+  gap:var(--sp-5);
+}
+
+.editor__workspace.is-split #pane-write {
+  min-width:0;
+  padding-right:var(--sp-5);
+  border-right:1px solid var(--hairline);
+}
+
+.editor__workspace.is-split #pane-preview {
+  min-width:0;
+  max-height:68vh;
+  overflow:auto;
+}
+
 .ink-editor__actionbar {
   position:sticky;
   bottom:0;
@@ -1169,7 +1191,35 @@ body.page {
   border-top:1px solid var(--hairline);
 }
 
-.ink-editor__actionbar .pill { margin-right:auto; }
+.writer-state {
+  display:inline-flex;
+  align-items:center;
+  gap:var(--sp-2);
+  min-width:112px;
+  color:var(--ink-2);
+  font-size:var(--fs-sm);
+  font-weight:var(--fw-semibold);
+}
+
+.writer-state__dot {
+  width:8px;
+  height:8px;
+  border-radius:50%;
+  background:var(--ink-4);
+}
+
+.writer-state--saving .writer-state__dot { background:var(--brand); animation:ink-pulse 900ms ease-in-out infinite alternate; }
+.writer-state--published .writer-state__dot { background:var(--ok); }
+.writer-state--scheduled .writer-state__dot { background:var(--warn); }
+.writer-state--error { color:var(--down-ink); }
+.writer-state--error .writer-state__dot { background:var(--down); }
+
+@keyframes ink-pulse { to { opacity:.35; transform:scale(.78); } }
+
+.writer-privacy {
+  margin:calc(var(--sp-2) * -1) 0 0;
+  font-size:var(--fs-micro);
+}
 
 .ink-setting {
   display:flex;
@@ -1195,6 +1245,38 @@ body.page {
   border-radius:var(--r-sm);
   border:1px solid var(--border);
   margin-top:var(--sp-2);
+}
+
+.tag-suggestions {
+  display:flex;
+  flex-wrap:wrap;
+  gap:var(--sp-2);
+  margin-top:var(--sp-2);
+  padding:var(--sp-2);
+  border:1px solid var(--border);
+  border-radius:var(--r-sm);
+  background:var(--surface);
+  box-shadow:var(--sh-sm);
+}
+
+.tag-suggestions[hidden] { display:none; }
+
+.tag-suggestions__item {
+  border:1px solid var(--border);
+  border-radius:999px;
+  padding:5px 9px;
+  background:var(--surface-2);
+  color:var(--ink-2);
+  font:inherit;
+  font-size:var(--fs-sm);
+  cursor:pointer;
+}
+
+.tag-suggestions__item:hover,
+.tag-suggestions__item:focus-visible {
+  border-color:var(--brand);
+  color:var(--brand-ink);
+  outline:none;
 }
 
 .draftbar {
@@ -1849,6 +1931,12 @@ body.page {
   .ink-editor { grid-template-columns:1fr; }
   .ink-editor__rail { position:static; }
   .ink-form { grid-template-columns:1fr; }
+  .editor__workspace.is-split { grid-template-columns:1fr; }
+  .editor__workspace.is-split #pane-write {
+    padding-right:0;
+    border-right:0;
+    border-bottom:1px solid var(--hairline);
+  }
 }
 
 @media (max-width:720px) {
@@ -1872,6 +1960,10 @@ body.page {
   .ink-search { flex-direction:column; }
   .ink-search .btn { width:100%; }
   .ink-ask__foot { flex-wrap:wrap; }
+  .ink-editor__actionbar { flex-wrap:wrap; }
+  .ink-editor__actionbar .spacer { display:none; }
+  .writer-state { width:100%; }
+  .ink-editor__actionbar .btn { flex:1 1 auto; }
 }
 
 /* S16 DARK RAMP ----------------------------------------------------------- */

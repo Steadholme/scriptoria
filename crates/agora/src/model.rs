@@ -45,6 +45,16 @@ pub struct ThreadDigest {
     pub first_body_md: String,
 }
 
+/// One thread returned by discovery search. The original-post body is carried separately from
+/// [`Thread`] so the search page can render a safe excerpt, while `reply_count` avoids an N+1
+/// count query in the handler. This is a read model, not a stored table.
+#[derive(Clone, Debug)]
+pub struct ThreadSearchHit {
+    pub thread: Thread,
+    pub first_body_md: String,
+    pub reply_count: i64,
+}
+
 /// A blocked author (maps 1:1 to a `banned_authors` row). Keyed by the gateway-injected
 /// `author_sub`; while present it rejects that user's new threads and replies. `reason` and
 /// `banned_by` are short operator notes for the audit trail.

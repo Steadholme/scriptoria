@@ -10,6 +10,7 @@
 //! HTML in the drive's origin. Owner raw downloads and public share fetches also honor HTTP Range
 //! so browser-native image/video/audio media can stream and seek without buffering the whole blob.
 
+use axum::extract::multipart::MultipartRejection;
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
@@ -22,7 +23,8 @@ use crate::config::{clamp_page, effective_quota, Config};
 use crate::error::AppError;
 use crate::handlers::{
     app_css, dynamic_js, esc, expiry_options, fmt_ts, human_size, parse_expiry,
-    resolve_content_type, safe_filename, userbox, FILE_SVG, SHIELD_SVG,
+    render_share_room_error, resolve_content_type, safe_filename, share_room_html,
+    share_room_html_with_csrf, userbox, FILE_SVG, SHIELD_SVG,
 };
 use crate::model::{FileComment, FileRec, FolderRec, VersionRec};
 use crate::store::{FolderDelete, MAX_VERSIONS_PER_FILE};
@@ -975,6 +977,67 @@ pub async fn delete_comment(
 // GET /s/{token} — public share fetch (NO SSO)
 // ---------------------------------------------------------------------------
 
+/// Collapse every public capability failure into the product-owned Share Room error shell. Backend
+/// details are never reflected to anonymous callers.
+fn share_room_response(result: Result<Response, AppError>) -> Response {
+    match result {
+        Ok(response) => response,
+        Err(error) => {
+            let (status, heading, message) = match error {
+                AppError::BadRequest(detail) => {
+                    tracing::warn!(reason = %detail, "public capability request rejected");
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "Request rejected",
+                        "Aperture could not accept this request. Reload the room and try again."
+                            .to_string(),
+                    )
+                }
+                AppError::Forbidden(_) => (
+                    StatusCode::FORBIDDEN,
+                    "Access denied",
+                    "This capability does not grant access to that item.".to_string(),
+                ),
+                AppError::NotFound(_) => (
+                    StatusCode::NOT_FOUND,
+                    "Share not found",
+                    "This share link is invalid or has been removed.".to_string(),
+                ),
+                AppError::Gone(_) => (
+                    StatusCode::GONE,
+                    "Share expired",
+                    "This share link has expired and is no longer available.".to_string(),
+                ),
+                AppError::QuotaExceeded(detail) => {
+                    tracing::warn!(reason = %detail, "public upload rejected");
+                    (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "Upload unavailable",
+                        "This upload room cannot accept that file right now. Try a smaller file or contact the owner."
+                            .to_string(),
+                    )
+                }
+                AppError::Internal(detail) => {
+                    tracing::error!(reason = %detail, "public capability request failed");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Share Room unavailable",
+                        "Aperture could not complete this request. Try again later.".to_string(),
+                    )
+                }
+            };
+            render_share_room_error(status, heading, &message)
+        }
+    }
+}
+
+fn share_expiry_label(expires_at: Option<i64>) -> String {
+    match expires_at {
+        Some(expiry) => format!("Expires {}", fmt_ts(expiry)),
+        None => "No expiry".to_string(),
+    }
+}
+
 /// `GET /s/{token}` — fetch a shared file by its unguessable token, WITHOUT SSO. Deploy marks the
 /// `/s/` prefix `auth=public`; this handler never consults identity or ownership. Honors the share
 /// lifecycle: a revoked token is 404, an expired link is 410 Gone, and a password-protected link
@@ -983,17 +1046,25 @@ pub async fn share(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(token): Path<String>,
-) -> Result<Response, AppError> {
-    let rec = load_shared(&state, &token).await?;
-    // Password-protected: never serve the bytes on a bare GET — prompt for the password first.
-    if rec.share_has_password() {
-        return Ok(render_share_prompt(
-            &format!("/s/{token}"),
-            StatusCode::OK,
-            None,
-        ));
-    }
-    serve_shared(&state, &rec, &headers).await
+) -> Response {
+    share_room_response(
+        async move {
+            let rec = load_shared(&state, &token).await?;
+            // Password-protected: never serve the bytes on a bare GET — prompt first.
+            if rec.share_has_password() {
+                return Ok(render_share_prompt(
+                    &format!("/s/{token}"),
+                    StatusCode::OK,
+                    None,
+                    "file",
+                    rec.expires_at,
+                    "Unlock and download",
+                ));
+            }
+            serve_shared(&state, &rec, &headers).await
+        }
+        .await,
+    )
 }
 
 /// Submitted share-link password (the public unlock form). The route is unauthenticated and this
@@ -1012,41 +1083,54 @@ pub async fn share_unlock(
     headers: HeaderMap,
     Path(token): Path<String>,
     Form(form): Form<SharePasswordForm>,
-) -> Result<Response, AppError> {
-    let rec = load_shared(&state, &token).await?;
-    match &rec.share_password_hash {
-        // Correct password (or the link is no longer protected) -> serve.
-        Some(hash) if auth::verify_share_password(hash, &form.password) => {
-            serve_shared(&state, &rec, &headers).await
+) -> Response {
+    share_room_response(
+        async move {
+            let rec = load_shared(&state, &token).await?;
+            match &rec.share_password_hash {
+                // Correct password (or the link is no longer protected) -> serve.
+                Some(hash) if auth::verify_share_password(hash, &form.password) => {
+                    serve_shared(&state, &rec, &headers).await
+                }
+                None => serve_shared(&state, &rec, &headers).await,
+                Some(_) => Ok(render_share_prompt(
+                    &format!("/s/{token}"),
+                    StatusCode::UNAUTHORIZED,
+                    Some("Incorrect password."),
+                    "file",
+                    rec.expires_at,
+                    "Unlock and download",
+                )),
+            }
         }
-        None => serve_shared(&state, &rec, &headers).await,
-        Some(_) => Ok(render_share_prompt(
-            &format!("/s/{token}"),
-            StatusCode::UNAUTHORIZED,
-            Some("Incorrect password."),
-        )),
-    }
+        .await,
+    )
 }
 
 /// `GET /s/{token}/view` — render the public share landing page used for unfurls and human opens.
 /// Password-protected links do not reveal metadata here; the prompt posts to `/s/{token}`, the
 /// existing unlock route that serves the bytes after a correct password.
-pub async fn share_landing(
-    State(state): State<AppState>,
-    Path(token): Path<String>,
-) -> Result<Response, AppError> {
-    let mut rec = load_shared(&state, &token).await?;
-    if rec.share_has_password() {
-        return Ok(render_share_prompt(
-            &format!("/s/{token}"),
-            StatusCode::OK,
-            None,
-        ));
-    }
-    if state.store.bump_view_count(&rec.id).await.is_ok() {
-        rec.view_count += 1;
-    }
-    Ok(render_share_landing(&state.config, &rec, &token))
+pub async fn share_landing(State(state): State<AppState>, Path(token): Path<String>) -> Response {
+    share_room_response(
+        async move {
+            let mut rec = load_shared(&state, &token).await?;
+            if rec.share_has_password() {
+                return Ok(render_share_prompt(
+                    &format!("/s/{token}"),
+                    StatusCode::OK,
+                    None,
+                    "file",
+                    rec.expires_at,
+                    "Unlock and download",
+                ));
+            }
+            if state.store.bump_view_count(&rec.id).await.is_ok() {
+                rec.view_count += 1;
+            }
+            Ok(render_share_landing(&state.config, &rec, &token))
+        }
+        .await,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1056,25 +1140,29 @@ pub async fn share_landing(
 /// `GET /s/folder/{token}` — the public index of a shared folder's files, WITHOUT SSO. Honors the same
 /// lifecycle as a file share: revoked/unknown token -> 404, expired -> 410, password-protected ->
 /// a password prompt (no listing). The owner comes from the folder row, never the request.
-pub async fn share_folder(
-    State(state): State<AppState>,
-    Path(token): Path<String>,
-) -> Result<Response, AppError> {
-    let folder = load_shared_folder(&state, &token).await?;
-    if folder.share_has_password() {
-        return Ok(render_share_prompt(
-            &format!("/s/folder/{token}"),
-            StatusCode::OK,
-            None,
-        ));
-    }
-    let files = state
-        .store
-        .list_files_in_folder(&folder.id, &folder.owner_sub)
-        .await
-        .unwrap_or_default();
-    emit_folder_share_audit(&state, &folder);
-    Ok(render_folder_index(&folder, &files, &token, None))
+pub async fn share_folder(State(state): State<AppState>, Path(token): Path<String>) -> Response {
+    share_room_response(
+        async move {
+            let folder = load_shared_folder(&state, &token).await?;
+            if folder.share_has_password() {
+                return Ok(render_share_prompt(
+                    &format!("/s/folder/{token}"),
+                    StatusCode::OK,
+                    None,
+                    "folder",
+                    folder.expires_at,
+                    "Open shared folder",
+                ));
+            }
+            let files = state
+                .store
+                .list_files_in_folder(&folder.id, &folder.owner_sub)
+                .await?;
+            emit_folder_share_audit(&state, &folder);
+            Ok(render_folder_index(&folder, &files, &token, None))
+        }
+        .await,
+    )
 }
 
 /// `POST /s/folder/{token}` — verify a protected folder's password and, on success, render the index with
@@ -1084,30 +1172,37 @@ pub async fn share_folder_unlock(
     State(state): State<AppState>,
     Path(token): Path<String>,
     Form(form): Form<SharePasswordForm>,
-) -> Result<Response, AppError> {
-    let folder = load_shared_folder(&state, &token).await?;
-    let unlocked = match &folder.share_password_hash {
-        Some(hash) => auth::verify_share_password(hash, &form.password),
-        None => true,
-    };
-    if !unlocked {
-        return Ok(render_share_prompt(
-            &format!("/s/folder/{token}"),
-            StatusCode::UNAUTHORIZED,
-            Some("Incorrect password."),
-        ));
-    }
-    let files = state
-        .store
-        .list_files_in_folder(&folder.id, &folder.owner_sub)
-        .await
-        .unwrap_or_default();
-    emit_folder_share_audit(&state, &folder);
-    // Non-password folders never reach this branch with a value; carry the password only when set.
-    let pw = folder
-        .share_has_password()
-        .then_some(form.password.as_str());
-    Ok(render_folder_index(&folder, &files, &token, pw))
+) -> Response {
+    share_room_response(
+        async move {
+            let folder = load_shared_folder(&state, &token).await?;
+            let unlocked = match &folder.share_password_hash {
+                Some(hash) => auth::verify_share_password(hash, &form.password),
+                None => true,
+            };
+            if !unlocked {
+                return Ok(render_share_prompt(
+                    &format!("/s/folder/{token}"),
+                    StatusCode::UNAUTHORIZED,
+                    Some("Incorrect password."),
+                    "folder",
+                    folder.expires_at,
+                    "Open shared folder",
+                ));
+            }
+            let files = state
+                .store
+                .list_files_in_folder(&folder.id, &folder.owner_sub)
+                .await?;
+            emit_folder_share_audit(&state, &folder);
+            // Non-password folders never reach this branch with a value; carry the password only when set.
+            let pw = folder
+                .share_has_password()
+                .then_some(form.password.as_str());
+            Ok(render_folder_index(&folder, &files, &token, pw))
+        }
+        .await,
+    )
 }
 
 /// `GET /s/folder/{token}/f/{fid}` — download one file listed under a NON-password folder share. A
@@ -1116,18 +1211,26 @@ pub async fn share_folder_unlock(
 pub async fn share_folder_file(
     State(state): State<AppState>,
     Path((token, fid)): Path<(String, String)>,
-) -> Result<Response, AppError> {
-    let folder = load_shared_folder(&state, &token).await?;
-    if folder.share_has_password() {
-        return Ok(render_share_prompt(
-            &format!("/s/folder/{token}"),
-            StatusCode::UNAUTHORIZED,
-            Some("Enter the folder password to download."),
-        ));
-    }
-    let file = shared_folder_file(&state, &folder, &fid).await?;
-    let bytes = state.blobs.get(&file.object_key).await?;
-    Ok(serve_blob(&file, bytes))
+) -> Response {
+    share_room_response(
+        async move {
+            let folder = load_shared_folder(&state, &token).await?;
+            if folder.share_has_password() {
+                return Ok(render_share_prompt(
+                    &format!("/s/folder/{token}"),
+                    StatusCode::UNAUTHORIZED,
+                    Some("Enter the folder password to download."),
+                    "folder",
+                    folder.expires_at,
+                    "Open shared folder",
+                ));
+            }
+            let file = shared_folder_file(&state, &folder, &fid).await?;
+            let bytes = state.blobs.get(&file.object_key).await?;
+            Ok(serve_blob(&file, bytes))
+        }
+        .await,
+    )
 }
 
 /// `POST /s/folder/{token}/f/{fid}` — download one file under a PASSWORD-protected folder share, gated by
@@ -1136,20 +1239,28 @@ pub async fn share_folder_file_unlock(
     State(state): State<AppState>,
     Path((token, fid)): Path<(String, String)>,
     Form(form): Form<SharePasswordForm>,
-) -> Result<Response, AppError> {
-    let folder = load_shared_folder(&state, &token).await?;
-    if let Some(hash) = &folder.share_password_hash {
-        if !auth::verify_share_password(hash, &form.password) {
-            return Ok(render_share_prompt(
-                &format!("/s/folder/{token}"),
-                StatusCode::UNAUTHORIZED,
-                Some("Incorrect password."),
-            ));
+) -> Response {
+    share_room_response(
+        async move {
+            let folder = load_shared_folder(&state, &token).await?;
+            if let Some(hash) = &folder.share_password_hash {
+                if !auth::verify_share_password(hash, &form.password) {
+                    return Ok(render_share_prompt(
+                        &format!("/s/folder/{token}"),
+                        StatusCode::UNAUTHORIZED,
+                        Some("Incorrect password."),
+                        "folder",
+                        folder.expires_at,
+                        "Open shared folder",
+                    ));
+                }
+            }
+            let file = shared_folder_file(&state, &folder, &fid).await?;
+            let bytes = state.blobs.get(&file.object_key).await?;
+            Ok(serve_blob(&file, bytes))
         }
-    }
-    let file = shared_folder_file(&state, &folder, &fid).await?;
-    let bytes = state.blobs.get(&file.object_key).await?;
-    Ok(serve_blob(&file, bytes))
+        .await,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1157,15 +1268,25 @@ pub async fn share_folder_file_unlock(
 // ---------------------------------------------------------------------------
 
 /// `GET /u/{token}` — render an anonymous upload form for a folder upload inbox. It never lists
-/// existing files. A CSRF cookie is still minted because the POST changes server state.
+/// existing files. A CSRF cookie is minted once, then reused across reloads and tabs because the
+/// POST changes server state and a rotating double-submit cookie would invalidate sibling tabs.
 pub async fn upload_inbox(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(token): Path<String>,
+) -> Response {
+    share_room_response(upload_inbox_inner(state, headers, token).await)
+}
+
+async fn upload_inbox_inner(
+    state: AppState,
+    headers: HeaderMap,
+    token: String,
 ) -> Result<Response, AppError> {
     let folder = load_upload_folder(&state, &token).await?;
-    let csrf = auth::new_csrf_token();
-    let html = render_upload_inbox(&folder, &token, &csrf, None);
-    Ok(html_with_csrf(StatusCode::OK, html, &csrf))
+    let csrf = auth::existing_or_new_csrf_token(&headers);
+    let html = render_upload_inbox(&state.config, &folder, &token, &csrf, None);
+    Ok(share_room_html_with_csrf(StatusCode::OK, html, &csrf))
 }
 
 /// `POST /u/{token}` — anonymous upload into the token's folder. The visitor cannot choose owner
@@ -1174,6 +1295,24 @@ pub async fn upload_inbox_submit(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(token): Path<String>,
+    multipart: Result<Multipart, MultipartRejection>,
+) -> Response {
+    let result = match multipart {
+        Ok(multipart) => upload_inbox_submit_inner(state, headers, token, multipart).await,
+        Err(rejection) => {
+            tracing::warn!(reason = %rejection, "public upload multipart rejected");
+            Err(AppError::BadRequest(
+                "invalid public upload multipart envelope".to_string(),
+            ))
+        }
+    };
+    share_room_response(result)
+}
+
+async fn upload_inbox_submit_inner(
+    state: AppState,
+    headers: HeaderMap,
+    token: String,
     mut multipart: Multipart,
 ) -> Result<Response, AppError> {
     let folder = load_upload_folder(&state, &token).await?;
@@ -1315,10 +1454,15 @@ pub async fn upload_inbox_submit(
         &folder.id,
         "file",
     ));
-    let csrf = auth::new_csrf_token();
     let status = Some(format!("Uploaded {}.", rec.name));
-    let html = render_upload_inbox(&folder, &token, &csrf, status.as_deref());
-    Ok(html_with_csrf(StatusCode::OK, html, &csrf))
+    let html = render_upload_inbox(
+        &state.config,
+        &folder,
+        &token,
+        &csrf_field,
+        status.as_deref(),
+    );
+    Ok(share_room_html_with_csrf(StatusCode::OK, html, &csrf_field))
 }
 
 /// Load a folder by its public share token, enforcing the lifecycle (missing/revoked -> 404,
@@ -1351,19 +1495,22 @@ async fn load_upload_folder(state: &AppState, token: &str) -> Result<FolderRec, 
 }
 
 fn render_upload_inbox(
+    config: &Config,
     folder: &FolderRec,
     token: &str,
     csrf: &str,
     status: Option<&str>,
 ) -> String {
     let status_html = match status {
-        Some(msg) => format!("<div class=\"toast toast--ok\">{}</div>", esc(msg)),
+        Some(msg) => format!("<p class=\"sr-status\" role=\"status\">{}</p>", esc(msg)),
         None => String::new(),
     };
     UPLOAD_INBOX_HTML
-        .replace("{{CSS}}", app_css())
-        .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{HEADING}}", &esc(&folder.name))
+        .replace(
+            "{{MAX_UPLOAD}}",
+            &esc(&human_size(config.max_upload as i64)),
+        )
         .replace("{{STATUS}}", &status_html)
         .replace("{{ACTION}}", &format!("/u/{}", esc(token)))
         .replace("{{CSRF}}", &esc(csrf))
@@ -1460,41 +1607,54 @@ fn render_folder_index(
     unlock_password: Option<&str>,
 ) -> Response {
     let rows = if files.is_empty() {
-        "<li class=\"share-file share-file--empty\">This folder has no files.</li>".to_string()
+        "<li class=\"sr-empty\">This shared folder is empty.</li>".to_string()
     } else {
         files
             .iter()
             .map(|f| {
                 let download = match unlock_password {
                     Some(pw) => format!(
-                        "<form class=\"share-file__dl\" method=\"post\" action=\"/s/folder/{token}/f/{fid}\">\
+                        "<form method=\"post\" action=\"/s/folder/{token}/f/{fid}\">\
                            <input type=\"hidden\" name=\"password\" value=\"{pw}\">\
-                           <button class=\"btn btn-secondary btn-sm\" type=\"submit\">Download</button>\
+                           <button class=\"sr-button sr-button--small\" type=\"submit\">Download</button>\
                          </form>",
                         token = esc(token),
                         fid = esc(&f.id),
                         pw = esc(pw),
                     ),
                     None => format!(
-                        "<a class=\"btn btn-secondary btn-sm\" href=\"/s/folder/{token}/f/{fid}\">Download</a>",
+                        "<a class=\"sr-button sr-button--small\" href=\"/s/folder/{token}/f/{fid}\">Download</a>",
                         token = esc(token),
                         fid = esc(&f.id),
                     ),
                 };
+                // Existing unprotected image downloads are already safe inline endpoints. Reuse
+                // exactly that authority for a product-native quick preview; protected folders keep
+                // their POST-only download flow and intentionally do not expose a preview URL.
+                let preview = if unlock_password.is_none() && f.is_image() {
+                    let src = format!("/s/folder/{token}/f/{}", f.id);
+                    format!(
+                        "<button class=\"sr-button sr-button--small\" type=\"button\" data-share-preview=\"{src}\" data-share-preview-name=\"{name}\">Preview</button>",
+                        src = esc(&src),
+                        name = esc(&f.name),
+                    )
+                } else {
+                    String::new()
+                };
                 format!(
-                    "<li class=\"share-file\">\
-                       <span class=\"ap-filetile {tone}\" aria-hidden=\"true\">{ext}</span>\
-                       <div class=\"share-file__info\">\
-                         <span class=\"share-file__name\" title=\"{name}\">{name}</span>\
-                         <span class=\"share-file__meta\">{ctype} · {size}</span>\
+                    "<li class=\"sr-file-row\">\
+                       <span class=\"sr-file-row__icon\" aria-hidden=\"true\">{ext}</span>\
+                       <div>\
+                         <span class=\"sr-file-row__name\" title=\"{name}\">{name}</span>\
+                         <span class=\"sr-file-row__meta\">{ctype} · {size}</span>\
                        </div>\
-                       {download}\
+                       <div class=\"sr-file-row__actions\">{preview}{download}</div>\
                      </li>",
-                    tone = ap_tone_class(&f.content_type),
                     ext = esc(&ext_label(&f.name)),
                     name = esc(&f.name),
                     ctype = esc(&f.content_type),
                     size = esc(&human_size(f.size)),
+                    preview = preview,
                     download = download,
                 )
             })
@@ -1507,12 +1667,19 @@ fn render_folder_index(
         n => format!("{n} files"),
     };
     let html = SHARE_FOLDER_HTML
-        .replace("{{CSS}}", app_css())
-        .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{HEADING}}", &esc(&folder.name))
         .replace("{{COUNT}}", &esc(&count))
+        .replace(
+            "{{ACCESS_STATE}}",
+            if unlock_password.is_some() {
+                "Password verified"
+            } else {
+                "Link access"
+            },
+        )
+        .replace("{{EXPIRY}}", &esc(&share_expiry_label(folder.expires_at)))
         .replace("{{FILES}}", &rows);
-    (StatusCode::OK, Html(html)).into_response()
+    share_room_html(StatusCode::OK, html)
 }
 
 // ---------------------------------------------------------------------------
@@ -2066,17 +2233,25 @@ async fn serve_shared(
 /// Render the public share-link password prompt (`status` = 200 on first ask, 401 after a wrong
 /// password). `action` is the form POST target (`/s/{token}` for a file, `/s/folder/{token}` for a
 /// folder). `error` is an optional inline message.
-fn render_share_prompt(action: &str, status: StatusCode, error: Option<&str>) -> Response {
+fn render_share_prompt(
+    action: &str,
+    status: StatusCode,
+    error: Option<&str>,
+    kind: &str,
+    expires_at: Option<i64>,
+    action_label: &str,
+) -> Response {
     let error_html = match error {
-        Some(msg) => format!("<p class=\"form-error\">{}</p>", esc(msg)),
+        Some(msg) => format!("<p class=\"sr-alert\" role=\"alert\">{}</p>", esc(msg)),
         None => String::new(),
     };
     let html = SHARE_PW_HTML
-        .replace("{{CSS}}", app_css())
-        .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{ERROR}}", &error_html)
-        .replace("{{ACTION}}", &esc(action));
-    (status, Html(html)).into_response()
+        .replace("{{ACTION}}", &esc(action))
+        .replace("{{KIND}}", &esc(kind))
+        .replace("{{EXPIRY}}", &esc(&share_expiry_label(expires_at)))
+        .replace("{{ACTION_LABEL}}", &esc(action_label));
+    share_room_html(status, html)
 }
 
 fn render_share_landing(config: &Config, rec: &FileRec, token: &str) -> Response {
@@ -2115,25 +2290,28 @@ fn render_share_landing(config: &Config, rec: &FileRec, token: &str) -> Response
 
     let preview = if rec.is_image() {
         format!(
-            "<img class=\"share-landing__media-img\" src=\"/s/{token}\" alt=\"{name}\">",
+            "<img src=\"/s/{token}\" alt=\"{name}\">",
             token = esc(token),
             name = esc(&rec.name),
         )
     } else {
-        render_type_thumb(&rec.content_type, &rec.name)
+        format!(
+            "<div class=\"sr-file-art\">{}</div>",
+            render_type_thumb(&rec.content_type, &rec.name)
+        )
     };
 
     let html = SHARE_LANDING_HTML
-        .replace("{{CSS}}", app_css())
         .replace("{{NAME}}", &esc(&rec.name))
         .replace("{{OG_META}}", &og_meta)
         .replace("{{PREVIEW}}", &preview)
         .replace("{{TYPE}}", &esc(&rec.content_type))
         .replace("{{SIZE}}", &esc(&human_size(rec.size)))
         .replace("{{VIEWS}}", &rec.view_count.to_string())
+        .replace("{{EXPIRY}}", &esc(&share_expiry_label(rec.expires_at)))
         .replace("{{DOWNLOAD_URL}}", &format!("/s/{}", esc(token)))
         .replace("{{EMBED}}", &render_embed_codes(config, rec));
-    Html(html).into_response()
+    share_room_html(StatusCode::OK, html)
 }
 
 // ---------------------------------------------------------------------------
@@ -3953,7 +4131,7 @@ mod tests {
     fn render_type_thumb_bakes_escaped_label() {
         let svg = render_type_thumb("application/pdf", "report.pdf");
         assert!(svg.starts_with("<svg"));
-        assert!(svg.contains("image/svg") == false); // it's the body, not a content type
+        assert!(!svg.contains("image/svg")); // it's the body, not a content type
         assert!(svg.contains(">PDF<"));
         assert!(svg.contains("#B91C1C")); // pdf ink color
                                           // A hostile "extension" is neutralized by ext_label (whitelist) before it can reach the SVG.

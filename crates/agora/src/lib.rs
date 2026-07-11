@@ -27,6 +27,8 @@
 //! - `POST /t/{tid}/p/{pid}/react`      toggle a reaction (up/heart) on a post
 //! - `POST /t/{id}/accept`   thread author/admin mark (or unmark) a reply as the accepted answer
 //! - `POST /t/{id}/subscribe` toggle the current user's thread subscription
+//! - `GET  /search`           shareable title + original-post search (`?q=&category=`)
+//! - `GET  /api/search/suggest` bounded same-origin quick-search suggestions
 //! - `POST /api/similar`     (sso+CSRF) top-3 existing threads similar to a draft {title,body}
 //! - `GET  /api/thread/{id}/summary`  extractive summary (top sentences) of a thread
 
@@ -90,6 +92,8 @@ pub fn app(state: AppState) -> Router {
         .route("/t/{id}/accept", post(handlers::forum::accept_answer))
         .route("/t/{id}/subscribe", post(handlers::forum::toggle_subscription))
         .route("/new", get(handlers::forum::new_form).post(handlers::forum::create))
+        .route("/search", get(handlers::search::page))
+        .route("/api/search/suggest", get(handlers::search::suggest))
         .route("/api/similar", post(handlers::insight::similar))
         .route("/api/thread/{id}/summary", get(handlers::insight::summary))
         .merge(admin_router())

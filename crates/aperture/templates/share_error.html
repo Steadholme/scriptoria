@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>{{STATUS}} · Aperture Share Room</title>
+  <link rel="stylesheet" href="/s/share-room.css">
+</head>
+<body data-ap-share-room data-ap-surface="error">
+  <header class="sr-topbar">
+    <a class="sr-brand" href="https://w33d.xyz" aria-label="HOLDFAST home">
+      <span class="sr-brand__mark" aria-hidden="true"></span>
+      <span>Aperture<small>PUBLIC SHARE ROOM</small></span>
+    </a>
+  </header>
+  <main class="sr-shell sr-error">
+    <section class="sr-card" role="alert" aria-labelledby="errorTitle">
+      <div class="sr-card__icon" aria-hidden="true">{{STATUS}}</div>
+      <p class="sr-eyebrow">Share Room unavailable</p>
+      <h1 id="errorTitle">{{HEADING}}</h1>
+      <p class="sr-summary">{{MESSAGE}}</p>
+      <p class="sr-trust-note">The link may be invalid, expired, revoked, or temporarily unavailable. Aperture does not reveal whether another private item exists.</p>
+    </section>
+  </main>
+  <footer class="sr-foot">Served by HOLDFAST Aperture · Public capability access</footer>
+</body>
+</html>

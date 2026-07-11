@@ -4,53 +4,51 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>{{NAME}} &middot; Aperture &middot; HOLDFAST</title>
+  <title>{{NAME}} · Aperture Share Room</title>
   {{OG_META}}
-  <style>{{CSS}}</style>
+  <link rel="stylesheet" href="/s/share-room.css">
 </head>
-<body class="page-share-landing">
-  <header class="appbar">
-    <a class="appbar__brand" href="/" aria-label="HOLDFAST Aperture home">
-      <span class="app-tile" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="22" x2="2" y1="12" y2="12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><line x1="6" x2="6.01" y1="16" y2="16"/><line x1="10" x2="10.01" y1="16" y2="16"/></svg></span>
-      <span class="appbar__name"><b>Drive</b><span>drive.w33d.xyz</span></span>
+<body data-ap-share-room data-ap-surface="file">
+  <header class="sr-topbar">
+    <a class="sr-brand" href="https://w33d.xyz" aria-label="HOLDFAST home">
+      <span class="sr-brand__mark" aria-hidden="true"></span>
+      <span>Aperture<small>PUBLIC SHARE ROOM</small></span>
     </a>
-	    <span class="appbar__spacer"></span>
-	    <span class="ap-pubbar__tag"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-8 9-4.5-1.5-8-4-8-9V5l8-3 8 3v8Z"/><path d="m9 12 2 2 4-5"/></svg>Shared via Drive</span>
-	  </header>
-	
-	  <main class="console share-landing ap-share">
-	    <div class="share-landing__media ap-share__stage">{{PREVIEW}}</div>
-	    <h1 class="share-landing__title ap-share__name">{{NAME}}</h1>
-	    <p class="share-landing__meta ap-share__facts"><span class="ap-fact ap-fact--type mono">{{TYPE}}</span><span class="ap-fact">{{SIZE}}</span><span class="share-landing__views ap-fact ap-fact--views">{{VIEWS}} views</span></p>
-	    <div class="share-landing__actions">
-	      <a class="btn btn-primary btn-lg" href="{{DOWNLOAD_URL}}"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>Download</a>
-	    </div>
-    {{EMBED}}
+    <span class="sr-topbar__state">Capability verified</span>
+  </header>
+
+  <main class="sr-shell">
+    <article class="sr-room" aria-labelledby="shareTitle">
+      <div class="sr-stage">{{PREVIEW}}</div>
+      <section class="sr-panel">
+        <p class="sr-eyebrow">Shared file</p>
+        <h1 id="shareTitle">{{NAME}}</h1>
+        <p class="sr-summary">A read-only file shared through an unguessable Aperture capability link.</p>
+
+        <div class="sr-chips" aria-label="Share status">
+          <span class="sr-chip sr-chip--safe">Link access</span>
+          <span class="sr-chip">Read only</span>
+          <span class="sr-chip">{{EXPIRY}}</span>
+        </div>
+
+        <dl class="sr-meta">
+          <div><dt>Type</dt><dd>{{TYPE}}</dd></div>
+          <div><dt>Size</dt><dd>{{SIZE}}</dd></div>
+          <div><dt>Access</dt><dd>No sign-in</dd></div>
+          <div><dt>Opened</dt><dd>{{VIEWS}} times</dd></div>
+        </dl>
+
+        <div class="sr-actions">
+          <a class="sr-button sr-button--primary" href="{{DOWNLOAD_URL}}">Download file</a>
+        </div>
+
+        <p class="sr-trust-note">Anyone holding this link can download this file. The owner can expire, password-protect, or revoke access at any time.</p>
+        {{EMBED}}
+      </section>
+    </article>
   </main>
 
-  <script>
-    (function () {
-      var buttons = document.querySelectorAll('.copy-btn');
-      Array.prototype.forEach.call(buttons, function (btn) {
-        btn.addEventListener('click', function () {
-          var row = btn.closest ? btn.closest('.embed-box__row') : btn.parentNode;
-          var selector = btn.getAttribute('data-copy') || '';
-          var input = row ? row.querySelector(selector) : null;
-          if (!input) { return; }
-          input.select();
-          if (input.setSelectionRange) { input.setSelectionRange(0, input.value.length); }
-          var done = function () {
-            btn.textContent = 'Copied';
-            setTimeout(function () { btn.textContent = btn.getAttribute('data-label'); }, 1200);
-          };
-          if (navigator.clipboard) {
-            navigator.clipboard.writeText(input.value).then(done, function () { try { document.execCommand('copy'); done(); } catch (e) {} });
-          } else {
-            try { document.execCommand('copy'); done(); } catch (e) {}
-          }
-        });
-      });
-    })();
-  </script>
+  <footer class="sr-foot">Served by HOLDFAST Aperture · Public capability access</footer>
+  <script src="/s/share-room.js" defer></script>
 </body>
 </html>

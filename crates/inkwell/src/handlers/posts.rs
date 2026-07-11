@@ -6,10 +6,12 @@
 //! (never a client field), and every state-changing POST is double-submit CSRF protected.
 //! A post may be edited or deleted only by its own author.
 
+use std::collections::BTreeMap;
+
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
-use axum::Form;
+use axum::{Form, Json};
 use serde::{Deserialize, Serialize};
 
 use crate::audit::AuditEvent;
@@ -24,8 +26,8 @@ const LIST_HTML: &str = include_str!("../../templates/list.html");
 const POST_HTML: &str = include_str!("../../templates/post.html");
 const EDITOR_HTML: &str = include_str!("../../templates/editor.html");
 
-/// Form body shared by compose + edit. `published` is a checkbox: present (`"on"`) when ticked,
-/// absent otherwise. Identity is NEVER taken from the form — only from the gateway headers.
+/// Form body shared by compose + edit. Publication changes require an explicit [`PublishIntent`];
+/// identity is NEVER taken from the form — only from the gateway headers.
 #[derive(Debug, Deserialize)]
 pub struct PostForm {
     #[serde(default)]
@@ -42,12 +44,59 @@ pub struct PostForm {
     /// Optional UTC datetime-local value. Blank or omitted keeps the legacy immediate behavior.
     #[serde(default)]
     pub publish_at: String,
+    /// Browser-enhanced epoch seconds for a local-time scheduling choice. When absent, the server
+    /// interprets `publish_at` as UTC so the no-JS form remains correct.
+    #[serde(default)]
+    pub publish_at_epoch: String,
     #[serde(default)]
     pub pinned: Option<String>,
+    /// Explicit Writer Studio action: `save_draft`, `publish_now`, or `schedule`.
+    /// A missing value means Draft on create and "preserve current publication state" on edit.
     #[serde(default)]
-    pub published: Option<String>,
+    pub intent: String,
     #[serde(default)]
     pub csrf_token: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublishIntent {
+    SaveDraft,
+    PublishNow,
+    Schedule,
+    Preserve,
+}
+
+impl PublishIntent {
+    fn for_create(raw: &str) -> Result<Self, AppError> {
+        match raw.trim() {
+            "" | "save_draft" => Ok(Self::SaveDraft),
+            "publish_now" => Ok(Self::PublishNow),
+            "schedule" => Ok(Self::Schedule),
+            other => Err(AppError::InvalidRequest(format!(
+                "unknown publication intent: {other}"
+            ))),
+        }
+    }
+
+    fn for_update(raw: &str) -> Result<Self, AppError> {
+        match raw.trim() {
+            "" => Ok(Self::Preserve),
+            "save_draft" => Ok(Self::SaveDraft),
+            "publish_now" => Ok(Self::PublishNow),
+            "schedule" => Ok(Self::Schedule),
+            other => Err(AppError::InvalidRequest(format!(
+                "unknown publication intent: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SaveResponse {
+    ok: bool,
+    slug: String,
+    state: &'static str,
+    redirect: String,
 }
 
 /// Minimal form body for delete: just the CSRF token (identity comes from the gateway headers).
@@ -65,6 +114,66 @@ pub struct IndexQuery {
     pub before: Option<String>,
     #[serde(default)]
     pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct EditorQuery {
+    #[serde(default)]
+    pub studio_saved: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct TagSuggestionsQuery {
+    #[serde(default)]
+    pub prefix: String,
+    pub limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct TagSuggestionsResponse {
+    items: Vec<String>,
+}
+
+/// `GET /api/tags?prefix=&limit=` — bounded autocomplete for Writer Studio. Suggestions are drawn
+/// only from published posts plus the authenticated author's own drafts/scheduled posts, so one
+/// author cannot infer another author's unpublished taxonomy. JSON is consumed with `textContent`.
+pub async fn tag_suggestions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<TagSuggestionsQuery>,
+) -> Result<Response, AppError> {
+    let (sub, _) = auth::require_author(&headers)?;
+    let prefix: String = query.prefix.trim().chars().take(40).collect();
+    let prefix_lower = prefix.to_lowercase();
+    let limit = query.limit.unwrap_or(8).clamp(1, 20);
+    let posts = state
+        .store
+        .list_visible_posts(None, crate::config::MAX_PAGE, now_secs(), Some(&sub))
+        .await;
+    let mut by_slug = BTreeMap::new();
+    for post in posts {
+        for tag in crate::tags::parse_tags(&post.tags) {
+            let safe_display = !tag
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '<' | '>' | '&' | '"' | '\''));
+            if safe_display
+                && (prefix_lower.is_empty() || tag.to_lowercase().starts_with(&prefix_lower))
+            {
+                by_slug.entry(crate::tags::tag_slug(&tag)).or_insert(tag);
+            }
+        }
+    }
+    let items = by_slug.into_values().take(limit).collect();
+    let mut response = Json(TagSuggestionsResponse { items }).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -382,6 +491,8 @@ pub async fn view(
 /// `GET /new` — the compose form.
 pub async fn new_form(State(_state): State<AppState>, headers: HeaderMap) -> Response {
     let email = auth::display_email(&headers);
+    let subject = auth::author_sub(&headers).unwrap_or_else(|| "anonymous".to_string());
+    let recovery_scope = recovery_scope(&subject);
     let is_admin = auth::is_admin(&headers);
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
     let theme = odyssey::resolve_theme(
@@ -393,19 +504,19 @@ pub async fn new_form(State(_state): State<AppState>, headers: HeaderMap) -> Res
         email: &email,
         is_admin,
         theme,
-        state_label: "published",
+        state_label: "draft",
+        saved: false,
         heading: "New post",
         subhead: "Compose a post in Markdown. You are the author.",
         action: "/new",
+        recovery_scope: &recovery_scope,
         csrf: &csrf,
         title_value: "",
         body_value: "",
         tags_value: "",
         cover_value: "",
         publish_at_value: "",
-        published: true,
         pinned: false,
-        submit_label: "Publish",
         cancel_href: "/",
         delete_slug: None,
     });
@@ -427,8 +538,9 @@ pub async fn create(
     }
     let body_md = form.body.trim().to_string();
     let cover_url = sanitize_cover(&form.cover_url)?;
-    let publish_at = parse_publish_at(&form.publish_at)?;
     let now = now_secs();
+    let intent = PublishIntent::for_create(&form.intent)?;
+    let (published, publish_at) = publication_from_intent(intent, &form, now, false, 0)?;
     let fallback = now_nanos().to_string();
     let slug = unique_slug(state.store.as_ref(), title, &fallback).await;
 
@@ -441,7 +553,7 @@ pub async fn create(
         author_email: email,
         created_at: now,
         updated_at: now,
-        published: form.published.is_some(),
+        published,
         publish_at,
         featured: false,
         pinned: form.pinned.is_some(),
@@ -466,7 +578,7 @@ pub async fn create(
     // Keep the ask index in step (best-effort; never fails the create).
     crate::reindex_post(state.store.as_ref(), &post).await;
 
-    Ok(redirect(&format!("/p/{slug}")))
+    Ok(save_response(&headers, &post))
 }
 
 // ---------------------------------------------------------------------------
@@ -512,6 +624,7 @@ pub async fn edit_form(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(slug): Path<String>,
+    Query(query): Query<EditorQuery>,
 ) -> Result<Response, AppError> {
     let (sub, email) = auth::require_author(&headers)?;
     let is_admin = auth::is_admin(&headers);
@@ -528,6 +641,8 @@ pub async fn edit_form(
     }
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
     let state_label = publication_detail(&post, now_secs());
+    let saved = query.studio_saved.as_deref() == Some(state_label);
+    let recovery_scope = recovery_scope(&sub);
     let theme = odyssey::resolve_theme(
         headers
             .get(axum::http::header::COOKIE)
@@ -539,18 +654,18 @@ pub async fn edit_form(
         is_admin,
         theme,
         state_label,
+        saved,
         heading: "Edit post",
         subhead: "Update the title, body, or publication state.",
         action: &format!("/edit/{}", esc(&post.slug)),
+        recovery_scope: &recovery_scope,
         csrf: &csrf,
         title_value: &post.title,
         body_value: &post.body_md,
         tags_value: &post.tags,
         cover_value: &post.cover_url,
         publish_at_value: &format_publish_at_value(post.publish_at),
-        published: post.published,
         pinned: post.pinned,
-        submit_label: "Save changes",
         cancel_href: &format!("/p/{}", esc(&post.slug)),
         delete_slug: Some(&post.slug),
     });
@@ -586,10 +701,14 @@ pub async fn update(
     post.body_md = form.body.trim().to_string();
     post.tags = crate::tags::normalize(&form.tags);
     post.cover_url = sanitize_cover(&form.cover_url)?;
-    post.publish_at = parse_publish_at(&form.publish_at)?;
-    post.published = form.published.is_some();
+    let now = now_secs();
+    let intent = PublishIntent::for_update(&form.intent)?;
+    let (published, publish_at) =
+        publication_from_intent(intent, &form, now, post.published, post.publish_at)?;
+    post.publish_at = publish_at;
+    post.published = published;
     post.pinned = form.pinned.is_some();
-    post.updated_at = now_secs();
+    post.bump_updated_at(now);
     state.store.update_post(&post).await?;
     tracing::info!(slug = %slug, "post updated");
 
@@ -602,13 +721,13 @@ pub async fn update(
         "post.update",
         actor,
         &slug,
-        publication_detail(&post, now_secs()),
+        publication_detail(&post, now),
     ));
 
     // Re-chunk on edit (a now-draft post is de-indexed). Best-effort; never fails the update.
     crate::reindex_post(state.store.as_ref(), &post).await;
 
-    Ok(redirect(&format!("/p/{slug}")))
+    Ok(save_response(&headers, &post))
 }
 
 // ---------------------------------------------------------------------------
@@ -687,6 +806,38 @@ fn render_cover(cover_url: &str, wrapper_class: &str, alt: &str) -> String {
         src = esc(cover_url),
         alt = esc(alt),
     )
+}
+
+fn publication_from_intent(
+    intent: PublishIntent,
+    form: &PostForm,
+    now: i64,
+    current_published: bool,
+    current_publish_at: i64,
+) -> Result<(bool, i64), AppError> {
+    match intent {
+        PublishIntent::SaveDraft => Ok((false, 0)),
+        PublishIntent::PublishNow => Ok((true, 0)),
+        PublishIntent::Preserve => Ok((current_published, current_publish_at)),
+        PublishIntent::Schedule => {
+            let publish_at = if form.publish_at_epoch.trim().is_empty() {
+                // No JavaScript: datetime-local is documented and interpreted as UTC.
+                parse_publish_at(&form.publish_at)?
+            } else {
+                form.publish_at_epoch.trim().parse::<i64>().map_err(|_| {
+                    AppError::InvalidRequest(
+                        "publish_at_epoch must be UTC epoch seconds".to_string(),
+                    )
+                })?
+            };
+            if publish_at <= now {
+                return Err(AppError::InvalidRequest(
+                    "scheduled publication time must be in the future".to_string(),
+                ));
+            }
+            Ok((true, publish_at))
+        }
+    }
 }
 
 fn parse_publish_at(raw: &str) -> Result<i64, AppError> {
@@ -776,6 +927,44 @@ fn publication_detail(post: &Post, now: i64) -> &'static str {
     } else {
         "published"
     }
+}
+
+fn save_response(headers: &HeaderMap, post: &Post) -> Response {
+    let state = publication_detail(post, now_secs());
+    let redirect_to = if state == "published" {
+        format!("/p/{}", post.slug)
+    } else {
+        format!("/edit/{}?studio_saved={state}", post.slug)
+    };
+    let accepts_json = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|part| part.trim() == "application/json"));
+    if accepts_json {
+        let mut response = Json(SaveResponse {
+            ok: true,
+            slug: post.slug.clone(),
+            state,
+            redirect: redirect_to,
+        })
+        .into_response();
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
+        response
+    } else {
+        redirect(&redirect_to)
+    }
+}
+
+/// Stable non-sensitive browser-storage scope. The gateway subject never appears in HTML or in a
+/// localStorage key; 96 bits of SHA-256 output are sufficient to avoid accidental user collisions.
+fn recovery_scope(subject: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(subject.as_bytes());
+    hex::encode(&digest[..12])
 }
 
 /// How many related posts to show beneath an article.
@@ -937,28 +1126,43 @@ struct EditorView<'a> {
     is_admin: bool,
     theme: &'a str,
     state_label: &'a str,
+    saved: bool,
     heading: &'a str,
     subhead: &'a str,
     action: &'a str,
+    recovery_scope: &'a str,
     csrf: &'a str,
     title_value: &'a str,
     body_value: &'a str,
     tags_value: &'a str,
     cover_value: &'a str,
     publish_at_value: &'a str,
-    published: bool,
     pinned: bool,
-    submit_label: &'a str,
     cancel_href: &'a str,
     /// `Some(slug)` on the edit form -> render a separate delete form; `None` on compose.
     delete_slug: Option<&'a str>,
 }
 
 fn render_editor(v: EditorView<'_>) -> String {
-    let state_pill_html = match v.state_label {
-        "draft" => r#"<span class="pill">Draft</span>"#,
-        "scheduled" => r#"<span class="pill pill--warn">Scheduled</span>"#,
-        _ => r#"<span class="pill pill--ok">Published</span>"#,
+    let state_name = match v.state_label {
+        "scheduled" => "Scheduled",
+        "published" => "Published",
+        _ => "Draft",
+    };
+    let state_text = if v.saved {
+        format!("Saved · {state_name}")
+    } else {
+        state_name.to_string()
+    };
+    let state_pill_html = format!(
+        r#"<span class="writer-state writer-state--{state}" id="writerStatus" data-state="{state}" role="status" aria-live="polite"><span class="writer-state__dot" aria-hidden="true"></span><span id="writerStatusText">{text}</span></span>"#,
+        state = esc(v.state_label),
+        text = esc(&state_text),
+    );
+    let preserve_action = if v.delete_slug.is_some() {
+        r#"<button class="btn btn-secondary" type="submit" name="intent" value="" data-final-state="preserve">Save changes</button>"#
+    } else {
+        ""
     };
     let delete_block = match v.delete_slug {
         Some(slug) => format!(
@@ -979,19 +1183,17 @@ fn render_editor(v: EditorView<'_>) -> String {
         .replace("{{HEADING}}", &esc(v.heading))
         .replace("{{SUBHEAD}}", &esc(v.subhead))
         .replace("{{ACTION}}", v.action)
+        .replace("{{RECOVERY_SCOPE}}", &esc(v.recovery_scope))
         .replace("{{CSRF}}", &esc(v.csrf))
         .replace("{{TITLE_VALUE}}", &esc(v.title_value))
         .replace("{{BODY_VALUE}}", &esc(v.body_value))
         .replace("{{TAGS_VALUE}}", &esc(v.tags_value))
         .replace("{{COVER_VALUE}}", &esc(v.cover_value))
         .replace("{{PUBLISH_AT_VALUE}}", &esc(v.publish_at_value))
-        .replace(
-            "{{PUBLISHED_CHECKED}}",
-            if v.published { "checked" } else { "" },
-        )
         .replace("{{PINNED_CHECKED}}", if v.pinned { "checked" } else { "" })
-        .replace("{{STATE_PILL}}", state_pill_html)
-        .replace("{{SUBMIT_LABEL}}", &esc(v.submit_label))
+        .replace("{{STATE_PILL}}", &state_pill_html)
+        .replace("{{STATE_KEY}}", &esc(v.state_label))
+        .replace("{{PRESERVE_ACTION}}", preserve_action)
         .replace("{{CANCEL_HREF}}", v.cancel_href)
         .replace("{{DELETE}}", &delete_block);
     page_shell(

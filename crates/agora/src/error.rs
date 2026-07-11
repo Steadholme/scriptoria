@@ -58,6 +58,13 @@ impl IntoResponse for AppError {
 /// Store failures collapse to a 500 server_error.
 impl From<crate::store::StoreError> for AppError {
     fn from(e: crate::store::StoreError) -> Self {
-        AppError::Internal(e.to_string())
+        match e {
+            crate::store::StoreError::InvalidOperation(message) => {
+                AppError::InvalidRequest(message)
+            }
+            crate::store::StoreError::Backend(message) => {
+                AppError::Internal(format!("store error: {message}"))
+            }
+        }
     }
 }

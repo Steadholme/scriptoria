@@ -1,11 +1,9 @@
 //! Full-text search over the blog's published posts (`GET /search?q=`).
 //!
-//! Search reuses the SAME lexical/BoW index the "ask your blog" feature builds — the `chunks`
-//! table already holds every PUBLISHED post's body, chunked and rebuildable — and ranks it against
-//! the query with [`crate::index::rank`]. Because only published posts are ever indexed, results
-//! never leak drafts, so search is a plain public GET (no identity, no CSRF, no mutation — nothing
-//! to audit). The index is self-healing: an empty index triggers a lazy full rebuild on the first
-//! search, exactly like `/ask`.
+//! Search reuses the SAME lexical/BoW index the "ask your blog" feature builds. Each query ranks an
+//! authoritative snapshot of posts public at that instant; the persisted `chunks` table is only a
+//! repaired derived cache. Consequently a scheduled post appears as soon as its instant arrives,
+//! while a stale/de-index failure can never expose a draft or old body.
 //!
 //! Each result carries a short excerpt with the matched query terms wrapped in `<mark>`. The
 //! excerpt is HTML-escaped per segment BEFORE any `<mark>` is inserted, so author text can never
@@ -19,6 +17,7 @@ use axum::response::{Html, IntoResponse, Response};
 use serde::Deserialize;
 
 use crate::auth;
+use crate::error::AppError;
 use crate::handlers::{esc, fmt_date, page_shell};
 use crate::index::{self, Scored};
 use crate::AppState;
@@ -45,7 +44,7 @@ pub async fn search_page(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(sq): Query<SearchQuery>,
-) -> Response {
+) -> Result<Response, AppError> {
     let email = auth::display_email(&headers);
     let is_admin = auth::is_admin(&headers);
     let theme = odyssey::resolve_theme(
@@ -63,13 +62,7 @@ pub async fn search_page(
     let results_html = if query.is_empty() {
         empty_prompt()
     } else {
-        // Lazy initial index: rebuild from the published posts on the first search so search works
-        // without an explicit reindex step (self-healing, mirrors /ask).
-        if state.store.count_chunks().await == 0 {
-            let n = crate::build_full_index(state.store.as_ref()).await;
-            tracing::info!(chunks = n, "lazy index build on first search");
-        }
-        let chunks = state.store.fetch_chunks().await;
+        let chunks = crate::public_index_snapshot(state.store.as_ref()).await?;
         let top = index::rank(&query, &chunks, TOP_K);
         if top.is_empty() {
             no_results(&query)
@@ -91,7 +84,7 @@ pub async fn search_page(
         theme,
         &fragment,
     );
-    Html(page).into_response()
+    Ok(Html(page).into_response())
 }
 
 // ---------------------------------------------------------------------------

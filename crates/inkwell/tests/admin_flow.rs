@@ -219,7 +219,7 @@ async fn admin_can_edit_and_delete_any_authors_post() {
     let body = form(&[
         ("title", "Edited By Admin"),
         ("body", "moderated"),
-        ("published", "on"),
+        ("intent", "publish_now"),
         ("csrf_token", CSRF),
     ]);
     let (status, _) = call(
@@ -325,7 +325,7 @@ async fn create_post(state: &AppState, title: &str, sub: &str, email: &str) {
     let body = form(&[
         ("title", title),
         ("body", "body text"),
-        ("published", "on"),
+        ("intent", "publish_now"),
         ("csrf_token", CSRF),
     ]);
     let (status, _) = call(state, post_edit("/new", &body, sub, email, None)).await;
@@ -391,11 +391,19 @@ fn post_edit(uri: &str, body: &str, sub: &str, email: &str, groups: Option<&str>
 }
 
 fn form(pairs: &[(&str, &str)]) -> String {
-    pairs
+    let mut fields = pairs
         .iter()
         .map(|(k, v)| format!("{}={}", k, enc(v)))
-        .collect::<Vec<_>>()
-        .join("&")
+        .collect::<Vec<_>>();
+    if !pairs.iter().any(|(key, _)| *key == "intent") {
+        let intent = if pairs.iter().any(|(key, _)| *key == "published") {
+            "publish_now"
+        } else {
+            "save_draft"
+        };
+        fields.push(format!("intent={intent}"));
+    }
+    fields.join("&")
 }
 
 fn enc(s: &str) -> String {

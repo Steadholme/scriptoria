@@ -217,15 +217,33 @@ async fn admin_delete_any_thread_and_post() {
     let (s, _h, _b) =
         send(&state, post_as(&format!("{loc}/reply"), TOK, "u_bob", "bob@holdfast.local", "", reply)).await;
     assert_eq!(s, StatusCode::SEE_OTHER);
-    let pid = state
+    let posts = state
         .store
         .posts_in_thread(&tid)
         .await
-        .unwrap()
+        .unwrap();
+    let op_id = posts.first().unwrap().id.clone();
+    let pid = posts
         .into_iter()
         .find(|p| p.author_sub == "u_bob")
         .unwrap()
         .id;
+
+    // The OP owns the thread identity. Even an admin must use Delete thread, otherwise the thread
+    // author could gain edit authority over a promoted reply written by someone else.
+    let (s, _h, body) = send(
+        &state,
+        post_admin(
+            &format!("/admin/posts/{op_id}/delete"),
+            TOK,
+            ADMIN_GROUPS,
+            form(&[("csrf", TOK)]),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "admin cannot delete OP alone");
+    assert!(body.contains("delete the thread"));
+    assert_eq!(state.store.count_posts(&tid).await.unwrap(), 2);
 
     let (s, _h, _b) = send(
         &state,
@@ -244,6 +262,17 @@ async fn admin_delete_any_thread_and_post() {
     assert_eq!(s, StatusCode::SEE_OTHER);
     let (s, _h, _b) = send(&state, get(&loc)).await;
     assert_eq!(s, StatusCode::NOT_FOUND, "thread gone");
+    let (_s, _h, search) = send(&state, get("/search?q=body")).await;
+    assert!(
+        !search.contains("Doomed"),
+        "Delete thread removes its OP text from SSR search"
+    );
+    let (_s, _h, suggestions) = send(&state, get("/api/search/suggest?q=body")).await;
+    let suggestions: serde_json::Value = serde_json::from_str(&suggestions).unwrap();
+    assert!(
+        suggestions["results"].as_array().unwrap().is_empty(),
+        "Delete thread removes its OP text from suggestions"
+    );
 }
 
 // ---------------------------------------------------------------------------

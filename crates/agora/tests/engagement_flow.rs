@@ -84,7 +84,7 @@ async fn thread_subscription_toggle_and_filter() {
 
     let (_s, _h, thread_page) = send(&state, get_as(&subscribed_loc, ALICE_SUB, ALICE_EMAIL)).await;
     assert!(
-        thread_page.contains("Unsubscribe"),
+        thread_page.contains("Unfollow"),
         "subscribed thread shows the reverse action"
     );
     assert!(thread_page.contains(r#"data-wire-target=".subscription-form""#));
@@ -121,8 +121,8 @@ async fn thread_subscription_toggle_and_filter() {
 
     let (_s, _h, other_page) = send(&state, get_as(&other_loc, ALICE_SUB, ALICE_EMAIL)).await;
     assert!(
-        other_page.contains("Subscribe"),
-        "unsubscribed thread still offers subscribe"
+        other_page.contains("Follow"),
+        "thread outside Following still offers follow"
     );
 }
 

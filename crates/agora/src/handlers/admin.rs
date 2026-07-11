@@ -482,6 +482,12 @@ pub async fn delete_post(
         .await?
         .ok_or_else(|| AppError::NotFound("post not found".to_string()))?;
     let thread_id = post.thread_id.clone();
+    let op = state.store.first_post_in_thread(&thread_id).await?;
+    if op.as_ref().is_some_and(|original| original.id == id) {
+        return Err(AppError::InvalidRequest(
+            "the original post cannot be deleted separately; delete the thread".to_string(),
+        ));
+    }
     state.store.delete_post(&id).await?;
     state.audit.emit(AuditEvent::notice(
         "admin.post.delete",

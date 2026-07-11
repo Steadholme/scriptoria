@@ -136,6 +136,15 @@ fn gateway_key() -> &'static str {
         .as_str()
 }
 
+/// Whether the shared gateway identity-signing key is configured.
+///
+/// Development keeps the historical unsigned-header seam, but production owner routes use this
+/// signal to fail closed instead of treating an arbitrary `X-Auth-Subject` as trusted when the
+/// deployment forgot `GATEWAY_HMAC_KEY`.
+pub fn gateway_identity_verification_enabled() -> bool {
+    !gateway_key().is_empty()
+}
+
 /// Verify the gateway-injected identity is authentic. When `GATEWAY_HMAC_KEY` is set AND an
 /// identity (`X-Auth-Subject`) is present, a valid `X-Auth-Sig` — HMAC-SHA256 over
 /// `subject "\n" groups "\n" minute` for the current OR previous minute — is REQUIRED; a rogue
@@ -157,9 +166,12 @@ pub fn gateway_identity_ok(headers: &HeaderMap) -> bool {
     };
     let win = now_unix() / 60;
     // Accept the current and previous minute (clock skew + minute-boundary tolerance).
-    [win, win - 1]
-        .iter()
-        .any(|&w| ct_eq(sig.as_bytes(), sign_identity(key, &subject, &groups, w).as_bytes()))
+    [win, win - 1].iter().any(|&w| {
+        ct_eq(
+            sig.as_bytes(),
+            sign_identity(key, &subject, &groups, w).as_bytes(),
+        )
+    })
 }
 
 /// Recompute the gateway signature — byte-identical to Sluice's `auth.SignIdentity` (Go).
@@ -209,6 +221,17 @@ pub fn new_csrf_token() -> String {
     random_alnum(CSRF_LEN)
 }
 
+/// Reuse the browser's valid double-submit token, minting one only when the cookie is absent or
+/// malformed. Public upload rooms use this instead of rotating on every GET: two tabs therefore
+/// share one stable token and cannot invalidate each other's queued uploads.
+pub fn existing_or_new_csrf_token(headers: &HeaderMap) -> String {
+    get_cookie(headers, CSRF_COOKIE)
+        .filter(|value| {
+            value.len() == CSRF_LEN && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+        .unwrap_or_else(new_csrf_token)
+}
+
 /// `Set-Cookie` value for the (JS-readable) CSRF cookie.
 pub fn csrf_cookie(value: &str) -> String {
     format!("{CSRF_COOKIE}={value}; Path=/; Secure; SameSite=Lax; Max-Age={CSRF_TTL}")
@@ -254,9 +277,10 @@ pub fn hash_share_password(password: &str) -> String {
 /// value missing the `$` separator (never produced by [`hash_share_password`]) fails closed.
 pub fn verify_share_password(stored: &str, submitted: &str) -> bool {
     match stored.split_once('$') {
-        Some((salt, digest)) => {
-            ct_eq(sha256_hex(&format!("{salt}:{submitted}")).as_bytes(), digest.as_bytes())
-        }
+        Some((salt, digest)) => ct_eq(
+            sha256_hex(&format!("{salt}:{submitted}")).as_bytes(),
+            digest.as_bytes(),
+        ),
         None => false,
     }
 }
@@ -325,14 +349,20 @@ mod tests {
 
         // Comma-separated groups (with whitespace) parse and match by exact name.
         let mut admins = HeaderMap::new();
-        admins.insert(HEADER_GROUPS, HeaderValue::from_static("dev, infra-admins ,x"));
+        admins.insert(
+            HEADER_GROUPS,
+            HeaderValue::from_static("dev, infra-admins ,x"),
+        );
         assert_eq!(groups(&admins), vec!["dev", "infra-admins", "x"]);
         assert!(is_admin(&admins));
         assert!(require_admin(&admins).is_ok());
 
         // A non-admin group list is rejected — no substring matching.
         let mut other = HeaderMap::new();
-        other.insert(HEADER_GROUPS, HeaderValue::from_static("readers,admins-not"));
+        other.insert(
+            HEADER_GROUPS,
+            HeaderValue::from_static("readers,admins-not"),
+        );
         assert!(!is_admin(&other));
         assert!(require_admin(&other).is_err());
 
@@ -340,7 +370,10 @@ mod tests {
         // `/admin`, WITHOUT the caller holding a global admin group.
         let mut delegated = HeaderMap::new();
         delegated.insert(HEADER_GROUPS, HeaderValue::from_static("drive-admins"));
-        assert!(is_admin(&delegated), "the product admin group authorizes the panel");
+        assert!(
+            is_admin(&delegated),
+            "the product admin group authorizes the panel"
+        );
         assert!(require_admin(&delegated).is_ok());
 
         // A random, unrelated group is still rejected (403).
@@ -381,5 +414,24 @@ mod tests {
         assert!(verify_csrf(&h, &token));
         assert!(!verify_csrf(&h, "not-the-token"));
         assert!(!verify_csrf(&HeaderMap::new(), &token));
+    }
+
+    #[test]
+    fn csrf_cookie_is_reused_only_when_well_formed() {
+        let token = new_csrf_token();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            format!("{CSRF_COOKIE}={token}").parse().unwrap(),
+        );
+        assert_eq!(existing_or_new_csrf_token(&headers), token);
+
+        headers.insert(
+            header::COOKIE,
+            format!("{CSRF_COOKIE}=short").parse().unwrap(),
+        );
+        let replacement = existing_or_new_csrf_token(&headers);
+        assert_eq!(replacement.len(), CSRF_LEN);
+        assert_ne!(replacement, "short");
     }
 }

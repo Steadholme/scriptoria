@@ -11,7 +11,7 @@
 //! and `PgStore` drives sqlx natively — there is NO `block_in_place` and NO sync-over-async
 //! bridge, so a DB round-trip never blocks a worker thread.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -61,6 +61,12 @@ impl Post {
     pub fn is_scheduled_at(&self, now: i64) -> bool {
         self.published && self.publish_at > now
     }
+
+    /// Advance the content/cache version even when two mutations land in the same wall-clock
+    /// second. Chunks use `updated_at` as their version, so equality must imply current content.
+    pub fn bump_updated_at(&mut self, now: i64) {
+        self.updated_at = now.max(self.updated_at.saturating_add(1));
+    }
 }
 
 /// Public index cursor matching `ORDER BY pinned DESC, created_at DESC, id DESC`.
@@ -106,7 +112,7 @@ impl Default for Settings {
 /// A retrieval chunk: a slice of one published post's body, indexed for the "ask your blog"
 /// feature. `post_id` holds the post's slug (the stable URL key), so a citation links straight to
 /// `/p/{post_id}`. Maps 1:1 to a `chunks` row.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Chunk {
     pub id: String,
     pub post_id: String,
@@ -179,14 +185,22 @@ pub trait Store: Send + Sync {
     // -- "ask your blog" retrieval index (additive; see [`crate::index`]) -----------------
     //
     // The chunk table is a derived, rebuildable lexical index over the blog's OWN published
-    // posts. It carries NO authoritative data: it is (re)built from `posts` on create/update and
-    // lazily on the first ask, so an empty index is always self-healing.
+    // posts. It carries NO authoritative data: authoring updates it best-effort, while request-time
+    // incremental refresh repairs missing/outdated public post versions in bounded batches.
 
-    /// How many chunks are currently indexed (drives the lazy first-ask rebuild).
-    async fn count_chunks(&self) -> i64;
-    /// All indexed chunks, newest-indexed first (the ask handler ranks these in memory).
-    async fn fetch_chunks(&self) -> Vec<Chunk>;
-    /// Replace the ENTIRE chunk index with `chunks` (the lazy full rebuild). Returns the count.
+    /// Raw derived-cache count, used by diagnostics/tests. Backend failures remain observable.
+    async fn count_chunks(&self) -> Result<i64, StoreError>;
+    /// Raw derived-cache rows, used by diagnostics/tests. Public retrieval must instead use
+    /// [`Store::fetch_public_chunks`], which joins every chunk to its authoritative post version.
+    async fn fetch_chunks(&self) -> Result<Vec<Chunk>, StoreError>;
+    /// Incrementally rebuild at most `limit` public posts whose chunks are missing or carry an old
+    /// `updated_at` version. Draft/future posts are never candidates.
+    async fn refresh_public_chunks(&self, now: i64, limit: i64) -> Result<i64, StoreError>;
+    /// Read at most `limit` chunks that still join to a post public at `now` and whose
+    /// `indexed_at == posts.updated_at`. This is the only cache read Search/Ask may consume.
+    async fn fetch_public_chunks(&self, now: i64, limit: i64) -> Result<Vec<Chunk>, StoreError>;
+    /// Replace the ENTIRE chunk index with `chunks` for explicit maintenance/tests. Request paths
+    /// never call this method. Returns the count.
     async fn replace_all_chunks(&self, chunks: Vec<Chunk>) -> Result<i64, StoreError>;
     /// Replace just one post's chunks: drop every chunk for `post_id`, then insert `chunks`
     /// (empty `chunks` simply de-indexes the post — e.g. when it becomes a draft).
@@ -355,11 +369,11 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
-    async fn count_chunks(&self) -> i64 {
-        self.chunks.lock().expect("chunks lock poisoned").len() as i64
+    async fn count_chunks(&self) -> Result<i64, StoreError> {
+        Ok(self.chunks.lock().expect("chunks lock poisoned").len() as i64)
     }
 
-    async fn fetch_chunks(&self) -> Vec<Chunk> {
+    async fn fetch_chunks(&self) -> Result<Vec<Chunk>, StoreError> {
         let mut v: Vec<Chunk> = self.chunks.lock().expect("chunks lock poisoned").clone();
         // Newest-indexed first; ties broken by id so output is stable.
         v.sort_by(|a, b| {
@@ -367,7 +381,80 @@ impl Store for InMemoryStore {
                 .cmp(&a.indexed_at)
                 .then_with(|| a.id.cmp(&b.id))
         });
-        v
+        Ok(v)
+    }
+
+    async fn refresh_public_chunks(&self, now: i64, limit: i64) -> Result<i64, StoreError> {
+        let limit = limit.clamp(0, crate::config::INDEX_REFRESH_POST_LIMIT) as usize;
+        if limit == 0 {
+            return Ok(0);
+        }
+        // Keep one atomic in-memory view while deriving candidates. Every dual-lock path uses the
+        // same posts -> chunks order, so a concurrent Draft/version mutation cannot race the cache.
+        let posts_guard = self.posts.lock().expect("posts lock poisoned");
+        let mut cache = self.chunks.lock().expect("chunks lock poisoned");
+        let mut posts: Vec<Post> = posts_guard
+            .iter()
+            .filter(|post| post.is_public_at(now))
+            .cloned()
+            .collect();
+        posts.sort_by(|a, b| {
+            a.updated_at
+                .cmp(&b.updated_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let mut candidates: Vec<Post> = posts
+            .into_iter()
+            .filter(|post| {
+                let mut versions = cache
+                    .iter()
+                    .filter(|chunk| chunk.post_id == post.slug)
+                    .map(|chunk| chunk.indexed_at);
+                let first = versions.next();
+                first.is_none()
+                    || first != Some(post.updated_at)
+                    || versions.any(|version| version != post.updated_at)
+            })
+            .take(limit)
+            .collect();
+        let refreshed = candidates.len() as i64;
+        for post in candidates.drain(..) {
+            cache.retain(|chunk| chunk.post_id != post.slug);
+            cache.extend(crate::index::build_post_chunks(
+                &post.slug,
+                &post.title,
+                &post.body_md,
+                post.updated_at,
+            ));
+        }
+        Ok(refreshed)
+    }
+
+    async fn fetch_public_chunks(&self, now: i64, limit: i64) -> Result<Vec<Chunk>, StoreError> {
+        if limit <= 0 {
+            return Ok(Vec::new());
+        }
+        // Match PostgreSQL statement-snapshot semantics: visibility/version and chunks are read
+        // under one in-memory critical section, with the canonical posts -> chunks lock order.
+        let posts = self.posts.lock().expect("posts lock poisoned");
+        let cache = self.chunks.lock().expect("chunks lock poisoned");
+        let versions: HashMap<&str, i64> = posts
+            .iter()
+            .filter(|post| post.is_public_at(now))
+            .map(|post| (post.slug.as_str(), post.updated_at))
+            .collect();
+        let mut chunks: Vec<Chunk> = cache
+            .iter()
+            .filter(|chunk| versions.get(chunk.post_id.as_str()) == Some(&chunk.indexed_at))
+            .cloned()
+            .collect();
+        chunks.sort_by(|a, b| {
+            b.indexed_at
+                .cmp(&a.indexed_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        chunks.truncate(limit.min(crate::config::INDEX_CHUNK_LIMIT) as usize);
+        Ok(chunks)
     }
 
     async fn replace_all_chunks(&self, chunks: Vec<Chunk>) -> Result<i64, StoreError> {
@@ -464,9 +551,6 @@ fn rank_related_by_tags(candidates: Vec<Post>, slug: &str, tags: &str, limit: i6
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
-
-/// Hard cap on how many chunks the ask handler scans per query (keeps the in-memory rank bounded).
-const CHUNK_SCAN_LIMIT: i64 = 20_000;
 
 const POST_COLS: &str = "SELECT id, slug, title, body_md, author_sub, author_email, \
                          created_at, updated_at, published, publish_at, featured, pinned, \
@@ -583,6 +667,9 @@ impl PgStore {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_chunks_post_id ON chunks (post_id)")
             .execute(&self.pool)
             .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_chunks_indexed_at ON chunks (indexed_at)")
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -608,7 +695,79 @@ impl PgStore {
             "SELECT id, post_id, title, body, indexed_at \
              FROM chunks ORDER BY indexed_at DESC, id ASC LIMIT $1",
         )
-        .bind(CHUNK_SCAN_LIMIT)
+        .bind(crate::config::INDEX_CHUNK_LIMIT)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::chunk_from_row).collect()
+    }
+
+    async fn refresh_public_chunks_async(&self, now: i64, limit: i64) -> Result<i64, sqlx::Error> {
+        let limit = limit.clamp(0, crate::config::INDEX_REFRESH_POST_LIMIT);
+        if limit == 0 {
+            return Ok(0);
+        }
+        let _guard = self.index_lock.lock().await;
+        let rows = sqlx::query(&format!(
+            "{POST_COLS} WHERE published = TRUE AND (publish_at = 0 OR publish_at <= $1) \
+             AND (NOT EXISTS (\
+                    SELECT 1 FROM chunks c \
+                    WHERE c.post_id = posts.slug AND c.indexed_at = posts.updated_at\
+                  ) OR EXISTS (\
+                    SELECT 1 FROM chunks c \
+                    WHERE c.post_id = posts.slug AND c.indexed_at <> posts.updated_at\
+                  )) \
+             ORDER BY updated_at ASC, id ASC LIMIT $2"
+        ))
+        .bind(now)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let posts: Vec<Post> = rows
+            .iter()
+            .map(Self::post_from_row)
+            .collect::<Result<_, _>>()?;
+        if posts.is_empty() {
+            return Ok(0);
+        }
+
+        let mut tx = self.pool.begin().await?;
+        for post in &posts {
+            sqlx::query("DELETE FROM chunks WHERE post_id = $1")
+                .bind(&post.slug)
+                .execute(&mut *tx)
+                .await?;
+            let chunks = crate::index::build_post_chunks(
+                &post.slug,
+                &post.title,
+                &post.body_md,
+                post.updated_at,
+            );
+            for chunk in &chunks {
+                Self::insert_chunk(&mut tx, chunk).await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(posts.len() as i64)
+    }
+
+    async fn fetch_public_chunks_async(
+        &self,
+        now: i64,
+        limit: i64,
+    ) -> Result<Vec<Chunk>, sqlx::Error> {
+        if limit <= 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT c.id AS id, c.post_id AS post_id, c.title AS title, c.body AS body, \
+                    c.indexed_at AS indexed_at \
+             FROM chunks c \
+             JOIN posts p ON p.slug = c.post_id AND p.updated_at = c.indexed_at \
+             WHERE p.published = TRUE AND (p.publish_at = 0 OR p.publish_at <= $1) \
+             ORDER BY c.indexed_at DESC, c.id ASC LIMIT $2",
+        )
+        .bind(now)
+        .bind(limit.min(crate::config::INDEX_CHUNK_LIMIT))
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(Self::chunk_from_row).collect()
@@ -665,6 +824,7 @@ impl PgStore {
     }
 
     async fn delete_post_chunks_async(&self, post_id: &str) -> Result<(), sqlx::Error> {
+        let _guard = self.index_lock.lock().await;
         sqlx::query("DELETE FROM chunks WHERE post_id = $1")
             .bind(post_id)
             .execute(&self.pool)
@@ -1053,18 +1213,28 @@ impl Store for PgStore {
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
-    async fn count_chunks(&self) -> i64 {
-        self.count_chunks_async().await.unwrap_or_else(|e| {
-            tracing::error!(error = %e, "pg count_chunks failed");
-            0
-        })
+    async fn count_chunks(&self) -> Result<i64, StoreError> {
+        self.count_chunks_async()
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
-    async fn fetch_chunks(&self) -> Vec<Chunk> {
-        self.fetch_chunks_async().await.unwrap_or_else(|e| {
-            tracing::error!(error = %e, "pg fetch_chunks failed");
-            Vec::new()
-        })
+    async fn fetch_chunks(&self) -> Result<Vec<Chunk>, StoreError> {
+        self.fetch_chunks_async()
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn refresh_public_chunks(&self, now: i64, limit: i64) -> Result<i64, StoreError> {
+        self.refresh_public_chunks_async(now, limit)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn fetch_public_chunks(&self, now: i64, limit: i64) -> Result<Vec<Chunk>, StoreError> {
+        self.fetch_public_chunks_async(now, limit)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
     async fn replace_all_chunks(&self, chunks: Vec<Chunk>) -> Result<i64, StoreError> {

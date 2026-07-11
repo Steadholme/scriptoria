@@ -4,77 +4,56 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>{{HEADING}} · Upload request · Aperture · HOLDFAST</title>
-  <style>{{CSS}}</style>
+  <title>{{HEADING}} · Aperture Upload Room</title>
+  <link rel="stylesheet" href="/s/share-room.css">
 </head>
-<body class="page-console">
-  <header class="appbar">
-    <a class="appbar__brand" href="/" aria-label="HOLDFAST Aperture home">
-      <span class="app-tile" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="22" x2="2" y1="12" y2="12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><line x1="6" x2="6.01" y1="16" y2="16"/><line x1="10" x2="10.01" y1="16" y2="16"/></svg></span>
-      <span class="appbar__name"><b>Drive</b><span>drive.w33d.xyz</span></span>
-	    </a>
-	    <span class="appbar__spacer"></span>
-	    <span class="ap-pubbar__tag"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-8 9-4.5-1.5-8-4-8-9V5l8-3 8 3v8Z"/><path d="m9 12 2 2 4-5"/></svg>Shared via Drive</span>
-	  </header>
-	
-	  <main class="console ap-inbox">
-	    <div class="console__head">
-	      <div class="ap-inbox__glyph" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg></div>
-	      <p class="ap-inbox__eyebrow">Files requested</p>
-	      <h1>{{HEADING}}</h1>
-	      <p class="sub">Upload files into this request folder. Existing files are not listed.</p>
-	    </div>
+<body data-ap-share-room data-ap-surface="upload">
+  <header class="sr-topbar">
+    <a class="sr-brand" href="https://w33d.xyz" aria-label="HOLDFAST home">
+      <span class="sr-brand__mark" aria-hidden="true"></span>
+      <span>Aperture<small>PUBLIC UPLOAD ROOM</small></span>
+    </a>
+    <span class="sr-topbar__state">Upload-only capability</span>
+  </header>
 
-    {{STATUS}}
+  <main class="sr-shell sr-inbox">
+    <section class="sr-card" aria-labelledby="inboxTitle">
+      <div class="sr-card__icon" aria-hidden="true">⇧</div>
+      <p class="sr-eyebrow">Files requested</p>
+      <h1 id="inboxTitle">{{HEADING}}</h1>
+      <p class="sr-summary">Send files directly to this private request folder. Existing files and the owner’s Drive remain hidden.</p>
+      <div class="sr-chips" aria-label="Upload room status">
+        <span class="sr-chip sr-chip--safe">Upload only</span>
+        <span class="sr-chip">Files stay private</span>
+        <span class="sr-chip">Up to {{MAX_UPLOAD}} each</span>
+      </div>
 
-    <section class="card">
-      <div class="card__body">
-        <form id="uploadForm" class="dropzone" method="post" action="{{ACTION}}" enctype="multipart/form-data">
-          <input type="hidden" name="csrf_token" value="{{CSRF}}">
-          <input id="fileInput" class="dropzone__input" type="file" name="file" required>
-          <label for="fileInput" class="dropzone__label">
-            <span class="dropzone__icon" aria-hidden="true">&#8682;</span>
-            <span class="dropzone__text"><strong>Choose a file</strong> or drag &amp; drop it here</span>
-            <span id="fileName" class="dropzone__hint">Nothing selected yet</span>
-          </label>
-          <div class="dropzone__actions">
-            <button class="btn btn-primary" type="submit">Upload</button>
-          </div>
-	        </form>
-	      </div>
-	    </section>
-	    <p class="ap-inbox__trust">Uploads go straight to this folder — only its owner can see them.</p>
-	  </main>
+      {{STATUS}}
+      <p class="sr-status" data-upload-summary role="status" aria-live="polite">Choose one file. With JavaScript enabled, you can queue several files and track each upload.</p>
 
-  <script>
-    (function () {
-      var input = document.getElementById('fileInput');
-      var name = document.getElementById('fileName');
-      var zone = document.getElementById('uploadForm');
-      if (!input || !zone) { return; }
-      function show() {
-        if (input.files && input.files.length) {
-          name.textContent = input.files[0].name;
-          zone.classList.add('has-file');
-        } else {
-          name.textContent = 'Nothing selected yet';
-          zone.classList.remove('has-file');
-        }
-      }
-      input.addEventListener('change', show);
-      ['dragenter', 'dragover'].forEach(function (ev) {
-        zone.addEventListener(ev, function (e) { e.preventDefault(); zone.classList.add('dragging'); });
-      });
-      ['dragleave', 'drop'].forEach(function (ev) {
-        zone.addEventListener(ev, function (e) { e.preventDefault(); zone.classList.remove('dragging'); });
-      });
-      zone.addEventListener('drop', function (e) {
-        if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
-          input.files = e.dataTransfer.files;
-          show();
-        }
-      });
-    })();
-  </script>
+      <form class="sr-dropzone" method="post" action="{{ACTION}}" enctype="multipart/form-data" data-upload-form>
+        <input type="hidden" name="csrf_token" value="{{CSRF}}">
+        <input id="fileInput" class="sr-dropzone__input" type="file" name="file" required>
+        <label class="sr-dropzone__pick" for="fileInput">
+          <span class="sr-dropzone__mark" aria-hidden="true">+</span>
+          <strong>Choose a file</strong>
+          <span class="sr-dropzone__hint">or drop files anywhere in this panel</span>
+        </label>
+        <div class="sr-dropzone__fallback">
+          <button class="sr-button sr-button--primary" type="submit">Upload selected file</button>
+        </div>
+      </form>
+
+      <section class="sr-queue" data-upload-queue hidden aria-labelledby="queueTitle">
+        <div class="sr-queue__head"><h2 id="queueTitle">Transfer queue</h2><span class="sr-chip">One secure POST per file</span></div>
+        <ul class="sr-queue__list" data-upload-list></ul>
+      </section>
+
+      <p class="sr-trust-note">This capability allows uploads only. Visitors cannot browse, preview, replace, or download anything already in the folder.</p>
+    </section>
+  </main>
+
+  <footer class="sr-foot">Served by HOLDFAST Aperture · Public upload capability</footer>
+  <script src="/s/share-room.js" defer></script>
 </body>
 </html>

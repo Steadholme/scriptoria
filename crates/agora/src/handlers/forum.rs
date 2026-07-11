@@ -227,7 +227,7 @@ pub async fn home(
         cats = cats_html,
         mentions = mentions_html,
         thread_title = if q.subscribed_only() {
-            "Subscribed threads"
+            "Following"
         } else {
             "Recent activity"
         },
@@ -1002,11 +1002,12 @@ pub async fn update_thread(
         ));
     }
 
-    // The original post is the oldest post in the thread (first in display order).
-    let posts = state.store.posts_in_thread(&id).await?;
-    let op_id = posts
-        .first()
-        .map(|p| p.id.clone())
+    // Resolve the stable OP identity; never infer it from second-granularity timestamps.
+    let op_id = state
+        .store
+        .first_post_in_thread(&id)
+        .await?
+        .map(|post| post.id)
         .ok_or_else(|| AppError::NotFound("thread has no original post".to_string()))?;
 
     state.store.update_thread(&id, title, &op_id, body).await?;
@@ -1462,7 +1463,8 @@ fn render_thread_list_controls(action: &str, q: &ThreadListQuery, show_subscribe
             label = label,
         )
     };
-    // Subscribed filter as a toggle link that preserves the current sort.
+    // Following filter as a toggle link that preserves the current sort. Storage keeps the
+    // existing subscription name, but the UI does not promise notification delivery.
     let filter = if show_subscribed {
         let (href, label, cls) = if sub {
             (
@@ -1473,7 +1475,7 @@ fn render_thread_list_controls(action: &str, q: &ThreadListQuery, show_subscribe
         } else {
             (
                 format!("{}?sort={}&filter=subscribed", esc(action), sort),
-                "Subscribed",
+                "Following",
                 "btn btn-ghost btn-sm",
             )
         };
@@ -1543,11 +1545,7 @@ async fn render_mentions_panel(state: &AppState, headers: &HeaderMap) -> Result<
 }
 
 fn render_subscription_form(thread_id: &str, csrf: &str, subscribed: bool) -> String {
-    let label = if subscribed {
-        "Unsubscribe"
-    } else {
-        "Subscribe"
-    };
+    let label = if subscribed { "Unfollow" } else { "Follow" };
     let class = if subscribed {
         "btn btn-secondary btn-sm"
     } else {
@@ -2208,8 +2206,9 @@ fn render_posts(
             tid = esc(thread_id),
             pid = esc(&p.id),
         );
-        // Admin can delete ANY post (original post included). The admin route is group-gated.
-        let admin_controls = if is_admin {
+        // Admins can remove any reply. The OP owns the thread identity and must be removed through
+        // Delete thread, so a reply by another author is never silently promoted into editable OP.
+        let admin_controls = if is_admin && i > 0 {
             format!(
                 r#"<form class="inline-form" method="post" action="/admin/posts/{pid}/delete" onsubmit="return confirm('Delete this post as admin? This cannot be undone.');">
     <input type="hidden" name="csrf" value="{csrf}">

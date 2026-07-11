@@ -65,7 +65,8 @@ pub struct S3Config {
 impl S3Config {
     fn from_env() -> Self {
         S3Config {
-            endpoint: env_nonempty("S3_ENDPOINT").unwrap_or_else(|| "http://cairn:9000".to_string()),
+            endpoint: env_nonempty("S3_ENDPOINT")
+                .unwrap_or_else(|| "http://cairn:9000".to_string()),
             bucket: env_nonempty("S3_BUCKET").unwrap_or_else(|| DEFAULT_S3_BUCKET.to_string()),
             region: env_nonempty("S3_REGION").unwrap_or_else(|| DEFAULT_S3_REGION.to_string()),
             access_key: env_nonempty("S3_ACCESS_KEY").unwrap_or_default(),
@@ -86,6 +87,10 @@ pub struct Config {
     /// Default per-owner storage quota, bytes (`APERTURE_DEFAULT_QUOTA_BYTES`; `0` = unlimited).
     /// A per-owner `owner_quotas` row overrides it — see [`effective_quota`].
     pub default_quota_bytes: i64,
+    /// Whether owner routes may synthesize the local `dev-user` identity when gateway headers are
+    /// absent. Enabled only by [`Config::dev`]; `HOLDFAST_PROFILE=prod` and
+    /// `REQUIRE_PERSISTENCE` boots always disable it.
+    pub allow_dev_identity: bool,
     /// S3 / Cairn settings.
     pub s3: S3Config,
 }
@@ -98,6 +103,7 @@ impl Config {
             max_upload: DEFAULT_MAX_UPLOAD,
             public_base: DEFAULT_PUBLIC_BASE.to_string(),
             default_quota_bytes: DEFAULT_QUOTA_BYTES,
+            allow_dev_identity: true,
             s3: S3Config {
                 endpoint: "http://cairn:9000".to_string(),
                 bucket: DEFAULT_S3_BUCKET.to_string(),
@@ -127,6 +133,13 @@ impl Config {
                 config.default_quota_bytes = n;
             }
         }
+        let production = std::env::var("HOLDFAST_PROFILE")
+            .map(|profile| profile.trim().eq_ignore_ascii_case("prod"))
+            .unwrap_or(false)
+            || env_truthy("REQUIRE_PERSISTENCE");
+        if production {
+            config.allow_dev_identity = false;
+        }
         config.s3 = S3Config::from_env();
         config
     }
@@ -144,6 +157,17 @@ fn env_nonempty(key: &str) -> Option<String> {
         Ok(v) if !v.is_empty() => Some(v),
         _ => None,
     }
+}
+
+fn env_truthy(key: &str) -> bool {
+    matches!(
+        std::env::var(key)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "on" | "true" | "1" | "yes"
+    )
 }
 
 #[cfg(test)]

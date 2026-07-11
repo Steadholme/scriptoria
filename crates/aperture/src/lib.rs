@@ -44,6 +44,7 @@
 //! - `GET /s/folder/{token}` — public index of a shared folder's files; `POST` unlocks a protected one;
 //!   `GET|POST /s/folder/{token}/f/{fid}` downloads one listed file, NO SSO [PUBLIC `/s/folder/` prefix]
 //! - `GET|POST /u/{token}` — public upload-only inbox for a folder, NO SSO [PUBLIC `/u/` prefix]
+//! - `GET /s/share-room.css|js` — product-owned public Share Room assets [PUBLIC, read-only]
 
 pub mod audit;
 pub mod auth;
@@ -85,6 +86,8 @@ pub fn app(state: AppState) -> Router {
     let body_limit = state.config.max_upload.saturating_add(1024 * 1024);
     Router::new()
         .route("/healthz", get(handlers::health::healthz))
+        .route("/s/share-room.css", get(handlers::share_room_css_asset))
+        .route("/s/share-room.js", get(handlers::share_room_js_asset))
         .route("/", get(handlers::files::gallery))
         .route("/upload", post(handlers::files::upload))
         .route("/f/{id}", get(handlers::files::detail))
@@ -154,10 +157,12 @@ pub fn app(state: AppState) -> Router {
         )
         .merge(admin_router())
         .layer(DefaultBodyLimit::max(body_limit))
-        // Reject a forged gateway identity (spoofed X-Auth-* from a rogue in-network peer):
-        // when GATEWAY_HMAC_KEY is set, an injected identity MUST carry a valid X-Auth-Sig.
-        // No-op when the key is unset or no identity is present (share route / dev).
-        .layer(axum::middleware::from_fn(require_gateway_sig))
+        // Verify injected identities and make owner routes fail closed when production receives no
+        // identity at all. Only health + the existing /s and /u capability namespaces are anonymous.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_gateway_sig,
+        ))
         .with_state(state)
 }
 
@@ -186,19 +191,41 @@ async fn require_admin_mw(
 
 /// Middleware enforcing [`auth::gateway_identity_ok`] — 401 on a missing/invalid signature.
 async fn require_gateway_sig(
+    axum::extract::State(state): axum::extract::State<AppState>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    if auth::gateway_identity_ok(req.headers()) {
-        next.run(req).await
-    } else {
-        (
+    let path = req.uri().path();
+    let anonymous_capability =
+        path == "/healthz" || path.starts_with("/s/") || path.starts_with("/u/");
+    let has_identity = req
+        .headers()
+        .get(auth::HEADER_SUBJECT)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .is_some_and(|subject| !subject.is_empty());
+
+    if !anonymous_capability
+        && !state.config.allow_dev_identity
+        && (!has_identity || !auth::gateway_identity_verification_enabled())
+    {
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            "gateway identity required",
+        )
+            .into_response();
+    }
+
+    if !auth::gateway_identity_ok(req.headers()) {
+        return (
             axum::http::StatusCode::UNAUTHORIZED,
             "invalid or missing gateway identity signature",
         )
-            .into_response()
+            .into_response();
     }
+
+    next.run(req).await
 }
 
 /// Construct dev state: dev [`Config`] + empty in-memory metadata + in-memory blobs. Used by
@@ -219,6 +246,13 @@ pub fn build_dev_state() -> AppState {
 /// Returns an error string on misconfiguration so `main` can fail loudly.
 pub async fn build_state_from_env() -> Result<AppState, String> {
     let config = Config::from_env();
+
+    if !config.allow_dev_identity && !auth::gateway_identity_verification_enabled() {
+        return Err(
+            "production owner routes require a non-empty GATEWAY_HMAC_KEY for signed gateway identities"
+                .to_string(),
+        );
+    }
 
     let store_kind = std::env::var("APERTURE_STORE").unwrap_or_else(|_| "memory".to_string());
     let store: Arc<dyn Store> = match store_kind.as_str() {

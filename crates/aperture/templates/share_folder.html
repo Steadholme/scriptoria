@@ -4,33 +4,43 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>{{HEADING}} · Shared folder · Aperture · HOLDFAST</title>
-  <style>{{CSS}}</style>
+  <title>{{HEADING}} · Aperture Share Room</title>
+  <link rel="stylesheet" href="/s/share-room.css">
 </head>
-<body class="page-console">
-  <header class="appbar">
-    <a class="appbar__brand" href="/" aria-label="HOLDFAST Aperture home">
-      <span class="app-tile" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="22" x2="2" y1="12" y2="12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><line x1="6" x2="6.01" y1="16" y2="16"/><line x1="10" x2="10.01" y1="16" y2="16"/></svg></span>
-      <span class="appbar__name"><b>Drive</b><span>drive.w33d.xyz</span></span>
-	    </a>
-	    <span class="appbar__spacer"></span>
-	    <span class="ap-pubbar__tag"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-8 9-4.5-1.5-8-4-8-9V5l8-3 8 3v8Z"/><path d="m9 12 2 2 4-5"/></svg>Shared via Drive</span>
-	  </header>
-	
-	  <main class="console ap-pubindex">
-	    <div class="console__head ap-pubindex__head">
-	      <div class="ap-pubindex__glyph" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h5l2 2.5h9a1 1 0 0 1 1 1V18a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Z"/></svg></div>
-	      <h1>{{HEADING}}</h1>
-	      <p class="sub">A shared folder. {{COUNT}} available to download — no sign-in required.</p>
-	    </div>
+<body data-ap-share-room data-ap-surface="folder">
+  <header class="sr-topbar">
+    <a class="sr-brand" href="https://w33d.xyz" aria-label="HOLDFAST home">
+      <span class="sr-brand__mark" aria-hidden="true"></span>
+      <span>Aperture<small>PUBLIC SHARE ROOM</small></span>
+    </a>
+    <span class="sr-topbar__state">Capability verified</span>
+  </header>
 
-    <section class="card">
-      <div class="card__body">
-        <ul class="share-file-list">
-          {{FILES}}
-        </ul>
+  <main class="sr-shell">
+    <section class="sr-folder-head" aria-labelledby="folderTitle">
+      <p class="sr-eyebrow">Shared folder</p>
+      <h1 id="folderTitle">{{HEADING}}</h1>
+      <p class="sr-summary">{{COUNT}} available through a read-only capability. No account is required.</p>
+      <div class="sr-chips" aria-label="Share status">
+        <span class="sr-chip sr-chip--safe">{{ACCESS_STATE}}</span>
+        <span class="sr-chip">Read only</span>
+        <span class="sr-chip">{{EXPIRY}}</span>
       </div>
     </section>
+
+    <ul class="sr-file-list" aria-label="Shared files">{{FILES}}</ul>
+    <p class="sr-trust-note">Only files directly inside this shared folder are visible. The owner may change or revoke this link without notice.</p>
   </main>
+
+  <div class="sr-dialog" data-share-dialog role="dialog" aria-modal="true" aria-label="Image preview" hidden>
+    <button class="sr-dialog__scrim" type="button" data-share-dialog-close aria-label="Close preview"></button>
+    <div class="sr-dialog__panel">
+      <button class="sr-dialog__close" type="button" data-share-dialog-close aria-label="Close preview">×</button>
+      <img data-share-dialog-image alt="">
+    </div>
+  </div>
+
+  <footer class="sr-foot">Served by HOLDFAST Aperture · Public capability access</footer>
+  <script src="/s/share-room.js" defer></script>
 </body>
 </html>

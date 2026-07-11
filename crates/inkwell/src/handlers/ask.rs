@@ -8,8 +8,9 @@
 //!
 //! Like the authoring flow, `/api/ask` is mounted behind the gateway `auth=sso` route: the user
 //! identity is taken from the injected `X-Auth-*`, and the POST is double-submit CSRF protected.
-//! The index is rebuildable + self-healing: an empty index triggers a lazy full rebuild on the
-//! first ask, so the feature works without any explicit reindex step.
+//! Every question uses an authoritative snapshot of posts public at that instant. The persisted
+//! chunk table is a repaired derived cache, so scheduled transitions need no background job and a
+//! stale cache can never expose a draft or old body.
 
 use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue};
@@ -64,8 +65,8 @@ pub async fn ask_page(State(_state): State<AppState>, headers: HeaderMap) -> Res
 // ---------------------------------------------------------------------------
 
 /// `POST /api/ask` — retrieve the top passages by keyword-overlap and render an extractive answer
-/// with citations linked to the source posts. Never 500s on retrieval shape; an empty index is
-/// rebuilt lazily on the way in.
+/// with citations linked to the source posts. Never 500s on retrieval shape; the public snapshot
+/// is rebuilt and cache-checked on the way in.
 pub async fn ask(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -93,14 +94,7 @@ pub async fn ask(
         ));
     }
 
-    // Lazy initial index: if nothing is indexed yet, rebuild from the published posts first so the
-    // very first ask has something to retrieve.
-    if state.store.count_chunks().await == 0 {
-        let n = crate::build_full_index(state.store.as_ref()).await;
-        tracing::info!(chunks = n, "lazy index build on first ask");
-    }
-
-    let chunks = state.store.fetch_chunks().await;
+    let chunks = crate::public_index_snapshot(state.store.as_ref()).await?;
     let top = index::rank(&question, &chunks, TOP_K);
 
     let answer_html = if top.is_empty() {

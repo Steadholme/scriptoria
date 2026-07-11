@@ -13,6 +13,10 @@ pub const DEFAULT_PAGE: i64 = 50;
 /// Hard ceiling on a single index page, regardless of what a client `?limit=` asks for. Keeps an
 /// unbounded scan bounded while every older page is still reachable via the `?before=` cursor.
 pub const MAX_PAGE: i64 = 200;
+/// Maximum public posts whose missing/outdated lexical chunks one request may repair.
+pub const INDEX_REFRESH_POST_LIMIT: i64 = 200;
+/// Maximum visibility-validated chunks Search/Ask may rank for one request.
+pub const INDEX_CHUNK_LIMIT: i64 = 20_000;
 
 /// Clamp a requested page size into `1..=MAX_PAGE`, falling back to [`DEFAULT_PAGE`] when the
 /// request omits `?limit=` or passes a non-positive value.

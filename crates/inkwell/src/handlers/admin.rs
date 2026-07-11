@@ -216,7 +216,7 @@ pub async fn pin(
 
     let mut post = load(&state, &slug).await?;
     post.pinned = !post.pinned;
-    post.updated_at = now_secs();
+    post.bump_updated_at(now_secs());
     state.store.update_post(&post).await?;
     tracing::info!(slug = %slug, pinned = post.pinned, "admin toggled pinned");
 
@@ -242,7 +242,7 @@ pub async fn feature(
 
     let mut post = load(&state, &slug).await?;
     post.featured = !post.featured;
-    post.updated_at = now_secs();
+    post.bump_updated_at(now_secs());
     state.store.update_post(&post).await?;
     tracing::info!(slug = %slug, featured = post.featured, "admin toggled featured");
 
@@ -272,7 +272,7 @@ pub async fn unpublish(
 
     let mut post = load(&state, &slug).await?;
     post.published = false;
-    post.updated_at = now_secs();
+    post.bump_updated_at(now_secs());
     state.store.update_post(&post).await?;
     tracing::info!(slug = %slug, "admin unpublished post");
 
@@ -347,7 +347,7 @@ pub async fn bulk(
             "pin" | "unpin" => {
                 if let Some(mut post) = state.store.get_post(slug).await {
                     post.pinned = action == "pin";
-                    post.updated_at = now_secs();
+                    post.bump_updated_at(now_secs());
                     state.store.update_post(&post).await?;
                     state.audit.emit(AuditEvent::info(
                         "admin.post.pin",
@@ -360,7 +360,7 @@ pub async fn bulk(
             "feature" | "unfeature" => {
                 if let Some(mut post) = state.store.get_post(slug).await {
                     post.featured = action == "feature";
-                    post.updated_at = now_secs();
+                    post.bump_updated_at(now_secs());
                     state.store.update_post(&post).await?;
                     state.audit.emit(AuditEvent::info(
                         "admin.post.feature",
@@ -377,7 +377,7 @@ pub async fn bulk(
             "unpublish" => {
                 if let Some(mut post) = state.store.get_post(slug).await {
                     post.published = false;
-                    post.updated_at = now_secs();
+                    post.bump_updated_at(now_secs());
                     state.store.update_post(&post).await?;
                     crate::reindex_post(state.store.as_ref(), &post).await;
                     state.audit.emit(AuditEvent::notice(

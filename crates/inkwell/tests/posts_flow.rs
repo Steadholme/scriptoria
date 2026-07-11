@@ -450,11 +450,24 @@ fn post_csrf(uri: &str, body: &str, ident: Option<(&str, &str)>) -> Request<Body
 }
 
 fn form(pairs: &[(&str, &str)]) -> String {
-    pairs
+    let mut fields = pairs
         .iter()
         .map(|(k, v)| format!("{}={}", k, enc(v)))
-        .collect::<Vec<_>>()
-        .join("&")
+        .collect::<Vec<_>>();
+    if !pairs.iter().any(|(key, _)| *key == "intent") {
+        let intent = if pairs
+            .iter()
+            .any(|(key, value)| *key == "publish_at" && !value.is_empty())
+        {
+            "schedule"
+        } else if pairs.iter().any(|(key, _)| *key == "published") {
+            "publish_now"
+        } else {
+            "save_draft"
+        };
+        fields.push(format!("intent={intent}"));
+    }
+    fields.join("&")
 }
 
 /// Minimal application/x-www-form-urlencoded value encoder.

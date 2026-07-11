@@ -40,7 +40,7 @@ use axum::Router;
 
 use crate::audit::AuditSink;
 use crate::config::{env_nonempty, Config};
-use crate::store::{InMemoryStore, PgStore, Post, Store};
+use crate::store::{Chunk, InMemoryStore, PgStore, Post, Store};
 
 /// Shared application state. Cheap to clone (everything behind `Arc` / a cloneable sink).
 #[derive(Clone)]
@@ -76,6 +76,8 @@ pub fn app(state: AppState) -> Router {
         // Live Markdown preview for the editor (author-gated + CSRF, read-only JSON). Additive
         // progressive enhancement: the compose/edit form still POSTs and works without JS.
         .route("/api/preview", post(handlers::posts::preview))
+        // Writer-only existing-tag autocomplete. Bounded, no-store, and read-only.
+        .route("/api/tags", get(handlers::posts::tag_suggestions))
         // Admin panel: an all-authors post management table + single-row site settings. Every
         // route below is gated by `auth::require_admin` inside the handler (403 for non-admins).
         .route("/admin", get(handlers::admin::index))
@@ -221,19 +223,21 @@ pub async fn unique_slug(store: &dyn Store, title: &str, fallback: &str) -> Stri
 }
 
 // ---------------------------------------------------------------------------
-// "Ask your blog" index orchestration (best-effort; never fails the caller)
+// "Ask your blog" index orchestration
 // ---------------------------------------------------------------------------
 //
-// The chunk index is a DERIVED view of the published posts. These helpers keep it in step with the
-// authoring flow — a failure here is logged and swallowed so it can NEVER break post create / edit
-// / delete, and the index is always self-healing (a lazy full rebuild runs on the first ask).
+// The chunk table is a DERIVED cache of public posts. Authoring writes update it best-effort so a
+// cache failure can never break the authoritative post save. Search and Ask incrementally repair a
+// bounded number of missing/outdated public post versions, then read only chunks that still JOIN to
+// a currently public post with the same `updated_at`. A failed cleanup therefore cannot leak a
+// draft or stale body, and a request never rebuilds the complete corpus.
 
 /// (Re)index a single post. A PUBLISHED post is chunked into the index; a DRAFT (or any unpublished
 /// post) is de-indexed so it never surfaces in an answer. Best-effort: errors are logged only.
 pub async fn reindex_post(store: &dyn Store, post: &Post) {
     let now = now_secs();
     let chunks = if post.is_public_at(now) {
-        index::build_post_chunks(&post.slug, &post.title, &post.body_md, now)
+        index::build_post_chunks(&post.slug, &post.title, &post.body_md, post.updated_at)
     } else {
         Vec::new()
     };
@@ -249,22 +253,44 @@ pub async fn deindex_post(store: &dyn Store, slug: &str) {
     }
 }
 
-/// Full lazy rebuild: chunk every published post into a fresh index. Returns the chunk count.
-/// Triggered on the first ask when the index is empty, so the feature works without an explicit
-/// reindex step.
+/// Return the bounded, visibility-validated public chunk snapshot used by Search and Ask.
+///
+/// Refresh and read failures are fail-closed and propagate to a 5xx; the existing cache is never
+/// replaced wholesale. Store implementations enforce visibility and `updated_at` again at read
+/// time, so stale Draft/future/old-body rows cannot enter a result even when cleanup failed.
+pub async fn public_index_snapshot(store: &dyn Store) -> Result<Vec<Chunk>, store::StoreError> {
+    let now = now_secs();
+    store
+        .refresh_public_chunks(now, config::INDEX_REFRESH_POST_LIMIT)
+        .await?;
+    store
+        .fetch_public_chunks(now, config::INDEX_CHUNK_LIMIT)
+        .await
+}
+
+/// Incrementally fill every missing public post version, then return the bounded valid chunk count.
+/// This explicit maintenance helper may loop; request handlers call [`public_index_snapshot`] once.
 pub async fn build_full_index(store: &dyn Store) -> i64 {
     let now = now_secs();
-    let mut chunks = Vec::new();
-    for p in store.list_posts(None, crate::config::MAX_PAGE).await {
-        if p.is_public_at(now) {
-            chunks.extend(index::build_post_chunks(&p.slug, &p.title, &p.body_md, now));
+    loop {
+        match store
+            .refresh_public_chunks(now, config::INDEX_REFRESH_POST_LIMIT)
+            .await
+        {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, "full public index refresh failed");
+                return 0;
+            }
         }
     }
-    match store.replace_all_chunks(chunks).await {
-        Ok(n) => n,
-        Err(e) => {
-            tracing::warn!(error = %e, "build_full_index failed (continuing)");
+    store
+        .fetch_public_chunks(now, config::INDEX_CHUNK_LIMIT)
+        .await
+        .map(|chunks| chunks.len() as i64)
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "full public index validated read failed");
             0
-        }
-    }
+        })
 }

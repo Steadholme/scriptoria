@@ -131,7 +131,9 @@ async fn call(state: &AppState, uri: &str) -> (StatusCode, String, String) {
 async fn create(state: &AppState, title: &str, body: &str, published: bool) {
     let mut pairs = vec![("title", title), ("body", body), ("csrf_token", CSRF)];
     if published {
-        pairs.push(("published", "on"));
+        pairs.push(("intent", "publish_now"));
+    } else {
+        pairs.push(("intent", "save_draft"));
     }
     let form = pairs
         .iter()
@@ -157,7 +159,7 @@ async fn create_scheduled(state: &AppState, title: &str, body: &str) {
         ("title", title),
         ("body", body),
         ("publish_at", future.as_str()),
-        ("published", "on"),
+        ("intent", "schedule"),
         ("csrf_token", CSRF),
     ]
     .iter()

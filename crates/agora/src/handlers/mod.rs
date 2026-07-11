@@ -9,6 +9,7 @@ pub mod admin;
 pub mod forum;
 pub mod health;
 pub mod insight;
+pub mod search;
 
 use axum::http::HeaderMap;
 use std::sync::OnceLock;
@@ -69,7 +70,11 @@ pub(crate) fn ag_initial(s: &str) -> String {
 /// Render a full page: fill the shell with the inlined CSS, the (raw) title, the Odyssey v2
 /// app-bar (brand tile + forum nav + avatar user-menu), and the already-built content HTML.
 pub fn render_page(title: &str, email_display: &str, content: &str) -> String {
-    let active = if title == "New thread" { "new" } else { "home" };
+    let active = match title {
+        "New thread" => "new",
+        "Search" => "search",
+        _ => "home",
+    };
     SHELL
         .replace("{{STYLE}}", app_css())
         .replace("{{DYNAMIC}}", dynamic_js())
@@ -95,6 +100,15 @@ pub fn app_bar(active: &str, email_display: &str) -> String {
         a_home = if active == "home" { " is-active" } else { "" },
         a_new = if active == "new" { " is-active" } else { "" },
     );
+    let quick_search = format!(
+        r#"<form class="ag-quick-search{active}" method="get" action="/search" role="search" aria-label="Quick search" data-ag-quick-search>
+  <button class="ag-quick-search__submit" type="submit" aria-label="Search discussions"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg></button>
+  <input id="ag-quick-search-input" type="search" name="q" maxlength="160" placeholder="Search discussions" autocomplete="off" role="combobox" aria-label="Search discussions" aria-autocomplete="list" aria-haspopup="listbox" aria-controls="ag-quick-search-results" aria-expanded="false">
+  <kbd class="ag-quick-search__key" aria-hidden="true">/</kbd>
+  <div id="ag-quick-search-results" class="ag-quick-search__results" role="listbox" aria-label="Search suggestions" data-ag-search-results hidden></div>
+</form>"#,
+        active = if active == "search" { " is-active" } else { "" },
+    );
     format!(
         r#"<header class="appbar">
   <a class="appbar__brand" href="/" aria-label="HOLDFAST Agora home">
@@ -102,11 +116,13 @@ pub fn app_bar(active: &str, email_display: &str) -> String {
     <span class="appbar__name"><b>Forum</b><span>forum.w33d.xyz</span></span>
   </a>
   {nav}
+  {quick_search}
   <span class="appbar__spacer"></span>
   <div class="appbar__right">{right}</div>
 </header>"#,
         icon = APP_ICON,
         nav = nav,
+        quick_search = quick_search,
         right = user_menu(email_display),
     )
 }

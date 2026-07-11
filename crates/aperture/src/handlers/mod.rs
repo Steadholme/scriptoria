@@ -14,12 +14,22 @@ pub mod admin;
 pub mod files;
 pub mod health;
 
-use axum::http::StatusCode;
-use axum::response::Html;
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::{Html, IntoResponse, Response};
 use std::sync::OnceLock;
 
 /// Aperture-only CSS layered after Odyssey's canonical font, tokens, and components.
 pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
+
+/// Product-owned public Share Room assets. These intentionally do not include Odyssey CSS,
+/// Components, Shell, Wire, Spark, or Motion: the anonymous capability surface owns its DOM and
+/// runtime end-to-end.
+pub const SHARE_ROOM_CSS: &str = include_str!("../../static/share-room.css");
+pub const SHARE_ROOM_JS: &str = include_str!("../../static/share-room.js");
+
+/// Executable policy for every anonymous Share Room HTML response. Assets are same-origin routes;
+/// uploads use same-origin XHR, and no inline script/style is permitted.
+pub const SHARE_ROOM_CSP: &str = "default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 
 static APP_CSS: OnceLock<String> = OnceLock::new();
 static DYNAMIC_JS: OnceLock<String> = OnceLock::new();
@@ -43,6 +53,58 @@ pub fn dynamic_js() -> &'static str {
         .as_str()
 }
 
+/// Wrap product-owned public HTML with its strict CSP and anti-embedding/referrer posture.
+pub fn share_room_html(status: StatusCode, body: String) -> Response {
+    let mut response = (status, Html(body)).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(SHARE_ROOM_CSP),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    response
+}
+
+/// Public upload-room HTML plus the stable double-submit cookie used by its form.
+pub fn share_room_html_with_csrf(status: StatusCode, body: String, csrf: &str) -> Response {
+    let mut response = share_room_html(status, body);
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&crate::auth::csrf_cookie(csrf))
+            .expect("generated CSRF cookie is a valid header value"),
+    );
+    response
+}
+
+fn share_room_asset(content_type: &'static str, body: &'static str) -> Response {
+    let mut response = body.into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=300"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
+/// Product-owned, public, read-only Share Room stylesheet.
+pub async fn share_room_css_asset() -> Response {
+    share_room_asset("text/css; charset=utf-8", SHARE_ROOM_CSS)
+}
+
+/// Product-owned, public, read-only Share Room runtime.
+pub async fn share_room_js_asset() -> Response {
+    share_room_asset("text/javascript; charset=utf-8", SHARE_ROOM_JS)
+}
+
 /// The HOLDFAST shield glyph (small, for the app-bar brand lockup).
 pub const SHIELD_SVG: &str = r##"<svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="hf-shield-sm" x1="8" y1="4" x2="40" y2="44" gradientUnits="userSpaceOnUse"><stop stop-color="#818CF8"/><stop offset="1" stop-color="#4F46E5"/></linearGradient></defs><path d="M24 4 8 9.5V22c0 11 7 17.4 16 21.5C33 39.4 40 33 40 22V9.5L24 4Z" fill="url(#hf-shield-sm)"/><rect x="20" y="19" width="8" height="13" rx="1" fill="#fff" fill-opacity="0.92"/><path d="M20 19v-2.5a4 4 0 0 1 8 0V19" stroke="#fff" stroke-width="2" stroke-opacity="0.92" fill="none"/></svg>"##;
 
@@ -54,6 +116,7 @@ pub const LOGOUT_URL: &str = "https://sso.w33d.xyz/_gw/auth/logout";
 
 /// Branded error page shell.
 const ERROR_HTML: &str = include_str!("../../templates/error.html");
+const SHARE_ERROR_HTML: &str = include_str!("../../templates/share_error.html");
 
 /// The share-link expiry menu: `(form value, label)`. A numeric value is a TTL in seconds;
 /// `never` keeps the share link forever. The fixed list is a trusted allow-list (reused from
@@ -271,6 +334,17 @@ pub fn render_error(
         .replace("{{HEADING}}", &esc(heading))
         .replace("{{MESSAGE}}", &esc(message));
     (status, Html(body))
+}
+
+/// Render an anonymous capability error without importing the signed-in Odyssey shell. Internal
+/// details are supplied by the caller only after it has collapsed backend failures to a generic
+/// message.
+pub fn render_share_room_error(status: StatusCode, heading: &str, message: &str) -> Response {
+    let body = SHARE_ERROR_HTML
+        .replace("{{STATUS}}", &status.as_u16().to_string())
+        .replace("{{HEADING}}", &esc(heading))
+        .replace("{{MESSAGE}}", &esc(message));
+    share_room_html(status, body)
 }
 
 /// Minimal HTML escaping for text/attribute interpolation.
