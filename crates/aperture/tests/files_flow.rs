@@ -147,6 +147,30 @@ impl Resp {
     }
 }
 
+fn assert_drive_current(html: &str, href: &str) {
+    let nav = html
+        .split_once("<nav class=\"ap-nav\"")
+        .expect("Drive rail nav")
+        .1
+        .split_once("</nav>")
+        .expect("Drive rail nav close")
+        .0;
+    assert_eq!(
+        nav.matches("aria-current=\"page\"").count(),
+        1,
+        "exactly one Drive rail destination is current"
+    );
+    let marker = format!("href=\"{href}\"");
+    let current_link = nav
+        .split("</a>")
+        .find(|link| link.contains(&marker))
+        .unwrap_or_else(|| panic!("Drive rail contains {href}"));
+    assert!(
+        current_link.contains("aria-current=\"page\""),
+        "{href} is the one current Drive rail destination"
+    );
+}
+
 async fn send(app: &axum::Router, req: Request<Body>) -> Resp {
     let res = app.clone().oneshot(req).await.unwrap();
     let status = res.status();
@@ -1755,6 +1779,7 @@ async fn library_control_plane_is_url_backed_cross_tree_and_owner_scoped() {
     assert!(search_html.contains("Quarterly Report"));
     assert!(search_html.contains("q=Quarterly%20Report&amp;type=image&amp;before="));
     assert!(search_html.contains("&amp;limit=1"));
+    assert_drive_current(&search_html, "/");
 
     let folders = send(&app, get("/?q=Quarterly&type=folder", Some("alice"))).await;
     assert_eq!(folders.status, StatusCode::OK);
@@ -1792,6 +1817,7 @@ async fn library_control_plane_is_url_backed_cross_tree_and_owner_scoped() {
     let shared = send(&app, get("/?view=shared", Some("alice"))).await;
     assert_eq!(shared.status, StatusCode::OK);
     let shared_html = shared.text();
+    assert_drive_current(&shared_html, "/?view=shared");
     assert!(shared_html.contains("Shared by me"));
     assert!(shared_html.contains("Expired"));
     assert!(shared_html.contains("Password"));
@@ -1802,8 +1828,10 @@ async fn library_control_plane_is_url_backed_cross_tree_and_owner_scoped() {
 
     let recent = send(&app, get("/?view=recent", Some("alice"))).await;
     assert_eq!(recent.status, StatusCode::OK);
-    assert!(recent.text().contains("Quarterly Report detail.png"));
-    assert!(recent.text().contains("Quarterly Intake"));
+    let recent_html = recent.text();
+    assert_drive_current(&recent_html, "/?view=recent");
+    assert!(recent_html.contains("Quarterly Report detail.png"));
+    assert!(recent_html.contains("Quarterly Intake"));
 }
 
 #[tokio::test]
@@ -2143,11 +2171,76 @@ async fn bulk_forms_work_without_js_and_reject_csrf_foreign_or_oversized_batches
 
     let gallery = send(&app, get("/", Some("alice"))).await;
     let html = gallery.text();
-    assert!(html.contains("id=\"bulkSelection\""));
+    assert_drive_current(&html, "/");
+    let wire_followup = send(
+        &app,
+        get_with_cookie("/?view=recent", Some("alice"), &alice_csrf),
+    )
+    .await;
+    assert_eq!(
+        wire_followup.csrf_cookie().as_deref(),
+        Some(alice_csrf.as_str()),
+        "gallery GETs retain the current token so a partial Wire delete cannot stale other forms"
+    );
+    assert!(wire_followup
+        .text()
+        .contains(&format!("name=\"csrf_token\" value=\"{alice_csrf}\"")));
+    assert_eq!(
+        html.matches("id=\"bulkSelection\"").count(),
+        1,
+        "the no-JS selection form has one stable owner"
+    );
     assert!(html.contains(&format!("name=\"item:file:{alice_file}\"")));
     assert!(html.contains("form=\"bulkSelection\""));
     assert!(html.contains("formaction=\"/items/move\""));
     assert!(html.contains("formaction=\"/items/trash\""));
+    assert!(html.contains("data-bulk-actions"));
+    assert!(html.contains("data-bulk-anchor hidden"));
+    assert!(html.contains("Choose items below, then use these actions."));
+    assert!(html.contains("data-bulk-select-all aria-pressed=\"false\" hidden"));
+    assert!(
+        html.find("<div class=\"drive-content\"").unwrap()
+            < html.find("<aside class=\"folder-rail").unwrap(),
+        "content and results precede the heavy rail in source/mobile order"
+    );
+    assert!(html.contains(r#"data-wire-nav=".drive-layout""#));
+    assert!(html.contains("grid-template-areas:\"content rail\""));
+    assert!(html.contains("grid-template-areas:\"content\" \"rail\""));
+    assert!(html.contains("document.addEventListener('odyssey:swap'"));
+    assert!(html.contains("initUpload(event.target)"));
+    assert!(html.contains("Promise.resolve().then(function () { syncNav(swapUrl); });"));
+    assert!(html.contains("var knownView = currentView === 'recent'"));
+    assert!(html.contains("current.searchParams.get('folder')"));
+    let wire_after = html
+        .split_once("document.addEventListener('wire:after', function ()")
+        .expect("Drive product wire:after handler")
+        .1
+        .split_once("window.addEventListener('resize'")
+        .expect("Drive product wire:after boundary")
+        .0;
+    assert!(wire_after.contains("syncNav(location.href)"));
+    assert!(!wire_after.contains("event.detail"));
+    assert!(
+        !wire_after.contains("recount"),
+        "view navigation must retain the server-rendered item count"
+    );
+    assert!(html.contains("form.classList.contains('trash-form')"));
+    assert_eq!(html.matches("setTimeout(recount").count(), 2);
+    assert!(html.contains("function initUploadDrop()"));
+    assert!(html.contains("function currentUpload()"));
+    assert!(html.contains("if (!current.zone || !current.input)"));
+    assert!(html.contains("Open My Drive to upload files"));
+    assert!(html.contains("document.body.classList.remove('is-dragging')"));
+    assert!(html.contains("label.insertAdjacentElement('afterend', form)"));
+    assert!(html.contains("has-mobile-bulk-owner"));
+    assert!(
+        html.contains(".page-console .appbar__nav"),
+        "Files and Requests remain visible in the 390px app shell"
+    );
+    assert!(html.contains(".ap-bulk.is-enhanced.has-selection"));
+    assert!(html.contains(".page-console.has-bulk-selection .drive-content"));
+    assert!(html.contains("overscroll-behavior:contain"));
+    assert!(html.contains("border-left:0"));
 
     let bad_csrf = send(
         &app,
@@ -2330,6 +2423,19 @@ async fn trash_restore_and_purge_lifecycle() {
     let store: Arc<dyn Store> = state.store.clone();
     let blobs: Arc<dyn Blobs> = state.blobs.clone();
     let app = app(state);
+    let empty_trash = send(&app, get("/?view=trash", Some("alice"))).await;
+    assert_eq!(empty_trash.status, StatusCode::OK);
+    let empty_html = empty_trash.text();
+    assert_drive_current(&empty_html, "/?view=trash");
+    assert!(empty_html.contains("id=\"filesLabel\">Items</h2>"));
+    assert!(empty_html.contains("No items"));
+    assert!(empty_html.contains(
+        "Deleted files and folders can be restored for up to 30 days unless you delete them forever sooner."
+    ));
+    assert!(!empty_html.contains("<form class=\"ap-library-search\""));
+    assert!(!empty_html.contains("id=\"libraryQuery\""));
+    assert!(!empty_html.contains("id=\"newFolder\""));
+
     let (id, csrf) = upload_png(&app, "alice").await;
     let token = enable_file_share(&app, &store, &id, "alice", &csrf).await;
     let rec = store.get(&id).await.unwrap().unwrap();
@@ -2347,6 +2453,31 @@ async fn trash_restore_and_purge_lifecycle() {
     assert_eq!(del.status, StatusCode::FOUND);
     assert!(store.get(&id).await.unwrap().unwrap().trashed_at > 0);
     assert_eq!(store.usage_for_owner("alice").await.unwrap(), rec.size);
+    let trash_page = send(&app, get("/?view=trash", Some("alice"))).await;
+    let trash_html = trash_page.text();
+    assert!(trash_html.contains("id=\"filesLabel\">Items</h2>"));
+    assert!(trash_html.contains("class=\"file-card__meta ap-trash-meta\""));
+    assert!(trash_html.contains("File ·"));
+    assert!(trash_html.contains("Eligible for automatic deletion after <time"));
+    assert!(!trash_html.contains("Permanently deleted <time"));
+    assert!(trash_html
+        .contains(".gallery-grid:not(.is-list) .file-card--trash .ap-trash-meta"));
+    assert!(trash_html.contains(".file-card:has(.card-menu[open])"));
+    assert!(trash_html.contains("z-index:25;"));
+    assert!(trash_html.contains("overflow:visible;"));
+    assert!(trash_html.contains("bottom:30px;"));
+    assert!(trash_html.contains(".gallery-grid.is-list:has(.card-menu[open])"));
+    assert!(!trash_html.contains("class=\"card-menu__pop\" role=\"menu\""));
+    assert!(trash_html.contains(
+        ".gallery-grid.is-list .file-card--trash .file-card__body"
+    ));
+    assert!(trash_html.contains(
+        ".gallery-grid.is-list .file-card--trash .ap-date { display:inline; }"
+    ));
+    assert!(trash_html.contains(
+        "Trashed files and folders stay in storage and count toward quota until deleted forever."
+    ));
+    assert!(!trash_html.contains("<form class=\"ap-library-search\""));
     assert!(send(&app, get("/", Some("alice")))
         .await
         .text()
@@ -2941,6 +3072,7 @@ async fn folder_tree_subfolders_breadcrumb_and_scoped_upload() {
 
     // Parent view: breadcrumb back to My Drive, the Child tile, and an Up-to-root tile.
     let pv = send(&app, get(&format!("/?folder={pfid}"), Some("alice"))).await;
+    assert_drive_current(&pv.text(), &format!("/?folder={pfid}"));
     assert!(pv.text().contains("breadcrumb"));
     assert!(
         pv.text().contains(">My Drive<"),
@@ -3072,6 +3204,12 @@ async fn folder_trash_restore_and_purge_preserves_then_frees_subtree_blobs() {
     assert!(blobs.get(&deep_key).await.is_ok(), "Trash retains the blob");
     let trash = send(&app, get("/?view=trash", Some("alice"))).await;
     assert!(trash.text().contains("Parent"));
+    assert!(trash.text().contains("Folder · Contents recover together"));
+    assert!(
+        trash
+            .text()
+            .contains("Eligible for automatic deletion after <time")
+    );
     assert!(
         !trash.text().contains("Child</"),
         "descendants are deduplicated"

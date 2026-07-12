@@ -70,11 +70,19 @@ input[type=url], input[type=datetime-local], input[type=date], textarea, select 
 .ap-bulk__destination { display:flex; align-items:center; gap:7px; color:var(--ink-3, #667085); font-size:12px; font-weight:700; }
 .ap-bulk__destination select { min-width:150px; min-height:34px; border-radius:9px; }
 .ap-bulk button:disabled { opacity:.45; cursor:not-allowed; }
-.gallery-grid.is-list .ap-select { position:static; grid-column:1; align-self:center; }
-.gallery-grid.is-list .file-card { grid-template-columns:28px 40px minmax(0,1fr) 110px 84px 34px; }
-.gallery-grid.is-list .file-card__link { grid-column:2; }
-.gallery-grid.is-list .file-card__body { grid-column:3 / -1; }
-
+.ap-bulk__actions[hidden] { display:none; }
+.ap-bulk.is-enhanced:not(.has-selection) {
+  position:static;
+  min-height:38px;
+  margin:4px 0 14px;
+  padding:4px 0;
+  border-color:transparent;
+  background:transparent;
+  box-shadow:none;
+  backdrop-filter:none;
+}
+.ap-bulk.is-enhanced:not(.has-selection) .ap-bulk__count { color:var(--ink-3); }
+.ap-bulk.is-enhanced.has-selection { border-color:color-mix(in srgb, var(--brand) 24%, var(--border)); }
 @media (max-width:640px) {
   .ap-bulk { top:6px; align-items:stretch; }
   .ap-bulk__actions { width:100%; margin-inline-start:0; }
@@ -416,7 +424,7 @@ body.page { max-width:none; margin:0; padding:0; }
 .card-menu__btn::-webkit-details-marker { display:none; }
 .file-card:hover .card-menu__btn, .card-menu[open] .card-menu__btn, .card-menu:focus-within .card-menu__btn, .card-menu__btn:focus-visible { opacity:1; }
 .card-menu__btn:hover { color:var(--ink); }
-.card-menu__pop { position:absolute; top:30px; right:0; z-index:20; width:236px; background:var(--surface); border:1px solid var(--border); border-radius:var(--r-sm); box-shadow:var(--sh-pop); padding:10px; display:flex; flex-direction:column; gap:10px; }
+.card-menu__pop { position:absolute; top:auto; right:0; bottom:30px; z-index:20; width:236px; background:var(--surface); border:1px solid var(--border); border-radius:var(--r-sm); box-shadow:var(--sh-pop); padding:10px; display:flex; flex-direction:column; gap:10px; }
 .card-menu__form { display:flex; gap:6px; margin:0; }
 .rename-form__input { flex:1 1 auto; min-width:0; }
 
@@ -680,26 +688,74 @@ body.is-dragging .ap-dropscrim { display:grid; }
   display:flex; flex-direction:column; gap:0; border:1px solid var(--border);
   border-radius:var(--r); background:var(--surface); overflow:hidden;
 }
+.gallery-grid.is-list:has(.card-menu[open]) { overflow:visible; }
 .gallery-grid.is-list .file-card {
   display:grid; grid-template-columns:40px minmax(0,1fr) 150px 84px 132px 34px;
   gap:12px; align-items:center; padding:10px 12px; border:0; border-radius:0; box-shadow:none;
 }
 .gallery-grid.is-list .file-card + .file-card { border-top:1px solid var(--hairline); }
 .gallery-grid.is-list .file-card:hover { background:var(--surface-2); box-shadow:none; transform:none; }
-.gallery-grid.is-list .file-card__link { width:40px; height:40px; grid-column:1; }
+.gallery-grid.is-list .file-card__link { width:40px; height:40px; }
 .gallery-grid.is-list .thumb { width:40px; height:40px; border-radius:var(--r-xs); }
-.gallery-grid.is-list .file-card__body,
-.gallery-grid.is-list .file-card__meta { display:contents; }
-.gallery-grid.is-list .ap-name-row { grid-column:2; }
-.gallery-grid.is-list .ap-badges { grid-column:3; }
-.gallery-grid.is-list .ap-size { grid-column:4; }
-.gallery-grid.is-list .ap-date { grid-column:5; color:var(--ink-3); font-size:12px; }
-.gallery-grid.is-list .card-menu { position:static; grid-column:6; justify-self:end; }
+.gallery-grid.is-list .ap-date { color:var(--ink-3); font-size:12px; }
 .gallery-grid.is-list .card-menu__btn { opacity:1; }
-.gallery-grid.is-list .file-card--folder { grid-template-columns:40px minmax(0,1fr) 34px; }
-.gallery-grid.is-list .file-card--folder .file-card__body { display:flex; grid-column:2; border:0; padding:0; }
-.gallery-grid.is-list .file-card--trash { grid-template-columns:40px minmax(0,1fr) 132px auto; }
 .gallery-grid.is-list .file-card--empty { display:block; }
+
+/* Selection is a real leading control, so list rows use one compact DOM-faithful layout instead
+   of flattening each metadata child into a brittle table with display:contents. */
+.ap-list-head {
+  grid-template-columns:28px 40px minmax(0,1fr) auto;
+}
+.ap-list-head > :first-child { grid-column:1 / 3; }
+.ap-list-head > :nth-child(2) { grid-column:3; }
+.ap-list-head [data-col="shared"],
+.ap-list-head [data-col="size"],
+.ap-list-head [data-col="modified"] { display:none; }
+.ap-list-head > :last-child { grid-column:4; }
+.gallery-grid.is-list .file-card,
+.gallery-grid.is-list .file-card--folder,
+.gallery-grid.is-list .file-card--trash {
+  grid-template-columns:28px 40px minmax(0,1fr) auto;
+  min-height:64px;
+}
+.gallery-grid.is-list .ap-select { position:static; grid-column:1; align-self:center; }
+.gallery-grid.is-list .file-card__link,
+.gallery-grid.is-list .file-card--trash > .thumb { grid-column:2; }
+.gallery-grid.is-list .file-card--trash .thumb--file {
+  min-height:40px;
+  height:40px;
+}
+.gallery-grid.is-list .file-card__body,
+.gallery-grid.is-list .file-card--folder .file-card__body,
+.gallery-grid.is-list .file-card--trash .file-card__body {
+  display:grid;
+  grid-template-columns:minmax(0,1fr) auto;
+  grid-column:3 / -1;
+  gap:5px 12px;
+  align-items:center;
+  min-width:0;
+  padding:0;
+  border:0;
+}
+.gallery-grid.is-list .ap-name-row,
+.gallery-grid.is-list .file-card--trash .file-card__name { grid-column:1; }
+.gallery-grid.is-list .file-card__meta,
+.gallery-grid.is-list .ap-trash-meta {
+  display:flex;
+  grid-column:1;
+  gap:5px 12px;
+  align-items:center;
+  flex-wrap:wrap;
+  min-width:0;
+}
+.gallery-grid.is-list .card-menu,
+.gallery-grid.is-list .trash-actions {
+  position:static;
+  grid-column:2;
+  grid-row:1 / span 2;
+  align-self:center;
+  justify-self:end;
+}
 
 /* ============================================================================
    S6 cards
@@ -742,6 +798,8 @@ body.is-dragging .ap-dropscrim { display:grid; }
 .file-card--folder:hover .ap-folder-cue { transform:translateX(2px); color:var(--brand-ink); }
 .file-card--trash .thumb--file { min-height:120px; }
 .file-card--trash .trash-actions { justify-content:flex-start; }
+.ap-trash-meta { display:grid; gap:5px; align-items:start; }
+.ap-trash-meta__recovery { color:var(--brand-ink); font-weight:650; }
 
 /* ============================================================================
    S7 detail
@@ -876,14 +934,28 @@ body.is-dragging .ap-dropscrim { display:grid; }
 }
 @media (max-width:720px) {
   .ap-toolbar { grid-template-columns:1fr; align-items:start; }
-  .ap-list-head.is-list { grid-template-columns:40px minmax(0,1fr) 84px 34px; }
+  .ap-list-head.is-list { grid-template-columns:28px 36px minmax(0,1fr) 34px; }
   .ap-list-head [data-col="shared"],
+  .ap-list-head [data-col="size"],
   .ap-list-head [data-col="modified"] { display:none; }
-  .gallery-grid.is-list .file-card { grid-template-columns:40px minmax(0,1fr) 84px 34px; }
+  .gallery-grid.is-list .file-card,
+  .gallery-grid.is-list .file-card--folder,
+  .gallery-grid.is-list .file-card--trash {
+    grid-template-columns:28px 36px minmax(0,1fr) 34px;
+  }
+  .gallery-grid.is-list .file-card__body,
+  .gallery-grid.is-list .file-card--folder .file-card__body,
+  .gallery-grid.is-list .file-card--trash .file-card__body { grid-column:3 / -1; }
   .gallery-grid.is-list .ap-badges,
   .gallery-grid.is-list .ap-date { display:none; }
-  .gallery-grid.is-list .ap-size { grid-column:3; }
-  .gallery-grid.is-list .card-menu { grid-column:4; }
+  .gallery-grid.is-list .card-menu { grid-column:2; }
+  .gallery-grid.is-list .file-card--trash .file-card__body { grid-template-columns:1fr; }
+  .gallery-grid.is-list .file-card--trash .trash-actions {
+    grid-column:1;
+    grid-row:auto;
+    justify-self:start;
+  }
+  .gallery-grid.is-list .file-card--trash .ap-date { display:inline; }
 }
 @media (max-width:640px) {
   .console__head.ap-drivehead,
@@ -904,11 +976,13 @@ body.is-dragging .ap-dropscrim { display:grid; }
 }
 .console--drive .drive-layout {
   display:grid;
-  grid-template-columns:260px minmax(0, 1fr);
+  grid-template-columns:minmax(0, 1fr) 260px;
+  grid-template-areas:"content rail";
   gap:0;
   min-height:calc(100vh - var(--appbar-h, 56px));
 }
 .folder-rail.ap-rail {
+  grid-area:rail;
   position:sticky;
   top:var(--appbar-h, 56px);
   height:calc(100vh - var(--appbar-h, 56px));
@@ -919,13 +993,18 @@ body.is-dragging .ap-dropscrim { display:grid; }
   padding:18px 14px;
   overflow:auto;
   border:0;
-  border-right:1px solid var(--border);
+  border-left:1px solid var(--border);
   border-radius:0;
   background:var(--surface);
   box-shadow:none;
 }
 .ap-rail__top { flex:0 0 auto; }
-.ap-rail__nav { flex:1 1 auto; min-height:0; }
+.ap-rail__nav {
+  flex:1 1 auto;
+  min-height:0;
+  overflow:auto;
+  overscroll-behavior:contain;
+}
 .ap-rail__bottom {
   flex:0 0 auto;
   margin-top:auto;
@@ -1090,6 +1169,7 @@ body.is-dragging .ap-dropscrim { display:grid; }
   background:var(--surface-2);
 }
 .drive-content {
+  grid-area:content;
   min-width:0;
   padding:22px 32px 64px;
 }
@@ -1265,6 +1345,15 @@ body.is-dragging .ap-dropscrim { display:grid; }
   overflow:hidden;
   transform:translateY(0);
 }
+.file-card:has(.card-menu[open]) {
+  position:relative;
+  z-index:25;
+  overflow:visible;
+}
+.gallery-grid:not(.is-list) .file-card:has(.card-menu[open]) .file-card__link {
+  overflow:hidden;
+  border-radius:calc(var(--r-sm) - 1px) calc(var(--r-sm) - 1px) 0 0;
+}
 .file-card:hover {
   border-color:color-mix(in srgb, var(--brand) 26%, var(--border));
   box-shadow:var(--sh-md);
@@ -1334,6 +1423,10 @@ body.is-dragging .ap-dropscrim { display:grid; }
   border-top:1px solid var(--hairline);
 }
 .gallery-grid:not(.is-list) .file-card__meta { display:none; }
+.gallery-grid:not(.is-list) .file-card--trash .ap-trash-meta {
+  display:grid;
+  margin-top:8px;
+}
 .gallery-grid:not(.is-list) .ap-library-item .file-card__meta {
   display:flex;
   margin-top:8px;
@@ -1525,10 +1618,14 @@ body.has-preview { overflow:hidden; }
 .request-policy small { min-width:0; overflow-wrap:anywhere; }
 
 @media (max-width:900px) {
-  .console--drive .drive-layout { grid-template-columns:1fr; }
+  .console--drive .drive-layout {
+    grid-template-columns:1fr;
+    grid-template-areas:"content" "rail";
+  }
   .folder-rail.ap-rail {
     position:static;
     height:auto;
+    border-left:0;
     border-right:0;
     border-bottom:1px solid var(--border);
   }
@@ -1536,6 +1633,30 @@ body.has-preview { overflow:hidden; }
   .drive-content { padding:20px 18px 54px; }
 }
 @media (max-width:720px) {
+  .page-console .appbar {
+    gap:8px;
+    padding-inline:10px;
+  }
+  .page-console .appbar__brand { gap:7px; }
+  .page-console .appbar__name span { display:none; }
+  .page-console .appbar__nav {
+    display:flex;
+    gap:0;
+    margin-left:0;
+  }
+  .page-console .appnav {
+    height:32px;
+    padding-inline:8px;
+    font-size:12.5px;
+  }
+  .page-console .appnav svg,
+  .page-console .appbar__right .allapps,
+  .page-console .usermenu__caret { display:none; }
+  .page-console .usermenu__btn {
+    width:36px;
+    padding:0;
+    justify-content:center;
+  }
   .request-policy { grid-template-columns:1fr; }
   .request-create-row { grid-template-columns:1fr; }
   .request-receipt { align-items:flex-start; flex-direction:column; }
@@ -1556,6 +1677,35 @@ body.has-preview { overflow:hidden; }
   .ap-library-search__field { grid-column:1/-1; }
   .ap-library-search select { width:100%; }
   .ap-library-search .btn { width:100%; }
+  .ap-bulk.is-enhanced.has-selection {
+    position:fixed;
+    inset:auto 10px max(10px, env(safe-area-inset-bottom));
+    z-index:80;
+    max-height:min(58vh, 360px);
+    margin:0;
+    padding:10px;
+    overflow:auto;
+    border-radius:16px;
+    box-shadow:var(--sh-pop);
+  }
+  .ap-bulk.is-enhanced.has-selection .ap-bulk__actions {
+    display:grid;
+    grid-template-columns:minmax(0,1fr) minmax(0,1fr);
+    width:100%;
+    margin-inline-start:0;
+  }
+  .ap-bulk.is-enhanced.has-selection .ap-bulk__destination {
+    grid-column:1 / -1;
+    display:grid;
+    grid-template-columns:auto minmax(0,1fr);
+  }
+  .ap-bulk.is-enhanced.has-selection .ap-bulk__destination > span { white-space:nowrap; }
+  .ap-bulk.is-enhanced.has-selection .ap-bulk__destination select {
+    width:100%;
+    min-width:0;
+  }
+  .has-mobile-bulk-owner { transform:none !important; }
+  .page-console.has-bulk-selection .drive-content { padding-bottom:210px; }
   .folder-grid,
   .gallery-grid { grid-template-columns:1fr; }
   .ap-preview {

@@ -128,6 +128,8 @@ async fn thread_summary_endpoint_and_card() {
     assert_eq!(status, StatusCode::OK);
     assert!(page.contains("Thread summary"), "summary card present");
     assert!(page.contains("summary__list"));
+    assert!(page.contains("Top sentences from posts visible on this page"));
+    assert!(!page.contains("Top sentences across this thread"));
     assert!(page.contains("Nightly export job failing"), "thread still renders");
     assert!(page.contains("1 reply"));
 }

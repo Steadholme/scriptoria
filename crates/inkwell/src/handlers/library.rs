@@ -91,12 +91,12 @@ pub async fn index(
         .as_ref()
         .map(|cursor| {
             format!(
-                r#"<nav class="ink-library__pager" aria-label="Content Library pages"><a class="btn btn-secondary" href="{}">Load older work</a></nav>"#,
+                r#"<nav class="ink-library__pager" aria-label="Author library pages"><a class="btn btn-secondary" href="{}">Load older work</a></nav>"#,
                 esc(&library_url(&view, Some(cursor)))
             )
         })
         .unwrap_or_default();
-    let status_options = render_status_options(view.status);
+    let status_tabs = render_status_tabs(&view);
     let result_summary = if page.posts.len() == 1 {
         "1 post on this page".to_string()
     } else {
@@ -109,7 +109,12 @@ pub async fn index(
         .replace("{{NOTICE}}", &notice)
         .replace("{{QUERY}}", &esc(&view.q))
         .replace("{{TAG}}", &esc(&view.tag))
-        .replace("{{STATUS_OPTIONS}}", &status_options)
+        .replace("{{STATUS_TABS}}", &status_tabs)
+        .replace("{{STATUS_KEY}}", status_key(view.status))
+        .replace(
+            "{{ADVANCED_OPEN}}",
+            if view.tag.is_empty() { "" } else { " open" },
+        )
         .replace("{{LIMIT}}", &view.limit.to_string())
         .replace("{{RESULT_SUMMARY}}", &result_summary)
         .replace("{{CSRF}}", &esc(&csrf))
@@ -122,10 +127,10 @@ pub async fn index(
             .and_then(|value| value.to_str().ok()),
     );
     let page = page_shell(PageShell {
-        head_title: "Content library · Inkwell",
+        head_title: "Studio · Inkwell",
         body_class: "page-console page-library",
         rss: false,
-        nav_title: "Library",
+        nav_title: "Studio",
         email: &email,
         is_admin: auth::is_admin(&headers),
         theme,
@@ -273,7 +278,7 @@ fn status_key(status: LibraryStatus) -> &'static str {
     }
 }
 
-fn render_status_options(selected: LibraryStatus) -> String {
+fn render_status_tabs(view: &ViewState) -> String {
     [
         (LibraryStatus::All, "All"),
         (LibraryStatus::Draft, "Draft"),
@@ -282,13 +287,27 @@ fn render_status_options(selected: LibraryStatus) -> String {
     ]
     .into_iter()
     .map(|(status, label)| {
+        let mut target = view.clone();
+        target.status = status;
+        target.cursor = None;
+        target.changed = 0;
         format!(
-            r#"<option value="{}"{}>{label}</option>"#,
-            status_key(status),
-            if status == selected { " selected" } else { "" },
+            r#"    <a class="ink-library__status-tab{}" href="{}"{}>{label}</a>"#,
+            if status == view.status {
+                " is-active"
+            } else {
+                ""
+            },
+            esc(&library_url(&target, None)),
+            if status == view.status {
+                r#" aria-current="page""#
+            } else {
+                ""
+            },
         )
     })
-    .collect()
+    .collect::<Vec<_>>()
+    .join("\n")
 }
 
 fn render_row(post: &Post, view: &ViewState, current_url: &str) -> String {
@@ -334,7 +353,7 @@ fn render_row(post: &Post, view: &ViewState, current_url: &str) -> String {
     };
     format!(
         r#"        <article class="ink-library__row" role="listitem">
-          <label class="ink-library__select"><input type="checkbox" name="items" form="library-bulk" value="{selection}" aria-label="Select {title}"></label>
+          <label class="ink-library__select"><input type="checkbox" name="items" form="library-bulk" value="{selection}" data-library-item aria-label="Select {title}"></label>
           <div class="ink-library__main">
             <div class="ink-library__titleline"><a href="{edit_href}">{title}</a><span class="ink-library__badges">{flags}</span></div>
             <p class="muted">Updated {updated}{schedule} · version {version}</p>

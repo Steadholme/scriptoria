@@ -24,6 +24,14 @@ async fn full_blog_flow_in_memory() {
     let (status, body) = call(&state, get("/")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("No posts yet"), "empty index placeholder");
+    assert!(body.contains(r#"aria-label="Blog sections""#));
+    assert!(body.contains(r#"href="/library""#));
+    assert!(body.contains(">Studio</a>"));
+    assert!(
+        !body.contains(r#"href="/new">New post"#)
+            && !body.contains(r#"href="/new">Write the first post"#),
+        "the public reader does not promote authoring"
+    );
 
     // --- GET /new sets a CSRF cookie ---------------------------------------
     let resp = app(state.clone()).oneshot(get("/new")).await.unwrap();

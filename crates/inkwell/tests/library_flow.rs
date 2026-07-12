@@ -58,14 +58,36 @@ async fn library_is_private_owner_scoped_and_composable_without_javascript() {
     let (status, headers, body) = call(&state, get("/library", "alice", None)).await;
     assert_eq!(status, StatusCode::OK);
     assert_private_no_store(&headers);
-    assert!(body.contains("Content library"));
+    assert!(body.contains("<h1>Studio</h1>"));
+    assert!(body.contains("Author library"));
     assert!(body.contains(r#"method="get" action="/library""#));
     assert!(body.contains(r#"method="post" action="/library/posts/bulk""#));
+    assert!(body.contains(r#"aria-label="Author library status""#));
+    assert!(body.contains(r#"data-select-page"#));
+    assert!(body.contains(r#"data-selection-count"#));
+    assert!(body.contains(r#"data-bulk-tag"#));
+    assert!(body.contains(r#"input[data-library-item]"#));
+    assert!(body.contains("bulk.hidden = selected === 0"));
+    assert!(body.contains(".ink-library__bulk[hidden] { display:none; }"));
+    assert!(body.contains("bulkTag.hidden = action.value !== 'add_tag'"));
+    assert!(body.contains("var MAX_SELECTION = 50"));
+    assert!(body.contains("Math.min(boxes.length, MAX_SELECTION)"));
+    assert!(body.contains("slice(MAX_SELECTION).forEach"));
+    assert!(body.contains("Select first 50"));
+    assert!(body.contains("maximum reached"));
+    assert!(body.contains("box.disabled = selectionLimitReached && !box.checked"));
+    assert!(body.contains("@media (max-width:340px)"));
+    assert!(body.contains(".appbar__nav .appnav { padding-inline:9px; font-size:13px; }"));
+    assert!(body.contains(".appbar__nav .appnav svg { display:none; }"));
+    assert!(body.contains(".ink-library .ink-library__status-tab { padding-inline:6px; }"));
+    assert!(body.contains("Every selected version is checked"));
     assert!(body.contains("alice-published"));
     assert!(body.contains("alice-draft-needle"));
     assert!(body.contains("alice-scheduled"));
     assert!(!body.contains("bob-private-needle"));
-    assert!(body.contains(r#"appnav is-active" href="/library""#));
+    assert!(body.contains(
+        r#"class="appnav appnav--studio is-active" href="/library" aria-current="page""#
+    ));
     let (_, _, first_page) = call(
         &state,
         get(&format!("/library?as_of={now}&limit=1"), "alice", None),
@@ -85,7 +107,12 @@ async fn library_is_private_owner_scoped_and_composable_without_javascript() {
     assert!(!filtered.contains("alice-scheduled"));
     assert!(!filtered.contains("bob-private-needle"));
     assert!(filtered.contains(r#"name="q" type="search""#));
-    assert!(filtered.contains(r#"option value="draft" selected"#));
+    assert!(filtered.contains(r#"name="status" value="draft""#));
+    assert!(filtered.contains(
+        r#"class="ink-library__status-tab is-active" href="/library?q=needle&amp;status=draft&amp;tag=Rust"#
+    ));
+    assert!(filtered.contains(r#"class="ink-library__advanced" open"#));
+    assert!(filtered.contains(r#"name="tag" type="text" maxlength="40" value="Rust""#));
 
     // Admin membership does not widen the author workspace; site-wide moderation stays /admin.
     let (_, _, admin_library) = call(&state, get("/library", "alice", Some("admins"))).await;

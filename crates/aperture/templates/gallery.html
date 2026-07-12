@@ -23,13 +23,7 @@
   </header>
 
   <main class="console console--drive">
-    <div class="drive-layout" data-wire-nav="#ap-drive">
-      <aside class="folder-rail ap-rail" aria-label="Drive navigation">
-        <div class="ap-rail__top">{{UPLOAD}}</div>
-        <div class="ap-rail__nav">{{SIDEBAR}}</div>
-        <div class="ap-rail__bottom">{{USAGE}}</div>
-      </aside>
-
+    <div class="drive-layout" data-wire-nav=".drive-layout">
       <div class="drive-content" id="ap-drive" data-spark="view:grid" data-spark-persist="view=aperture:view">
         {{LIBRARY_CONTROLS}}
         <div class="ap-toolbar">
@@ -49,7 +43,7 @@
           <div class="drive-section__head">
             <h2 class="drive-section__label" id="filesLabel">{{ITEMS_LABEL}}</h2>
           </div>
-          <div class="ap-list-head" hidden data-spark-class="is-list:view=list" aria-hidden="true"><span></span><span>Name</span><span data-col="shared">Shared</span><span>Size</span><span data-col="modified">Modified</span><span></span></div>
+          <div class="ap-list-head" hidden data-spark-class="is-list:view=list" aria-hidden="true"><span></span><span>Name</span><span data-col="shared">Shared</span><span data-col="size">Size</span><span data-col="modified">Modified</span><span></span></div>
           <ul class="gallery-grid" data-spark-class="is-list:view=list">
             {{CARDS}}
           </ul>
@@ -57,6 +51,12 @@
 
         {{PAGER}}
       </div>
+
+      <aside class="folder-rail ap-rail" aria-label="Drive navigation">
+        <div class="ap-rail__top">{{UPLOAD}}</div>
+        <div class="ap-rail__nav">{{SIDEBAR}}</div>
+        <div class="ap-rail__bottom">{{USAGE}}</div>
+      </aside>
     </div>
   </main>
 
@@ -88,16 +88,19 @@
 	        if (window.OdysseySpark && window.OdysseySpark.toast) {
 	          window.OdysseySpark.toast(msg, ok);
 	        }
-	      }
+      }
 
       // ---- Drag & drop + XHR upload with a progress bar --------------------
-      (function () {
-        var input = document.getElementById('fileInput');
-        var name = document.getElementById('fileName');
-        var zone = document.getElementById('uploadForm');
-        var progress = document.getElementById('uploadProgress');
-        var bar = document.getElementById('uploadBar');
-        if (!input || !zone) { return; }
+      var uploadDragDepth = 0;
+      function initUpload(root) {
+        root = root || document;
+        var input = root.querySelector('#fileInput');
+        var name = root.querySelector('#fileName');
+        var zone = root.querySelector('#uploadForm');
+        var progress = root.querySelector('#uploadProgress');
+        var bar = root.querySelector('#uploadBar');
+        if (!input || !zone || zone.hasAttribute('data-upload-enhanced')) { return; }
+        zone.setAttribute('data-upload-enhanced', 'true');
         function show() {
           if (input.files && input.files.length) {
             name.textContent = input.files[0].name;
@@ -163,36 +166,8 @@
 	            upload();
 	          }
 	        });
-	        var depth = 0;
-	        function hasFiles(e) {
-	          var types = e.dataTransfer && e.dataTransfer.types;
-	          return types && Array.prototype.indexOf.call(types, 'Files') > -1;
-	        }
-	        document.addEventListener('dragenter', function (e) {
-	          if (!hasFiles(e)) { return; }
-	          e.preventDefault();
-	          depth += 1;
-	          document.body.classList.add('is-dragging');
-	        });
-	        document.addEventListener('dragover', function (e) {
-	          if (!hasFiles(e)) { return; }
-	          e.preventDefault();
-	        });
-	        document.addEventListener('dragleave', function () {
-	          depth = Math.max(0, depth - 1);
-	          if (depth === 0) { document.body.classList.remove('is-dragging'); }
-	        });
-	        document.addEventListener('drop', function (e) {
-	          if (!hasFiles(e)) { return; }
-	          e.preventDefault();
-	          depth = 0;
-	          document.body.classList.remove('is-dragging');
-	          if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
-	            input.files = e.dataTransfer.files;
-	            show();
-	            upload();
-	          }
-	        });
+	        zone.__apUpload = upload;
+	        zone.__apShowUpload = show;
 	        // Keep the explicit Upload button working through the same XHR path.
         zone.addEventListener('submit', function (e) {
           if (window.FormData && window.XMLHttpRequest && input.files && input.files.length) {
@@ -200,7 +175,64 @@
             upload();
           }
         });
-      })();
+      }
+      initUpload(document);
+
+      // Install the document-level drop contract even when Trash is the first page loaded. The
+      // current DOM remains authoritative: only a live upload form may advertise or accept a drop.
+      function initUploadDrop() {
+        if (document.documentElement.hasAttribute('data-upload-drop-enhanced')) { return; }
+        document.documentElement.setAttribute('data-upload-drop-enhanced', 'true');
+        function hasFiles(e) {
+          var types = e.dataTransfer && e.dataTransfer.types;
+          return types && Array.prototype.indexOf.call(types, 'Files') > -1;
+        }
+        function currentUpload() {
+          return {
+            zone: document.getElementById('uploadForm'),
+            input: document.getElementById('fileInput')
+          };
+        }
+        document.addEventListener('dragenter', function (e) {
+          if (!hasFiles(e)) { return; }
+          var current = currentUpload();
+          if (!current.zone || !current.input) {
+            uploadDragDepth = 0;
+            document.body.classList.remove('is-dragging');
+            return;
+          }
+          e.preventDefault();
+          uploadDragDepth += 1;
+          document.body.classList.add('is-dragging');
+        });
+        document.addEventListener('dragover', function (e) {
+          if (!hasFiles(e)) { return; }
+          var current = currentUpload();
+          if (!current.zone || !current.input) { return; }
+          e.preventDefault();
+        });
+        document.addEventListener('dragleave', function () {
+          uploadDragDepth = Math.max(0, uploadDragDepth - 1);
+          if (uploadDragDepth === 0) { document.body.classList.remove('is-dragging'); }
+        });
+        document.addEventListener('drop', function (e) {
+          if (!hasFiles(e)) { return; }
+          e.preventDefault();
+          uploadDragDepth = 0;
+          document.body.classList.remove('is-dragging');
+          var current = currentUpload();
+          if (!current.zone || !current.input) {
+            toast('Open My Drive to upload files', false);
+            return;
+          }
+          if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
+            current.input.files = e.dataTransfer.files;
+            if (current.zone.__apShowUpload) { current.zone.__apShowUpload(); }
+            if (current.zone.__apUpload) { current.zone.__apUpload(); }
+          }
+        });
+      }
+      initUploadDrop();
 
       // ---- Inline media preview overlay ------------------------------------
       (function () {
@@ -316,27 +348,38 @@
 	          .catch(function () { if (nameEl) { nameEl.textContent = prev; nameEl.setAttribute('title', prev); } toast('Rename failed', false); });
 	      }
 	
-	      document.addEventListener('wire:after', function (e) {
-	        if (!e.detail || /view=trash/.test(e.detail.url || '')) { return; }
-	        recount();
-	      });
 
-	      // Sync the rail nav highlight to the swapped view (Trash / My Drive / folder) so
-	      // wire-navigation feels like Google Drive: content swaps, the active row follows,
-	      // no full-page reload. The rail lives OUTSIDE #ap-drive, so it needs this nudge.
+	      // Odyssey's generic current-link matcher intentionally treats a query-less href as a
+	      // broad route match. Drive views need exact URL state, so the product owns the final rail
+	      // projection after both forward Wire navigation and History restoration.
 	      function syncNav(url) {
-	        var here;
-	        try { var u = new URL(url || location.href, location.href); here = u.pathname + u.search; }
-	        catch (_) { here = location.pathname + location.search; }
-	        var rows = document.querySelectorAll('.ap-nav__row');
-	        for (var i = 0; i < rows.length; i++) {
-	          var href = rows[i].getAttribute('href') || '';
-	          var match = href === here || (href === '/' && (here === '/' || here === ''));
-	          rows[i].classList.toggle('is-active', match);
+	        var current;
+	        try {
+	          current = new URL(url || location.href, location.href);
+	        } catch (_) {
+	          current = new URL(location.href);
 	        }
+	        var currentView = current.searchParams.get('view') || '';
+	        var currentFolder = current.searchParams.get('folder') || '';
+	        var knownView = currentView === 'recent' || currentView === 'shared' || currentView === 'trash';
+	        document.querySelectorAll('.ap-nav__row').forEach(function (row) {
+	          var target = null;
+	          try {
+	            target = new URL(row.getAttribute('href') || '', location.href);
+	          } catch (_) {}
+	          var targetView = target ? (target.searchParams.get('view') || '') : '';
+	          var targetFolder = target ? (target.searchParams.get('folder') || '') : '';
+	          var sameRoute = !!target && target.pathname === current.pathname;
+	          var active = sameRoute && (
+	            (knownView && targetView === currentView) ||
+	            (!knownView && currentFolder && targetFolder === currentFolder) ||
+	            (!knownView && !currentFolder && !targetView && !targetFolder)
+	          );
+	          row.classList.toggle('is-active', active);
+	          if (active) { row.setAttribute('aria-current', 'page'); }
+	          else { row.removeAttribute('aria-current'); }
+	        });
 	      }
-	      document.addEventListener('wire:after', function (e) { syncNav(e.detail && e.detail.url); });
-	      window.addEventListener('popstate', function () { syncNav(location.href); });
 
         // ---- Current-page multi-select enhancement -------------------------
         // Checkboxes and the external `form=` association are the no-JS contract. This layer only
@@ -347,17 +390,44 @@
         }
         function syncBulk() {
           var form = document.querySelector('[data-bulk-form]');
-          if (!form) { return; }
+          if (!form) {
+            document.body.classList.remove('has-bulk-selection');
+            return;
+          }
           var items = bulkItems();
           var selected = items.filter(function (item) { return item.checked; });
+          var anchor = document.querySelector('[data-bulk-anchor]');
+          var mobile = window.matchMedia && window.matchMedia('(max-width:720px)').matches;
+          document.querySelectorAll('.has-mobile-bulk-owner').forEach(function (owner) {
+            owner.classList.remove('has-mobile-bulk-owner');
+          });
+          if (mobile && selected.length) {
+            var label = selected[selected.length - 1].closest('.ap-select');
+            if (label) {
+              if (label.parentElement) { label.parentElement.classList.add('has-mobile-bulk-owner'); }
+              if (label.nextElementSibling !== form) { label.insertAdjacentElement('afterend', form); }
+            }
+          } else if (anchor && anchor.nextElementSibling !== form) {
+            anchor.insertAdjacentElement('afterend', form);
+          }
+          form.classList.add('is-enhanced');
+          form.classList.toggle('has-selection', selected.length > 0);
+          form.setAttribute('data-selection-count', String(selected.length));
+          document.body.classList.toggle('has-bulk-selection', selected.length > 0);
           items.forEach(function (item) {
             var card = item.closest('.file-card, .folder-tile');
             if (card) { card.classList.toggle('is-selected', item.checked); }
           });
           var count = form.querySelector('[data-bulk-count]');
-          if (count) { count.textContent = selected.length ? (selected.length + ' selected') : 'Select items to act'; }
+          if (count) { count.textContent = selected.length + ' selected'; }
           var all = form.querySelector('[data-bulk-select-all]');
-          if (all) { all.textContent = items.length && selected.length === items.length ? 'Clear selection' : ('Select this page (' + items.length + ')'); }
+          if (all) {
+            all.hidden = items.length === 0;
+            all.textContent = items.length && selected.length === items.length ? 'Clear selection' : ('Select this page (' + items.length + ')');
+            all.setAttribute('aria-pressed', String(items.length > 0 && selected.length === items.length));
+          }
+          var actions = form.querySelector('[data-bulk-actions]');
+          if (actions) { actions.hidden = selected.length === 0; }
           form.querySelectorAll('button[type=submit]').forEach(function (button) { button.disabled = selected.length === 0; });
         }
         document.addEventListener('click', function (event) {
@@ -382,12 +452,39 @@
           lastBulkItem = item;
           setTimeout(syncBulk, 0);
         });
-	      document.addEventListener('wire:after', function () { lastBulkItem = null; syncBulk(); });
+	      document.addEventListener('odyssey:swap', function (event) {
+	        if (!event.target.matches || !event.target.matches('.drive-layout')) { return; }
+	        var swapUrl = event.detail && event.detail.url;
+	        uploadDragDepth = 0;
+	        document.body.classList.remove('is-dragging');
+	        lastBulkItem = null;
+	        initUpload(event.target);
+	        syncBulk();
+	        // Popstate calls Odyssey's broad markCurrent() after dispatching odyssey:swap. Re-project
+	        // Drive's semantic URL state in a microtask, after that generic matcher and before paint.
+	        Promise.resolve().then(function () { syncNav(swapUrl); });
+	      });
+	      document.addEventListener('wire:after', function () {
+	        // GET navigation has already pushed History; mutations deliberately leave it untouched.
+	        // Project from the browser URL so a redirected card delete cannot highlight My Drive
+	        // while the user remains inside a folder.
+	        syncNav(location.href);
+	      });
+	      window.addEventListener('resize', syncBulk);
 	      syncBulk();
+	      if (document.readyState === 'loading') {
+	        document.addEventListener('DOMContentLoaded', function () { syncNav(location.href); });
+	      } else {
+	        syncNav(location.href);
+	      }
 	
 	      document.addEventListener('submit', function (e) {
 	        var form = e.target;
 	        if (!form || form.tagName !== 'FORM') { return; }
+	        if (form.classList.contains('trash-form') && form.hasAttribute('data-wire')) {
+	          form.addEventListener('wire:error', function () { setTimeout(recount, 0); }, { once:true });
+	          setTimeout(recount, 220);
+	        }
 	        if (form.classList.contains('rename-form')) {
 	          if (!window.OdysseyWire) { return; }
 	          e.preventDefault();

@@ -156,6 +156,26 @@ impl ThreadListQuery {
     }
 }
 
+/// Compact owner-scoped count used only inside the home rail. `None` means there is no trusted
+/// gateway subject, while zero deliberately renders no badge. The count is request-derived from
+/// the same authoritative reads as the app bar and never implies background delivery.
+fn render_personal_rail_count(count: Option<i64>, noun: &str) -> String {
+    let count = count.unwrap_or(0).max(0);
+    if count == 0 {
+        return String::new();
+    }
+    let display = if count > 99 {
+        "99+".to_string()
+    } else {
+        count.to_string()
+    };
+    format!(
+        r#"<span class="ag-cat__count ag-personal-count">{display} {noun}</span>"#,
+        display = display,
+        noun = esc(noun),
+    )
+}
+
 pub async fn home(
     State(state): State<AppState>,
     Query(q): Query<ThreadListQuery>,
@@ -223,6 +243,9 @@ pub async fn home(
     );
     let thread_controls =
         render_thread_list_controls("/", &q, viewer_sub.is_some(), true, q.status());
+    let counts = personal_counts(&state, &headers, now).await?;
+    let activity_count = render_personal_rail_count(counts.unread_activity, "unread");
+    let bookmark_count = render_personal_rail_count(counts.due_bookmarks, "due");
 
     let content = format!(
         r#"<div class="page-head">
@@ -234,12 +257,27 @@ pub async fn home(
 <div class="ag-home">
   <aside class="ag-rail">
     <a class="btn btn-primary ag-cta" href="/new">New thread</a>
-    <nav class="ag-rail__nav" aria-label="Categories">
-      <a class="ag-cat is-active" href="/"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span class="ag-cat__name">All threads</span></a>
+    <div class="ag-rail__group">
+      <p class="ag-rail__label">Discover</p>
+      <nav class="ag-rail__nav" aria-label="Discover discussions">
+      <a class="ag-cat{all_active}" href="/"{all_current}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span class="ag-cat__name">All threads</span></a>
       <a class="ag-cat" href="/questions"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M9.1 9a3 3 0 1 1 5.8 1c0 2-3 2-3 4"/><path d="M12 18h.01"/></svg><span class="ag-cat__name">Questions</span></a>
-      <a class="ag-cat" href="/activity"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg><span class="ag-cat__name">Activity</span></a>
+      </nav>
+    </div>
+    <div class="ag-rail__group ag-rail__group--personal">
+      <p class="ag-rail__label">For you</p>
+      <nav class="ag-rail__nav" aria-label="For you">
+      <a class="ag-cat" href="/activity"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg><span class="ag-cat__name">Activity</span>{activity_count}</a>
+      <a class="ag-cat" href="/bookmarks"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h12a1 1 0 0 1 1 1v17l-7-4-7 4V4a1 1 0 0 1 1-1z"/></svg><span class="ag-cat__name">Saved</span>{bookmark_count}</a>
+      <a class="ag-cat{following_active}" href="/?filter=subscribed"{following_current}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 5h8"/><path d="M6 9h12"/><path d="M4 13h16"/><path d="m9 17 3 3 3-3"/></svg><span class="ag-cat__name">Following</span></a>
+      </nav>
+    </div>
+    <div class="ag-rail__group">
+      <p class="ag-rail__label">Spaces</p>
+      <nav class="ag-rail__nav" aria-label="Categories">
       {cats}
-    </nav>
+      </nav>
+    </div>
   </aside>
   <div class="ag-feed">
     <section class="section">
@@ -250,12 +288,33 @@ pub async fn home(
   </div>
 </div>"#,
         cats = cats_html,
+        all_active = if q.subscribed_only() {
+            ""
+        } else {
+            " is-active"
+        },
+        all_current = if q.subscribed_only() {
+            ""
+        } else {
+            r#" aria-current="page""#
+        },
+        following_active = if q.subscribed_only() {
+            " is-active"
+        } else {
+            ""
+        },
+        following_current = if q.subscribed_only() {
+            r#" aria-current="page""#
+        } else {
+            ""
+        },
+        activity_count = activity_count,
+        bookmark_count = bookmark_count,
         thread_title = thread_list_title(&q, "Recent activity"),
         controls = thread_controls,
         recent = recent_html,
     );
 
-    let counts = personal_counts(&state, &headers, now).await?;
     Ok(Html(render_page_with_personal_counts(
         "Forum",
         &email_display(&headers),
@@ -572,6 +631,16 @@ pub async fn thread(
         has_newer,
     );
 
+    // The stable Latest anchor targets the final ordinary reply on this page. On the newest page
+    // that is the newest ordinary reply; if the solution is the only reply, it falls back to that
+    // solution, and an otherwise empty discussion falls back to its original post.
+    let latest_post_id = replies
+        .last()
+        .map(|post| post.id.clone())
+        .or_else(|| accepted_post.as_ref().map(|post| post.id.clone()))
+        .or_else(|| op.as_ref().map(|post| post.id.clone()))
+        .unwrap_or_default();
+
     // Display list: original post, then the accepted solution fixed directly below it, then one
     // full page of ordinary replies. The store excluded the solution before LIMIT, so it neither
     // disappears on another page nor renders twice on its natural page.
@@ -700,6 +769,8 @@ pub async fn thread(
         &valid_accepted_id,
         can_manage_answer,
         is_question,
+        !thread.locked,
+        &latest_post_id,
         &reactions,
         &bookmarks,
         &quoted_posts,
@@ -786,11 +857,17 @@ pub async fn thread(
     } else {
         format!(r#"<div class="ag-head-tools">{thread_actions}</div>"#)
     };
-    let head_side = if subscription_action.is_empty() {
-        String::new()
-    } else {
-        format!(r#"<div class="ag-head-side">{subscription_action}</div>"#)
-    };
+    // Product-native reading controls share the existing reply anchor, keyset route and the one
+    // authoritative subscription form. No duplicate form/id/state is introduced for the sticky
+    // desktop rail or its mobile bottom-dock presentation.
+    let reading_toolbar = render_thread_reading_toolbar(
+        &thread.id,
+        post_count,
+        &subscription_action,
+        !thread.locked,
+        is_question,
+        has_newer,
+    );
 
     let content = format!(
         r#"{crumbs}
@@ -800,11 +877,11 @@ pub async fn thread(
     <div class="ag-thread-meta">{category_chip}<span>Started by <strong>{author}</strong></span><time title="{created_abs}">{created_rel}</time><span>{replies}</span></div>
     {actions}
   </div>
-  {subscription}
   {admin_actions}
 </div>
+{reading_toolbar}
 {summary}
-<section class="posts">{posts}</section>
+<section id="thread-replies" class="posts" aria-label="Thread posts">{posts}</section>
 {pagination}
 {reply}"#,
         crumbs = crumbs,
@@ -816,8 +893,8 @@ pub async fn thread(
         created_rel = esc(&rel_time(thread.created_at, now)),
         replies = esc(&replies_label(post_count)),
         actions = head_tools,
-        subscription = head_side,
         admin_actions = admin_actions,
+        reading_toolbar = reading_toolbar,
         summary = summary_html,
         posts = posts_html,
         pagination = pagination,
@@ -1842,6 +1919,44 @@ fn thread_list_title(q: &ThreadListQuery, fallback: &'static str) -> &'static st
     }
 }
 
+fn render_thread_reading_toolbar(
+    thread_id: &str,
+    post_count: i64,
+    subscription_form: &str,
+    can_reply: bool,
+    is_question: bool,
+    has_newer: bool,
+) -> String {
+    let latest_href = if has_newer {
+        format!("/t/{}?latest=1#thread-latest", esc(thread_id))
+    } else {
+        "#thread-latest".to_string()
+    };
+    let reply_action = if can_reply {
+        format!(
+            r##"<a class="btn btn-primary btn-sm ag-thread-toolbar__reply" href="#reply">{label}</a>"##,
+            label = if is_question { "Answer" } else { "Reply" },
+        )
+    } else {
+        r#"<span class="btn btn-secondary btn-sm ag-thread-toolbar__locked" aria-disabled="true">Locked</span>"#
+            .to_string()
+    };
+    format!(
+        r#"<nav class="ag-thread-toolbar" aria-label="Thread reading actions">
+  <div class="ag-thread-toolbar__context"><span class="ag-thread-toolbar__eyebrow">In this thread</span><strong>{replies}</strong></div>
+  <div class="ag-thread-toolbar__actions">
+    <a class="btn btn-ghost btn-sm" href="{latest_href}">Latest</a>
+    {subscription_form}
+    {reply_action}
+  </div>
+</nav>"#,
+        replies = esc(&replies_label(post_count)),
+        latest_href = latest_href,
+        subscription_form = subscription_form,
+        reply_action = reply_action,
+    )
+}
+
 fn render_subscription_form(thread_id: &str, csrf: &str, subscribed: bool) -> String {
     let label = if subscribed { "Unfollow" } else { "Follow" };
     let class = if subscribed {
@@ -2279,7 +2394,7 @@ fn render_summary(posts: &[Post]) -> String {
     format!(
         r#"<section class="card pad summary ag-insight">
   <h2 class="section__title"><svg class="ag-insight__glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 1.7 5.3L19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7L12 3z"/><path d="M19 15v4"/><path d="M21 17h-4"/></svg>Thread summary <span class="badge badge-op">Auto</span></h2>
-  <p class="muted summary__note">Top sentences across this thread — generated locally, no AI service.</p>
+  <p class="muted summary__note">Top sentences from posts visible on this page — generated locally, no AI service.</p>
   <ul class="summary__list">{items}</ul>
 </section>"#,
         items = items,
@@ -2422,9 +2537,9 @@ fn render_reactions(
 /// each body is rendered through the markdown sanitiser. A REPLY (never the original post —
 /// that is edited/deleted via the thread controls) gets inline Edit/Delete controls when
 /// `viewer` is its author. Every post shows the reaction row; the reply marked as the accepted
-/// answer shows an "Accepted answer" badge, and when `can_accept` (thread author or admin) each
-/// reply gets a mark/unmark-accepted control. A post with `quoted_post_id` renders an escaped
-/// quote block above its own markdown body when the referenced post still exists in this thread.
+/// answer is wrapped once in a labelled Solution region, and when `can_accept` (thread author or
+/// admin) each reply gets a mark/unmark-accepted control. A post with `quoted_post_id` renders an
+/// escaped quote block above its own markdown body when the referenced post still exists here.
 #[allow(clippy::too_many_arguments)]
 fn render_posts(
     posts: &[Post],
@@ -2436,17 +2551,24 @@ fn render_posts(
     accepted_post_id: &str,
     can_manage_answer: bool,
     is_question: bool,
+    can_reply: bool,
+    latest_post_id: &str,
     reactions: &HashMap<String, Vec<ReactionCount>>,
     bookmarks: &HashMap<String, Bookmark>,
     quoted_posts: &HashMap<String, Post>,
 ) -> String {
     if posts.is_empty() {
-        return r#"<div class="empty">This thread has no posts.</div>"#.to_string();
+        return r#"<span id="thread-latest" class="ag-thread-latest-anchor" aria-hidden="true"></span><div class="empty">This thread has no posts.</div>"#.to_string();
     }
     let empty_counts: Vec<ReactionCount> = Vec::new();
     let mut out = String::new();
     for (i, p) in posts.iter().enumerate() {
         let is_accepted = i > 0 && !accepted_post_id.is_empty() && p.id == accepted_post_id;
+        let latest_anchor = if p.id == latest_post_id {
+            r#"<span id="thread-latest" class="ag-thread-latest-anchor" aria-hidden="true"></span>"#
+        } else {
+            ""
+        };
         let op = if i == 0 {
             " is-op"
         } else if is_accepted {
@@ -2454,14 +2576,11 @@ fn render_posts(
         } else {
             ""
         };
-        let mut tag = if i == 0 {
+        let tag = if i == 0 {
             r#"<span class="badge badge-op">Original post</span>"#.to_string()
         } else {
             String::new()
         };
-        if is_accepted {
-            tag.push_str(r#"<span class="badge badge-accepted">Accepted answer</span>"#);
-        }
         // Own-reply controls: not on the original post (i == 0), only for the author.
         let owner_controls = if i > 0 && viewer == Some(p.author_sub.as_str()) {
             format!(
@@ -2503,11 +2622,15 @@ fn render_posts(
         } else {
             String::new()
         };
-        let quote_control = format!(
-            r##"<a class="btn btn-ghost btn-sm" href="/t/{tid}?quote={pid}#reply">Quote</a>"##,
-            tid = esc(thread_id),
-            pid = esc(&p.id),
-        );
+        let quote_control = if can_reply {
+            format!(
+                r##"<a class="btn btn-ghost btn-sm" href="/t/{tid}?quote={pid}#reply">Quote</a>"##,
+                tid = esc(thread_id),
+                pid = esc(&p.id),
+            )
+        } else {
+            String::new()
+        };
         let bookmark_control = if viewer.is_none() {
             String::new()
         } else if let Some(bookmark) = bookmarks.get(&p.id) {
@@ -2546,6 +2669,7 @@ fn render_posts(
             String::new()
         };
         let controls = if quote_control.is_empty()
+            && bookmark_control.is_empty()
             && owner_controls.is_empty()
             && accept_control.is_empty()
             && admin_controls.is_empty()
@@ -2559,8 +2683,8 @@ fn render_posts(
         let counts = reactions.get(&p.id).unwrap_or(&empty_counts);
         let reactions_html = render_reactions(thread_id, &p.id, csrf, counts);
         let quote_html = render_quote_block(p, quoted_posts);
-        out.push_str(&format!(
-            r##"<article id="post-{pid}" class="post{op}">
+        let post_html = format!(
+            r##"<article id="post-{pid}" class="post{op}">{latest_anchor}
   <div class="ag-post-rail"><span class="avatar ag-avatar ag-tone-{tone}" aria-hidden="true">{initial}</span></div>
   <div class="ag-post-main">
     <header class="post__meta">
@@ -2575,6 +2699,7 @@ fn render_posts(
 </article>"##,
             pid = esc(&p.id),
             op = op,
+            latest_anchor = if is_accepted { "" } else { latest_anchor },
             tone = ag_tone(&p.author_sub),
             initial = esc(&ag_initial(&p.author_email)),
             author = esc(&p.author_email),
@@ -2585,7 +2710,23 @@ fn render_posts(
             body = markdown::render(&p.body_md),
             reactions = reactions_html,
             controls = controls,
-        ));
+        );
+        if is_accepted {
+            out.push_str(&format!(
+                r#"<section class="ag-solution" aria-labelledby="solution-heading-{pid}">{latest_anchor}
+  <header class="ag-solution__head">
+    <span class="ag-solution__eyebrow">Solution</span>
+    <h2 id="solution-heading-{pid}">Accepted answer</h2>
+  </header>
+  {post}
+</section>"#,
+                pid = esc(&p.id),
+                latest_anchor = latest_anchor,
+                post = post_html,
+            ));
+        } else {
+            out.push_str(&post_html);
+        }
     }
     out
 }

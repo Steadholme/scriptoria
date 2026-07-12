@@ -310,7 +310,7 @@ pub async fn index(
     }
     if posts.is_empty() && next_cursor.is_none() {
         cards.push_str(
-            r#"<div class="empty-state"><h2>No posts yet</h2><p>Start writing — your first post will appear here.</p><a class="btn btn-primary" href="/new">Write the first post</a></div>"#,
+            r#"<div class="empty-state"><h2>No posts yet</h2><p>Published stories will appear here.</p></div>"#,
         );
     }
 
@@ -2265,7 +2265,7 @@ fn render_editor(v: EditorView<'_>) -> String {
         head_title: &head_title,
         body_class: "page-console",
         rss: false,
-        nav_title: v.heading,
+        nav_title: "Studio",
         email: v.email,
         is_admin: v.is_admin,
         theme: v.theme,

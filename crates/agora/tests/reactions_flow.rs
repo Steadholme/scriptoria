@@ -140,9 +140,18 @@ async fn author_marks_accepted_answer_sorts_first_with_badge() {
     let reloaded = state.store.get_thread(&tid).await.unwrap().unwrap();
     assert_eq!(reloaded.accepted_post_id, second_reply);
 
-    // Render: the accepted badge shows, and the accepted reply now appears BEFORE the first reply.
+    // Render: the accepted reply owns one labelled Solution region and appears before the first
+    // ordinary reply. Its content is not duplicated in the normal stream.
     let (_s, _h, page) = send(&state, get_as(&loc, ALICE_SUB, ALICE_EMAIL)).await;
-    assert!(page.contains("Accepted answer"), "accepted badge rendered");
+    assert!(
+        page.contains("Accepted answer"),
+        "accepted heading rendered"
+    );
+    assert_eq!(page.matches(r#"class="ag-solution""#).count(), 1);
+    assert_eq!(page.matches("Second reply").count(), 1);
+    assert!(page.contains(".ag-solution .post[id] {"));
+    assert!(page.contains("scroll-margin-top:calc(var(--appbar-h,56px) + 124px);"));
+    assert!(page.contains("scroll-margin-top:calc(var(--appbar-h,56px) + 60px);"));
     let acc = page.find("Second reply").expect("accepted reply present");
     let first = page.find("First reply").expect("first reply present");
     assert!(acc < first, "accepted reply sorts before the earlier reply");

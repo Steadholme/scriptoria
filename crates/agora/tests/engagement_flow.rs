@@ -55,6 +55,15 @@ async fn quote_reply_renders_escaped_blockquote_and_deduplicated_activity() {
 
     let (_s, _h, home) = send(&state, get_as("/", ALICE_SUB, ALICE_EMAIL)).await;
     assert!(home.contains("Activity, 1 unread"));
+    assert!(home.contains(r#"aria-label="For you""#));
+    assert!(home.contains(r#"href="/bookmarks""#));
+    assert!(home.contains(">Saved</span>"));
+    assert!(home.contains(r#"href="/?filter=subscribed""#));
+    assert!(home.contains(r#"<a class="ag-cat is-active" href="/" aria-current="page">"#));
+    assert!(
+        home.contains(r#"class="ag-cat__count ag-personal-count">1 unread</span>"#),
+        "the home rail reuses the private request-derived Activity count"
+    );
     let (_s, _h, activity) = send(&state, get_as("/activity", ALICE_SUB, ALICE_EMAIL)).await;
     assert!(activity.contains("Quote and mention"));
     assert!(activity.contains("Mention"));
@@ -94,6 +103,23 @@ async fn thread_subscription_toggle_and_filter() {
         "subscribed thread shows the reverse action"
     );
     assert!(thread_page.contains(r#"data-wire-target=".subscription-form""#));
+    assert!(thread_page.contains(r#"class="ag-thread-toolbar""#));
+    assert!(thread_page.contains(r##"href="#reply">Reply</a>"##));
+    assert!(thread_page.contains(r##"href="#thread-latest">Latest</a>"##));
+    assert!(thread_page.contains(
+        "scroll-margin-top:calc(var(--appbar-h,56px) + 72px)"
+    ));
+    assert!(thread_page.contains(".post[id],"));
+    assert_eq!(
+        thread_page
+            .matches(&format!(
+                r#"action="/t/{}/subscribe""#,
+                subscribed_loc.trim_start_matches("/t/")
+            ))
+            .count(),
+        1,
+        "sticky toolbar reuses one authoritative subscription form"
+    );
 
     let (_s, _h, filtered) = send(
         &state,
@@ -102,6 +128,9 @@ async fn thread_subscription_toggle_and_filter() {
     .await;
     assert!(filtered.contains("Subscribed target"));
     assert!(!filtered.contains("Unsubscribed target"));
+    assert!(filtered.contains(
+        r#"<a class="ag-cat is-active" href="/?filter=subscribed" aria-current="page">"#
+    ));
 
     let (status, _h, _b) = send(
         &state,

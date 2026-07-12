@@ -53,16 +53,18 @@ pub fn esc(s: &str) -> String {
 /// The Inkwell (Blog) app-tile icon — a Lucide-style `file-text` glyph.
 pub const APP_ICON: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M16 13H8"/><path d="M16 17H8"/><path d="M10 9H8"/></svg>"##;
 
-/// Render the shared Odyssey v2 app-bar: the Blog app-tile + name on the left, the reading-nav in
-/// the middle (current marked `.is-active`), then an "All apps" waffle back to the apex portal and
-/// the avatar user-menu (Account / All apps / the preserved gateway Sign-out) on the right.
-/// `page_title` selects the active nav item; `email` is the gateway-injected address (empty or the
-/// neutral `—` placeholder on public, no-session reading pages → a minimal, no-identity avatar).
+/// Render the shared Odyssey v2 app-bar: the Blog app-tile + name on the left, reader navigation
+/// followed by one stable Studio entry, then an "All apps" waffle back to the apex portal and the
+/// avatar user-menu (Account / All apps / the preserved gateway Sign-out) on the right. Studio is
+/// deliberately rendered for every representation: the public chrome never varies merely to hint
+/// that a private author session exists. `page_title` selects the active nav item; `email` is the
+/// gateway-injected address (empty or the neutral `—` placeholder on public, no-session reading
+/// pages → a minimal, no-identity avatar).
 pub fn topbar(page_title: &str, email: &str, is_admin: bool, theme: &str) -> String {
     let active = match page_title {
         "Search" => "search",
         "Ask" => "ask",
-        "Library" => "library",
+        "Studio" | "Library" => "studio",
         _ => "posts",
     };
     let admin_nav = if is_admin {
@@ -72,23 +74,34 @@ pub fn topbar(page_title: &str, email: &str, is_admin: bool, theme: &str) -> Str
     };
     let nav = format!(
         concat!(
-            r#"<nav class="appbar__nav" aria-label="Inkwell">"#,
-            r#"<a class="appnav{a_posts}" href="/"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 22V12h6v10"/></svg>Posts</a>"#,
-            r#"<a class="appnav{a_search}" href="/search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>Search</a>"#,
-            r#"<a class="appnav{a_ask}" href="/ask"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/></svg>Ask</a>"#,
-            r#"<a class="appnav{a_library}" href="/library"{c_library}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16v14H4z"/><path d="M8 9h8M8 13h6"/></svg>Library</a>"#,
+            r#"<nav class="appbar__nav" aria-label="Blog sections">"#,
+            r#"<a class="appnav{a_posts}" href="/"{c_posts}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 22V12h6v10"/></svg>Posts</a>"#,
+            r#"<a class="appnav{a_search}" href="/search"{c_search}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>Search</a>"#,
+            r#"<a class="appnav{a_ask}" href="/ask"{c_ask}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/></svg>Ask</a>"#,
+            r#"<a class="appnav appnav--studio{a_studio}" href="/library"{c_studio}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z"/></svg>Studio</a>"#,
             r#"{admin_nav}"#,
             r#"</nav>"#,
         ),
         a_posts = if active == "posts" { " is-active" } else { "" },
         a_search = if active == "search" { " is-active" } else { "" },
         a_ask = if active == "ask" { " is-active" } else { "" },
-        a_library = if active == "library" {
-            " is-active"
+        a_studio = if active == "studio" { " is-active" } else { "" },
+        c_posts = if active == "posts" {
+            r#" aria-current="page""#
         } else {
             ""
         },
-        c_library = if active == "library" {
+        c_search = if active == "search" {
+            r#" aria-current="page""#
+        } else {
+            ""
+        },
+        c_ask = if active == "ask" {
+            r#" aria-current="page""#
+        } else {
+            ""
+        },
+        c_studio = if active == "studio" {
             r#" aria-current="page""#
         } else {
             ""

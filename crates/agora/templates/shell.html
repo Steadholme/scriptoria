@@ -23,7 +23,8 @@
   <script>
     // Progressive enhancement. Every control below is a real form/link that works without JS
     // (POST→303 / GET navigation). Odyssey wire handles reactions and subscriptions; this
-    // local script keeps accept-answer and sort tabs until their next touch.
+    // local script keeps sort tabs as a lightweight enhancement. Accepted-answer commands use
+    // their real POST→303 forms so the server can rebuild the one authoritative Solution region.
     (function () {
       var host = document.getElementById('hf-toasts');
       function toast(msg, kind) {
@@ -39,52 +40,6 @@
           setTimeout(function () { if (t.parentNode) { t.parentNode.removeChild(t); } }, 220);
         }, kind === 'err' ? 4200 : 2000);
       }
-      function body(form) { return new URLSearchParams(new FormData(form)); }
-
-      // ---- Accept answer (optimistic, reconciles every post) ----
-      function applyAccepted(acceptedId) {
-        Array.prototype.forEach.call(document.querySelectorAll('article.post'), function (post) {
-          var isOp = post.classList.contains('is-op');
-          var accept = post.querySelector('form[action$="/accept"] button');
-          var on = !!acceptedId && post.id === ('post-' + acceptedId);
-          post.classList.toggle('is-accepted', on && !isOp);
-          var meta = post.querySelector('.post__meta');
-          var badge = meta ? meta.querySelector('.badge-accepted') : null;
-          if (on && !isOp) {
-            if (!badge && meta) {
-              badge = document.createElement('span');
-              badge.className = 'badge badge-accepted';
-              badge.textContent = 'Accepted answer';
-              meta.appendChild(badge);
-            }
-          } else if (badge) {
-            badge.parentNode.removeChild(badge);
-          }
-          if (accept) { accept.textContent = (on && !isOp) ? 'Unmark accepted' : 'Mark accepted'; }
-        });
-      }
-      function handleAccept(form) {
-        var pidInput = form.querySelector('input[name="post_id"]');
-        var pid = pidInput ? pidInput.value : '';
-        var prev = null;
-        var cur = document.querySelector('article.post.is-accepted');
-        prev = cur ? cur.id.replace(/^post-/, '') : '';
-        var predicted = (prev === pid) ? '' : pid;
-        applyAccepted(predicted);
-        fetch(form.action, { method: 'POST', headers: { 'Accept': 'application/json' }, credentials: 'same-origin', body: body(form) })
-          .then(function (r) { if (!r.ok) { throw 0; } return r.json(); })
-          .then(function (d) { applyAccepted(d.accepted_post_id); })
-          .catch(function () { applyAccepted(prev); toast('Could not update the accepted answer', 'err'); });
-      }
-
-      document.addEventListener('submit', function (e) {
-        if (e.defaultPrevented) { return; }
-        var form = e.target;
-        if (!form || form.tagName !== 'FORM') { return; }
-        var action = form.getAttribute('action') || '';
-        if (/\/accept$/.test(action)) { e.preventDefault(); handleAccept(form); return; }
-      });
-
       // ---- Instant sort tabs (fetch + swap the thread list) ----
       (function () {
         var tabs = document.querySelectorAll('.sort-tabs a[data-sort-tab]');

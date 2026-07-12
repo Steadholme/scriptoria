@@ -321,6 +321,118 @@ bulk commands lock and validate every selection before any write; delete/recreat
 version exhaustion fail closed; safe `return_to` values cannot create an open redirect or invalid
 header; public reader/feed/sitemap/search authority still follows the committed post state.
 
+## Iteration 5: focus, inspect, publish
+
+Iteration 5 advances the existing v4 authority into product-native interaction models. It does not
+add a shared Odyssey page runtime, a database migration, a new public route, or a new mutation
+authority. The enhanced controls remain projections over the same SSR links and HTML forms.
+
+### Forum: Conversation Focus
+
+- Organize the home rail into Discover, For you, and Spaces. For you links Activity, Saved, and
+  Following without conflating request-derived unread/due counts with outbound delivery.
+- Give each thread one sticky reading toolbar for Latest, Reply/Answer, and the existing Follow
+  form. Desktop and mobile presentations reuse that single CSRF form instead of cloning state.
+- Render the accepted answer once inside a labelled Solution region directly after the original
+  post. Locked threads expose no reply shortcut that can bypass the server permission check.
+- Describe the extractive summary as sentences from posts visible on the current page; it must not
+  claim whole-thread authority when reply pagination bounds its input.
+
+Acceptance: the Follow form appears exactly once; Latest still resolves through keyset navigation;
+the Solution post is neither duplicated nor detached from its owner/reaction/bookmark controls;
+mobile fixed actions do not obscure anchors; all actions work as ordinary links/forms without
+JavaScript.
+
+### Drive: Explorer Priority
+
+- On narrow screens, place the file canvas, breadcrumb, result count, and primary Files/Requests
+  navigation before the full folder/action rail. The desktop rail remains the spatial workspace.
+- In the enhanced client, keep the selection surface compact at zero selected items and expand it
+  into a contextual action shelf only after real file/folder checkboxes are selected. The original
+  bounded form remains visible and complete without JavaScript.
+- Treat Trash as a Recovery Center for both files and folders. Do not render Library search/type
+  controls that silently leave Trash; use item language, deletion time, and the authoritative
+  automatic-deletion eligibility threshold, with Restore visually ahead of permanent deletion.
+
+Acceptance: the DOM contains no duplicate upload/bulk forms or ids; selection never becomes an
+unbounded cross-page promise; the mobile canvas precedes the rail and has no horizontal overflow;
+Trash retains `view=trash` for every action and does not imply a filter the Store does not execute.
+
+### Blog: Reader and Studio
+
+- Keep public reader chrome focused on Posts, Search, and Ask, with one stable Studio entry that
+  does not vary the shared representation merely to reveal an author session. Remove authoring
+  calls to action from the publication masthead and empty public index.
+- Make Studio the active information architecture for Library and Writer pages. Add URL-backed
+  All, Draft, Scheduled, and Published tabs; move the exact-tag field into an Advanced disclosure.
+- Under JavaScript, show the bounded bulk shelf only after selection, expose Select/Clear page and
+  an honest selected count, and reveal the tag input only for add/remove-tag commands. The same
+  max-50 stable-id/version form remains the no-JavaScript baseline.
+- Name the current editor pane Article body preview: it renders the sanitized body, not a complete
+  cover/byline/social/publication representation. A true full-document preview remains a later,
+  separately-authorized product slice.
+
+Acceptance: Reader and Studio navigation preserve complete cache `Vary`/private boundaries;
+status tabs retain query/tag/fixed-`as_of` state while resetting the cursor; CSS cannot override the
+bulk shelf's `hidden` attribute; Writer save/publish intents and recovery semantics are unchanged.
+
+### Competitive reference — 2026-07-12
+
+This comparison uses official product documentation, not visual-gallery screenshots. It guides the
+next task slice without turning Scriptoria into a clone or claiming capabilities it does not own.
+
+- Forum: [Discourse reading state](https://meta.discourse.org/t/understanding-discourse-for-new-users/96331),
+  [GitHub Discussion categories](https://docs.github.com/en/discussions/managing-discussions-for-your-community/managing-categories-for-discussions),
+  and [Stack Overflow accepted-answer semantics](https://stackoverflow.com/help/accepted-answer)
+  agree that category intent, reading continuity, and answer provenance are separate concerns.
+  Agora already has category-aware questions and one authoritative Solution region. Its next P0 is
+  deterministic `Continue reading / First unread`, followed by three understandable Follow levels;
+  it will not import Discourse's five-level notification menu, nested replies, or reputation gates.
+- Drive: [Google Drive keyboard guidance](https://support.google.com/drive/answer/2563044?hl=en),
+  [Dropbox Quick View](https://help.dropbox.com/view-edit/preview),
+  [Dropbox File Requests](https://help.dropbox.com/share/create-file-request), and
+  [Nextcloud File Drop](https://docs.nextcloud.com/server/stable/user_manual/en/files/file_drop.html)
+  show a stable explorer, contextual inspector, explicit intake queue, and upload-only capability
+  as distinct jobs. Aperture keeps its stricter anonymous `/u/` boundary and authoritative 30-day
+  recovery date. Its next P0 is an Explorer Inspector backed by the existing `/f/{id}` authority,
+  then an Open/Closed/Expired Request Inbox; it will not imply account ACLs or E2EE.
+- Blog: [Ghost publishing](https://ghost.org/help/publishing-content/),
+  [Ghost Library views](https://ghost.org/changelog/sidebar-views-filter/),
+  [Substack's publishing flow](https://support.substack.com/hc/en-us/articles/360037831771-How-do-I-publish-a-new-post-on-Substack),
+  and [WordPress scheduling](https://wordpress.com/support/schedule-a-post-or-page/) converge on a
+  quiet editor followed by an explicit publication review. Inkwell's next P0 is `Review & publish`
+  with target state, timezone, final URL, metadata, and desktop/mobile Reader preview. It will not
+  absorb newsletter delivery, paid audiences, a page builder, or a theme marketplace.
+
+The shared lesson is not “add more components.” Mature products preserve context between reads,
+make irreversible transitions explicit, and expose advanced controls only inside the task that
+owns them. Odyssey remains the accessibility/token foundation; these product workflows own their
+information architecture and interaction ceiling.
+
+### Iteration 5 candidate verification
+
+- The exact candidate passes 541/541 Rust tests across the six public products: Forum 111, Blog
+  112, Wiki 71, Comments 41, Paste 71, and Drive 135. Writer recovery passes 3/3 Node tests; the
+  composed binary and every crate pass strict Clippy, `git diff --check`, and the release build.
+- A real Chromium task audit passes at 320, 390, and 1440 px with JavaScript enabled and disabled.
+  Blog proves a public Reader without author CTA, stable Studio entry, 100-row `limit=100` page,
+  max-50 selection cap, contextual tag field, and no-JavaScript form. Forum creates a Support
+  question, posts and accepts an answer through POST → 303, renders one Solution, and lands Latest,
+  permalink, and Reply anchors below sticky chrome. Drive creates a folder, uploads, selects,
+  keyboard-enters the mobile action shelf, trashes, and reads lifecycle metadata in grid/list views.
+  All checked pages have zero horizontal overflow, console/page errors, or failed responses.
+- A separate real View Transition run proves the observed event order is `wire:after` then
+  `odyssey:swap`. Aperture therefore rebinds against the latter authoritative DOM event. Folder,
+  Back, and Trash swaps each retain the correct upload target, rail controls, bulk enhancement, and
+  exact CSRF cookie/form pair; Trash carries no stale upload or folder-management surface.
+- A sequential card-menu run proves two optimistic Trash mutations retain one valid double-submit
+  CSRF pair, with no stale remaining form or failed response. The keyboard-reachable action menu
+  opens upward inside the card, so the final grid row cannot clip Rename or Move to trash.
+- Blog public/Studio and Drive selected/Trash screenshots were inspected. Drive's source and
+  desktop visual order are both content-first, the mobile shelf is viewport-fixed but immediately
+  follows the selected checkbox in keyboard order, long rails scroll above the persistent usage
+  meter, and mixed Trash rows remain compact and readable at both widths.
+
 ### Iteration 3 candidate verification
 
 - The six public product crates pass 494/494 Rust tests; Writer recovery passes 3/3 browser-logic
@@ -361,12 +473,12 @@ header; public reader/feed/sitemap/search authority still follows the committed 
 
 ## Next iterations
 
-1. Forum: report + moderator review queue, saved collections, notification preferences and
-   external delivery receipts, then remaining list N+1 removal.
-2. Drive: a file inspector/preview task flow, Request Room passwords and dedicated rate limits,
-   then a capability-safe media picker for Blog.
-3. Blog: Drive media selection, separately-authorized draft preview, publication calendar, and an
-   explicit multi-writer collaboration/locking model.
+1. Forum: viewer/thread `Continue reading / First unread`, then three-level Follow preferences and
+   an explainable For-you feed built only from those real local signals.
+2. Drive: an in-explorer Inspector with a linked `/f/{id}` no-JavaScript fallback, then an
+   Open/Closed/Expired Request Inbox and capability-governance center.
+3. Blog: an explicit `Review & publish` preflight, then URL-backed Studio sorting/filters,
+   revocable draft preview, and a bounded publication-identity model.
 
 ## Rollout gate
 

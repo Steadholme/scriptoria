@@ -122,16 +122,20 @@ pub struct GalleryQuery {
     pub type_filter: Option<String>,
 }
 
-/// `GET /` — render the upload dropzone (with a fresh CSRF token) and one keyset page of the
-/// owner's files, newest-first. With no `?before` cursor this is the newest page (the default
-/// view, now capped at `DEFAULT_PAGE`); a `?before=<created_at>_<id>` cursor pages into older files.
+/// `GET /` — render the upload dropzone (with the browser's valid reusable double-submit CSRF
+/// token) and one keyset page of the owner's files, newest-first. With no `?before` cursor this is
+/// the newest page (the default view, now capped at `DEFAULT_PAGE`); a
+/// `?before=<created_at>_<id>` cursor pages into older files.
 pub async fn gallery(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(q): Query<GalleryQuery>,
 ) -> Result<Response, AppError> {
     let who = auth::identity(&headers);
-    let csrf = auth::new_csrf_token();
+    // Keep the owner's valid double-submit token stable across gallery GETs. Wire's optimistic
+    // single-card Trash path follows its POST redirect without replacing the rest of the DOM; a
+    // rotating GET token would otherwise invalidate every still-rendered form after that delete.
+    let csrf = auth::existing_or_new_csrf_token(&headers);
     // Same clamp the store applies, so `files.len() == limit` below is an exact "page was full" test.
     let limit = clamp_page(q.limit.unwrap_or(0));
     let search = clean_library_query(q.q.as_deref())?;
@@ -3898,12 +3902,13 @@ fn render_bulk_controls(
         )
     };
     format!(
-        "<form class=\"ap-bulk\" id=\"bulkSelection\" method=\"post\" action=\"{default_action}\" data-bulk-form>\
+        "<span data-bulk-anchor hidden></span>\
+         <form class=\"ap-bulk\" id=\"bulkSelection\" method=\"post\" action=\"{default_action}\" data-bulk-form>\
            <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
            <input type=\"hidden\" name=\"return_to\" value=\"{return_to}\">\
-           <button class=\"btn btn-ghost btn-sm ap-bulk__all\" type=\"button\" data-bulk-select-all>Select this page</button>\
-           <span class=\"ap-bulk__count\" data-bulk-count aria-live=\"polite\">Select items to act</span>\
-           <div class=\"ap-bulk__actions\">{actions}</div>\
+           <button class=\"btn btn-ghost btn-sm ap-bulk__all\" type=\"button\" data-bulk-select-all aria-pressed=\"false\" hidden>Select this page</button>\
+           <span class=\"ap-bulk__count\" data-bulk-count aria-live=\"polite\">Choose items below, then use these actions.</span>\
+           <div class=\"ap-bulk__actions\" data-bulk-actions>{actions}</div>\
          </form>",
         default_action = if trash_mode {
             "/trash/restore"
@@ -3929,24 +3934,17 @@ struct TrashRender<'a> {
 
 fn render_trash_gallery(input: TrashRender<'_>) -> String {
     let count = match input.items.len() {
-        0 => "Trash is empty".to_string(),
+        0 => "No items".to_string(),
         1 => "1 trashed item".to_string(),
         n => format!("{n} trashed items shown"),
     };
     let cards = if input.items.is_empty() {
-        "<li class=\"file-card file-card--empty ap-empty ap-empty--trash\"><div class=\"ap-empty__art\" aria-hidden=\"true\"></div><h3>Trash is empty.</h3><p>Deleted files stay here until purged.</p></li>".to_string()
+        "<li class=\"file-card file-card--empty ap-empty ap-empty--trash\"><div class=\"ap-empty__art\" aria-hidden=\"true\"></div><h3>Trash is empty.</h3><p>Deleted files and folders can be restored for up to 30 days unless you delete them forever sooner.</p></li>".to_string()
     } else {
         render_trash_cards(input.items, input.csrf)
     };
     let breadcrumb =
         "<nav class=\"breadcrumb\" aria-label=\"Folder path\"><a class=\"breadcrumb__crumb\" href=\"/\">My Drive</a><span class=\"breadcrumb__sep\" aria-hidden=\"true\">&rsaquo;</span><span class=\"breadcrumb__here\">Trash</span></nav>";
-    let controls = LibraryQuery {
-        view: LibraryView::All,
-        query: None,
-        type_filter: LibraryType::All,
-        before: None,
-        limit: crate::config::DEFAULT_PAGE,
-    };
     GALLERY_HTML
         .replace("{{CSS}}", app_css())
         .replace("{{DYNAMIC}}", dynamic_js())
@@ -3960,15 +3958,11 @@ fn render_trash_gallery(input: TrashRender<'_>) -> String {
         )
         .replace(
             "{{LIBRARY_CONTROLS}}",
-            &format!(
-                "{}{}",
-                render_library_controls(&controls),
-                render_bulk_controls(input.csrf, input.folders, true, "/?view=trash")
-            ),
+            &render_bulk_controls(input.csrf, input.folders, true, "/?view=trash"),
         )
         .replace("{{BREADCRUMB}}", breadcrumb)
         .replace("{{FOLDERS_SECTION}}", "")
-        .replace("{{ITEMS_LABEL}}", "Files")
+        .replace("{{ITEMS_LABEL}}", "Items")
         .replace("{{COUNT}}", &esc(&count))
         .replace("{{CARDS}}", &cards)
         .replace(
@@ -4008,15 +4002,27 @@ fn render_trash_cards(items: &[TrashItem], csrf: &str) -> String {
             } else {
                 ext_label(&item.name)
             };
-            let size = item.size.map(human_size).unwrap_or_else(|| "Folder".to_string());
+            let summary = item
+                .size
+                .map(human_size)
+                .unwrap_or_else(|| "Contents recover together".to_string());
             let kind = item.kind.slug();
+            let kind_label = if item.kind == LibraryItemKind::Folder {
+                "Folder"
+            } else {
+                "File"
+            };
             format!(
                 "<li class=\"file-card file-card--trash\" id=\"file-{id}\">\
                    <label class=\"ap-select\" title=\"Select {name}\"><span class=\"sr-only\">Select {name}</span><input type=\"checkbox\" name=\"item:{kind}:{id}\" value=\"1\" form=\"bulkSelection\" data-bulk-item></label>\
                    <div class=\"thumb thumb--file {tone}\">{glyph}<span class=\"thumb__ext {tone}\">{ext}</span></div>\
                    <div class=\"file-card__body\">\
                      <span class=\"file-card__name\" title=\"{name}\">{name}</span>\
-                     <div class=\"file-card__meta\"><span>{size}</span><span>Deleted <time class=\"ap-date\" data-spark-reltime data-ts=\"{deleted_ts}\" title=\"{deleted}\">{deleted}</time></span><span title=\"Delete forever after {purge}\">30-day recovery</span></div>\
+                     <div class=\"file-card__meta ap-trash-meta\">\
+                       <span>{kind_label} · {summary}</span>\
+                       <span>Deleted <time class=\"ap-date\" data-spark-reltime data-ts=\"{deleted_ts}\" title=\"{deleted}\">{deleted}</time></span>\
+                       <span class=\"ap-trash-meta__recovery\">Eligible for automatic deletion after <time class=\"ap-date\" title=\"{purge}\">{purge}</time></span>\
+                     </div>\
                      <div class=\"trash-actions\">\
                        <form method=\"post\" action=\"/trash/restore\">\
                          <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
@@ -4038,10 +4044,11 @@ fn render_trash_cards(items: &[TrashItem], csrf: &str) -> String {
                 ext = esc(&ext),
                 tone = tone,
                 kind = kind,
+                kind_label = kind_label,
                 id = esc(&item.id),
                 csrf = esc(csrf),
                 name = esc(&item.name),
-                size = esc(&size),
+                summary = esc(&summary),
                 deleted = esc(&deleted),
                 deleted_ts = item.trashed_at,
                 purge = esc(&purge),
@@ -4119,10 +4126,14 @@ fn render_sidebar(
         csrf = esc(csrf),
         parent = esc(&parent_id),
     );
-    let new_folder = format!(
-        "<details class=\"ap-fold ap-new-folder\"><summary>New folder</summary>{new_form}</details>",
-        new_form = new_form,
-    );
+    let new_folder = if trash_active {
+        String::new()
+    } else {
+        format!(
+            "<details class=\"ap-fold ap-new-folder\"><summary>New folder</summary>{new_form}</details>",
+            new_form = new_form,
+        )
+    };
 
     // Rename + delete + folder-share controls, shown only when viewing a specific folder.
     let manage = match active {
@@ -4165,15 +4176,37 @@ fn render_sidebar(
         )
     };
     let chain = active.map(|a| folder_chain(folders, a)).unwrap_or_default();
-    let tree = render_folder_tree(folders, active.map(|a| a.id.as_str()), &chain);
-    let all_active = if active.is_none() && !trash_active && library_active.is_none() {
+    let tree = if trash_active {
+        String::new()
+    } else {
+        render_folder_tree(folders, active.map(|a| a.id.as_str()), &chain)
+    };
+    let all_selected = active.is_none()
+        && !trash_active
+        && matches!(library_active, None | Some(LibraryView::All));
+    let all_active = if all_selected {
         " is-active"
     } else {
         ""
     };
+    let all_current = if all_selected {
+        " aria-current=\"page\""
+    } else {
+        ""
+    };
     let trash_active_class = if trash_active { " is-active" } else { "" };
+    let trash_current = if trash_active {
+        " aria-current=\"page\""
+    } else {
+        ""
+    };
     let recent_active = if library_active == Some(LibraryView::Recent) {
         " is-active"
+    } else {
+        ""
+    };
+    let recent_current = if library_active == Some(LibraryView::Recent) {
+        " aria-current=\"page\""
     } else {
         ""
     };
@@ -4182,29 +4215,34 @@ fn render_sidebar(
     } else {
         ""
     };
+    let shared_current = if library_active == Some(LibraryView::Shared) {
+        " aria-current=\"page\""
+    } else {
+        ""
+    };
     let foot = if trash_active {
-        "<p class=\"ap-rail__foot trash-note\">Trashed files stay in storage and count toward quota until deleted forever.</p>"
+        "<p class=\"ap-rail__foot trash-note\">Trashed files and folders stay in storage and count toward quota until deleted forever.</p>"
     } else {
         ""
     };
 
     format!(
         "<nav class=\"ap-nav\" aria-label=\"Drive folders\">\
-           <a class=\"ap-nav__row{all_active}\" href=\"/\">\
+           <a class=\"ap-nav__row{all_active}\" href=\"/\"{all_current}>\
              <svg class=\"ap-nav__ico\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z\"/></svg>\
              <span class=\"ap-nav__name\">My Drive</span>\
            </a>\
            {tree}\
            <div class=\"ap-rail__rule\" aria-hidden=\"true\"></div>\
-           <a class=\"ap-nav__row{recent_active}\" href=\"/?view=recent\">\
+           <a class=\"ap-nav__row{recent_active}\" href=\"/?view=recent\"{recent_current}>\
              <svg class=\"ap-nav__ico\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><circle cx=\"12\" cy=\"12\" r=\"9\"/><path d=\"M12 7v5l3 2\"/></svg>\
              <span class=\"ap-nav__name\">Recent</span>\
            </a>\
-           <a class=\"ap-nav__row{shared_active}\" href=\"/?view=shared\">\
+           <a class=\"ap-nav__row{shared_active}\" href=\"/?view=shared\"{shared_current}>\
              <svg class=\"ap-nav__ico\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7\"/><path d=\"M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7\"/></svg>\
              <span class=\"ap-nav__name\">Shared by me</span>\
            </a>\
-           <a class=\"ap-nav__row{trash_active_class}\" href=\"/?view=trash\">\
+           <a class=\"ap-nav__row{trash_active_class}\" href=\"/?view=trash\"{trash_current}>\
              <svg class=\"ap-nav__ico\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M3 6h18\"/><path d=\"M8 6V4h8v2\"/><path d=\"m19 6-1 14H6L5 6\"/></svg>\
              <span class=\"ap-nav__name\">Trash</span>\
            </a>\
@@ -4212,10 +4250,14 @@ fn render_sidebar(
          <div class=\"ap-rail__tools\">{new_folder}{settings}{foot}</div>",
         new_folder = new_folder,
         all_active = all_active,
+        all_current = all_current,
         tree = tree,
         recent_active = recent_active,
+        recent_current = recent_current,
         shared_active = shared_active,
+        shared_current = shared_current,
         trash_active_class = trash_active_class,
+        trash_current = trash_current,
         settings = settings,
         foot = foot,
     )
@@ -4248,12 +4290,18 @@ fn render_folder_tree_level(
         let active = active_id == Some(f.id.as_str());
         let expanded = chain.iter().any(|c| c.id == f.id);
         let class = if active { " is-active" } else { "" };
+        let current = if active {
+            " aria-current=\"page\""
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            "<li><a class=\"ap-nav__row{class}\" href=\"/?folder={id}\" title=\"{name}\">\
+            "<li><a class=\"ap-nav__row{class}\" href=\"/?folder={id}\" title=\"{name}\"{current}>\
                <svg class=\"ap-nav__ico\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M4 5h5l2 2.5h9a1 1 0 0 1 1 1V18a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Z\"/></svg>\
                <span class=\"ap-nav__name\">{name}</span>\
              </a>",
             class = class,
+            current = current,
             id = esc(&f.id),
             name = esc(&f.name),
         ));
@@ -4430,7 +4478,7 @@ fn render_cards(files: &[FileRec], csrf: &str) -> String {
                    <summary class=\"card-menu__btn\" title=\"Actions\" aria-label=\"File actions\">\
                      <svg viewBox=\"0 0 24 24\" width=\"16\" height=\"16\" fill=\"currentColor\" aria-hidden=\"true\"><circle cx=\"5\" cy=\"12\" r=\"1.6\"/><circle cx=\"12\" cy=\"12\" r=\"1.6\"/><circle cx=\"19\" cy=\"12\" r=\"1.6\"/></svg>\
                    </summary>\
-                   <div class=\"card-menu__pop\" role=\"menu\">\
+                   <div class=\"card-menu__pop\">\
                      <form class=\"card-menu__form rename-form\" method=\"post\" action=\"/f/{id}/rename\">\
                        <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
                        <input class=\"rename-form__input\" type=\"text\" name=\"name\" value=\"{name}\" maxlength=\"255\" required aria-label=\"New file name\">\

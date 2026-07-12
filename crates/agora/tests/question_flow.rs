@@ -68,6 +68,12 @@ async fn question_lifecycle_filters_and_historical_clear_are_coherent() {
     assert!(question_page.contains("Needs answer"));
     assert!(question_page.contains("Your answer"));
     assert!(question_page.contains("Post answer"));
+    assert_eq!(question_page.matches(r#"id="thread-latest""#).count(), 1);
+    assert!(
+        question_page.find(r#"id="thread-latest""#).unwrap()
+            < question_page.find("Original post").unwrap(),
+        "a question without replies anchors Latest at its original post"
+    );
 
     let answer_id = reply(
         &state,
@@ -93,6 +99,15 @@ async fn question_lifecycle_filters_and_historical_clear_are_coherent() {
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let (_, _, answered_page) = send(&state, get_as(&question, ALICE_SUB, ALICE_EMAIL)).await;
+    let solution = answered_page.find(r#"class="ag-solution""#).unwrap();
+    let latest = answered_page.find(r#"id="thread-latest""#).unwrap();
+    let heading = answered_page.find("Accepted answer</h2>").unwrap();
+    assert!(
+        solution < latest && latest < heading,
+        "when no ordinary reply remains, Latest anchors the labelled solution"
+    );
 
     let (_, _, answered) = send(&state, get("/questions?status=answered")).await;
     assert!(answered.contains("How should leases be renewed?"));
@@ -302,6 +317,9 @@ async fn accepted_solution_is_fixed_above_a_full_reply_page_without_duplication(
     assert!(first_page.contains("ordinary paged reply 19"));
     assert!(!first_page.contains("ordinary paged reply 20"));
     assert!(first_page.contains("Jump to latest"));
+    assert!(first_page.contains(&format!(
+        r#"href="/t/{thread_id}?latest=1#thread-latest">Latest</a>"#
+    )));
 
     let (_, _, latest_page) = send(
         &state,
@@ -311,6 +329,10 @@ async fn accepted_solution_is_fixed_above_a_full_reply_page_without_duplication(
     assert_eq!(latest_page.matches("THE PAGED SOLUTION").count(), 1);
     assert!(latest_page.contains("ordinary paged reply 23"));
     assert!(latest_page.contains("25 replies"));
+    assert_eq!(latest_page.matches(r#"id="thread-latest""#).count(), 1);
+    assert!(latest_page
+        .contains(r#"<article id="post-p_paged_answer_23" class="post"><span id="thread-latest""#));
+    assert!(latest_page.contains(r##"href="#thread-latest">Latest</a>"##));
 }
 
 #[tokio::test]

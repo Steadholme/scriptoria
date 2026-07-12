@@ -132,6 +132,15 @@ async fn admin_lock_blocks_new_replies() {
         !page.contains(&format!(r#"action="/t/{tid}/reply""#)),
         "no reply form action on a locked thread"
     );
+    assert!(page.contains("ag-thread-toolbar__locked"));
+    assert!(
+        !page.contains("ag-thread-toolbar__reply"),
+        "the sticky toolbar does not bypass the reply permission boundary"
+    );
+    assert!(
+        !page.contains("?quote="),
+        "a locked thread does not offer a Quote shortcut to the absent reply composer"
+    );
 
     // A reply is now refused.
     let reply = form(&[("csrf", TOK), ("body", "late reply")]);
@@ -146,6 +155,11 @@ async fn admin_lock_blocks_new_replies() {
     )
     .await;
     assert_eq!(s, StatusCode::SEE_OTHER);
+    let (_s, _h, unlocked_page) = send(&state, get(&loc)).await;
+    assert!(
+        unlocked_page.contains("?quote="),
+        "unlocking restores the post-level Quote action"
+    );
     let reply = form(&[("csrf", TOK), ("body", "now allowed")]);
     let (s, _h, _b) =
         send(&state, post_as(&format!("{loc}/reply"), TOK, ALICE_SUB, ALICE_EMAIL, "", reply)).await;

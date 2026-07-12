@@ -24,6 +24,8 @@ async fn writer_html_contract_and_missing_intent_default_to_draft() {
         r#"name="intent" value="schedule""#,
         r#"id="tab-split""#,
         r#"id="tab-reader""#,
+        "Split body preview",
+        "Article body preview",
         r#"role="status" aria-live="polite""#,
         r#"aria-autocomplete="list""#,
         "after 24 hours while open, or on your next visit",
@@ -45,6 +47,13 @@ async fn writer_html_contract_and_missing_intent_default_to_draft() {
         !html.contains("{{"),
         "all Writer template slots are resolved"
     );
+    assert!(
+        !html.contains("Reader preview"),
+        "body-only rendering is not presented as a complete reader preview"
+    );
+    assert!(html.contains(
+        r#"class="appnav appnav--studio is-active" href="/library" aria-current="page""#
+    ));
     let scope = html
         .split("data-recovery-scope=\"")
         .nth(1)

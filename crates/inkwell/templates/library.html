@@ -1,31 +1,35 @@
-<main class="console ink-library">
+<main class="console ink-library" data-library>
   <header class="console__head ink-library__head">
     <div>
-      <p class="ink-library__eyebrow">Writer workspace</p>
-      <h1>Content library</h1>
-      <p class="sub">Find, organize, and return to your own posts without mixing them into the public reader.</p>
+      <p class="ink-library__eyebrow">Private author workspace</p>
+      <h1>Studio</h1>
+      <p class="sub">Draft, schedule, and organize your own work away from the public reader.</p>
     </div>
     <a class="btn btn-primary" href="{{NEW_HREF}}">New post</a>
   </header>
 
+  <nav class="ink-library__status-tabs" aria-label="Author library status">
+{{STATUS_TABS}}
+  </nav>
+
   {{NOTICE}}
 
-  <section class="card ink-library__filters">
+  <section class="card ink-library__filters" aria-label="Library filters">
     <div class="card__body">
       <form method="get" action="/library" class="ink-library__filterform" role="search">
+        <input type="hidden" name="status" value="{{STATUS_KEY}}">
+        <input type="hidden" name="limit" value="{{LIMIT}}">
         <div class="field ink-library__query">
           <label for="library-q">Search your content</label>
           <input id="library-q" name="q" type="search" maxlength="200" value="{{QUERY}}" placeholder="Title, slug, body, or tag">
         </div>
-        <div class="field">
-          <label for="library-status">Status</label>
-          <select id="library-status" name="status">{{STATUS_OPTIONS}}</select>
-        </div>
-        <div class="field">
-          <label for="library-tag">Exact tag</label>
-          <input id="library-tag" name="tag" type="text" maxlength="40" value="{{TAG}}" placeholder="e.g. rust">
-        </div>
-        <input type="hidden" name="limit" value="{{LIMIT}}">
+        <details class="ink-library__advanced"{{ADVANCED_OPEN}}>
+          <summary>Advanced filters</summary>
+          <div class="field">
+            <label for="library-tag">Exact tag</label>
+            <input id="library-tag" name="tag" type="text" maxlength="40" value="{{TAG}}" placeholder="e.g. rust">
+          </div>
+        </details>
         <div class="ink-library__filteractions">
           <button class="btn btn-secondary" type="submit">Apply filters</button>
           <a class="btn btn-ghost" href="/library">Reset</a>
@@ -38,31 +42,112 @@
     <div class="card__body">
       <div class="ink-library__resultshead">
         <div>
-          <h2 id="library-results-title">Your posts</h2>
+          <h2 id="library-results-title">Author library</h2>
           <p class="muted">{{RESULT_SUMMARY}}</p>
         </div>
-        <form id="library-bulk" class="ink-library__bulk" method="post" action="/library/posts/bulk">
-          <input type="hidden" name="csrf_token" value="{{CSRF}}">
-          <input type="hidden" name="return_to" value="{{RETURN_TO}}">
-          <label for="library-action">Selected posts</label>
-          <select id="library-action" name="action">
-            <option value="publish_now">Publish now</option>
-            <option value="draft">Move to draft</option>
-            <option value="pin">Pin</option>
-            <option value="unpin">Unpin</option>
-            <option value="add_tag">Add tag</option>
-            <option value="remove_tag">Remove tag</option>
-          </select>
-          <label class="sr-only" for="library-bulk-tag">Tag for add or remove</label>
-          <input id="library-bulk-tag" name="tag" type="text" maxlength="40" placeholder="Tag for add/remove">
-          <button class="btn btn-secondary btn-sm" type="submit">Apply</button>
-        </form>
+        <button class="btn btn-ghost btn-sm ink-library__selectpage" type="button" data-select-page aria-controls="library-rows" aria-pressed="false" hidden>Select page</button>
       </div>
-      <p class="muted ink-library__bulkhelp">Select up to 50 posts. Every selected version is checked before any change is committed.</p>
-      <div class="ink-library__rows" role="list">
+      <form id="library-bulk" class="ink-library__bulk" method="post" action="/library/posts/bulk">
+        <input type="hidden" name="csrf_token" value="{{CSRF}}">
+        <input type="hidden" name="return_to" value="{{RETURN_TO}}">
+        <div class="ink-library__bulkstate">
+          <strong data-selection-count aria-live="polite">Selected posts</strong>
+          <span>Current page · maximum 50</span>
+        </div>
+        <label class="sr-only" for="library-action">Bulk action</label>
+        <select id="library-action" name="action">
+          <option value="publish_now">Publish now</option>
+          <option value="draft">Move to draft</option>
+          <option value="pin">Pin</option>
+          <option value="unpin">Unpin</option>
+          <option value="add_tag">Add tag</option>
+          <option value="remove_tag">Remove tag</option>
+        </select>
+        <label class="sr-only" for="library-bulk-tag">Tag for add or remove</label>
+        <input id="library-bulk-tag" name="tag" type="text" maxlength="40" placeholder="Tag for add/remove" data-bulk-tag>
+        <button class="btn btn-secondary btn-sm" type="submit">Apply</button>
+      </form>
+      <p class="muted ink-library__bulkhelp">Every selected version is checked before any change is committed. Without JavaScript, select posts first and use the same form above.</p>
+      <div class="ink-library__rows" id="library-rows" role="list">
 {{ROWS}}
       </div>
       {{PAGER}}
     </div>
   </section>
 </main>
+
+<script>
+  (function () {
+    var root = document.querySelector('[data-library]');
+    if (!root) { return; }
+    var bulk = document.getElementById('library-bulk');
+    var selectPage = root.querySelector('[data-select-page]');
+    var boxes = Array.prototype.slice.call(root.querySelectorAll('input[data-library-item]'));
+    if (!bulk) { return; }
+    root.classList.add('is-enhanced');
+    var count = bulk.querySelector('[data-selection-count]');
+    var action = document.getElementById('library-action');
+    var bulkTag = bulk.querySelector('[data-bulk-tag]');
+    var MAX_SELECTION = 50;
+
+    function syncBulkTag() {
+      if (!action || !bulkTag) { return; }
+      bulkTag.hidden = action.value !== 'add_tag' && action.value !== 'remove_tag';
+    }
+
+    function selectedCount() {
+      return boxes.filter(function (box) { return box.checked; }).length;
+    }
+
+    function syncSelection() {
+      var selected = selectedCount();
+      if (selected > MAX_SELECTION) {
+        boxes.filter(function (box) { return box.checked; }).slice(MAX_SELECTION).forEach(function (box) {
+          box.checked = false;
+        });
+        selected = MAX_SELECTION;
+      }
+      var selectionLimitReached = selected >= MAX_SELECTION;
+      bulk.hidden = selected === 0;
+      root.classList.toggle('has-selection', selected > 0);
+      boxes.forEach(function (box) {
+        box.disabled = selectionLimitReached && !box.checked;
+      });
+      if (count) {
+        count.textContent = selected + (selected === 1 ? ' post selected' : ' posts selected')
+          + (selectionLimitReached ? ' · maximum reached' : '');
+      }
+      if (selectPage) {
+        var pageSelectionSize = Math.min(boxes.length, MAX_SELECTION);
+        var allSelected = pageSelectionSize > 0 && selected === pageSelectionSize;
+        selectPage.hidden = boxes.length === 0;
+        selectPage.textContent = allSelected
+          ? 'Clear page'
+          : (boxes.length > MAX_SELECTION ? 'Select first 50' : 'Select page');
+        selectPage.setAttribute('aria-pressed', allSelected ? 'true' : 'false');
+      }
+    }
+
+    boxes.forEach(function (box) {
+      box.addEventListener('change', function () {
+        if (box.checked && selectedCount() > MAX_SELECTION) {
+          box.checked = false;
+        }
+        syncSelection();
+      });
+    });
+    if (action) { action.addEventListener('change', syncBulkTag); }
+    if (selectPage) {
+      selectPage.addEventListener('click', function () {
+        var pageSelectionSize = Math.min(boxes.length, MAX_SELECTION);
+        var shouldSelect = selectedCount() !== pageSelectionSize;
+        boxes.forEach(function (box, index) {
+          box.checked = shouldSelect && index < MAX_SELECTION;
+        });
+        syncSelection();
+      });
+    }
+    syncBulkTag();
+    syncSelection();
+  })();
+</script>
