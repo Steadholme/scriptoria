@@ -425,6 +425,204 @@ async fn thread_before_cursor_pages_to_older_replies() {
     assert!(page.contains("?latest=1"), "Jump to latest link present");
 }
 
+#[tokio::test]
+async fn reading_receipts_resume_at_exact_first_unread_without_swallowing_holes() {
+    let state = build_dev_state().await;
+    let tok = "csrftoken123";
+    let location = create_thread(&state, tok, "Reading continuity", "OP body.").await;
+    let tid = location.strip_prefix("/t/").unwrap().to_string();
+    let reply_count = REPLIES_PER_PAGE as usize + 5;
+    seed_replies(&state, &tid, reply_count).await;
+
+    let (status, _, first_page) =
+        send(&state, get_as(&location, ALICE_SUB, ALICE_EMAIL)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first_page.matches("id=\"thread-resume\"").count(), 1);
+    assert!(first_page.contains("First unread"));
+    assert!(first_page.contains("Mark page read &amp; continue"));
+    assert!(first_page.contains("body: new URLSearchParams(new FormData(form))"));
+
+    let visible = state.store.posts_in_thread(&tid).await.unwrap();
+    let visible_ids = visible
+        .iter()
+        .take(REPLIES_PER_PAGE as usize + 1)
+        .map(|post| post.id.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let body = form(&[("csrf", tok), ("post_ids", &visible_ids)]);
+    let (status, headers, _) = send(
+        &state,
+        post_form_as(
+            &format!("{location}/read"),
+            tok,
+            ALICE_SUB,
+            ALICE_EMAIL,
+            body,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        headers.get(header::LOCATION).unwrap().to_str().unwrap(),
+        format!("{location}?resume=1#thread-resume")
+    );
+    let reading = state
+        .store
+        .thread_reading_state(ALICE_SUB, &tid)
+        .await
+        .unwrap();
+    assert!(reading.started);
+    assert_eq!(reading.unread_count, 5);
+    assert_eq!(reading.first_unread.as_ref().unwrap().body_md, "reply-body-020");
+
+    let (_, _, home) = send(&state, get_as("/", ALICE_SUB, ALICE_EMAIL)).await;
+    assert!(home.contains("Continue · 5 new"));
+    assert!(home.contains(&format!("/t/{tid}?resume=1#thread-resume")));
+
+    let (_, _, resumed) = send(
+        &state,
+        get_as(&format!("{location}?resume=1"), ALICE_SUB, ALICE_EMAIL),
+    )
+    .await;
+    assert!(resumed.contains("reply-body-020"));
+    assert_eq!(resumed.matches("id=\"thread-resume\"").count(), 1);
+    assert!(resumed.find("First unread").unwrap() < resumed.find("reply-body-020").unwrap());
+
+    let latest = state
+        .store
+        .replies_page(
+            &tid,
+            &visible[0].id,
+            None,
+            &agora::store::ReplyAnchor::Latest,
+            REPLIES_PER_PAGE,
+        )
+        .await
+        .unwrap();
+    let mut bob_ids = vec![visible[0].id.clone()];
+    bob_ids.extend(latest.into_iter().map(|post| post.id));
+    state
+        .store
+        .mark_thread_posts_read(BOB_SUB, &tid, &bob_ids, 123)
+        .await
+        .unwrap();
+    let bob = state
+        .store
+        .thread_reading_state(BOB_SUB, &tid)
+        .await
+        .unwrap();
+    assert_eq!(bob.unread_count, 5);
+    assert_eq!(bob.first_unread.unwrap().body_md, "reply-body-000");
+}
+
+#[tokio::test]
+async fn accepted_solution_can_be_the_exact_first_unread_boundary() {
+    let state = build_dev_state().await;
+    let tok = "csrftoken123";
+    let body = form(&[
+        ("csrf", tok),
+        ("category", "support"),
+        ("title", "Accepted continuity"),
+        ("body", "Question body."),
+    ]);
+    let (status, headers, _) = send(&state, post_form("/new", Some(tok), true, body)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let location = headers.get(header::LOCATION).unwrap().to_str().unwrap();
+    let tid = location.strip_prefix("/t/").unwrap();
+    let op = state.store.first_post_in_thread(tid).await.unwrap().unwrap();
+    let solution = Post {
+        id: "p_solution_reading".to_string(),
+        thread_id: tid.to_string(),
+        body_md: "The accepted solution body.".to_string(),
+        quoted_post_id: String::new(),
+        author_sub: BOB_SUB.to_string(),
+        author_email: BOB_EMAIL.to_string(),
+        created_at: op.created_at + 10,
+    };
+    let later = Post {
+        id: "p_later_reading".to_string(),
+        body_md: "A later ordinary reply.".to_string(),
+        created_at: op.created_at + 20,
+        ..solution.clone()
+    };
+    state.store.add_reply(&solution).await.unwrap();
+    state.store.add_reply(&later).await.unwrap();
+    state
+        .store
+        .mutate_accepted_answer(
+            tid,
+            agora::store::AcceptedAnswerAction::Accept {
+                post_id: solution.id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    state
+        .store
+        .mark_thread_posts_read(ALICE_SUB, tid, &[op.id], 100)
+        .await
+        .unwrap();
+
+    let reading = state
+        .store
+        .thread_reading_state(ALICE_SUB, tid)
+        .await
+        .unwrap();
+    assert_eq!(reading.first_unread.as_ref().unwrap().id, solution.id);
+    let (_, _, page) = send(
+        &state,
+        get_as(&format!("{location}?resume=1"), ALICE_SUB, ALICE_EMAIL),
+    )
+    .await;
+    assert_eq!(page.matches("id=\"thread-resume\"").count(), 1);
+    assert_eq!(page.matches("The accepted solution body.").count(), 1);
+    assert!(page.contains("A later ordinary reply."));
+    assert!(page.find("First unread").unwrap() < page.find("Accepted answer").unwrap());
+}
+
+#[tokio::test]
+async fn reading_receipt_post_is_csrf_guarded_and_batch_atomic() {
+    let state = build_dev_state().await;
+    let tok = "csrftoken123";
+    let first_location = create_thread(&state, tok, "First receipt thread", "First OP.").await;
+    let second_location = create_thread(&state, tok, "Second receipt thread", "Second OP.").await;
+    let first_tid = first_location.strip_prefix("/t/").unwrap();
+    let second_tid = second_location.strip_prefix("/t/").unwrap();
+    let first_op = state.store.first_post_in_thread(first_tid).await.unwrap().unwrap();
+    let second_op = state.store.first_post_in_thread(second_tid).await.unwrap().unwrap();
+
+    let body = form(&[("csrf", tok), ("post_ids", &first_op.id)]);
+    let (status, _, _) = send(
+        &state,
+        post_form(&format!("{first_location}/read"), None, true, body.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _, _) = send(
+        &state,
+        post_form(&format!("{first_location}/read"), Some(tok), false, body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let result = state
+        .store
+        .mark_thread_posts_read(
+            ALICE_SUB,
+            first_tid,
+            &[first_op.id.clone(), second_op.id],
+            200,
+        )
+        .await;
+    assert!(result.is_err());
+    let reading = state
+        .store
+        .thread_reading_state(ALICE_SUB, first_tid)
+        .await
+        .unwrap();
+    assert!(!reading.started);
+}
+
 // --- helpers ---------------------------------------------------------------------------
 
 async fn send(state: &AppState, req: Request<Body>) -> (StatusCode, HeaderMap, String) {

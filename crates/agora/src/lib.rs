@@ -20,6 +20,7 @@
 //! - `GET  /new?cat=`        new-thread form (with live "similar existing threads" hints)
 //! - `POST /new`             create a thread
 //! - `POST /t/{id}/reply`    post a reply
+//! - `POST /t/{id}/read`     mark only the currently rendered posts read, then continue
 //! - `GET/POST /t/{id}/edit` edit one's OWN thread (title + original-post body)
 //! - `POST /t/{id}/delete`   delete one's OWN thread (and all its posts)
 //! - `GET/POST /t/{tid}/p/{pid}/edit`   edit one's OWN reply
@@ -106,6 +107,7 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/c/{id}", get(handlers::forum::category))
         .route("/t/{id}", get(handlers::forum::thread))
+        .route("/t/{id}/read", post(handlers::forum::mark_thread_read))
         .route("/t/{id}/reply", post(handlers::forum::reply))
         .route(
             "/t/{id}/edit",

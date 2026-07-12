@@ -115,14 +115,11 @@ pub async fn sitemap_xml(State(state): State<AppState>) -> Result<Response, AppE
 
 /// Absolute reading-view URL for a post slug (slugs are already URL-safe `[a-z0-9-]`).
 fn post_url(slug: &str) -> String {
-    format!("{}/p/{slug}", crate::config::SITE_BASE_URL)
+    super::posts::local_post_url(slug)
 }
 
 fn has_external_canonical(entry: &SitemapEntry) -> bool {
-    let override_url = entry.canonical_url.trim();
-    !override_url.is_empty()
-        && super::posts::canonical_url_is_safe(override_url)
-        && override_url != post_url(&entry.slug)
+    super::posts::canonical_excludes_local_url(&entry.canonical_url, &entry.slug)
 }
 
 /// An XML response with the given content type.

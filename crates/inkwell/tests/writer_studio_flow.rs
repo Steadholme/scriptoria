@@ -22,6 +22,13 @@ async fn writer_html_contract_and_missing_intent_default_to_draft() {
         r#"name="intent" value="save_draft""#,
         r#"name="intent" value="publish_now""#,
         r#"name="intent" value="schedule""#,
+        r#"formaction="/new/review" data-review-submit"#,
+        "Review schedule",
+        "Review &amp; publish",
+        r#"name="schedule_timezone""#,
+        r#"name="schedule_offset_minutes""#,
+        r#"data-utc-epoch="""#,
+        r#"id="publish_at_epoch" name="publish_at_epoch" value="""#,
         r#"id="tab-split""#,
         r#"id="tab-reader""#,
         "Split body preview",
@@ -104,6 +111,304 @@ async fn writer_html_contract_and_missing_intent_default_to_draft() {
 }
 
 #[tokio::test]
+async fn review_publish_is_read_only_server_normalized_and_no_js_confirmable() {
+    let state = build_dev_state();
+    let future = ((now_secs() + 7_200) / 60) * 60;
+    let future_text = utc_datetime_local(future);
+    let future_epoch = future.to_string();
+    let review = form(&[
+        ("title", "  Reviewed Schedule  "),
+        (
+            "body",
+            "safe **body** <script>alert(1)</script> [bad](javascript:alert(2))",
+        ),
+        ("tags", "Rust, rust, Release"),
+        ("custom_excerpt", "Resolved release summary"),
+        ("meta_title", "Resolved search title"),
+        ("canonical_url", "https://example.com/original"),
+        ("social_image", "https://drive.w33d.xyz/s/review-card"),
+        ("publish_at", &future_text),
+        ("publish_at_epoch", &future_epoch),
+        ("schedule_timezone", "Europe/Berlin"),
+        ("schedule_offset_minutes", "120"),
+        ("intent", "schedule"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, headers, html) = call(&state, post_json("/new/review", &review)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get(header::CACHE_CONTROL).unwrap(),
+        "private, no-store"
+    );
+    assert!(state.store.get_post("reviewed-schedule").await.is_none());
+    for contract in [
+        "Server-validated preflight",
+        "It is not a complete theme, inbox, or third-party social preview.",
+        r#"method="post" action="/new""#,
+        r#"formaction="/new/review" name="review_action" value="edit""#,
+        r#"name="intent" value="schedule""#,
+        r#"name="title" value="Reviewed Schedule""#,
+        r#"name="tags" value="Rust, Release""#,
+        "Resolved search title",
+        "Resolved release summary",
+        "https://example.com/original · the slug is not reserved during review; sitemap inclusion is decided after confirmation against the assigned local URL",
+        "The new slug is not reserved during review.",
+        "Europe/Berlin (UTC+02:00)",
+        "the UTC instant is authoritative",
+        "Sanitized article body sample",
+        "Review does not reserve a URL or consume Writer recovery.",
+    ] {
+        assert!(
+            html.contains(contract),
+            "missing review contract: {contract}"
+        );
+    }
+    assert!(html.contains(&format!(r#"name="publish_at_epoch" value="{future}""#)));
+    assert!(html.contains("<strong>body</strong>"));
+    assert!(!html.contains("<script>alert(1)</script>"));
+    assert!(!html.contains(r#"href="javascript:"#));
+    assert!(
+        !html.contains("local URL is excluded from the sitemap"),
+        "new-post review cannot claim exclusion before the slug is assigned"
+    );
+
+    // The same SSR route returns the canonical payload to a complete native editor without a
+    // write, so no-JavaScript authors do not rely on browser history to keep their draft.
+    let back = form(&[
+        ("review_action", "edit"),
+        ("title", "Reviewed Schedule"),
+        ("body", "safe body returned from review"),
+        ("tags", "Rust, Release"),
+        ("publish_at", &future_text),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, headers, editor) = call(&state, post_json("/new/review", &back)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get(header::CACHE_CONTROL).unwrap(),
+        "private, no-store"
+    );
+    assert!(editor.contains("Returned from review · keep editing before publication."));
+    assert!(editor.contains("safe body returned from review"));
+    assert!(editor.contains(r#"formaction="/new/review" data-review-submit"#));
+    assert!(state.store.get_post("reviewed-schedule").await.is_none());
+
+    // No JavaScript submits datetime-local as documented UTC; review converts it to the exact
+    // epoch that the existing final Schedule intent already authorizes.
+    let no_js = form(&[
+        ("title", "No JS Reviewed Schedule"),
+        ("body", "native form"),
+        ("publish_at", &future_text),
+        ("intent", "schedule"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, _, html) = call(&state, post_json("/new/review", &no_js)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("no JavaScript input was interpreted as UTC"));
+    assert!(html.contains(&format!(r#"name="publish_at_epoch" value="{future}""#)));
+
+    // Template-looking prose is valid article content. Preflight must insert the canonical
+    // payload in one pass: later template slots must never rewrite an earlier user value.
+    let literal_body = "literal {{INTENT}} {{CONFIRM_LABEL}} {{BODY_PREVIEW}} {{HIDDEN_FIELDS}}";
+    let literal_excerpt = "excerpt {{INTENT}}";
+    let literal_meta_title = "search {{DESCRIPTION}}";
+    let literal_social_title = "social {{SOCIAL_DESCRIPTION}}";
+    let literal_review = form(&[
+        ("title", "Literal Template Tokens"),
+        ("body", literal_body),
+        ("custom_excerpt", literal_excerpt),
+        ("meta_title", literal_meta_title),
+        ("social_title", literal_social_title),
+        ("intent", "publish_now"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, headers, literal_html) =
+        call(&state, post_json("/new/review", &literal_review)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get(header::CACHE_CONTROL).unwrap(),
+        "private, no-store"
+    );
+    let confirmed_title = hidden_input(&literal_html, "title");
+    let confirmed_body = hidden_textarea(&literal_html, "body");
+    let confirmed_excerpt = hidden_textarea(&literal_html, "custom_excerpt");
+    let confirmed_meta_title = hidden_input(&literal_html, "meta_title");
+    let confirmed_social_title = hidden_input(&literal_html, "social_title");
+    assert_eq!(confirmed_body, literal_body);
+    assert_eq!(confirmed_excerpt, literal_excerpt);
+    assert_eq!(confirmed_meta_title, literal_meta_title);
+    assert_eq!(confirmed_social_title, literal_social_title);
+    assert!(literal_html.contains(r#"name="intent" value="publish_now""#));
+    assert!(literal_html.contains("Confirm publish now"));
+
+    // Submit exactly the canonical hidden payload returned by preflight to the unchanged final
+    // authority, proving the two-step native form round-trip does not alter valid literal text.
+    let confirmation = form(&[
+        ("title", &confirmed_title),
+        ("body", &confirmed_body),
+        ("custom_excerpt", &confirmed_excerpt),
+        ("meta_title", &confirmed_meta_title),
+        ("social_title", &confirmed_social_title),
+        ("intent", "publish_now"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, _, _) = call(&state, post_json("/new", &confirmation)).await;
+    assert_eq!(status, StatusCode::OK);
+    let stored = state
+        .store
+        .get_post("literal-template-tokens")
+        .await
+        .unwrap();
+    assert_eq!(stored.body_md, literal_body);
+    assert_eq!(stored.custom_excerpt, literal_excerpt);
+    assert_eq!(stored.meta_title, literal_meta_title);
+    assert_eq!(stored.social_title, literal_social_title);
+
+    let existing = form(&[
+        ("title", "Canonical Existing"),
+        ("body", "stable local canonical"),
+        ("intent", "save_draft"),
+        ("csrf_token", CSRF),
+    ]);
+    assert_eq!(
+        call(&state, post_json("/new", &existing)).await.0,
+        StatusCode::OK
+    );
+    let existing = state.store.get_post("canonical-existing").await.unwrap();
+    let self_review = form(&[
+        ("title", "Canonical Existing"),
+        ("body", "stable local canonical"),
+        (
+            "canonical_url",
+            "https://blog.w33d.xyz/p/canonical-existing",
+        ),
+        ("expected_post_id", &existing.id),
+        ("expected_version", "1"),
+        ("intent", "publish_now"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, _, self_html) = call(
+        &state,
+        post_json("/edit/canonical-existing/review", &self_review),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(self_html.contains("matches the stable local Reader URL and remains in the sitemap"));
+    assert!(!self_html.contains("local URL is excluded from the sitemap"));
+
+    let external_review = form(&[
+        ("title", "Canonical Existing"),
+        ("body", "stable local canonical"),
+        ("canonical_url", "https://example.com/canonical-existing"),
+        ("expected_post_id", &existing.id),
+        ("expected_version", "1"),
+        ("intent", "publish_now"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, _, external_html) = call(
+        &state,
+        post_json("/edit/canonical-existing/review", &external_review),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(external_html.contains(
+        "differs from the stable local Reader URL, so the local URL is excluded from the sitemap"
+    ));
+    assert!(state
+        .store
+        .get_post("canonical-existing")
+        .await
+        .unwrap()
+        .canonical_url
+        .is_empty());
+
+    let invalid_review = form(&[
+        ("title", "Draft Does Not Review"),
+        ("intent", "save_draft"),
+        ("csrf_token", CSRF),
+    ]);
+    assert_eq!(
+        call(&state, post_json("/new/review", &invalid_review))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn review_routes_require_identity_csrf_and_edit_ownership() {
+    let state = build_dev_state();
+    let review = form(&[
+        ("title", "Boundary Review"),
+        ("body", "private submission"),
+        ("intent", "publish_now"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, headers, _) =
+        call(&state, post_as("/new/review", &review, None, Some(CSRF))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        headers.get(header::CACHE_CONTROL).unwrap(),
+        "private, no-store"
+    );
+
+    let (status, headers, _) = call(
+        &state,
+        post_as(
+            "/new/review",
+            &review,
+            Some("u_writer"),
+            Some("different-token"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        headers.get(header::CACHE_CONTROL).unwrap(),
+        "private, no-store"
+    );
+
+    let draft = form(&[
+        ("title", "Owned Boundary Review"),
+        ("body", "authoritative owner body"),
+        ("intent", "save_draft"),
+        ("csrf_token", CSRF),
+    ]);
+    assert_eq!(
+        call(&state, post_json("/new", &draft)).await.0,
+        StatusCode::OK
+    );
+    let post = state.store.get_post("owned-boundary-review").await.unwrap();
+    let foreign_review = form(&[
+        ("title", "Foreign overwrite"),
+        ("body", "must not be accepted"),
+        ("expected_post_id", &post.id),
+        ("expected_version", "1"),
+        ("intent", "publish_now"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, headers, _) = call(
+        &state,
+        post_as(
+            "/edit/owned-boundary-review/review",
+            &foreign_review,
+            Some("u_other"),
+            Some(CSRF),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        headers.get(header::CACHE_CONTROL).unwrap(),
+        "private, no-store"
+    );
+    let unchanged = state.store.get_post("owned-boundary-review").await.unwrap();
+    assert_eq!(unchanged.author_sub, "u_writer");
+    assert_eq!(unchanged.body_md, "authoritative owner body");
+    assert!(!unchanged.published);
+}
+
+#[tokio::test]
 async fn explicit_intents_publish_schedule_and_preserve_edit_state() {
     let state = build_dev_state();
 
@@ -145,6 +450,12 @@ async fn explicit_intents_publish_schedule_and_preserve_edit_state() {
         later.publish_at, future,
         "browser UTC epoch is authoritative"
     );
+    let (_, _, scheduled_editor) = call(&state, get_auth("/edit/later-post")).await;
+    let future_utc = utc_datetime_local(future);
+    assert!(scheduled_editor.contains(&format!(
+        r#"value="{future_utc}" data-utc-value="{future_utc}" data-utc-epoch="{future}""#
+    )));
+    assert!(scheduled_editor.contains(r#"id="publish_at_epoch" name="publish_at_epoch" value="""#));
     assert!(
         state.store.count_chunks().await.unwrap() > 0,
         "an existing published post keeps the derived cache non-empty"
@@ -581,6 +892,27 @@ fn post_json(uri: &str, body: &str) -> Request<Body> {
         .unwrap()
 }
 
+fn post_as(
+    uri: &str,
+    body: &str,
+    subject: Option<&str>,
+    csrf_cookie: Option<&str>,
+) -> Request<Body> {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+    if let Some(subject) = subject {
+        request = request
+            .header("x-auth-subject", subject)
+            .header("x-auth-email", format!("{subject}@hf"));
+    }
+    if let Some(token) = csrf_cookie {
+        request = request.header(header::COOKIE, format!("__Host-csrf={token}"));
+    }
+    request.body(Body::from(body.to_string())).unwrap()
+}
+
 fn form(pairs: &[(&str, &str)]) -> String {
     pairs
         .iter()
@@ -613,4 +945,22 @@ fn utc_datetime_local(secs: i64) -> String {
         dt.hour(),
         dt.minute(),
     )
+}
+
+fn hidden_input(html: &str, name: &str) -> String {
+    let marker = format!(r#"name="{name}" value=""#);
+    html.split(&marker)
+        .nth(1)
+        .and_then(|tail| tail.split('"').next())
+        .unwrap_or_else(|| panic!("missing hidden input {name}"))
+        .to_string()
+}
+
+fn hidden_textarea(html: &str, name: &str) -> String {
+    let marker = format!(r#"<textarea name="{name}" hidden>"#);
+    html.split(&marker)
+        .nth(1)
+        .and_then(|tail| tail.split("</textarea>").next())
+        .unwrap_or_else(|| panic!("missing hidden textarea {name}"))
+        .to_string()
 }

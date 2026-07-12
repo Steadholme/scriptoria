@@ -133,6 +133,17 @@ pub struct Post {
     pub created_at: i64,
 }
 
+/// Authoritative subject-scoped reading projection for one thread. Receipts are stored per post,
+/// so `first_unread` remains exact after a user jumps to Latest or sees a floated accepted answer;
+/// a single high-water cursor would incorrectly swallow those unread holes.
+#[derive(Clone, Debug)]
+pub struct ThreadReadingState {
+    pub started: bool,
+    pub unread_count: i64,
+    pub first_unread: Option<Post>,
+    pub last_contiguous_read: Option<Post>,
+}
+
 /// One parsed `@username` occurrence for a post. Usernames are normalised to lowercase at write
 /// time and are matched against the viewer's gateway email local-part.
 #[derive(Clone, Debug, Serialize)]

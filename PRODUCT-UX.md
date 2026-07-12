@@ -471,14 +471,136 @@ information architecture and interaction ceiling.
   prevents a detail, Request Room, Share Room, admin, error, or upload page from reintroducing the
   implicit owner-gated `/favicon.ico` request that the browser audit caught.
 
+## Iteration 6: continuity, context, consequence
+
+Iteration 6 turns the three v5 orientation surfaces into authoritative workflows. Odyssey still
+owns tokens, focus visibility and reduced-motion semantics; Forum reading state, Drive owner
+inspection and Blog publication review remain product data and product runtime.
+
+### Forum: Continue reading / First unread
+
+- Store subject-scoped receipts per post, not one last-read cursor. A user may jump to Latest or
+  see the accepted Solution outside chronological order; those actions must not silently mark the
+  unseen posts between them read.
+- Resolve `?resume=1` from the earliest post without a receipt. The original post remains the
+  canonical floor, an ordinary first unread begins an inclusive ascending keyset page, and an
+  accepted first unread keeps the single fixed Solution region without consuming an ordinary
+  reply slot.
+- Mark only the OP, Solution and ordinary replies actually rendered on the current page. The
+  CSRF-guarded form is the no-JavaScript authority; the IntersectionObserver enhancement submits
+  the same bounded form when the reader reaches the page boundary.
+- Project reading state over a bounded set of thread ids in one Store call. A started thread with
+  unread posts links directly to `Continue · N new`; first-time historical content does not create
+  a synthetic global notification backlog.
+
+Acceptance: Memory and PostgreSQL isolate gateway subjects, validate the whole max-24 post batch
+before writing, preserve same-second/random-id holes, and cascade receipts when a post or thread is
+deleted. GET never writes. Latest, Activity-style Around, accepted-answer promotion, locked threads
+and old Before/After cursors retain their existing authority and pagination semantics.
+
+The interaction follows the official [Discourse first-unread behaviour](https://meta.discourse.org/t/access-the-top-of-the-topic-page/269510),
+but Agora does not import its timeline runtime or notification-level menu. GitHub's thread-level
+notification unread bit is insufficient here because an Agora page can contain real reading holes.
+
+### Drive: Explorer Inspector
+
+- Every file card remains a canonical owner `/f/{id}` link. The enhanced Explorer asks that same
+  route for an Inspector fragment with `X-Aperture-Surface: inspector`; failed fetch, disabled
+  JavaScript, refresh and modifier-click all land on the complete detail page.
+- Build a dedicated token-free view model. It may expose owner file id/name/type/size/location,
+  created/updated times, boolean sharing posture, counts and known version/comment events; it can
+  never receive a share token, password hash, object key, bucket or public `/s/` capability URL.
+- Use a desktop right sheet and mobile full-screen dialog so the Explorer remains the spatial
+  context. Back closes, Forward reloads the owner fragment, Escape/scrim close, Tab is trapped,
+  background surfaces become inert, media is stopped on close and focus returns to the surviving
+  opener after a Wire swap.
+- Describe Activity honestly. Aperture currently knows Uploaded, Last changed, retained versions
+  and comments; it does not fabricate rename/move/share actors from a generic `updated_at`.
+
+Acceptance: full and fragment representations share exact owner/Trash authorization and
+`private, no-store`; all image/video/audio/PDF/text/fallback preview routes stay same-origin and
+owner-only; the fragment contains no CSRF or capability material; Library Recent/Shared/Search,
+Wire navigation, History and no-JavaScript links remain coherent.
+
+This combines [Google Drive's file Details/activity side panel](https://support.google.com/drive/answer/2409045?co=GENIE.Platform%3DDesktop&hl=en)
+with [Dropbox Quick View's retained list context](https://help.dropbox.com/view-edit/preview), while
+keeping Aperture's stricter capability boundary and existing full-detail authority.
+
+### Blog: Review & publish
+
+- Publish now and Schedule first POST the complete editor payload to an author+CSRF protected SSR
+  review route. The review is read-only, `private, no-store`, does not consume autosave and uses the
+  same title, URL, metadata, image, schedule and fallback normalization as final publication.
+- Show the exact target state, UTC instant plus explanatory browser timezone, final local URL,
+  excerpt/search/social fallbacks, canonical effect, trusted Drive image and sanitized body sample.
+  Name the sample honestly; it is not a theme, email-client or social-platform rendering.
+- Confirmation POSTs the canonical payload to the existing `/new` or `/edit/{slug}` mutation with
+  its original explicit intent. Final authorisation, validation, immutable post id/edit-version
+  CAS, revision creation and autosave consumption still happen there, so a stale review cannot
+  become a last-write-wins save.
+- Edit draft/recovery from review must round-trip every literal value, including template-looking
+  text. A review-time edit conflict returns a private submitted-content recovery surface for
+  no-JavaScript users rather than dropping their uncommitted body.
+- A browser-originated schedule carries one exact UTC epoch through Review, local recovery and
+  server autosave. Repeated wall times during a DST rollback remain reversible until the author
+  actually edits the `datetime-local` field; no-JavaScript input continues to mean UTC.
+
+Acceptance: old clients may still direct-POST explicit publish/schedule intents; forged review
+fields gain no authority because final handlers revalidate; no-JavaScript uses UTC input and the
+same two-step flow; placeholder literals survive preflight → confirm byte-for-byte; review does not
+write a post or revision. A successful read-only review does not touch autosave; a stale edit
+review may persist the latest submitted payload only as an owner-scoped recovery copy before
+returning `409`, so refresh cannot discard the conflict the page claims to preserve. Self-canonical
+and external-canonical explanations use the same rule as sitemap emission.
+
+The two-step decision follows WordPress.com's documented
+[pre-publish checks](https://wordpress.com/support/posts/) and Ghost's separation of
+[preview, publish and schedule](https://ghost.org/help/publishing-content/). Inkwell keeps its
+server-owned CAS and does not imply subscriber email delivery, a full theme preview or social
+network rendering.
+
+### Odyssey Foundation: compact public chrome
+
+- Odyssey `1.1.1` contains the shared fix for the product chrome rather than leaving a Forum-only
+  override: at 360 px and below the app name/caret compact while the product tile, theme/apps and
+  account entry remain available.
+- Long account identifiers are constrained inside the user popover instead of increasing the
+  document scroll width while the popover is hidden. This contract is covered by canonical CSS
+  tests and the vendored fingerprint, then consumed by Scriptoria through `odysseyctl`.
+- Forum still owns its denser activity/search controls and post metadata wrapping. Odyssey does
+  not learn Forum receipt state, Drive Inspector layout or Blog publishing state.
+
+### Iteration 6 candidate verification
+
+- The six public product crates pass 549/549 Rust tests: Forum 114, Blog 116, Wiki 71, Comments 41,
+  Paste 71 and Drive 136. Writer recovery passes 5/5 Node tests; all six crates and the composed
+  Scriptoria binary pass strict Clippy, `git diff --check` and the release build.
+- A fresh PostgreSQL 18 matrix passes 15/15 real migration/store tests. Forum's matrix includes
+  exact subject-scoped post receipts and post-delete cascade; the other five product stores retain
+  their complete migration round trips.
+- Real Chromium passes the three product workflows at 320 / 390 / 1440 px with JavaScript and
+  no-JavaScript fallbacks, plus all six Host arms: zero horizontal overflow, console warning/error,
+  page error or failed workflow response. The run proves exact five-unread resume, native receipt
+  submission, Inspector Back/Forward/Escape/focus/PDF/no-JS detail, SSR review/edit/confirm, a
+  Europe/Berlin second-fold `02:30`, and a native no-JavaScript schedule.
+- Browser and read-only cross-review found issues that string tests did not: multipart `415` on the
+  automatic Forum receipt, 320 px appbar/post overflow, an Inspector scrim entering the focus ring,
+  stale focus restoration, ambiguous schedule epoch, stale Review recovery and self-canonical
+  wording. Each is fixed in the product or Foundation layer that owns it.
+- Canonical Odyssey canary passes 66/66 tests plus `odysseyctl` 5/5; the stable backport passes
+  63/63 plus `odysseyctl` 4/4. Scriptoria consumes stable `1.1.1` fingerprint
+  `fnv1a64:03ea328c48069dc7`; the reproducible stable check
+  `cargo run --locked --manifest-path ../odyssey-1.1.1/tools/odysseyctl/Cargo.toml -- check --repo scriptoria`
+  is clean. The PATH canary binary is deliberately not the verifier for a stable consumer.
+
 ## Next iterations
 
-1. Forum: viewer/thread `Continue reading / First unread`, then three-level Follow preferences and
-   an explainable For-you feed built only from those real local signals.
-2. Drive: an in-explorer Inspector with a linked `/f/{id}` no-JavaScript fallback, then an
-   Open/Closed/Expired Request Inbox and capability-governance center.
-3. Blog: an explicit `Review & publish` preflight, then URL-backed Studio sorting/filters,
-   revocable draft preview, and a bounded publication-identity model.
+1. Forum: three-level Follow preferences and an explainable For-you feed built only from real local
+   reading, following and activity signals.
+2. Drive: an Open/Closed/Expired Request Inbox, then a capability-governance center backed by real
+   owner event authority rather than inferred activity.
+3. Blog: URL-backed Studio sorting/filters, then revocable draft preview and a bounded
+   publication-identity model.
 
 ## Rollout gate
 

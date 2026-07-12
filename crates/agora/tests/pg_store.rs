@@ -123,6 +123,31 @@ async fn pg_store_full_integration() {
     let reloaded = pg.get_thread(&thread.id).await.unwrap().unwrap();
     assert_eq!(reloaded.last_at, now + 5, "last_at bumped to reply time");
 
+    let initial_reading = pg.thread_reading_state("reader_a", &thread.id).await.unwrap();
+    assert!(!initial_reading.started);
+    assert_eq!(initial_reading.unread_count, 2);
+    assert_eq!(initial_reading.first_unread.as_ref().unwrap().id, first.id);
+    pg.mark_thread_posts_read("reader_a", &thread.id, std::slice::from_ref(&reply.id), now + 6)
+        .await
+        .unwrap();
+    let hole = pg.thread_reading_state("reader_a", &thread.id).await.unwrap();
+    assert!(hole.started);
+    assert_eq!(hole.unread_count, 1);
+    assert_eq!(hole.first_unread.as_ref().unwrap().id, first.id);
+    assert!(
+        pg.thread_reading_state("reader_b", &thread.id)
+            .await
+            .unwrap()
+            .first_unread
+            .is_some()
+    );
+    pg.mark_thread_posts_read("reader_a", &thread.id, std::slice::from_ref(&first.id), now + 7)
+        .await
+        .unwrap();
+    let caught_up = pg.thread_reading_state("reader_a", &thread.id).await.unwrap();
+    assert_eq!(caught_up.unread_count, 0);
+    assert!(caught_up.first_unread.is_none());
+
     // recent_threads orders by last_at DESC.
     let recent = pg.recent_threads(10).await.unwrap();
     assert_eq!(recent.len(), 1);
@@ -261,6 +286,14 @@ async fn pg_store_full_integration() {
         pg.reactions_for_post(&reply.id, None).await.unwrap().is_empty(),
         "reactions removed with the deleted post"
     );
+    let receipt_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM forum_post_read_receipts WHERE post_id = $1",
+    )
+    .bind(&reply.id)
+    .fetch_one(&raw)
+    .await
+    .unwrap();
+    assert_eq!(receipt_count, 0, "post deletion cascades reading receipts");
 
     // Delete the whole thread: thread + remaining posts go together.
     pg.delete_thread(&thread.id).await.expect("delete thread");
@@ -279,6 +312,6 @@ async fn pg_store_full_integration() {
     println!(
         "PG STORE INTEGRATION OK: migrate (idempotent) + seed (idempotent) + create_thread + \
          add_reply (last_at bump) + ordering + update_thread/update_post/delete_post/delete_thread \
-         + HTTP create/render against Postgres"
+         + exact reading receipts + HTTP create/render against Postgres"
     );
 }

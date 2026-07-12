@@ -1,0 +1,61 @@
+<main class="console console--narrow ink-preflight">
+  <header class="console__head ink-preflight__head">
+    <div>
+      <p class="ink-preflight__eyebrow">Server-validated preflight</p>
+      <h1>{{HEADING}}</h1>
+      <p class="sub">This page reviews the server-normalized payload that will be submitted. It is not a complete theme, inbox, or third-party social preview.</p>
+    </div>
+  </header>
+
+  <section class="card ink-preflight__decision" aria-labelledby="preflight-action-title">
+    <div class="card__body">
+      <p class="ink-preflight__eyebrow">Final action</p>
+      <h2 id="preflight-action-title">{{ACTION_TITLE}}</h2>
+      <p>{{ACTION_DETAIL}}</p>
+      <dl class="ink-preflight__facts">
+        <div><dt>Reader URL</dt><dd>{{TARGET}}</dd></div>
+        <div><dt>Timing</dt><dd>{{SCHEDULE_CONTEXT}}</dd></div>
+        <div><dt>Organization</dt><dd>{{ORGANIZATION}}</dd></div>
+      </dl>
+    </div>
+  </section>
+
+  <div class="ink-preflight__grid">
+    <section class="card" aria-labelledby="preflight-checks-title">
+      <div class="card__body">
+        <h2 class="card__title" id="preflight-checks-title">Publication checks</h2>
+        <ul class="ink-preflight__checks">{{CHECKS}}</ul>
+      </div>
+    </section>
+
+    <section class="card" aria-labelledby="preflight-metadata-title">
+      <div class="card__body">
+        <h2 class="card__title" id="preflight-metadata-title">Resolved metadata</h2>
+        <p class="field__hint muted">These values use the same server fallbacks as the public article response.</p>
+        <dl class="ink-preflight__metadata">
+          <div><dt>Search title</dt><dd>{{SEARCH_TITLE}}</dd></div>
+          <div><dt>Description</dt><dd>{{DESCRIPTION}}</dd></div>
+          <div><dt>Canonical</dt><dd>{{CANONICAL}}</dd></div>
+          <div><dt>Social title</dt><dd>{{SOCIAL_TITLE}}</dd></div>
+          <div><dt>Social description</dt><dd>{{SOCIAL_DESCRIPTION}}</dd></div>
+          <div><dt>Social image</dt><dd>{{SOCIAL_IMAGE}}</dd></div>
+        </dl>
+      </div>
+    </section>
+  </div>
+
+  <section class="card" aria-labelledby="preflight-body-title">
+    <div class="card__body">
+      <h2 class="card__title" id="preflight-body-title">Sanitized article body sample</h2>
+      <p class="field__hint muted">This is the exact Markdown sanitizer output only. Reader chrome, cover placement, metadata consumers, and external clients are outside this sample.</p>
+      <div class="article__body ink-preflight__body">{{BODY_PREVIEW}}</div>
+    </div>
+  </section>
+
+  <form class="ink-preflight__actions" method="post" action="{{FINAL_ACTION}}">
+    {{HIDDEN_FIELDS}}
+    <button class="btn btn-secondary" type="submit" formaction="{{REVIEW_ACTION}}" name="review_action" value="edit">Edit draft</button>
+    <button class="btn btn-primary" type="submit" name="intent" value="{{INTENT}}">{{CONFIRM_LABEL}}</button>
+  </form>
+  <p class="writer-privacy muted">Confirmation still passes through the existing server authorization, CSRF, and validation; existing posts also retain edit-version CAS. Review does not reserve a URL or consume Writer recovery.</p>
+</main>

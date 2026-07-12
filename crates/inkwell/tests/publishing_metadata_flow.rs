@@ -58,10 +58,29 @@ async fn published_metadata_is_escaped_and_flows_to_cards_feed_and_sitemap_polic
     let (_, feed) = call(&state, get("/feed.xml", None)).await;
     assert!(feed.contains("The deliberate card and feed summary."));
 
+    let self_canonical = form(&[
+        ("title", "Self Canonical Story"),
+        ("body", "the canonical is the stable local Reader URL"),
+        (
+            "canonical_url",
+            "https://blog.w33d.xyz/p/self-canonical-story",
+        ),
+        ("intent", "publish_now"),
+        ("csrf_token", CSRF),
+    ]);
+    assert_eq!(
+        call(&state, post("/new", &self_canonical)).await.0,
+        StatusCode::SEE_OTHER
+    );
+
     let (_, sitemap) = call(&state, get("/sitemap.xml", None)).await;
     assert!(
         !sitemap.contains("/p/metadata-story"),
         "an external canonical excludes the duplicate local URL from the sitemap"
+    );
+    assert!(
+        sitemap.contains("/p/self-canonical-story"),
+        "a self-canonical matches the local URL and remains in the sitemap"
     );
 }
 
@@ -215,12 +234,7 @@ async fn writer_fields_are_no_js_and_server_limits_and_url_policies_win() {
     assert_eq!(stored.social_title.chars().count(), 200);
     assert_eq!(stored.social_description.chars().count(), 500);
 
-    let post_id = state
-        .store
-        .get_post("truncated-metadata")
-        .await
-        .unwrap()
-        .id;
+    let post_id = state.store.get_post("truncated-metadata").await.unwrap().id;
     let edit = form(&[
         ("title", "Truncated Metadata"),
         ("body", "updated body"),

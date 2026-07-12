@@ -25,6 +25,7 @@
 //! - `forum_activity_deliveries(activity_id TEXT, recipient_kind TEXT, recipient_key TEXT,
 //!    reason TEXT)`
 //! - `forum_activity_receipts(activity_id TEXT, viewer_sub TEXT, read_at BIGINT)`
+//! - `forum_post_read_receipts(viewer_sub TEXT, post_id TEXT, read_at BIGINT)`
 //! - `forum_bookmarks(bookmark_id TEXT, owner_sub TEXT, post_id TEXT, note TEXT, remind_at BIGINT,
 //!    created_at BIGINT, updated_at BIGINT, version BIGINT)`
 
@@ -37,7 +38,7 @@ use thiserror::Error;
 use crate::model::{
     ActivityDelivery, ActivityEvent, ActivityItem, ActivityKind, ActivityReason,
     ActivityRecipientKind, BannedAuthor, Bookmark, BookmarkItem, Category, CategoryFormat, Mention,
-    Post, ReactionCount, Thread, ThreadDigest, ThreadSearchHit,
+    Post, ReactionCount, Thread, ThreadDigest, ThreadReadingState, ThreadSearchHit,
 };
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
@@ -66,6 +67,8 @@ pub enum StoreError {
 #[derive(Clone, Debug)]
 pub enum ReplyAnchor {
     First,
+    /// Inclusive ascending page beginning at an authoritative first-unread reply.
+    From(i64, String),
     After(i64, String),
     Before(i64, String),
     Latest,
@@ -172,6 +175,10 @@ pub enum BookmarkReminderUpdate {
 
 /// Hard mutation bound shared by the UI and both Store implementations.
 pub const MAX_ACTIVITY_BATCH: usize = 30;
+/// OP + accepted solution + one ordinary reply page, with a small defensive margin.
+pub const MAX_THREAD_READ_BATCH: usize = 24;
+/// Home/category list projection bound; prevents an accidental unbounded metadata query.
+pub const MAX_THREAD_READING_STATE_BATCH: usize = 200;
 /// A thread cannot accumulate an unbounded reply fan-out.
 pub const MAX_THREAD_FOLLOWERS: usize = 256;
 /// Parsed aliases are deduplicated before this per-post bound is enforced.
@@ -331,6 +338,58 @@ fn bookmark_state_matches(bookmark: &Bookmark, state: BookmarkState, now: i64) -
         BookmarkState::All => true,
         BookmarkState::Due => bookmark.remind_at.is_some_and(|at| at <= now),
         BookmarkState::Scheduled => bookmark.remind_at.is_some_and(|at| at > now),
+    }
+}
+
+fn bounded_thread_ids(thread_ids: &[String]) -> Result<Vec<String>, StoreError> {
+    let mut unique = BTreeSet::new();
+    for thread_id in thread_ids {
+        if !thread_id.trim().is_empty() {
+            unique.insert(thread_id.clone());
+        }
+    }
+    if unique.len() > MAX_THREAD_READING_STATE_BATCH {
+        return Err(StoreError::InvalidOperation(format!(
+            "reading state accepts at most {MAX_THREAD_READING_STATE_BATCH} threads"
+        )));
+    }
+    Ok(unique.into_iter().collect())
+}
+
+fn bounded_post_ids(post_ids: &[String]) -> Result<Vec<String>, StoreError> {
+    let mut unique = BTreeSet::new();
+    for post_id in post_ids {
+        let post_id = post_id.trim();
+        if !post_id.is_empty() {
+            unique.insert(post_id.to_string());
+        }
+    }
+    if unique.is_empty() {
+        return Err(StoreError::InvalidOperation(
+            "marking read requires at least one post".to_string(),
+        ));
+    }
+    if unique.len() > MAX_THREAD_READ_BATCH {
+        return Err(StoreError::InvalidOperation(format!(
+            "one reading receipt may contain at most {MAX_THREAD_READ_BATCH} posts"
+        )));
+    }
+    Ok(unique.into_iter().collect())
+}
+
+fn reading_state_from_posts(posts: &[Post], read_post_ids: &HashSet<String>) -> ThreadReadingState {
+    let is_read = |post: &Post| read_post_ids.contains(&post.id);
+    let first_unread_index = posts.iter().position(|post| !is_read(post));
+    let unread_count = posts.iter().filter(|post| !is_read(post)).count() as i64;
+    ThreadReadingState {
+        started: posts.iter().any(is_read),
+        unread_count,
+        first_unread: first_unread_index.map(|index| posts[index].clone()),
+        last_contiguous_read: match first_unread_index {
+            Some(0) => None,
+            Some(index) => posts.get(index - 1).cloned(),
+            None => posts.last().cloned(),
+        },
     }
 }
 
@@ -537,6 +596,28 @@ pub trait Store: Send + Sync {
         subscriber_sub: &str,
     ) -> Result<bool, StoreError>;
 
+    /// Exact per-post reading projection for one stable gateway subject and thread.
+    async fn thread_reading_state(
+        &self,
+        viewer_sub: &str,
+        thread_id: &str,
+    ) -> Result<ThreadReadingState, StoreError>;
+    /// One bounded list projection. Implementations must not issue one backend query per thread.
+    async fn thread_reading_states(
+        &self,
+        viewer_sub: &str,
+        thread_ids: &[String],
+    ) -> Result<HashMap<String, ThreadReadingState>, StoreError>;
+    /// Atomically mark one rendered page of posts read. The Store deduplicates, bounds, and
+    /// re-authorises every post against `thread_id` before writing any receipt.
+    async fn mark_thread_posts_read(
+        &self,
+        viewer_sub: &str,
+        thread_id: &str,
+        post_ids: &[String],
+        read_at: i64,
+    ) -> Result<(), StoreError>;
+
     /// One authoritative keyset page of activity for a gateway subject. Mention aliases are
     /// resolved to a unique subject when the event is written; reads never authorise by email.
     /// Content is joined from live thread/post rows and deleted targets are never returned.
@@ -681,6 +762,7 @@ pub struct InMemoryStore {
     activity_events: Mutex<Vec<ActivityEvent>>,
     activity_deliveries: Mutex<Vec<StoredActivityDelivery>>,
     activity_receipts: Mutex<Vec<ActivityReceipt>>,
+    post_read_receipts: Mutex<HashMap<(String, String), i64>>,
     bookmarks: Mutex<Vec<Bookmark>>,
     banned: Mutex<Vec<BannedAuthor>>,
     /// One row per `(post_id, user_sub, kind)` — the in-memory mirror of `post_reactions`.
@@ -1239,6 +1321,11 @@ impl Store for InMemoryStore {
         // Same keyset predicate as the SQL path: strictly newer/older than the composite cursor.
         match anchor {
             ReplyAnchor::First | ReplyAnchor::Latest => {}
+            ReplyAnchor::From(ts, id) => {
+                v.retain(|p| {
+                    p.created_at > *ts || (p.created_at == *ts && p.id.as_str() >= id.as_str())
+                });
+            }
             ReplyAnchor::After(ts, id) => {
                 v.retain(|p| {
                     p.created_at > *ts || (p.created_at == *ts && p.id.as_str() > id.as_str())
@@ -1257,7 +1344,7 @@ impl Store for InMemoryStore {
         }
         // First/After walk ascending; Before/Latest walk descending — matching the SQL ORDER BY.
         match anchor {
-            ReplyAnchor::First | ReplyAnchor::After(..) => {
+            ReplyAnchor::First | ReplyAnchor::From(..) | ReplyAnchor::After(..) => {
                 v.sort_by(|a, b| {
                     a.created_at
                         .cmp(&b.created_at)
@@ -1704,6 +1791,10 @@ impl Store for InMemoryStore {
             .lock()
             .expect("activity_receipts lock poisoned")
             .retain(|receipt| !removed_activity_ids.contains(&receipt.activity_id));
+        self.post_read_receipts
+            .lock()
+            .expect("post_read_receipts lock poisoned")
+            .retain(|(_, post_id), _| !removed_ids.contains(post_id));
         Ok(())
     }
 
@@ -1812,6 +1903,10 @@ impl Store for InMemoryStore {
             .lock()
             .expect("activity_receipts lock poisoned")
             .retain(|receipt| !removed_activity_ids.contains(&receipt.activity_id));
+        self.post_read_receipts
+            .lock()
+            .expect("post_read_receipts lock poisoned")
+            .retain(|(_, receipt_post_id), _| receipt_post_id != post_id);
         Ok(())
     }
 
@@ -2113,6 +2208,104 @@ impl Store for InMemoryStore {
             .expect("subscriptions lock poisoned")
             .iter()
             .any(|s| s.thread_id == thread_id && s.subscriber_sub == subscriber_sub))
+    }
+
+    async fn thread_reading_state(
+        &self,
+        viewer_sub: &str,
+        thread_id: &str,
+    ) -> Result<ThreadReadingState, StoreError> {
+        self.thread_reading_states(viewer_sub, &[thread_id.to_string()])
+            .await?
+            .remove(thread_id)
+            .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))
+    }
+
+    async fn thread_reading_states(
+        &self,
+        viewer_sub: &str,
+        thread_ids: &[String],
+    ) -> Result<HashMap<String, ThreadReadingState>, StoreError> {
+        let thread_ids = bounded_thread_ids(thread_ids)?;
+        let threads = self.threads.lock().expect("threads lock poisoned");
+        let original_posts = self
+            .original_posts
+            .lock()
+            .expect("original_posts lock poisoned");
+        let posts = self.posts.lock().expect("posts lock poisoned");
+        let receipts = self
+            .post_read_receipts
+            .lock()
+            .expect("post_read_receipts lock poisoned");
+        let read_post_ids: HashSet<String> = receipts
+            .keys()
+            .filter(|(subject, _)| subject == viewer_sub)
+            .map(|(_, post_id)| post_id.clone())
+            .collect();
+        let mut states = HashMap::new();
+        for thread_id in thread_ids {
+            if threads.iter().all(|thread| thread.id != thread_id) {
+                continue;
+            }
+            let mut thread_posts: Vec<Post> = posts
+                .iter()
+                .filter(|post| post.thread_id == thread_id)
+                .cloned()
+                .collect();
+            let op_id = original_posts.get(&thread_id).map(String::as_str);
+            thread_posts.sort_by(|left, right| {
+                (op_id != Some(left.id.as_str()))
+                    .cmp(&(op_id != Some(right.id.as_str())))
+                    .then_with(|| {
+                        left.created_at
+                            .cmp(&right.created_at)
+                            .then_with(|| left.id.cmp(&right.id))
+                    })
+            });
+            states.insert(
+                thread_id.clone(),
+                reading_state_from_posts(&thread_posts, &read_post_ids),
+            );
+        }
+        Ok(states)
+    }
+
+    async fn mark_thread_posts_read(
+        &self,
+        viewer_sub: &str,
+        thread_id: &str,
+        post_ids: &[String],
+        read_at: i64,
+    ) -> Result<(), StoreError> {
+        let post_ids = bounded_post_ids(post_ids)?;
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        if self
+            .threads
+            .lock()
+            .expect("threads lock poisoned")
+            .iter()
+            .all(|thread| thread.id != thread_id)
+        {
+            return Err(StoreError::NotFound("thread not found".to_string()));
+        }
+        let posts = self.posts.lock().expect("posts lock poisoned");
+        if post_ids.iter().any(|post_id| {
+            posts
+                .iter()
+                .all(|post| post.id != *post_id || post.thread_id != thread_id)
+        }) {
+            return Err(StoreError::NotFound("thread post not found".to_string()));
+        }
+        let mut receipts = self
+            .post_read_receipts
+            .lock()
+            .expect("post_read_receipts lock poisoned");
+        for post_id in post_ids {
+            receipts
+                .entry((viewer_sub.to_string(), post_id))
+                .or_insert(read_at);
+        }
+        Ok(())
     }
 
     async fn activity_page(
@@ -3324,6 +3517,28 @@ impl PgStore {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_posts_thread ON posts (thread_id)")
             .execute(&self.pool)
             .await?;
+        // Subject-scoped reading continuity is stored per post rather than as a high-water
+        // cursor. This preserves unread holes after Latest/activity jumps and after the accepted
+        // answer is floated out of natural chronology. The FK lets every old/new delete path
+        // clean receipts without knowing about this additive feature.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS forum_post_read_receipts (\
+                 viewer_sub TEXT NOT NULL, \
+                 post_id TEXT NOT NULL, \
+                 read_at BIGINT NOT NULL, \
+                 PRIMARY KEY (viewer_sub, post_id), \
+                 CONSTRAINT fk_forum_post_read_receipt_post FOREIGN KEY (post_id) \
+                     REFERENCES posts(id) ON DELETE CASCADE\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_forum_post_read_receipts_post \
+             ON forum_post_read_receipts (post_id)",
+        )
+        .execute(&self.pool)
+        .await?;
         // Personal bookmarks are addressed only by the stable gateway subject. The Post FK is
         // also the cross-version deletion protocol: an older binary deleting a post still removes
         // its private bookmarks. Owner guard rows serialize quota checks for concurrent creates.
@@ -4321,6 +4536,24 @@ impl PgStore {
                     .bind(thread_id)
                     .bind(op_id)
                     .bind(excluded_post_id)
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+            ReplyAnchor::From(ts, id) => {
+                let sql = format!(
+                    "SELECT {} FROM posts WHERE thread_id = $1 AND id <> $2 \
+                     AND ($3 IS NULL OR id <> $3) \
+                     AND (created_at > $4 OR (created_at = $4 AND id >= $5)) \
+                     ORDER BY created_at ASC, id ASC LIMIT $6",
+                    Self::POST_COLS
+                );
+                sqlx::query(&sql)
+                    .bind(thread_id)
+                    .bind(op_id)
+                    .bind(excluded_post_id)
+                    .bind(ts)
+                    .bind(id)
                     .bind(limit)
                     .fetch_all(&self.pool)
                     .await?
@@ -5463,6 +5696,109 @@ impl PgStore {
         Ok(n > 0)
     }
 
+    async fn thread_reading_states_async(
+        &self,
+        viewer_sub: &str,
+        thread_ids: &[String],
+    ) -> Result<HashMap<String, ThreadReadingState>, StoreError> {
+        let thread_ids = bounded_thread_ids(thread_ids)?;
+        if thread_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = (0..thread_ids.len())
+            .map(|index| format!("${}", index + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {}, r.read_at AS read_at \
+             FROM posts AS p \
+             JOIN threads AS t ON t.id = p.thread_id \
+             LEFT JOIN forum_post_read_receipts AS r \
+               ON r.post_id = p.id AND r.viewer_sub = $1 \
+             WHERE p.thread_id IN ({placeholders}) \
+             ORDER BY p.thread_id ASC, \
+                      CASE WHEN p.id = t.first_post_id THEN 0 ELSE 1 END ASC, \
+                      p.created_at ASC, p.id ASC",
+            Self::POST_COLS_P,
+        );
+        let mut query = sqlx::query(&sql).bind(viewer_sub);
+        for thread_id in &thread_ids {
+            query = query.bind(thread_id);
+        }
+        let rows = query.fetch_all(&self.pool).await.map_err(backend)?;
+        let mut posts_by_thread: HashMap<String, Vec<Post>> = HashMap::new();
+        let mut read_post_ids = HashSet::new();
+        for row in rows {
+            let post = Self::post_from_row(&row).map_err(backend)?;
+            if row
+                .try_get::<Option<i64>, _>("read_at")
+                .map_err(backend)?
+                .is_some()
+            {
+                read_post_ids.insert(post.id.clone());
+            }
+            posts_by_thread
+                .entry(post.thread_id.clone())
+                .or_default()
+                .push(post);
+        }
+        let mut states = HashMap::new();
+        for thread_id in thread_ids {
+            if let Some(posts) = posts_by_thread.remove(&thread_id) {
+                states.insert(thread_id, reading_state_from_posts(&posts, &read_post_ids));
+            }
+        }
+        Ok(states)
+    }
+
+    async fn mark_thread_posts_read_async(
+        &self,
+        viewer_sub: &str,
+        thread_id: &str,
+        post_ids: &[String],
+        read_at: i64,
+    ) -> Result<(), StoreError> {
+        let post_ids = bounded_post_ids(post_ids)?;
+        if viewer_sub.trim().is_empty() || read_at < 0 {
+            return Err(StoreError::InvalidOperation(
+                "invalid thread reading receipt".to_string(),
+            ));
+        }
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        sqlx::query_scalar::<_, String>("SELECT id FROM threads WHERE id = $1 FOR UPDATE")
+            .bind(thread_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(backend)?
+            .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))?;
+        for post_id in &post_ids {
+            let owner = sqlx::query_scalar::<_, String>(
+                "SELECT thread_id FROM posts WHERE id = $1 FOR UPDATE",
+            )
+            .bind(post_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(backend)?;
+            if owner.as_deref() != Some(thread_id) {
+                return Err(StoreError::NotFound("thread post not found".to_string()));
+            }
+        }
+        for post_id in post_ids {
+            sqlx::query(
+                "INSERT INTO forum_post_read_receipts (viewer_sub, post_id, read_at) \
+                 VALUES ($1, $2, $3) ON CONFLICT (viewer_sub, post_id) DO NOTHING",
+            )
+            .bind(viewer_sub)
+            .bind(post_id)
+            .bind(read_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+        }
+        tx.commit().await.map_err(backend)?;
+        Ok(())
+    }
+
     async fn activity_page_async(
         &self,
         viewer_sub: &str,
@@ -6369,6 +6705,37 @@ impl Store for PgStore {
         self.is_thread_subscribed_async(thread_id, subscriber_sub)
             .await
             .map_err(backend)
+    }
+
+    async fn thread_reading_state(
+        &self,
+        viewer_sub: &str,
+        thread_id: &str,
+    ) -> Result<ThreadReadingState, StoreError> {
+        self.thread_reading_states_async(viewer_sub, &[thread_id.to_string()])
+            .await?
+            .remove(thread_id)
+            .ok_or_else(|| StoreError::NotFound("thread not found".to_string()))
+    }
+
+    async fn thread_reading_states(
+        &self,
+        viewer_sub: &str,
+        thread_ids: &[String],
+    ) -> Result<HashMap<String, ThreadReadingState>, StoreError> {
+        self.thread_reading_states_async(viewer_sub, thread_ids)
+            .await
+    }
+
+    async fn mark_thread_posts_read(
+        &self,
+        viewer_sub: &str,
+        thread_id: &str,
+        post_ids: &[String],
+        read_at: i64,
+    ) -> Result<(), StoreError> {
+        self.mark_thread_posts_read_async(viewer_sub, thread_id, post_ids, read_at)
+            .await
     }
 
     async fn activity_page(

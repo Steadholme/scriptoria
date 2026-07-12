@@ -60,18 +60,18 @@
     </div>
   </main>
 
-  <div class="ap-preview" id="apPreview" hidden aria-hidden="true" role="dialog" aria-modal="true" aria-label="File preview">
-    <button class="ap-preview__scrim" type="button" data-preview-close aria-label="Close preview"></button>
-    <section class="ap-preview__panel" role="document">
+  <div class="ap-preview ap-inspector" id="apPreview" hidden aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="apInspectorTitle">
+    <button class="ap-preview__scrim" type="button" tabindex="-1" data-preview-close aria-label="Close file inspector"></button>
+    <section class="ap-preview__panel" role="document" aria-busy="false">
       <header class="ap-preview__bar">
-        <div class="ap-preview__title" data-preview-title></div>
+        <div class="ap-preview__heading"><span>File inspector</span><h2 class="ap-preview__title" id="apInspectorTitle" data-preview-title>File</h2></div>
         <div class="ap-preview__actions">
-          <a class="btn btn-ghost btn-sm" href="/" data-preview-detail>Open detail</a>
+          <a class="btn btn-ghost btn-sm" href="/" data-preview-detail>Full details</a>
           <a class="btn btn-secondary btn-sm" href="/" data-preview-download>Download</a>
-          <button class="ap-preview__close" type="button" data-preview-close aria-label="Close preview">×</button>
+          <button class="ap-preview__close" type="button" data-preview-close aria-label="Close file inspector">×</button>
         </div>
       </header>
-      <div class="ap-preview__body" data-preview-body></div>
+      <div class="ap-preview__body" data-preview-body data-inspector-body></div>
     </section>
   </div>
 
@@ -234,93 +234,260 @@
       }
       initUploadDrop();
 
-      // ---- Inline media preview overlay ------------------------------------
+      // ---- Owner-authoritative in-explorer Inspector ------------------------
+      // Every trigger remains a canonical /f/{id} link. Without fetch/JS it navigates to the full
+      // detail page; enhancement asks that same owner route for a deliberately token-free fragment.
       (function () {
         var overlay = document.getElementById('apPreview');
-        if (!overlay) { return; }
-        var body = overlay.querySelector('[data-preview-body]');
+        if (!overlay || !window.fetch || !window.DOMParser || !window.history) { return; }
+        var panel = overlay.querySelector('.ap-preview__panel');
+        var body = overlay.querySelector('[data-inspector-body]');
         var title = overlay.querySelector('[data-preview-title]');
         var detail = overlay.querySelector('[data-preview-detail]');
         var download = overlay.querySelector('[data-preview-download]');
         var closeBtns = overlay.querySelectorAll('[data-preview-close]');
-        if (!body || !title || !detail || !download) { return; }
+        var closeButton = overlay.querySelector('.ap-preview__close');
+        if (!panel || !body || !title || !detail || !download || !closeButton) { return; }
 
-        function clearPreview() {
-          var players = body.querySelectorAll('video, audio');
-          Array.prototype.forEach.call(players, function (player) {
-            try { player.pause(); } catch (e) {}
-            player.removeAttribute('src');
-            try { player.load(); } catch (e) {}
+        var requestController = null;
+        var requestGeneration = 0;
+        var opener = null;
+        var activeId = '';
+        var previousTitle = document.title;
+        var inertState = [];
+        var pendingRestoreId = '';
+
+        function fileId(url) {
+          var match = url && url.origin === location.origin && url.pathname.match(/^\/f\/([A-Za-z0-9]+)$/);
+          return match ? match[1] : '';
+        }
+
+        function matchingLink(id) {
+          var links = document.querySelectorAll('a[data-inspector-link][href]');
+          for (var i = 0; i < links.length; i++) {
+            try {
+              if (fileId(new URL(links[i].getAttribute('href'), location.href)) === id) { return links[i]; }
+            } catch (_) {}
+          }
+          return null;
+        }
+
+        function setBackgroundInert(on) {
+          if (on) {
+            inertState = [];
+            [document.querySelector('.appbar'), document.querySelector('.console--drive')].forEach(function (node) {
+              if (!node) { return; }
+              inertState.push({ node:node, aria:node.getAttribute('aria-hidden') });
+              node.setAttribute('aria-hidden', 'true');
+              node.inert = true;
+            });
+            return;
+          }
+          inertState.forEach(function (entry) {
+            entry.node.inert = false;
+            if (entry.aria === null) { entry.node.removeAttribute('aria-hidden'); }
+            else { entry.node.setAttribute('aria-hidden', entry.aria); }
           });
+          inertState = [];
+        }
+
+        function clearInspector() {
+          body.querySelectorAll('video, audio').forEach(function (player) {
+            try { player.pause(); } catch (_) {}
+            player.removeAttribute('src');
+            try { player.load(); } catch (_) {}
+          });
+          body.querySelectorAll('iframe, img').forEach(function (media) { media.removeAttribute('src'); });
           body.textContent = '';
         }
 
-        function closePreview() {
-          clearPreview();
+        function markInspected(id) {
+          document.querySelectorAll('.file-card.is-inspected').forEach(function (card) {
+            card.classList.remove('is-inspected');
+          });
+          var link = matchingLink(id);
+          var card = link && link.closest('.file-card');
+          if (card) { card.classList.add('is-inspected'); }
+        }
+
+        function focusTarget(id) {
+          var target = opener && opener.isConnected ? opener : matchingLink(id);
+          if (!target) {
+            target = document.querySelector('.drive-content');
+            if (target && !target.hasAttribute('tabindex')) { target.setAttribute('tabindex', '-1'); }
+          }
+          if (target && target.focus) {
+            try { target.focus({ preventScroll:true }); } catch (_) { target.focus(); }
+          }
+        }
+
+        function closeInspector(restoreFocus, waitForSwap) {
+          requestGeneration += 1;
+          if (requestController) { requestController.abort(); requestController = null; }
+          var closingId = activeId;
+          clearInspector();
           overlay.hidden = true;
           overlay.setAttribute('aria-hidden', 'true');
+          panel.setAttribute('aria-busy', 'false');
           document.body.classList.remove('has-preview');
-        }
-
-        function mediaNode(kind, src, name) {
-          var node;
-          if (kind === 'video') {
-            node = document.createElement('video');
-            node.className = 'ap-preview__media ap-preview__media--video';
-            node.controls = true;
-            node.preload = 'metadata';
-            node.setAttribute('playsinline', '');
-          } else if (kind === 'audio') {
-            node = document.createElement('audio');
-            node.className = 'ap-preview__media ap-preview__media--audio';
-            node.controls = true;
-            node.preload = 'metadata';
-          } else if (kind === 'image') {
-            node = document.createElement('img');
-            node.className = 'ap-preview__media ap-preview__media--image';
-            node.alt = name;
-          } else {
-            return null;
+          setBackgroundInert(false);
+          markInspected('');
+          document.title = previousTitle;
+          activeId = '';
+          if (restoreFocus && closingId) {
+            pendingRestoreId = waitForSwap ? closingId : '';
+            focusTarget(closingId);
+          } else if (!waitForSwap) {
+            pendingRestoreId = '';
           }
-          node.src = src;
-          return node;
+          opener = null;
         }
 
-        function openPreview(card) {
-          var id = card.getAttribute('data-preview-id');
-          var kind = card.getAttribute('data-preview-kind');
-          var name = card.getAttribute('data-preview-name') || 'Preview';
-          if (!id || !kind) { return false; }
-          var detailUrl = '/f/' + encodeURIComponent(id);
-          var rawUrl = detailUrl + '/raw';
-          var node = mediaNode(kind, rawUrl, name);
-          if (!node) { return false; }
-          clearPreview();
+        function requestClose() {
+          var state = history.state && history.state.apertureInspector;
+          if (state && state.id === activeId) { history.back(); }
+          else { closeInspector(true, false); }
+        }
+
+        function openInspector(fragment, url, trigger, pushHistory) {
+          var id = fileId(url);
+          var name = fragment.getAttribute('data-inspector-name') || 'File';
+          clearInspector();
+          opener = trigger || matchingLink(id);
+          previousTitle = document.title;
+          activeId = id;
+          pendingRestoreId = '';
           title.textContent = name;
-          detail.setAttribute('href', detailUrl);
-          download.setAttribute('href', rawUrl);
-          body.appendChild(node);
+          detail.setAttribute('href', url.pathname);
+          download.setAttribute('href', url.pathname + '/raw');
+          body.appendChild(document.importNode(fragment, true));
+          body.scrollTop = 0;
           overlay.hidden = false;
           overlay.setAttribute('aria-hidden', 'false');
+          panel.setAttribute('aria-busy', 'false');
           document.body.classList.add('has-preview');
-          var close = overlay.querySelector('.ap-preview__close');
-          if (close && close.focus) { close.focus(); }
+          closeButton.focus();
+          setBackgroundInert(true);
+          markInspected(id);
+          document.title = name + ' · Drive · Aperture · HOLDFAST';
+          if (pushHistory) {
+            history.pushState({ apertureInspector:{
+              id:id,
+              returnUrl:location.pathname + location.search + location.hash
+            } }, '', url.pathname);
+          }
+          var inserted = body.querySelector('[data-inspector-fragment]');
+          if (inserted) {
+            inserted.dispatchEvent(new CustomEvent('odyssey:swap', {
+              bubbles:true,
+              detail:{ url:url.href, mode:'inspector', selector:'[data-inspector-fragment]' }
+            }));
+          }
+        }
+
+        function loadInspector(url, trigger, pushHistory) {
+          var id = fileId(url);
+          if (!id) { return false; }
+          requestGeneration += 1;
+          var generation = requestGeneration;
+          if (requestController) { requestController.abort(); }
+          requestController = window.AbortController ? new AbortController() : null;
+          if (trigger) { trigger.setAttribute('aria-busy', 'true'); }
+          panel.setAttribute('aria-busy', 'true');
+          var options = {
+            credentials:'same-origin',
+            headers:{ 'Accept':'text/html', 'X-Aperture-Surface':'inspector' }
+          };
+          if (requestController) { options.signal = requestController.signal; }
+          fetch(url.href, options).then(function (response) {
+            var contentType = response.headers.get('Content-Type') || '';
+            var responseUrl = new URL(response.url, location.href);
+            if (!response.ok || responseUrl.origin !== location.origin || responseUrl.pathname !== url.pathname || contentType.toLowerCase().indexOf('text/html') < 0) {
+              throw { status:response.status };
+            }
+            return response.text();
+          }).then(function (html) {
+            if (generation !== requestGeneration) { throw { stale:true }; }
+            var doc = new DOMParser().parseFromString(html, 'text/html');
+            var fragment = doc.querySelector('[data-inspector-fragment]');
+            if (!fragment || fragment.getAttribute('data-inspector-id') !== id) { throw { status:0 }; }
+            openInspector(fragment, url, trigger, pushHistory);
+          }).catch(function (error) {
+            if ((error && error.name === 'AbortError') || (error && error.stale)) { return; }
+            if (pushHistory) { window.location.assign(url.href); }
+            else { window.location.reload(); }
+          }).finally(function () {
+            if (trigger) { trigger.removeAttribute('aria-busy'); }
+            if (generation === requestGeneration) {
+              requestController = null;
+              panel.setAttribute('aria-busy', 'false');
+            }
+          });
           return true;
         }
 
-        document.addEventListener('click', function (e) {
-          if (e.defaultPrevented || e.button || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) { return; }
-          var target = e.target;
-          var card = target.closest ? target.closest('[data-preview]') : null;
-          if (!card) { return; }
-          if (target.closest('form, button, input, select, textarea, details.card-menu')) { return; }
-          if (openPreview(card)) { e.preventDefault(); }
+        document.addEventListener('click', function (event) {
+          if (event.defaultPrevented || event.button || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) { return; }
+          var link = event.target.closest && event.target.closest('a[data-inspector-link]');
+          if (!link) { return; }
+          var url;
+          try { url = new URL(link.getAttribute('href'), location.href); } catch (_) { return; }
+          if (loadInspector(url, link, true)) { event.preventDefault(); }
         });
-        Array.prototype.forEach.call(closeBtns, function (btn) {
-          btn.addEventListener('click', closePreview);
+
+        Array.prototype.forEach.call(closeBtns, function (button) {
+          button.addEventListener('click', requestClose);
         });
-        document.addEventListener('keydown', function (e) {
-          if (e.key === 'Escape' && !overlay.hidden) { closePreview(); }
+
+        document.addEventListener('keydown', function (event) {
+          if (overlay.hidden) { return; }
+          if (event.key === 'Escape') {
+            event.preventDefault();
+            requestClose();
+            return;
+          }
+          if (event.key !== 'Tab') { return; }
+          var focusable = overlay.querySelectorAll('a[href], button:not([disabled]):not([tabindex="-1"]), iframe:not([tabindex="-1"]), video[controls], audio[controls], [tabindex]:not([tabindex="-1"])');
+          if (!focusable.length) { event.preventDefault(); closeButton.focus(); return; }
+          var first = focusable[0];
+          var last = focusable[focusable.length - 1];
+          if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault();
+            last.focus();
+          } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault();
+            first.focus();
+          }
+        });
+
+        document.addEventListener('focusin', function (event) {
+          if (!overlay.hidden && !overlay.contains(event.target)) { closeButton.focus(); }
+        });
+
+        window.addEventListener('popstate', function (event) {
+          var state = event.state && event.state.apertureInspector;
+          var url = new URL(location.href);
+          if (state && state.id === fileId(url)) {
+            loadInspector(url, matchingLink(state.id), false);
+          } else {
+            closeInspector(true, !!(event.state && event.state.odysseyWire));
+          }
+        });
+
+        document.addEventListener('odyssey:swap', function (event) {
+          if (!event.target.matches || !event.target.matches('.drive-layout')) { return; }
+          var state = history.state && history.state.apertureInspector;
+          if (!state) { closeInspector(false, !!pendingRestoreId); }
+          if (pendingRestoreId) {
+            var id = pendingRestoreId;
+            pendingRestoreId = '';
+            Promise.resolve().then(function () { focusTarget(id); });
+          }
+        });
+
+        window.addEventListener('pagehide', function () {
+          if (requestController) { requestController.abort(); }
+          clearInspector();
         });
       })();
 

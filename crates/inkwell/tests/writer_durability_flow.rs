@@ -226,6 +226,77 @@ async fn autosave_sequence_conflict_recovery_and_consume_are_owner_scoped() {
 }
 
 #[tokio::test]
+async fn autosave_canonicalizes_exact_non_utc_epoch_for_reversible_recovery() {
+    let state = build_dev_state();
+    create_post(
+        &state,
+        "Fold Recovery",
+        "authoritative draft",
+        "save_draft",
+        None,
+    )
+    .await;
+    let post = state.store.get_post("fold-recovery").await.unwrap();
+    let (_, _, editor) = call(&state, get_auth("/edit/fold-recovery", "u_writer", None)).await;
+    let session = hidden(&editor, "autosave_session");
+    // Europe/Berlin 2026-10-25 02:30 occurs twice. 01:30Z is the second occurrence (CET), not
+    // the first 00:30Z occurrence selected by a naive local-time reconstruction.
+    let second_fold_epoch = time::Date::from_calendar_date(2026, time::Month::October, 25)
+        .unwrap()
+        .with_hms(1, 30, 0)
+        .unwrap()
+        .assume_utc()
+        .unix_timestamp();
+    let exact_epoch = second_fold_epoch.to_string();
+    let autosave = form(&[
+        ("title", "Fold Recovery"),
+        ("body", "second fold exact recovery"),
+        ("publish_at", "2026-10-25T02:30"),
+        ("publish_at_epoch", &exact_epoch),
+        ("schedule_timezone", "Europe/Berlin"),
+        ("expected_version", "1"),
+        ("expected_post_id", &post.id),
+        ("autosave_session", &session),
+        ("client_seq", "1"),
+        ("csrf_token", CSRF),
+    ]);
+    assert_eq!(
+        call(
+            &state,
+            post_auth(
+                "/api/writer/autosave/fold-recovery",
+                &autosave,
+                "u_writer",
+                None,
+                true,
+            ),
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let stored = state
+        .store
+        .get_writer_autosave(&session, "u_writer", now_secs())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.publish_at, "2026-10-25T01:30:00");
+    assert_ne!(stored.publish_at, "2026-10-25T02:30");
+
+    let recover_uri = format!("/edit/fold-recovery?recover={session}");
+    let (_, headers, recovered_editor) =
+        call(&state, get_auth(&recover_uri, "u_writer", None)).await;
+    assert_private_no_store(&headers);
+    assert!(recovered_editor.contains(
+        &format!(
+            r#"value="2026-10-25T01:30" data-utc-value="2026-10-25T01:30" data-utc-epoch="{second_fold_epoch}""#
+        )
+    ));
+    assert!(recovered_editor.contains(r#"id="publish_at_epoch" name="publish_at_epoch" value="""#));
+}
+
+#[tokio::test]
 async fn legacy_open_forms_without_post_identity_conflict_into_private_recovery() {
     let state = build_dev_state();
     create_post(
@@ -639,6 +710,186 @@ async fn history_restore_is_authorized_append_only_and_preserves_visibility() {
             .edit_version,
         3
     );
+}
+
+#[tokio::test]
+async fn edit_review_is_read_only_cas_bound_and_does_not_consume_autosave() {
+    let state = build_dev_state();
+    create_post(
+        &state,
+        "Review Durable",
+        "authoritative draft",
+        "save_draft",
+        None,
+    )
+    .await;
+    let original = state.store.get_post("review-durable").await.unwrap();
+    let (_, _, editor) = call(&state, get_auth("/edit/review-durable", "u_writer", None)).await;
+    let session = hidden(&editor, "autosave_session");
+    let autosave = form(&[
+        ("title", "Review Durable"),
+        ("body", "private autosave before review"),
+        ("expected_version", "1"),
+        ("expected_post_id", &original.id),
+        ("autosave_session", &session),
+        ("client_seq", "1"),
+        ("csrf_token", CSRF),
+    ]);
+    assert_eq!(
+        call(
+            &state,
+            post_auth(
+                "/api/writer/autosave/review-durable",
+                &autosave,
+                "u_writer",
+                None,
+                true,
+            ),
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+
+    let review = form(&[
+        ("title", "Review Durable Published"),
+        ("body", "reviewed body remains unsaved"),
+        ("meta_title", "Resolved review metadata"),
+        ("expected_version", "1"),
+        ("expected_post_id", &original.id),
+        ("autosave_session", &session),
+        ("client_seq", "1"),
+        ("intent", "publish_now"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, headers, html) = call(
+        &state,
+        post_auth(
+            "/edit/review-durable/review",
+            &review,
+            "u_writer",
+            None,
+            false,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_private_no_store(&headers);
+    assert!(html.contains(r#"method="post" action="/edit/review-durable""#));
+    assert!(html.contains(r#"name="expected_version" value="1""#));
+    assert!(html.contains(&format!(
+        r#"name="expected_post_id" value="{}""#,
+        original.id
+    )));
+    assert!(html.contains("Resolved review metadata"));
+    let unchanged = state.store.get_post("review-durable").await.unwrap();
+    assert_eq!(unchanged.edit_version, 1);
+    assert!(!unchanged.published);
+    assert_eq!(unchanged.body_md, "authoritative draft");
+    assert!(state
+        .store
+        .get_writer_autosave(&session, "u_writer", now_secs())
+        .await
+        .unwrap()
+        .is_some());
+
+    let back = form(&[
+        ("review_action", "edit"),
+        ("title", "Review Durable Published"),
+        ("body", "reviewed body remains unsaved"),
+        ("expected_version", "1"),
+        ("expected_post_id", &original.id),
+        ("autosave_session", &session),
+        ("client_seq", "1"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, headers, editor) = call(
+        &state,
+        post_auth(
+            "/edit/review-durable/review",
+            &back,
+            "u_writer",
+            None,
+            false,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_private_no_store(&headers);
+    assert!(editor.contains("Returned from review · changes remain unsaved."));
+    assert!(editor.contains("reviewed body remains unsaved"));
+    assert!(editor.contains(r#"formaction="/edit/review-durable/review" data-review-submit"#));
+    assert!(state
+        .store
+        .get_writer_autosave(&session, "u_writer", now_secs())
+        .await
+        .unwrap()
+        .is_some());
+
+    let mut concurrent = unchanged;
+    concurrent.body_md = "concurrent authoritative winner".to_string();
+    concurrent.updated_at = now_secs();
+    state.store.update_post(&concurrent).await.unwrap();
+    let (status, headers, conflict_page) = call(
+        &state,
+        post_auth(
+            "/edit/review-durable/review",
+            &review,
+            "u_writer",
+            None,
+            false,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_private_no_store(&headers);
+    assert!(conflict_page.contains("A newer version was saved"));
+    assert!(conflict_page.contains("reviewed body remains unsaved"));
+    assert!(conflict_page.contains(&format!("/edit/review-durable?recover={session}")));
+    let retained = state
+        .store
+        .get_writer_autosave(&session, "u_writer", now_secs())
+        .await
+        .unwrap()
+        .expect("stale review persists its latest full submission");
+    assert_eq!(retained.body_md, "reviewed body remains unsaved");
+    assert_eq!(retained.meta_title, "Resolved review metadata");
+    assert_eq!(retained.base_version, 2);
+    assert_eq!(retained.client_seq, 2);
+    assert_eq!(
+        state
+            .store
+            .get_post("review-durable")
+            .await
+            .unwrap()
+            .body_md,
+        "concurrent authoritative winner"
+    );
+    assert!(state
+        .store
+        .get_writer_autosave(&session, "u_writer", now_secs())
+        .await
+        .unwrap()
+        .is_some());
+
+    // A still-open review form can also outlive an unreused deletion. It returns the private
+    // caller submission recovery surface rather than a direct 404 and never exposes another row.
+    state.store.delete_post("review-durable").await.unwrap();
+    let (status, headers, identity_page) = call(
+        &state,
+        post_auth(
+            "/edit/review-durable/review",
+            &review,
+            "u_writer",
+            None,
+            false,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_private_no_store(&headers);
+    assert!(identity_page.contains("This post changed identity"));
+    assert!(identity_page.contains("reviewed body remains unsaved"));
 }
 
 #[tokio::test]

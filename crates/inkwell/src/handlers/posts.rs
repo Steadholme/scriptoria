@@ -28,6 +28,7 @@ use crate::{now_nanos, now_secs, unique_slug, AppState};
 const LIST_HTML: &str = include_str!("../../templates/list.html");
 const POST_HTML: &str = include_str!("../../templates/post.html");
 const EDITOR_HTML: &str = include_str!("../../templates/editor.html");
+const PREFLIGHT_HTML: &str = include_str!("../../templates/preflight.html");
 const PUBLIC_REPRESENTATION_VARY: &str = "Cookie, X-Auth-Subject, X-Auth-Email, X-Auth-Groups";
 
 pub const CUSTOM_EXCERPT_MAX: usize = 500;
@@ -79,6 +80,12 @@ pub struct PostForm {
     /// interprets `publish_at` as UTC so the no-JS form remains correct.
     #[serde(default)]
     pub publish_at_epoch: String,
+    /// Browser timezone context is informational only. The server continues to authorize the exact
+    /// publication instant from `publish_at_epoch`, or UTC `publish_at` when JavaScript is absent.
+    #[serde(default)]
+    pub schedule_timezone: String,
+    #[serde(default)]
+    pub schedule_offset_minutes: String,
     #[serde(default)]
     pub pinned: Option<String>,
     /// Explicit Writer Studio action: `save_draft`, `publish_now`, or `schedule`.
@@ -101,6 +108,10 @@ pub struct PostForm {
     /// validation and never participates in authoring or authorization.
     #[serde(default)]
     pub return_to: String,
+    /// The SSR review page posts its canonical payload back here to reopen the editor without a
+    /// write. It is deliberately separate from publication `intent`.
+    #[serde(default)]
+    pub review_action: String,
     #[serde(default)]
     pub csrf_token: String,
 }
@@ -134,6 +145,16 @@ impl PublishIntent {
             other => Err(AppError::InvalidRequest(format!(
                 "unknown publication intent: {other}"
             ))),
+        }
+    }
+
+    fn for_review(raw: &str) -> Result<Self, AppError> {
+        match raw.trim() {
+            "publish_now" => Ok(Self::PublishNow),
+            "schedule" => Ok(Self::Schedule),
+            _ => Err(AppError::InvalidRequest(
+                "review requires publish_now or schedule".to_string(),
+            )),
         }
     }
 }
@@ -704,6 +725,7 @@ pub async fn new_form(
         heading: "New post",
         subhead: "Compose a post in Markdown. You are the author.",
         action: "/new",
+        review_action: "/new/review",
         autosave_url: "",
         autosave_session: "",
         expected_version: 0,
@@ -726,6 +748,7 @@ pub async fn new_form(
         social_description_value: "",
         social_image_value: "",
         publish_at_value: "",
+        publish_at_epoch: None,
         pinned: false,
         cancel_href: &cancel_href,
         delete_slug: None,
@@ -742,42 +765,35 @@ pub async fn create(
     let (sub, email) = auth::require_author(&headers)?;
     auth::verify_csrf(&headers, &form.csrf_token)?;
 
-    let title = form.title.trim();
-    if title.is_empty() {
-        return Err(AppError::InvalidRequest("title is required".to_string()));
-    }
-    let body_md = form.body.trim().to_string();
-    let cover_url = sanitize_cover(&form.cover_url)?;
-    let publication_meta = publication_metadata(&form)?;
     let now = now_secs();
     let intent = PublishIntent::for_create(&form.intent)?;
-    let (published, publish_at) = publication_from_intent(intent, &form, now, false, 0)?;
+    let prepared = prepare_publication(&form, intent, now, false, 0)?;
     let fallback = now_nanos().to_string();
-    let slug = unique_slug(state.store.as_ref(), title, &fallback).await;
+    let slug = unique_slug(state.store.as_ref(), &prepared.title, &fallback).await;
 
     let post = Post {
         id: format!("post_{}", now_nanos()),
         slug: slug.clone(),
-        title: title.to_string(),
-        body_md,
+        title: prepared.title,
+        body_md: prepared.body_md,
         author_sub: sub,
         author_email: email,
         created_at: now,
         updated_at: now,
         edit_version: 1,
-        published,
-        publish_at,
+        published: prepared.published,
+        publish_at: prepared.publish_at,
         featured: false,
-        pinned: form.pinned.is_some(),
-        tags: crate::tags::normalize(&form.tags),
-        cover_url,
-        custom_excerpt: publication_meta.custom_excerpt,
-        meta_title: publication_meta.meta_title,
-        meta_description: publication_meta.meta_description,
-        canonical_url: publication_meta.canonical_url,
-        social_title: publication_meta.social_title,
-        social_description: publication_meta.social_description,
-        social_image: publication_meta.social_image,
+        pinned: prepared.pinned,
+        tags: prepared.tags,
+        cover_url: prepared.cover_url,
+        custom_excerpt: prepared.metadata.custom_excerpt,
+        meta_title: prepared.metadata.meta_title,
+        meta_description: prepared.metadata.meta_description,
+        canonical_url: prepared.metadata.canonical_url,
+        social_title: prepared.metadata.social_title,
+        social_description: prepared.metadata.social_description,
+        social_image: prepared.metadata.social_image,
     };
     state.store.create_post(&post).await?;
     tracing::info!(slug = %slug, "post created");
@@ -837,6 +853,138 @@ pub async fn preview(
 }
 
 // ---------------------------------------------------------------------------
+// Review & publish (read-only SSR preflight)
+// ---------------------------------------------------------------------------
+
+/// `POST /new/review` — validate and normalize a proposed publication without writing it. The
+/// returned native HTML form confirms through the existing `/new` authority, so old clients and
+/// no-JavaScript browsers retain the same final server contract.
+pub async fn review_new(
+    headers: HeaderMap,
+    Form(form): Form<PostForm>,
+) -> Result<Response, AppError> {
+    let (sub, email) = auth::require_author(&headers)?;
+    auth::verify_csrf(&headers, &form.csrf_token)?;
+    if form.review_action.trim() == "edit" {
+        return Ok(review_editor_new(&headers, &sub, &email, &form));
+    }
+    reject_unknown_review_action(&form.review_action)?;
+    let intent = PublishIntent::for_review(&form.intent)?;
+    let now = now_secs();
+    let prepared = prepare_publication(&form, intent, now, false, 0)?;
+    let preview_post = transient_review_post(&prepared, "pending-review", &sub, &email, now);
+    Ok(private_no_store(
+        Html(render_preflight(PreflightView {
+            email: &email,
+            is_admin: auth::is_admin(&headers),
+            theme: resolved_theme(&headers),
+            heading: "Review publication",
+            final_action: "/new",
+            review_action: "/new/review",
+            intent,
+            form: &form,
+            prepared: &prepared,
+            preview_post: &preview_post,
+            stable_slug: None,
+            current_was_public: false,
+            expected_post_id: "",
+            expected_version: 0,
+        }))
+        .into_response(),
+    ))
+}
+
+/// `POST /edit/{slug}/review` — owner/admin-only read-only preflight bound to immutable post id and
+/// edit version. It never consumes Writer autosave; the final `/edit/{slug}` CAS remains decisive.
+pub async fn review_edit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+    Form(form): Form<PostForm>,
+) -> Result<Response, AppError> {
+    let (sub, email) = auth::require_author(&headers)?;
+    auth::verify_csrf(&headers, &form.csrf_token)?;
+    let Some(current) = state.store.get_post_authoritative(&slug).await? else {
+        // A review form can outlive deletion exactly like a final edit form. Preserve the caller's
+        // submitted body on a private identity-conflict surface instead of discarding it as 404.
+        return Ok(identity_conflict_response(&headers, &form.body));
+    };
+    if form.expected_post_id.trim() != current.id {
+        return Ok(identity_conflict_response(&headers, &form.body));
+    }
+    if current.author_sub != sub && !auth::is_admin(&headers) {
+        return Err(AppError::Forbidden(
+            "you can only review your own posts".to_string(),
+        ));
+    }
+    let expected_version = form.expected_version.trim().parse::<i64>().unwrap_or(-1);
+    if expected_version != current.edit_version {
+        let recovery_session = retain_conflicting_submission(
+            &state,
+            &sub,
+            &slug,
+            &current.id,
+            &form,
+            form.autosave_session.trim(),
+        )
+        .await?;
+        return Ok(match recovery_session {
+            Some(recovery_session) => save_conflict_response(
+                &headers,
+                &slug,
+                current.edit_version,
+                &recovery_session,
+                &form.body,
+                &form.return_to,
+            ),
+            None => identity_conflict_response(&headers, &form.body),
+        });
+    }
+    if form.review_action.trim() == "edit" {
+        return Ok(review_editor_existing(
+            &headers, &sub, &email, &current, &form,
+        ));
+    }
+    reject_unknown_review_action(&form.review_action)?;
+    let intent = PublishIntent::for_review(&form.intent)?;
+    let now = now_secs();
+    let prepared = prepare_publication(&form, intent, now, current.published, current.publish_at)?;
+    let mut preview_post = current.clone();
+    apply_prepared_publication(&mut preview_post, prepared.clone());
+    let final_action = format!("/edit/{}", esc(&slug));
+    let review_action = format!("/edit/{}/review", esc(&slug));
+    Ok(private_no_store(
+        Html(render_preflight(PreflightView {
+            email: &email,
+            is_admin: auth::is_admin(&headers),
+            theme: resolved_theme(&headers),
+            heading: "Review changes",
+            final_action: &final_action,
+            review_action: &review_action,
+            intent,
+            form: &form,
+            prepared: &prepared,
+            preview_post: &preview_post,
+            stable_slug: Some(&current.slug),
+            current_was_public: current.is_public_at(now),
+            expected_post_id: &current.id,
+            expected_version: current.edit_version,
+        }))
+        .into_response(),
+    ))
+}
+
+fn reject_unknown_review_action(raw: &str) -> Result<(), AppError> {
+    if raw.trim().is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::InvalidRequest(
+            "unknown review action".to_string(),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Edit
 // ---------------------------------------------------------------------------
 
@@ -892,6 +1040,7 @@ pub async fn edit_form(
         .filter(|autosave| autosave.post_id == post.id);
     let mut editor_post = post.clone();
     let mut publish_at_value = format_publish_at_value(post.publish_at);
+    let mut publish_at_epoch = (post.publish_at > 0).then_some(post.publish_at);
     let recovery_notice = if let Some(autosave) = &recovered {
         editor_post.title = autosave.title.clone();
         editor_post.body_md = autosave.body_md.clone();
@@ -905,7 +1054,12 @@ pub async fn edit_form(
         editor_post.social_description = autosave.social_description.clone();
         editor_post.social_image = autosave.social_image.clone();
         editor_post.pinned = autosave.pinned;
-        publish_at_value = autosave.publish_at.clone();
+        publish_at_epoch = parse_publish_at(&autosave.publish_at)
+            .ok()
+            .filter(|epoch| *epoch > 0);
+        publish_at_value = publish_at_epoch
+            .map(format_publish_at_value)
+            .unwrap_or_else(|| autosave.publish_at.clone());
         format!(
             r#"<div class="draftbar server-recovery"><span>Private conflict recovery copy loaded · review it against current server version {} before saving.</span></div>"#,
             autosave.base_version
@@ -932,6 +1086,7 @@ pub async fn edit_form(
         heading: "Edit post",
         subhead: "Update the title, body, or publication state.",
         action: &format!("/edit/{}", esc(&post.slug)),
+        review_action: &format!("/edit/{}/review", esc(&post.slug)),
         autosave_url: &format!("/api/writer/autosave/{}", esc(&post.slug)),
         autosave_session: &autosave_session,
         expected_version: post.edit_version,
@@ -954,6 +1109,7 @@ pub async fn edit_form(
         social_description_value: &editor_post.social_description,
         social_image_value: &editor_post.social_image,
         publish_at_value: &publish_at_value,
+        publish_at_epoch,
         pinned: editor_post.pinned,
         cancel_href: &cancel_href,
         delete_slug: Some(&post.slug),
@@ -992,29 +1148,10 @@ pub async fn update(
     }
     let loaded_post_id = post.id.clone();
 
-    let title = form.title.trim();
-    if title.is_empty() {
-        return Err(AppError::InvalidRequest("title is required".to_string()));
-    }
-    post.title = title.to_string();
-    post.body_md = form.body.trim().to_string();
-    post.tags = crate::tags::normalize(&form.tags);
-    post.cover_url = sanitize_cover(&form.cover_url)?;
-    let publication_meta = publication_metadata(&form)?;
-    post.custom_excerpt = publication_meta.custom_excerpt;
-    post.meta_title = publication_meta.meta_title;
-    post.meta_description = publication_meta.meta_description;
-    post.canonical_url = publication_meta.canonical_url;
-    post.social_title = publication_meta.social_title;
-    post.social_description = publication_meta.social_description;
-    post.social_image = publication_meta.social_image;
     let now = now_secs();
     let intent = PublishIntent::for_update(&form.intent)?;
-    let (published, publish_at) =
-        publication_from_intent(intent, &form, now, post.published, post.publish_at)?;
-    post.publish_at = publish_at;
-    post.published = published;
-    post.pinned = form.pinned.is_some();
+    let prepared = prepare_publication(&form, intent, now, post.published, post.publish_at)?;
+    apply_prepared_publication(&mut post, prepared);
     post.updated_at = now;
     // Forms opened before `expected_post_id` shipped must never become last-write-wins even when
     // they happen to carry a currently valid version. Force the normal CAS-conflict recovery path.
@@ -1428,6 +1565,7 @@ fn delete_conflict() -> AppError {
 // Render helpers
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct PublicationMetadata {
     custom_excerpt: String,
     meta_title: String,
@@ -1438,12 +1576,100 @@ struct PublicationMetadata {
     social_image: String,
 }
 
+/// Canonical server-normalized authoring payload shared by final mutations and the read-only
+/// Review & publish step. Keeping one preparation path prevents the review from promising values
+/// that the authoritative save would later trim, reject, or reinterpret.
+#[derive(Clone)]
+struct PreparedPublication {
+    title: String,
+    body_md: String,
+    tags: String,
+    cover_url: String,
+    metadata: PublicationMetadata,
+    pinned: bool,
+    published: bool,
+    publish_at: i64,
+}
+
+fn prepare_publication(
+    form: &PostForm,
+    intent: PublishIntent,
+    now: i64,
+    current_published: bool,
+    current_publish_at: i64,
+) -> Result<PreparedPublication, AppError> {
+    let title = form.title.trim();
+    if title.is_empty() {
+        return Err(AppError::InvalidRequest("title is required".to_string()));
+    }
+    let (published, publish_at) =
+        publication_from_intent(intent, form, now, current_published, current_publish_at)?;
+    Ok(PreparedPublication {
+        title: title.to_string(),
+        body_md: form.body.trim().to_string(),
+        tags: crate::tags::normalize(&form.tags),
+        cover_url: sanitize_cover(&form.cover_url)?,
+        metadata: publication_metadata(form)?,
+        pinned: form.pinned.is_some(),
+        published,
+        publish_at,
+    })
+}
+
+fn apply_prepared_publication(post: &mut Post, prepared: PreparedPublication) {
+    post.title = prepared.title;
+    post.body_md = prepared.body_md;
+    post.tags = prepared.tags;
+    post.cover_url = prepared.cover_url;
+    post.custom_excerpt = prepared.metadata.custom_excerpt;
+    post.meta_title = prepared.metadata.meta_title;
+    post.meta_description = prepared.metadata.meta_description;
+    post.canonical_url = prepared.metadata.canonical_url;
+    post.social_title = prepared.metadata.social_title;
+    post.social_description = prepared.metadata.social_description;
+    post.social_image = prepared.metadata.social_image;
+    post.pinned = prepared.pinned;
+    post.published = prepared.published;
+    post.publish_at = prepared.publish_at;
+}
+
 fn valid_autosave_session(raw: &str) -> bool {
     raw.len() == 64 && raw.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn raw_bounded(raw: &str, max_chars: usize) -> String {
     raw.chars().take(max_chars).collect()
+}
+
+fn exact_publish_at_epoch(raw: &str) -> Option<i64> {
+    let epoch = raw.trim().parse::<i64>().ok()?;
+    (epoch > 0 && time::OffsetDateTime::from_unix_timestamp(epoch).is_ok()).then_some(epoch)
+}
+
+fn editor_publish_at_epoch(form: &PostForm) -> Option<i64> {
+    exact_publish_at_epoch(&form.publish_at_epoch).or_else(|| {
+        parse_publish_at(&form.publish_at)
+            .ok()
+            .filter(|epoch| *epoch > 0)
+    })
+}
+
+fn canonical_autosave_publish_at(form: &PostForm) -> String {
+    let Some(epoch) = exact_publish_at_epoch(&form.publish_at_epoch) else {
+        return raw_bounded(&form.publish_at, 64);
+    };
+    let Ok(instant) = time::OffsetDateTime::from_unix_timestamp(epoch) else {
+        return raw_bounded(&form.publish_at, 64);
+    };
+    format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}",
+        year = instant.year(),
+        month = u8::from(instant.month()),
+        day = instant.day(),
+        hour = instant.hour(),
+        minute = instant.minute(),
+        second = instant.second(),
+    )
 }
 
 fn writer_autosave_from_form(
@@ -1472,7 +1698,10 @@ fn writer_autosave_from_form(
         social_title: raw_bounded(&form.social_title, SOCIAL_TITLE_MAX),
         social_description: raw_bounded(&form.social_description, SOCIAL_DESCRIPTION_MAX),
         social_image: raw_bounded(&form.social_image, SOCIAL_IMAGE_MAX),
-        publish_at: raw_bounded(&form.publish_at, 64),
+        // The browser wall time is ambiguous during a DST fold. Persist an accepted exact epoch
+        // as a canonical UTC datetime in the existing column so recovery remains schema-free and
+        // reversible; legacy/no-JavaScript submissions still retain their raw UTC wall value.
+        publish_at: canonical_autosave_publish_at(form),
         pinned: form.pinned.is_some(),
         updated_at: now,
         expires_at: now.saturating_add(crate::config::AUTOSAVE_TTL_SECS),
@@ -1707,6 +1936,20 @@ fn sanitize_canonical_url(raw: &str) -> Result<String, AppError> {
 
 pub(crate) fn canonical_url_is_safe(raw: &str) -> bool {
     sanitize_canonical_url(raw).is_ok()
+}
+
+pub(crate) fn local_post_url(slug: &str) -> String {
+    format!("{}/p/{slug}", crate::config::SITE_BASE_URL)
+}
+
+/// The single rule shared by sitemap emission and publication preflight. A safe explicit
+/// canonical excludes the local URL only when it is actually different from that post's stable
+/// Reader URL; a self-canonical remains discoverable in the sitemap.
+pub(crate) fn canonical_excludes_local_url(canonical_url: &str, slug: &str) -> bool {
+    let canonical_url = canonical_url.trim();
+    !canonical_url.is_empty()
+        && canonical_url_is_safe(canonical_url)
+        && canonical_url != local_post_url(slug)
 }
 
 fn sanitize_social_image(raw: &str) -> Result<String, AppError> {
@@ -2137,6 +2380,530 @@ fn render_card(post: &Post, viewer_sub: Option<&str>, now: i64) -> String {
     )
 }
 
+struct PreflightView<'a> {
+    email: &'a str,
+    is_admin: bool,
+    theme: &'a str,
+    heading: &'a str,
+    final_action: &'a str,
+    review_action: &'a str,
+    intent: PublishIntent,
+    form: &'a PostForm,
+    prepared: &'a PreparedPublication,
+    preview_post: &'a Post,
+    stable_slug: Option<&'a str>,
+    current_was_public: bool,
+    expected_post_id: &'a str,
+    expected_version: i64,
+}
+
+fn resolved_theme(headers: &HeaderMap) -> &'static str {
+    odyssey::resolve_theme(
+        headers
+            .get(header::COOKIE)
+            .and_then(|value| value.to_str().ok()),
+    )
+}
+
+fn transient_review_post(
+    prepared: &PreparedPublication,
+    slug: &str,
+    author_sub: &str,
+    author_email: &str,
+    now: i64,
+) -> Post {
+    Post {
+        id: "review-only".to_string(),
+        slug: slug.to_string(),
+        title: prepared.title.clone(),
+        body_md: prepared.body_md.clone(),
+        author_sub: author_sub.to_string(),
+        author_email: author_email.to_string(),
+        created_at: now,
+        updated_at: now,
+        edit_version: 0,
+        published: prepared.published,
+        publish_at: prepared.publish_at,
+        featured: false,
+        pinned: prepared.pinned,
+        tags: prepared.tags.clone(),
+        cover_url: prepared.cover_url.clone(),
+        custom_excerpt: prepared.metadata.custom_excerpt.clone(),
+        meta_title: prepared.metadata.meta_title.clone(),
+        meta_description: prepared.metadata.meta_description.clone(),
+        canonical_url: prepared.metadata.canonical_url.clone(),
+        social_title: prepared.metadata.social_title.clone(),
+        social_description: prepared.metadata.social_description.clone(),
+        social_image: prepared.metadata.social_image.clone(),
+    }
+}
+
+fn clean_context(raw: &str, max_chars: usize) -> String {
+    raw.trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(max_chars)
+        .collect()
+}
+
+fn format_utc_instant(secs: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp(secs)
+        .map(|instant| {
+            format!(
+                "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC",
+                year = instant.year(),
+                month = u8::from(instant.month()),
+                day = instant.day(),
+                hour = instant.hour(),
+                minute = instant.minute(),
+            )
+        })
+        .unwrap_or_else(|_| "Invalid UTC instant".to_string())
+}
+
+fn format_offset(raw: &str) -> Option<String> {
+    let minutes = raw.trim().parse::<i32>().ok()?.clamp(-14 * 60, 14 * 60);
+    let sign = if minutes < 0 { '-' } else { '+' };
+    let absolute = minutes.abs();
+    Some(format!(
+        "UTC{sign}{:02}:{:02}",
+        absolute / 60,
+        absolute % 60
+    ))
+}
+
+fn push_hidden_input(out: &mut String, name: &str, value: &str) {
+    out.push_str(&format!(
+        r#"<input type="hidden" name="{}" value="{}">"#,
+        esc(name),
+        esc(value)
+    ));
+}
+
+fn push_hidden_text(out: &mut String, name: &str, value: &str) {
+    out.push_str(&format!(
+        r#"<textarea name="{}" hidden>{}</textarea>"#,
+        esc(name),
+        esc(value)
+    ));
+}
+
+fn preflight_hidden_fields(view: &PreflightView<'_>) -> String {
+    let prepared = view.prepared;
+    let mut out = String::new();
+    push_hidden_input(&mut out, "csrf_token", &view.form.csrf_token);
+    push_hidden_input(
+        &mut out,
+        "expected_version",
+        &view.expected_version.to_string(),
+    );
+    push_hidden_input(&mut out, "expected_post_id", view.expected_post_id);
+    push_hidden_input(&mut out, "autosave_session", &view.form.autosave_session);
+    push_hidden_input(&mut out, "client_seq", &view.form.client_seq);
+    push_hidden_input(
+        &mut out,
+        "return_to",
+        &validated_return_to(Some(&view.form.return_to)),
+    );
+    push_hidden_input(&mut out, "title", &prepared.title);
+    push_hidden_text(&mut out, "body", &prepared.body_md);
+    push_hidden_input(&mut out, "tags", &prepared.tags);
+    push_hidden_input(&mut out, "cover_url", &prepared.cover_url);
+    push_hidden_text(
+        &mut out,
+        "custom_excerpt",
+        &prepared.metadata.custom_excerpt,
+    );
+    push_hidden_input(&mut out, "meta_title", &prepared.metadata.meta_title);
+    push_hidden_text(
+        &mut out,
+        "meta_description",
+        &prepared.metadata.meta_description,
+    );
+    push_hidden_input(&mut out, "canonical_url", &prepared.metadata.canonical_url);
+    push_hidden_input(&mut out, "social_title", &prepared.metadata.social_title);
+    push_hidden_text(
+        &mut out,
+        "social_description",
+        &prepared.metadata.social_description,
+    );
+    push_hidden_input(&mut out, "social_image", &prepared.metadata.social_image);
+    let publish_at = if view.intent == PublishIntent::Schedule {
+        format_publish_at_value(prepared.publish_at)
+    } else {
+        view.form.publish_at.clone()
+    };
+    push_hidden_input(&mut out, "publish_at", &publish_at);
+    let publish_at_epoch = if view.intent == PublishIntent::Schedule {
+        prepared.publish_at.to_string()
+    } else {
+        String::new()
+    };
+    push_hidden_input(&mut out, "publish_at_epoch", &publish_at_epoch);
+    push_hidden_input(
+        &mut out,
+        "schedule_timezone",
+        &clean_context(&view.form.schedule_timezone, 80),
+    );
+    push_hidden_input(
+        &mut out,
+        "schedule_offset_minutes",
+        &clean_context(&view.form.schedule_offset_minutes, 8),
+    );
+    if prepared.pinned {
+        push_hidden_input(&mut out, "pinned", "on");
+    }
+    out
+}
+
+fn preflight_checks(view: &PreflightView<'_>) -> String {
+    let mut checks = vec![
+        r#"<li class="ink-preflight__check is-ready"><strong>Ready</strong><span>Title and publication action passed server validation.</span></li>"#.to_string(),
+        r#"<li class="ink-preflight__check is-ready"><strong>Ready</strong><span>Canonical, cover, and social image URL policies passed.</span></li>"#.to_string(),
+    ];
+    if view.prepared.body_md.is_empty() {
+        checks.push(r#"<li class="ink-preflight__check is-warning"><strong>Review</strong><span>The article body is empty.</span></li>"#.to_string());
+    }
+    if view.prepared.tags.is_empty() {
+        checks.push(r#"<li class="ink-preflight__check is-warning"><strong>Optional</strong><span>No tags are assigned.</span></li>"#.to_string());
+    }
+    if view.prepared.cover_url.is_empty() {
+        checks.push(r#"<li class="ink-preflight__check is-warning"><strong>Optional</strong><span>No cover image; Reader cards remain text-first.</span></li>"#.to_string());
+    }
+    if view.prepared.metadata.custom_excerpt.is_empty() {
+        checks.push(r#"<li class="ink-preflight__check is-warning"><strong>Fallback</strong><span>Cards and descriptions derive an excerpt from the Markdown body.</span></li>"#.to_string());
+    }
+    if view.prepared.metadata.social_image.is_empty() && view.prepared.cover_url.is_empty() {
+        checks.push(r#"<li class="ink-preflight__check is-warning"><strong>Fallback</strong><span>Social metadata uses a summary card without an image.</span></li>"#.to_string());
+    }
+    if view.intent == PublishIntent::Schedule && view.current_was_public {
+        checks.push(r#"<li class="ink-preflight__check is-warning"><strong>Visibility</strong><span>This post is public now. Confirming the schedule removes it from public surfaces until the future instant.</span></li>"#.to_string());
+    }
+    if !view.prepared.metadata.canonical_url.is_empty() {
+        match view.stable_slug {
+            Some(slug)
+                if canonical_excludes_local_url(&view.prepared.metadata.canonical_url, slug) =>
+            {
+                checks.push(r#"<li class="ink-preflight__check is-warning"><strong>Canonical</strong><span>This canonical differs from the stable local Reader URL, so the local article is excluded from the sitemap.</span></li>"#.to_string());
+            }
+            Some(_) => {
+                checks.push(r#"<li class="ink-preflight__check is-ready"><strong>Canonical</strong><span>This self-canonical matches the stable local Reader URL, which remains in the sitemap.</span></li>"#.to_string());
+            }
+            None => {
+                checks.push(r#"<li class="ink-preflight__check is-warning"><strong>Canonical</strong><span>The new slug is not reserved during review. Sitemap inclusion is decided after confirmation by comparing this canonical with the assigned local URL.</span></li>"#.to_string());
+            }
+        }
+    }
+    checks.join("")
+}
+
+/// Replace placeholders found in the original template exactly once. Replacement values are
+/// appended verbatim and never scanned again, so valid author content such as `{{INTENT}}` cannot
+/// be mistaken for a later template placeholder and silently rewritten.
+fn render_literal_template(template: &str, replacements: &[(&str, String)]) -> String {
+    let mut rendered = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find("{{") {
+        rendered.push_str(&rest[..open]);
+        let candidate = &rest[open..];
+        let Some(close) = candidate.find("}}") else {
+            rendered.push_str(candidate);
+            return rendered;
+        };
+        let end = close + 2;
+        let placeholder = &candidate[..end];
+        if let Some((_, value)) = replacements.iter().find(|(name, _)| *name == placeholder) {
+            rendered.push_str(value);
+        } else {
+            rendered.push_str(placeholder);
+        }
+        rest = &candidate[end..];
+    }
+    rendered.push_str(rest);
+    rendered
+}
+
+fn render_preflight(view: PreflightView<'_>) -> String {
+    let metadata = public_post_meta(view.preview_post);
+    let search_title = if view.prepared.metadata.meta_title.is_empty() {
+        view.prepared.title.clone()
+    } else {
+        view.prepared.metadata.meta_title.clone()
+    };
+    let description = metadata.description.clone().unwrap_or_default();
+    let social_title = metadata.og_title.clone().unwrap_or_default();
+    let social_description = metadata.og_description.clone().unwrap_or_default();
+    let social_image = metadata
+        .og_image
+        .clone()
+        .unwrap_or_else(|| "No image · summary card".to_string());
+    let canonical = if !view.prepared.metadata.canonical_url.is_empty() {
+        match view.stable_slug {
+            Some(slug)
+                if canonical_excludes_local_url(
+                    &view.prepared.metadata.canonical_url,
+                    slug,
+                ) => format!(
+                    "{} · differs from the stable local Reader URL, so the local URL is excluded from the sitemap",
+                    view.prepared.metadata.canonical_url
+                ),
+            Some(_) => format!(
+                "{} · matches the stable local Reader URL and remains in the sitemap",
+                view.prepared.metadata.canonical_url
+            ),
+            None => format!(
+                "{} · the slug is not reserved during review; sitemap inclusion is decided after confirmation against the assigned local URL",
+                view.prepared.metadata.canonical_url
+            ),
+        }
+    } else if let Some(slug) = view.stable_slug {
+        format!("{}/p/{slug}", crate::config::SITE_BASE_URL)
+    } else {
+        "Local canonical and slug are assigned atomically when you confirm.".to_string()
+    };
+    let target = view
+        .stable_slug
+        .map(|slug| format!("{}/p/{slug}", crate::config::SITE_BASE_URL))
+        .unwrap_or_else(|| {
+            "A unique URL will be assigned from the title at confirmation.".to_string()
+        });
+    let (intent_key, action_title, action_detail, confirm_label, schedule_context) =
+        match view.intent {
+            PublishIntent::PublishNow => (
+                "publish_now",
+                "Publish now",
+                "The post becomes public only after the final server save succeeds.",
+                "Confirm publish now",
+                "No schedule · the server records the confirmation instant.".to_string(),
+            ),
+            PublishIntent::Schedule => {
+                let timezone = clean_context(&view.form.schedule_timezone, 80);
+                let offset = format_offset(&view.form.schedule_offset_minutes);
+                let context = if timezone.is_empty() {
+                    format!(
+                        "{} · no JavaScript input was interpreted as UTC.",
+                        format_utc_instant(view.prepared.publish_at)
+                    )
+                } else {
+                    format!(
+                    "{} · browser zone {}{} is informational; the UTC instant is authoritative.",
+                    format_utc_instant(view.prepared.publish_at),
+                    timezone,
+                    offset
+                        .map(|value| format!(" ({value})"))
+                        .unwrap_or_default(),
+                )
+                };
+                (
+                    "schedule",
+                    "Schedule",
+                    "The post remains private until the exact future UTC instant below.",
+                    "Confirm schedule",
+                    context,
+                )
+            }
+            _ => unreachable!("review accepts only public transitions"),
+        };
+    let body_preview = if view.prepared.body_md.is_empty() {
+        r#"<p class="muted">No body content to render.</p>"#.to_string()
+    } else {
+        markdown::render_html(&view.prepared.body_md)
+    };
+    let organization = format!(
+        "{} · {}",
+        if view.prepared.pinned {
+            "Pinned in Reader"
+        } else {
+            "Not pinned"
+        },
+        if view.prepared.tags.is_empty() {
+            "No tags".to_string()
+        } else {
+            format!("Tags: {}", view.prepared.tags)
+        }
+    );
+    let fragment = render_literal_template(
+        PREFLIGHT_HTML,
+        &[
+            ("{{HEADING}}", esc(view.heading)),
+            ("{{ACTION_TITLE}}", action_title.to_string()),
+            ("{{ACTION_DETAIL}}", action_detail.to_string()),
+            ("{{TARGET}}", esc(&target)),
+            ("{{SCHEDULE_CONTEXT}}", esc(&schedule_context)),
+            ("{{ORGANIZATION}}", esc(&organization)),
+            ("{{CHECKS}}", preflight_checks(&view)),
+            ("{{SEARCH_TITLE}}", esc(&search_title)),
+            ("{{DESCRIPTION}}", esc(&description)),
+            ("{{CANONICAL}}", esc(&canonical)),
+            ("{{SOCIAL_TITLE}}", esc(&social_title)),
+            ("{{SOCIAL_DESCRIPTION}}", esc(&social_description)),
+            ("{{SOCIAL_IMAGE}}", esc(&social_image)),
+            ("{{BODY_PREVIEW}}", body_preview),
+            ("{{FINAL_ACTION}}", esc(view.final_action)),
+            ("{{REVIEW_ACTION}}", esc(view.review_action)),
+            ("{{HIDDEN_FIELDS}}", preflight_hidden_fields(&view)),
+            ("{{INTENT}}", intent_key.to_string()),
+            ("{{CONFIRM_LABEL}}", confirm_label.to_string()),
+        ],
+    );
+    page_shell(PageShell {
+        head_title: "Review & publish · Inkwell",
+        body_class: "page-console page-preflight",
+        rss: false,
+        nav_title: "Studio",
+        email: view.email,
+        is_admin: view.is_admin,
+        theme: view.theme,
+        fragment: &fragment,
+        metadata: None,
+    })
+}
+
+fn review_editor_new(headers: &HeaderMap, sub: &str, email: &str, form: &PostForm) -> Response {
+    let return_to = validated_return_to(Some(&form.return_to));
+    let cancel_href = if return_to.is_empty() {
+        "/".to_string()
+    } else {
+        return_to.clone()
+    };
+    let scope = recovery_scope(sub);
+    let page = render_editor(EditorView {
+        email,
+        is_admin: auth::is_admin(headers),
+        theme: resolved_theme(headers),
+        state_label: "draft",
+        saved: false,
+        heading: "New post",
+        subhead: "Returned from review · keep editing before publication.",
+        action: "/new",
+        review_action: "/new/review",
+        autosave_url: "",
+        autosave_session: "",
+        expected_version: 0,
+        expected_post_id: "",
+        client_seq: 0,
+        history_href: "",
+        return_to: &return_to,
+        recovery_notice: "",
+        recovery_scope: &scope,
+        csrf: &form.csrf_token,
+        title_value: &form.title,
+        body_value: &form.body,
+        tags_value: &form.tags,
+        cover_value: &form.cover_url,
+        custom_excerpt_value: &form.custom_excerpt,
+        meta_title_value: &form.meta_title,
+        meta_description_value: &form.meta_description,
+        canonical_url_value: &form.canonical_url,
+        social_title_value: &form.social_title,
+        social_description_value: &form.social_description,
+        social_image_value: &form.social_image,
+        publish_at_value: &form.publish_at,
+        publish_at_epoch: editor_publish_at_epoch(form),
+        pinned: form.pinned.is_some(),
+        cancel_href: &cancel_href,
+        delete_slug: None,
+    });
+    private_no_store(Html(page).into_response())
+}
+
+fn review_editor_existing(
+    headers: &HeaderMap,
+    sub: &str,
+    email: &str,
+    current: &Post,
+    form: &PostForm,
+) -> Response {
+    review_editor_existing_response(
+        headers,
+        sub,
+        email,
+        current,
+        form,
+        ReviewEditorPresentation {
+            status: StatusCode::OK,
+            subhead: "Returned from review · changes remain unsaved.",
+            recovery_notice: "",
+        },
+    )
+}
+
+struct ReviewEditorPresentation<'a> {
+    status: StatusCode,
+    subhead: &'a str,
+    recovery_notice: &'a str,
+}
+
+fn review_editor_existing_response(
+    headers: &HeaderMap,
+    sub: &str,
+    email: &str,
+    current: &Post,
+    form: &PostForm,
+    presentation: ReviewEditorPresentation<'_>,
+) -> Response {
+    let return_to = validated_return_to(Some(&form.return_to));
+    let cancel_href = if return_to.is_empty() {
+        format!("/p/{}", current.slug)
+    } else {
+        return_to.clone()
+    };
+    let history_href = if return_to.is_empty() {
+        format!("/edit/{}/history", current.slug)
+    } else {
+        format!(
+            "/edit/{}/history?return_to={}",
+            current.slug,
+            crate::handlers::library::percent_encode(&return_to)
+        )
+    };
+    let action = format!("/edit/{}", current.slug);
+    let review_action = format!("/edit/{}/review", current.slug);
+    let autosave_url = format!("/api/writer/autosave/{}", current.slug);
+    let scope = recovery_scope(sub);
+    let client_seq = form.client_seq.trim().parse::<i64>().unwrap_or(0).max(0);
+    let page = render_editor(EditorView {
+        email,
+        is_admin: auth::is_admin(headers),
+        theme: resolved_theme(headers),
+        state_label: publication_detail(current, now_secs()),
+        saved: false,
+        heading: "Edit post",
+        subhead: presentation.subhead,
+        action: &action,
+        review_action: &review_action,
+        autosave_url: &autosave_url,
+        autosave_session: &form.autosave_session,
+        expected_version: current.edit_version,
+        expected_post_id: &current.id,
+        client_seq,
+        history_href: &history_href,
+        return_to: &return_to,
+        recovery_notice: presentation.recovery_notice,
+        recovery_scope: &scope,
+        csrf: &form.csrf_token,
+        title_value: &form.title,
+        body_value: &form.body,
+        tags_value: &form.tags,
+        cover_value: &form.cover_url,
+        custom_excerpt_value: &form.custom_excerpt,
+        meta_title_value: &form.meta_title,
+        meta_description_value: &form.meta_description,
+        canonical_url_value: &form.canonical_url,
+        social_title_value: &form.social_title,
+        social_description_value: &form.social_description,
+        social_image_value: &form.social_image,
+        publish_at_value: &form.publish_at,
+        publish_at_epoch: editor_publish_at_epoch(form),
+        pinned: form.pinned.is_some(),
+        cancel_href: &cancel_href,
+        delete_slug: Some(&current.slug),
+    });
+    let mut response = Html(page).into_response();
+    *response.status_mut() = presentation.status;
+    private_no_store(response)
+}
+
 /// Inputs for rendering the compose/edit form (one shared template).
 struct EditorView<'a> {
     email: &'a str,
@@ -2147,6 +2914,7 @@ struct EditorView<'a> {
     heading: &'a str,
     subhead: &'a str,
     action: &'a str,
+    review_action: &'a str,
     autosave_url: &'a str,
     autosave_session: &'a str,
     expected_version: i64,
@@ -2169,6 +2937,7 @@ struct EditorView<'a> {
     social_description_value: &'a str,
     social_image_value: &'a str,
     publish_at_value: &'a str,
+    publish_at_epoch: Option<i64>,
     pinned: bool,
     cancel_href: &'a str,
     /// `Some(slug)` on the edit form -> render a separate delete form; `None` on compose.
@@ -2225,41 +2994,55 @@ fn render_editor(v: EditorView<'_>) -> String {
         None => String::new(),
     };
 
-    let fragment = EDITOR_HTML
-        .replace("{{HEADING}}", &esc(v.heading))
-        .replace("{{SUBHEAD}}", &esc(v.subhead))
-        .replace("{{ACTION}}", v.action)
-        .replace("{{AUTOSAVE_URL}}", &esc(v.autosave_url))
-        .replace("{{AUTOSAVE_SESSION}}", &esc(v.autosave_session))
-        .replace("{{EXPECTED_VERSION}}", &v.expected_version.to_string())
-        .replace("{{EXPECTED_POST_ID}}", &esc(v.expected_post_id))
-        .replace("{{CLIENT_SEQ}}", &v.client_seq.to_string())
-        .replace("{{RETURN_TO}}", &esc(v.return_to))
-        .replace("{{HISTORY_ACTION}}", &history_action)
-        .replace("{{SERVER_RECOVERY_NOTICE}}", v.recovery_notice)
-        .replace("{{RECOVERY_SCOPE}}", &esc(v.recovery_scope))
-        .replace("{{CSRF}}", &esc(v.csrf))
-        .replace("{{TITLE_VALUE}}", &esc(v.title_value))
-        .replace("{{BODY_VALUE}}", &esc(v.body_value))
-        .replace("{{TAGS_VALUE}}", &esc(v.tags_value))
-        .replace("{{COVER_VALUE}}", &esc(v.cover_value))
-        .replace("{{CUSTOM_EXCERPT_VALUE}}", &esc(v.custom_excerpt_value))
-        .replace("{{META_TITLE_VALUE}}", &esc(v.meta_title_value))
-        .replace("{{META_DESCRIPTION_VALUE}}", &esc(v.meta_description_value))
-        .replace("{{CANONICAL_URL_VALUE}}", &esc(v.canonical_url_value))
-        .replace("{{SOCIAL_TITLE_VALUE}}", &esc(v.social_title_value))
-        .replace(
-            "{{SOCIAL_DESCRIPTION_VALUE}}",
-            &esc(v.social_description_value),
-        )
-        .replace("{{SOCIAL_IMAGE_VALUE}}", &esc(v.social_image_value))
-        .replace("{{PUBLISH_AT_VALUE}}", &esc(v.publish_at_value))
-        .replace("{{PINNED_CHECKED}}", if v.pinned { "checked" } else { "" })
-        .replace("{{STATE_PILL}}", &state_pill_html)
-        .replace("{{STATE_KEY}}", &esc(v.state_label))
-        .replace("{{PRESERVE_ACTION}}", preserve_action)
-        .replace("{{CANCEL_HREF}}", v.cancel_href)
-        .replace("{{DELETE}}", &delete_block);
+    let fragment = render_literal_template(
+        EDITOR_HTML,
+        &[
+            ("{{HEADING}}", esc(v.heading)),
+            ("{{SUBHEAD}}", esc(v.subhead)),
+            ("{{ACTION}}", v.action.to_string()),
+            ("{{REVIEW_ACTION}}", esc(v.review_action)),
+            ("{{AUTOSAVE_URL}}", esc(v.autosave_url)),
+            ("{{AUTOSAVE_SESSION}}", esc(v.autosave_session)),
+            ("{{EXPECTED_VERSION}}", v.expected_version.to_string()),
+            ("{{EXPECTED_POST_ID}}", esc(v.expected_post_id)),
+            ("{{CLIENT_SEQ}}", v.client_seq.to_string()),
+            ("{{RETURN_TO}}", esc(v.return_to)),
+            ("{{HISTORY_ACTION}}", history_action),
+            ("{{SERVER_RECOVERY_NOTICE}}", v.recovery_notice.to_string()),
+            ("{{RECOVERY_SCOPE}}", esc(v.recovery_scope)),
+            ("{{CSRF}}", esc(v.csrf)),
+            ("{{TITLE_VALUE}}", esc(v.title_value)),
+            ("{{BODY_VALUE}}", esc(v.body_value)),
+            ("{{TAGS_VALUE}}", esc(v.tags_value)),
+            ("{{COVER_VALUE}}", esc(v.cover_value)),
+            ("{{CUSTOM_EXCERPT_VALUE}}", esc(v.custom_excerpt_value)),
+            ("{{META_TITLE_VALUE}}", esc(v.meta_title_value)),
+            ("{{META_DESCRIPTION_VALUE}}", esc(v.meta_description_value)),
+            ("{{CANONICAL_URL_VALUE}}", esc(v.canonical_url_value)),
+            ("{{SOCIAL_TITLE_VALUE}}", esc(v.social_title_value)),
+            (
+                "{{SOCIAL_DESCRIPTION_VALUE}}",
+                esc(v.social_description_value),
+            ),
+            ("{{SOCIAL_IMAGE_VALUE}}", esc(v.social_image_value)),
+            ("{{PUBLISH_AT_VALUE}}", esc(v.publish_at_value)),
+            (
+                "{{PUBLISH_AT_EPOCH}}",
+                v.publish_at_epoch
+                    .map(|epoch| epoch.to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "{{PINNED_CHECKED}}",
+                (if v.pinned { "checked" } else { "" }).to_string(),
+            ),
+            ("{{STATE_PILL}}", state_pill_html),
+            ("{{STATE_KEY}}", esc(v.state_label)),
+            ("{{PRESERVE_ACTION}}", preserve_action.to_string()),
+            ("{{CANCEL_HREF}}", v.cancel_href.to_string()),
+            ("{{DELETE}}", delete_block),
+        ],
+    );
     let head_title = format!("{} · Inkwell", v.heading);
     page_shell(PageShell {
         head_title: &head_title,

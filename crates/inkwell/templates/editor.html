@@ -49,8 +49,8 @@
         {{HISTORY_ACTION}}
         {{PRESERVE_ACTION}}
         <button class="btn btn-secondary" type="submit" name="intent" value="save_draft" data-final-state="draft">Save draft</button>
-        <button class="btn btn-secondary" type="submit" name="intent" value="schedule" data-final-state="scheduled">Schedule</button>
-        <button class="btn btn-primary" type="submit" name="intent" value="publish_now" data-final-state="published">Publish now</button>
+        <button class="btn btn-secondary" type="submit" name="intent" value="schedule" formaction="{{REVIEW_ACTION}}" data-review-submit data-final-state="scheduled">Review schedule</button>
+        <button class="btn btn-primary" type="submit" name="intent" value="publish_now" formaction="{{REVIEW_ACTION}}" data-review-submit data-final-state="published">Review &amp; publish</button>
       </div>
       <p class="writer-privacy muted">Crash recovery can remain in this browser profile until Writer Studio deletes it: after 24 hours while open, or on your next visit. It is not a server save, and other users of this browser profile may be able to read it.</p>
     </div>
@@ -60,10 +60,12 @@
           <h2 class="card__title">Publish</h2>
           <p class="field__hint muted">Choose an explicit action below the editor. Saving a draft never publishes it.</p>
           <div class="field">
-            <label for="publish_at">Schedule in your local time</label>
-            <input type="datetime-local" id="publish_at" name="publish_at" value="{{PUBLISH_AT_VALUE}}" data-utc-value="{{PUBLISH_AT_VALUE}}">
+            <label for="publish_at">Schedule date and time</label>
+            <input type="datetime-local" id="publish_at" name="publish_at" value="{{PUBLISH_AT_VALUE}}" data-utc-value="{{PUBLISH_AT_VALUE}}" data-utc-epoch="{{PUBLISH_AT_EPOCH}}">
             <input type="hidden" id="publish_at_epoch" name="publish_at_epoch" value="">
-            <p class="field__hint muted" id="scheduleConfirm">Choose a time, then use Schedule. Writer Studio will confirm the UTC instant before saving.</p>
+            <input type="hidden" id="schedule_timezone" name="schedule_timezone" value="">
+            <input type="hidden" id="schedule_offset_minutes" name="schedule_offset_minutes" value="">
+            <p class="field__hint muted" id="scheduleConfirm">Choose a time, then review the exact UTC instant before scheduling.</p>
             <noscript><p class="field__hint muted">JavaScript is off: this value is interpreted as UTC.</p></noscript>
           </div>
           <div class="field field--inline ink-setting">
@@ -297,16 +299,45 @@
     // ---- Local scheduling, with an explicit UTC hand-off -----------------
     var publishAtEl = document.getElementById('publish_at');
     var publishEpochEl = document.getElementById('publish_at_epoch');
+    var scheduleTimezoneEl = document.getElementById('schedule_timezone');
+    var scheduleOffsetEl = document.getElementById('schedule_offset_minutes');
     var scheduleConfirm = document.getElementById('scheduleConfirm');
     function localInputValue(date) {
       function pad(n) { return String(n).padStart(2, '0'); }
       return date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate()) + 'T' + pad(date.getHours()) + ':' + pad(date.getMinutes());
     }
+    function exactDateFromEpoch(raw) {
+      if (typeof raw !== 'string' || !/^[0-9]+$/.test(raw)) { return null; }
+      var epoch = Number(raw);
+      if (!Number.isSafeInteger(epoch) || epoch <= 0) { return null; }
+      var exact = new Date(epoch * 1000);
+      return Number.isNaN(exact.getTime()) ? null : exact;
+    }
+    function wallTimeMatchesExact(wallTime, exact) {
+      return typeof wallTime === 'string' && !!exact && localInputValue(exact) === wallTime.slice(0, 16);
+    }
+    function showScheduleInstant(exact) {
+      var timezone = '';
+      try { timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (e) {}
+      if (scheduleTimezoneEl) { scheduleTimezoneEl.value = timezone; }
+      if (scheduleOffsetEl) { scheduleOffsetEl.value = String(-exact.getTimezoneOffset()); }
+      if (scheduleConfirm) {
+        scheduleConfirm.textContent = 'Local ' + exact.toLocaleString() + (timezone ? ' (' + timezone + ')' : '') + ' \u2192 UTC ' + exact.toISOString().replace('.000Z', 'Z');
+      }
+    }
+    function restoreExactSchedule(rawEpoch) {
+      if (!publishAtEl || !publishEpochEl) { return false; }
+      var exact = exactDateFromEpoch(rawEpoch);
+      if (!wallTimeMatchesExact(publishAtEl.value, exact)) { return false; }
+      publishEpochEl.value = String(Math.floor(exact.getTime() / 1000));
+      showScheduleInstant(exact);
+      return true;
+    }
     function syncSchedule() {
       if (!publishAtEl || !publishEpochEl || !scheduleConfirm) { return false; }
       if (!publishAtEl.value) {
         publishEpochEl.value = '';
-        scheduleConfirm.textContent = 'Choose a time, then use Schedule. Writer Studio will confirm the UTC instant before saving.';
+        scheduleConfirm.textContent = 'Choose a time, then review the exact UTC instant before scheduling.';
         return false;
       }
       var local = new Date(publishAtEl.value);
@@ -315,18 +346,39 @@
         scheduleConfirm.textContent = 'Choose a valid local date and time.';
         return false;
       }
+      if (localInputValue(local) !== publishAtEl.value.slice(0, 16)) {
+        publishEpochEl.value = '';
+        scheduleConfirm.textContent = 'That local time does not exist because of a clock change. Choose another time.';
+        return false;
+      }
       publishEpochEl.value = String(Math.floor(local.getTime() / 1000));
-      scheduleConfirm.textContent = 'Local ' + local.toLocaleString() + ' \u2192 UTC ' + local.toISOString().replace('.000Z', 'Z');
+      showScheduleInstant(local);
       return true;
     }
+    function scheduleIsReady() {
+      if (publishEpochEl && restoreExactSchedule(publishEpochEl.value)) { return true; }
+      return syncSchedule();
+    }
     if (publishAtEl) {
-      var initialUtc = publishAtEl.getAttribute('data-utc-value');
-      if (initialUtc) {
-        var utcDate = new Date(initialUtc + ':00Z');
-        if (!Number.isNaN(utcDate.getTime())) { publishAtEl.value = localInputValue(utcDate); }
+      var initialExact = exactDateFromEpoch(publishAtEl.getAttribute('data-utc-epoch'));
+      if (initialExact) {
+        publishAtEl.value = localInputValue(initialExact);
+        publishEpochEl.value = String(Math.floor(initialExact.getTime() / 1000));
+        showScheduleInstant(initialExact);
+      } else {
+        var initialUtc = publishAtEl.getAttribute('data-utc-value');
+        if (initialUtc) {
+          var utcDate = new Date(initialUtc + ':00Z');
+          if (!Number.isNaN(utcDate.getTime())) {
+            publishAtEl.value = localInputValue(utcDate);
+            publishEpochEl.value = String(Math.floor(utcDate.getTime() / 1000));
+            showScheduleInstant(utcDate);
+          }
+        } else {
+          syncSchedule();
+        }
       }
       publishAtEl.addEventListener('input', syncSchedule);
-      syncSchedule();
     }
 
     // ---- Write / Preview tabs --------------------------------------------
@@ -455,6 +507,7 @@
                socialDescription: socialDescriptionEl ? socialDescriptionEl.value : '',
                socialImage: socialImageEl ? socialImageEl.value : '',
                publishAt: document.getElementById('publish_at') ? document.getElementById('publish_at').value : '',
+               publishAtEpoch: document.getElementById('publish_at_epoch') ? document.getElementById('publish_at_epoch').value : '',
                pinned: !!(form.querySelector('input[name="pinned"]') && form.querySelector('input[name="pinned"]').checked),
                ts: Date.now() };
     }
@@ -473,12 +526,18 @@
       syncCover();
       syncSocialPreview();
       var publishAtEl = document.getElementById('publish_at');
-      if (publishAtEl && typeof d.publishAt === 'string') { publishAtEl.value = d.publishAt; publishAtEl.dispatchEvent(new Event('input')); }
+      if (publishAtEl && typeof d.publishAt === 'string') {
+        publishAtEl.value = d.publishAt;
+        if (!(typeof d.publishAtEpoch === 'string' && restoreExactSchedule(d.publishAtEpoch))) {
+          publishAtEl.dispatchEvent(new Event('input'));
+        }
+      }
       var pinnedEl = form.querySelector('input[name="pinned"]');
       if (pinnedEl && typeof d.pinned === 'boolean') { pinnedEl.checked = d.pinned; }
     }
     function differsFromForm(d) {
       var publishAtEl = document.getElementById('publish_at');
+      var publishEpochEl = document.getElementById('publish_at_epoch');
       var pinnedEl = form.querySelector('input[name="pinned"]');
       return (titleEl && d.title !== titleEl.value) ||
         (bodyEl && d.body !== bodyEl.value) ||
@@ -492,6 +551,7 @@
         (socialDescriptionEl && d.socialDescription !== socialDescriptionEl.value) ||
         (socialImageEl && d.socialImage !== socialImageEl.value) ||
         (publishAtEl && d.publishAt !== publishAtEl.value) ||
+        (publishEpochEl && typeof d.publishAtEpoch === 'string' && d.publishAtEpoch !== publishEpochEl.value) ||
         (pinnedEl && d.pinned !== pinnedEl.checked);
     }
     var autosaveTimer = null;
@@ -671,7 +731,7 @@
       // Missing/implicit intent is safe on both routes: create defaults to Draft, edit preserves
       // its current publication state. Never turn an implicit Enter key into an unpublish action.
       var intent = submitter ? submitter.value : '';
-      if (intent === 'schedule' && !syncSchedule()) {
+      if (intent === 'schedule' && !scheduleIsReady()) {
         event.preventDefault();
         setStatus('error', 'Error \u00b7 Choose a schedule time');
         if (publishAtEl) { publishAtEl.focus(); }
@@ -683,6 +743,10 @@
         localStorage.setItem(bakKey, JSON.stringify(backup));
         scheduleRecoveryCleanup(bakKey, BAK_TTL, backup.ts);
       } catch (e) {}
+      if (submitter && submitter.hasAttribute('data-review-submit')) {
+        setStatus('saving', 'Preparing review\u2026');
+        return;
+      }
       if (!window.fetch) { setStatus('saving'); return; }
 
       event.preventDefault();

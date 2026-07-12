@@ -72,10 +72,12 @@ pub fn app(state: AppState) -> Router {
             "/new",
             get(handlers::posts::new_form).post(handlers::posts::create),
         )
+        .route("/new/review", post(handlers::posts::review_new))
         .route(
             "/edit/{slug}",
             get(handlers::posts::edit_form).post(handlers::posts::update),
         )
+        .route("/edit/{slug}/review", post(handlers::posts::review_edit))
         .route("/edit/{slug}/history", get(handlers::posts::history))
         .route(
             "/edit/{slug}/history/{revision_id}/restore",

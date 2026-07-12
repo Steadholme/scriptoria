@@ -250,6 +250,16 @@ mod tests {
     }
 
     #[test]
+    fn app_css_contains_narrow_chrome_and_bounded_identity_copy() {
+        assert!(APP_CSS.contains("@media (max-width:360px)"));
+        assert!(APP_CSS.contains(".appbar__name { display:none; }"));
+        assert!(APP_CSS.contains(".usermenu__head > div { min-width:0; }"));
+        assert!(APP_CSS.contains(
+            ".usermenu__head b,.usermenu__head > div > span { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }"
+        ));
+    }
+
+    #[test]
     fn app_css_contains_view_transition_layer() {
         // The cross-document continuity headline: @view-transition opt-in + the reduced-motion guard
         // that reaches the ::view-transition-* pseudos the global `*{animation:none}` rule cannot.

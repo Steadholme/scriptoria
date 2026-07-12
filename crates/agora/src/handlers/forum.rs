@@ -22,7 +22,7 @@ use crate::handlers::{
     ag_initial, ag_tone, email_display, esc, fmt_ts, personal_counts, rel_time,
     render_page_with_personal_counts, replies_label,
 };
-use crate::model::{Bookmark, Post, ReactionCount, Thread};
+use crate::model::{Bookmark, Post, ReactionCount, Thread, ThreadReadingState};
 use crate::store::{
     AcceptedAnswerAction, ReplyAnchor, ThreadSort, ThreadStatusFilter,
     MAX_KLAXON_RECIPIENTS_PER_REPLY,
@@ -214,6 +214,7 @@ pub async fn home(
     for t in &recent {
         reply_counts.insert(t.id.clone(), state.store.count_posts(&t.id).await?);
     }
+    let reading_states = load_reading_states(&state, viewer_sub.as_deref(), &recent).await?;
 
     let mut cats_html = String::new();
     for c in &categories {
@@ -240,6 +241,7 @@ pub async fn home(
         Some(&cat_names),
         Some(&reply_counts),
         &question_categories,
+        &reading_states,
     );
     let thread_controls =
         render_thread_list_controls("/", &q, viewer_sub.is_some(), true, q.status());
@@ -368,12 +370,14 @@ pub async fn questions(
         .find(|category| category.format.is_question())
         .map(|category| format!("/new?cat={}", esc(&category.id)))
         .unwrap_or_else(|| "/new".to_string());
+    let reading_states = load_reading_states(&state, viewer_sub.as_deref(), &threads).await?;
     let list = render_thread_rows(
         &threads,
         now,
         Some(&category_names),
         None,
         &question_categories,
+        &reading_states,
     );
     let controls =
         render_thread_list_controls("/questions", &q, viewer_sub.is_some(), true, status);
@@ -453,7 +457,15 @@ pub async fn category(
     } else {
         HashSet::new()
     };
-    let list = render_thread_rows(&threads, now, None, None, &question_categories);
+    let reading_states = load_reading_states(&state, viewer_sub.as_deref(), &threads).await?;
+    let list = render_thread_rows(
+        &threads,
+        now,
+        None,
+        None,
+        &question_categories,
+        &reading_states,
+    );
     let controls = render_thread_list_controls(
         &format!("/c/{}", esc(&category.id)),
         &q,
@@ -535,6 +547,10 @@ pub struct ThreadQuery {
     pub around: Option<String>,
     #[serde(default)]
     pub quote: Option<String>,
+    /// Product-level continuation entry. It resolves from authoritative per-post receipts and is
+    /// intentionally separate from raw keyset cursors.
+    #[serde(default)]
+    pub resume: Option<String>,
 }
 
 pub async fn thread(
@@ -554,6 +570,11 @@ pub async fn thread(
         .as_ref()
         .map(|category| category.format.is_question())
         .unwrap_or(false);
+    let viewer = auth::identity_subject(&headers);
+    let reading_state = match viewer.as_deref() {
+        Some(subject) => Some(state.store.thread_reading_state(subject, &id).await?),
+        None => None,
+    };
 
     // Reply count (every post minus the original) — shown in the head + as the reply-list total.
     let post_count = state.store.count_posts(&id).await?;
@@ -571,7 +592,25 @@ pub async fn thread(
         .map(|post| post.id.clone())
         .unwrap_or_default();
     let accepted_id = (!valid_accepted_id.is_empty()).then_some(valid_accepted_id.as_str());
-    let anchor = resolve_anchor(&q);
+    let resume_requested = q
+        .resume
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    let first_unread = reading_state
+        .as_ref()
+        .and_then(|reading| reading.first_unread.as_ref());
+    let anchor = if resume_requested {
+        match first_unread {
+            Some(post) if post.id == op_id => ReplyAnchor::First,
+            Some(post) if Some(post.id.as_str()) == accepted_id => {
+                ReplyAnchor::After(post.created_at, post.id.clone())
+            }
+            Some(post) => ReplyAnchor::From(post.created_at, post.id.clone()),
+            None => ReplyAnchor::Latest,
+        }
+    } else {
+        resolve_anchor(&q)
+    };
     let mut fetched = state
         .store
         .replies_page(&id, &op_id, accepted_id, &anchor, REPLIES_PER_PAGE + 1)
@@ -591,12 +630,28 @@ pub async fn thread(
     } else {
         false
     };
+    let from_has_older = if let ReplyAnchor::From(ts, post_id) = &anchor {
+        !state
+            .store
+            .replies_page(
+                &id,
+                &op_id,
+                accepted_id,
+                &ReplyAnchor::Before(*ts, post_id.clone()),
+                1,
+            )
+            .await?
+            .is_empty()
+    } else {
+        false
+    };
     let has_more = fetched.len() as i64 > REPLIES_PER_PAGE;
     fetched.truncate(REPLIES_PER_PAGE as usize);
     let (replies, has_older, has_newer) = match anchor {
         // Ascending fetches: already oldest→newest. First has nothing older (OP is the floor);
         // After was reached from an older page, so older replies exist.
         ReplyAnchor::First => (fetched, false, has_more),
+        ReplyAnchor::From(..) => (fetched, from_has_older, has_more),
         ReplyAnchor::After(..) => (fetched, true, has_more),
         // Descending fetches: reverse to oldest→newest. Before/Latest were walked newest-first, so
         // `has_more` means more OLDER replies; Before was reached from a newer page.
@@ -654,7 +709,6 @@ pub async fn thread(
     posts.extend(replies);
 
     // The authenticated subject (if any) decides which edit/delete controls render.
-    let viewer = auth::identity_subject(&headers);
     let is_admin = auth::is_admin(&headers);
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
     let subscription_action = if let Some(sub) = viewer.as_deref() {
@@ -733,6 +787,12 @@ pub async fn thread(
     // Display order: the original post stays first, then the accepted reply (if any), then the
     // rest in their natural oldest-first order. Reordering a clone never touches storage.
     let ordered = order_posts_accepted_first(&posts, &valid_accepted_id);
+    let first_unread_id = reading_state
+        .as_ref()
+        .and_then(|reading| reading.first_unread.as_ref())
+        .map(|post| post.id.as_str());
+    let resume_marker_in_posts =
+        first_unread_id.is_some_and(|post_id| ordered.iter().any(|post| post.id == post_id));
     let quoted_posts = load_quoted_posts(&state, &thread.id, &ordered).await?;
 
     // Per-post reaction aggregates (counts + whether THIS viewer reacted), keyed by post id.
@@ -771,9 +831,17 @@ pub async fn thread(
         is_question,
         !thread.locked,
         &latest_post_id,
+        first_unread_id,
         &reactions,
         &bookmarks,
         &quoted_posts,
+    );
+    let read_progress = render_thread_read_progress(
+        &thread.id,
+        &csrf,
+        viewer.as_deref(),
+        reading_state.as_ref(),
+        &ordered,
     );
 
     // A locked thread shows a notice instead of the reply form (admins still moderate above).
@@ -860,14 +928,16 @@ pub async fn thread(
     // Product-native reading controls share the existing reply anchor, keyset route and the one
     // authoritative subscription form. No duplicate form/id/state is introduced for the sticky
     // desktop rail or its mobile bottom-dock presentation.
-    let reading_toolbar = render_thread_reading_toolbar(
-        &thread.id,
+    let reading_toolbar = render_thread_reading_toolbar(ThreadToolbarView {
+        thread_id: &thread.id,
         post_count,
-        &subscription_action,
-        !thread.locked,
+        subscription_form: &subscription_action,
+        can_reply: !thread.locked,
         is_question,
         has_newer,
-    );
+        reading_state: reading_state.as_ref(),
+        resume_marker_in_posts,
+    });
 
     let content = format!(
         r#"{crumbs}
@@ -882,6 +952,7 @@ pub async fn thread(
 {reading_toolbar}
 {summary}
 <section id="thread-replies" class="posts" aria-label="Thread posts">{posts}</section>
+{read_progress}
 {pagination}
 {reply}"#,
         crumbs = crumbs,
@@ -897,6 +968,7 @@ pub async fn thread(
         reading_toolbar = reading_toolbar,
         summary = summary_html,
         posts = posts_html,
+        read_progress = read_progress,
         pagination = pagination,
         reply = reply_form,
     );
@@ -909,6 +981,43 @@ pub async fn thread(
         counts,
     );
     Ok(html_response(html, set_cookie))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ThreadReadForm {
+    #[serde(default)]
+    pub csrf: String,
+    /// Comma-separated stable post ids rendered by the server for this bounded page.
+    #[serde(default)]
+    pub post_ids: String,
+}
+
+/// `POST /t/{id}/read` — subject-scoped, idempotent page receipt. A normal form follows the
+/// earliest remaining unread post; the IntersectionObserver enhancement asks for a 204 and keeps
+/// the current page in place. GET / resume never mutates reading state.
+pub async fn mark_thread_read(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<ThreadReadForm>,
+) -> Result<Response, AppError> {
+    auth::verify_csrf(&headers, &form.csrf)?;
+    let identity = auth::require_author(&headers)?;
+    let post_ids: Vec<String> = form
+        .post_ids
+        .split(',')
+        .map(str::trim)
+        .filter(|post_id| !post_id.is_empty())
+        .map(str::to_string)
+        .collect();
+    state
+        .store
+        .mark_thread_posts_read(&identity.sub, &id, &post_ids, now_secs())
+        .await?;
+    if wants_json(&headers) {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+    Ok(redirect_to(&format!("/t/{}?resume=1#thread-resume", id)))
 }
 
 // ===========================================================================
@@ -1919,41 +2028,142 @@ fn thread_list_title(q: &ThreadListQuery, fallback: &'static str) -> &'static st
     }
 }
 
-fn render_thread_reading_toolbar(
-    thread_id: &str,
+struct ThreadToolbarView<'a> {
+    thread_id: &'a str,
     post_count: i64,
-    subscription_form: &str,
+    subscription_form: &'a str,
     can_reply: bool,
     is_question: bool,
     has_newer: bool,
-) -> String {
-    let latest_href = if has_newer {
-        format!("/t/{}?latest=1#thread-latest", esc(thread_id))
+    reading_state: Option<&'a ThreadReadingState>,
+    resume_marker_in_posts: bool,
+}
+
+fn render_thread_reading_toolbar(view: ThreadToolbarView<'_>) -> String {
+    let latest_href = if view.has_newer {
+        format!("/t/{}?latest=1#thread-latest", esc(view.thread_id))
     } else {
         "#thread-latest".to_string()
     };
-    let reply_action = if can_reply {
+    let reply_action = if view.can_reply {
         format!(
             r##"<a class="btn btn-primary btn-sm ag-thread-toolbar__reply" href="#reply">{label}</a>"##,
-            label = if is_question { "Answer" } else { "Reply" },
+            label = if view.is_question { "Answer" } else { "Reply" },
         )
     } else {
         r#"<span class="btn btn-secondary btn-sm ag-thread-toolbar__locked" aria-disabled="true">Locked</span>"#
             .to_string()
     };
+    let continuity = match view.reading_state {
+        Some(reading) if reading.first_unread.is_some() => {
+            let marker = if view.resume_marker_in_posts {
+                ""
+            } else {
+                r#" id="thread-resume""#
+            };
+            let label = if reading.started {
+                "Continue reading"
+            } else {
+                "Start reading"
+            };
+            format!(
+                r##"<a{marker} class="btn btn-secondary btn-sm ag-thread-toolbar__continue" href="/t/{tid}?resume=1#thread-resume">{label}<span>{count} unread</span></a>"##,
+                marker = marker,
+                tid = esc(view.thread_id),
+                label = label,
+                count = reading.unread_count,
+            )
+        }
+        Some(_) => {
+            let marker = if view.resume_marker_in_posts {
+                ""
+            } else {
+                r#" id="thread-resume""#
+            };
+            format!(
+                r#"<span{marker} class="ag-thread-toolbar__caught"><span class="ag-thread-toolbar__caught-dot" aria-hidden="true"></span>Caught up</span>"#,
+                marker = marker,
+            )
+        }
+        None => String::new(),
+    };
     format!(
         r#"<nav class="ag-thread-toolbar" aria-label="Thread reading actions">
   <div class="ag-thread-toolbar__context"><span class="ag-thread-toolbar__eyebrow">In this thread</span><strong>{replies}</strong></div>
   <div class="ag-thread-toolbar__actions">
+    {continuity}
     <a class="btn btn-ghost btn-sm" href="{latest_href}">Latest</a>
     {subscription_form}
     {reply_action}
   </div>
 </nav>"#,
-        replies = esc(&replies_label(post_count)),
+        replies = esc(&replies_label(view.post_count)),
         latest_href = latest_href,
-        subscription_form = subscription_form,
+        continuity = continuity,
+        subscription_form = view.subscription_form,
         reply_action = reply_action,
+    )
+}
+
+fn render_thread_read_progress(
+    thread_id: &str,
+    csrf: &str,
+    viewer_sub: Option<&str>,
+    reading_state: Option<&ThreadReadingState>,
+    visible_posts: &[Post],
+) -> String {
+    if viewer_sub.is_none()
+        || visible_posts.is_empty()
+        || reading_state.is_some_and(|reading| reading.unread_count == 0)
+    {
+        return String::new();
+    }
+    let post_ids = visible_posts
+        .iter()
+        .map(|post| post.id.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"<section class="ag-read-progress" data-thread-read-progress>
+  <span class="ag-read-progress__sentinel" data-thread-read-sentinel aria-hidden="true"></span>
+  <div class="ag-read-progress__copy"><span>Reading progress</span><strong data-thread-read-status>Only posts shown on this page will be marked read.</strong></div>
+  <form class="inline-form" method="post" action="/t/{tid}/read" data-thread-read-form>
+    <input type="hidden" name="csrf" value="{csrf}">
+    <input type="hidden" name="post_ids" value="{post_ids}">
+    <button class="btn btn-secondary btn-sm" type="submit" data-thread-read-submit>Mark page read &amp; continue</button>
+  </form>
+</section>
+<script>
+(function () {{
+  var form = document.querySelector('[data-thread-read-form]');
+  var sentinel = document.querySelector('[data-thread-read-sentinel]');
+  if (!form || !sentinel || !window.fetch || !window.IntersectionObserver) return;
+  var sent = false;
+  var observer = new IntersectionObserver(function (entries) {{
+    if (sent || !entries.some(function (entry) {{ return entry.isIntersecting; }})) return;
+    sent = true;
+    observer.disconnect();
+    fetch(form.action, {{
+      method: 'POST', body: new URLSearchParams(new FormData(form)), credentials: 'same-origin',
+      headers: {{ 'Accept': 'application/json' }}
+    }}).then(function (response) {{
+      if (!response.ok) throw new Error('read receipt failed');
+      var status = document.querySelector('[data-thread-read-status]');
+      var button = document.querySelector('[data-thread-read-submit]');
+      if (status) status.textContent = 'Page marked read · Continue returns to the earliest unread post.';
+      if (button) {{ button.textContent = 'Read through this page'; button.disabled = true; }}
+      form.closest('[data-thread-read-progress]').classList.add('is-read');
+    }}).catch(function () {{
+      var status = document.querySelector('[data-thread-read-status]');
+      if (status) status.textContent = 'Automatic progress was not saved · use the button to retry.';
+    }});
+  }}, {{ rootMargin: '0px 0px -8% 0px' }});
+  observer.observe(sentinel);
+}})();
+</script>"#,
+        tid = esc(thread_id),
+        csrf = esc(csrf),
+        post_ids = esc(&post_ids),
     )
 }
 
@@ -2285,6 +2495,22 @@ fn render_edit_form(
     )
 }
 
+async fn load_reading_states(
+    state: &AppState,
+    viewer_sub: Option<&str>,
+    threads: &[Thread],
+) -> Result<HashMap<String, ThreadReadingState>, AppError> {
+    let Some(viewer_sub) = viewer_sub else {
+        return Ok(HashMap::new());
+    };
+    let thread_ids: Vec<String> = threads.iter().map(|thread| thread.id.clone()).collect();
+    state
+        .store
+        .thread_reading_states(viewer_sub, &thread_ids)
+        .await
+        .map_err(Into::into)
+}
+
 /// Render a list of threads as rows. When `cat_names` is provided (home page) each row also
 /// names its category; otherwise (category page) it is omitted.
 fn render_thread_rows(
@@ -2293,12 +2519,24 @@ fn render_thread_rows(
     cat_names: Option<&HashMap<&str, &str>>,
     counts: Option<&HashMap<String, i64>>,
     question_categories: &HashSet<&str>,
+    reading_states: &HashMap<String, ThreadReadingState>,
 ) -> String {
     if threads.is_empty() {
         return r#"<div class="empty"><div class="empty__ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div><h3>No threads yet — start the conversation.</h3><p>Every thread supports Markdown, reactions and @mentions.</p><a class="btn btn-primary btn-sm" href="/new">New thread</a></div>"#.to_string();
     }
     let mut out = String::new();
     for t in threads {
+        let reading = reading_states.get(&t.id);
+        let (href, reading_badge) = match reading {
+            Some(state) if state.started && state.unread_count > 0 => (
+                format!("/t/{}?resume=1#thread-resume", esc(&t.id)),
+                format!(
+                    r#"<span class="ag-row__continue">Continue · {count} new</span>"#,
+                    count = state.unread_count,
+                ),
+            ),
+            _ => (format!("/t/{}", esc(&t.id)), String::new()),
+        };
         let is_question = question_categories.contains(t.category_id.as_str());
         let cat_part = match cat_names {
             Some(map) => {
@@ -2344,15 +2582,15 @@ fn render_thread_rows(
             .unwrap_or_default();
         let pinned_class = if t.pinned { " ag-row--pinned" } else { "" };
         out.push_str(&format!(
-            r#"<a class="thread-row ag-row{pinned}" href="/t/{id}">
+            r#"<a class="thread-row ag-row{pinned}" href="{href}">
   <span class="avatar ag-avatar ag-tone-{tone}" aria-hidden="true">{initial}</span>
   <span class="thread-row__main">
     <span class="thread-row__title">{glyphs}<span class="ag-title">{title}</span></span>
-    <span class="thread-row__sub">{cat}{answer_state}<span class="ag-row__by">started by {author}</span></span>
+    <span class="thread-row__sub">{cat}{answer_state}{reading_badge}<span class="ag-row__by">started by {author}</span></span>
   </span>
   <span class="ag-row__side">{replies}<span class="thread-row__time" title="{abs}">{when}</span></span>
 </a>"#,
-            id = esc(&t.id),
+            href = href,
             pinned = pinned_class,
             tone = ag_tone(&t.author_sub),
             initial = esc(&ag_initial(&t.author_email)),
@@ -2360,6 +2598,7 @@ fn render_thread_rows(
             title = esc(&t.title),
             cat = cat_part,
             answer_state = answer_state,
+            reading_badge = reading_badge,
             author = esc(&t.author_email),
             replies = replies,
             abs = esc(&fmt_ts(t.last_at)),
@@ -2553,6 +2792,7 @@ fn render_posts(
     is_question: bool,
     can_reply: bool,
     latest_post_id: &str,
+    first_unread_post_id: Option<&str>,
     reactions: &HashMap<String, Vec<ReactionCount>>,
     bookmarks: &HashMap<String, Bookmark>,
     quoted_posts: &HashMap<String, Post>,
@@ -2563,6 +2803,11 @@ fn render_posts(
     let empty_counts: Vec<ReactionCount> = Vec::new();
     let mut out = String::new();
     for (i, p) in posts.iter().enumerate() {
+        if first_unread_post_id == Some(p.id.as_str()) {
+            out.push_str(
+                r#"<div id="thread-resume" class="ag-first-unread" role="separator"><span>First unread</span></div>"#,
+            );
+        }
         let is_accepted = i > 0 && !accepted_post_id.is_empty() && p.id == accepted_post_id;
         let latest_anchor = if p.id == latest_post_id {
             r#"<span id="thread-latest" class="ag-thread-latest-anchor" aria-hidden="true"></span>"#

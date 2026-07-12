@@ -73,6 +73,10 @@ const MAX_TEXT_PREVIEW_BYTES: usize = 256 * 1024;
 /// Depth guard when walking a folder's parent chain to build breadcrumbs (defensive; the tree is
 /// acyclic by construction).
 const MAX_TREE_DEPTH: usize = 64;
+/// Same-route content negotiation for the in-explorer Inspector. The canonical `/f/{id}` remains a
+/// complete HTML page for ordinary navigation; only the gallery's same-origin enhancement sends
+/// this header and receives the deliberately token-free fragment.
+const INSPECTOR_SURFACE_HEADER: &str = "x-aperture-surface";
 
 const GALLERY_HTML: &str = include_str!("../../templates/gallery.html");
 const DETAIL_HTML: &str = include_str!("../../templates/detail.html");
@@ -676,6 +680,22 @@ pub async fn detail(
 ) -> Result<Response, AppError> {
     let viewer = auth::identity(&headers);
     let rec = owned_file(&state, &id, &viewer).await?;
+    if inspector_surface_requested(&headers) {
+        let folder = match rec.folder_id.as_deref() {
+            Some(folder_id) => state.store.get_folder(folder_id, &viewer.subject).await?,
+            None => None,
+        };
+        let preview = build_inspector_preview(&state, &rec).await;
+        let versions = state.store.list_versions(&rec.id).await?;
+        let comments = state.store.list_comments(&rec.id).await?;
+        let view = InspectorView::from_file(&rec, folder.as_ref(), &versions, &comments);
+        let mut response =
+            (StatusCode::OK, Html(render_inspector(&view, &preview))).into_response();
+        response
+            .headers_mut()
+            .insert(header::VARY, HeaderValue::from_static("X-Aperture-Surface"));
+        return Ok(response);
+    }
     let csrf = auth::new_csrf_token();
     let folders = state
         .store
@@ -695,7 +715,18 @@ pub async fn detail(
         versions: &versions,
         comments: &comments,
     });
-    Ok(html_with_csrf(StatusCode::OK, html, &csrf))
+    let mut response = html_with_csrf(StatusCode::OK, html, &csrf);
+    response
+        .headers_mut()
+        .insert(header::VARY, HeaderValue::from_static("X-Aperture-Surface"));
+    Ok(response)
+}
+
+fn inspector_surface_requested(headers: &HeaderMap) -> bool {
+    headers
+        .get(INSPECTOR_SURFACE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("inspector"))
 }
 
 // ---------------------------------------------------------------------------
@@ -3625,9 +3656,9 @@ fn render_library_cards(items: &[LibraryItem], folders: &[FolderRec]) -> String 
                     format!(
                         "<li class=\"file-card file-card--{file_type} ap-library-item\" data-file-id=\"{id}\">\
                            <label class=\"ap-select\" title=\"Select {name}\"><span class=\"sr-only\">Select {name}</span><input type=\"checkbox\" name=\"item:file:{id}\" value=\"1\" form=\"bulkSelection\" data-bulk-item></label>\
-                           <a class=\"file-card__link\" href=\"/f/{id}\" data-wire-off>{thumb}</a>\
+                           <a class=\"file-card__link\" href=\"/f/{id}\" data-wire-off data-inspector-link>{thumb}</a>\
                            <div class=\"file-card__body\">\
-                             <div class=\"ap-name-row\"><span class=\"ap-glyph {tone}\">{ext}</span><a class=\"file-card__name\" href=\"/f/{id}\" title=\"{name}\">{name}</a></div>\
+                             <div class=\"ap-name-row\"><span class=\"ap-glyph {tone}\">{ext}</span><a class=\"file-card__name\" href=\"/f/{id}\" title=\"{name}\" data-wire-off data-inspector-link>{name}</a></div>\
                              <div class=\"file-card__meta\">{badges}<span class=\"ap-size\">{size}</span><span class=\"ap-location\">In {location}</span><time class=\"ap-date\" data-spark-reltime data-ts=\"{ts}\" title=\"{updated}\">{updated}</time></div>\
                            </div>\
                          </li>",
@@ -4424,16 +4455,6 @@ fn render_cards(files: &[FileRec], csrf: &str) -> String {
                 "file"
             };
             let media = f.is_media();
-            let preview_attrs = if media {
-                format!(
-                    " data-preview data-preview-id=\"{id}\" data-preview-kind=\"{kind}\" data-preview-name=\"{name}\"",
-                    id = esc(&f.id),
-                    kind = kind,
-                    name = esc(&f.name),
-                )
-            } else {
-                String::new()
-            };
             let media_class = if media { " file-card--media" } else { "" };
             let play = if f.is_video() || f.is_audio() {
                 format!(
@@ -4495,11 +4516,11 @@ fn render_cards(files: &[FileRec], csrf: &str) -> String {
                 name = esc(&f.name),
             );
             format!(
-                "<li class=\"file-card file-card--{kind}{media_class}\" id=\"file-{id}\" data-file-id=\"{id}\"{preview_attrs}>\
+                "<li class=\"file-card file-card--{kind}{media_class}\" id=\"file-{id}\" data-file-id=\"{id}\">\
                    <label class=\"ap-select\" title=\"Select {name}\"><span class=\"sr-only\">Select {name}</span><input type=\"checkbox\" name=\"item:file:{id}\" value=\"1\" form=\"bulkSelection\" data-bulk-item></label>\
-                   <a class=\"file-card__link\" href=\"/f/{id}\" data-wire-off>{thumb}</a>\
+                   <a class=\"file-card__link\" href=\"/f/{id}\" data-wire-off data-inspector-link>{thumb}</a>\
                    <div class=\"file-card__body\">\
-                     <div class=\"ap-name-row\"><span class=\"ap-glyph {tone}\" aria-hidden=\"true\">{ext}</span><a class=\"file-card__name\" href=\"/f/{id}\" title=\"{name}\" data-file-name>{name}</a></div>\
+                     <div class=\"ap-name-row\"><span class=\"ap-glyph {tone}\" aria-hidden=\"true\">{ext}</span><a class=\"file-card__name\" href=\"/f/{id}\" title=\"{name}\" data-file-name data-wire-off data-inspector-link>{name}</a></div>\
                      <div class=\"file-card__meta\">{badges}<span class=\"ap-size\">{size}</span><time class=\"ap-date\" data-spark-reltime data-ts=\"{created_ts}\" title=\"{date}\">{date}</time></div>\
                      {menu}\
                    </div>\
@@ -4508,7 +4529,6 @@ fn render_cards(files: &[FileRec], csrf: &str) -> String {
                 name = esc(&f.name),
                 kind = kind,
                 media_class = media_class,
-                preview_attrs = preview_attrs,
                 tone = tone,
                 ext = esc(&ext_label(&f.name)),
                 badges = badges,
@@ -4569,7 +4589,8 @@ fn render_card_badges(f: &FileRec) -> String {
     badges
 }
 
-/// Which inline preview a file gets on its detail page.
+/// Which inline preview a file gets on its detail page or in-explorer Inspector.
+#[derive(Clone, Copy)]
 enum Preview {
     Image,
     Video,
@@ -4593,6 +4614,16 @@ fn preview_kind(rec: &FileRec) -> Preview {
         Preview::Text
     } else {
         Preview::None
+    }
+}
+
+fn preview_stage_mod(kind: Preview) -> &'static str {
+    match kind {
+        Preview::Image => "ap-stage--checker",
+        Preview::Video => "ap-stage--player ap-stage--video",
+        Preview::Audio => "ap-stage--player ap-stage--audio",
+        Preview::Text | Preview::Pdf => "ap-stage--doc",
+        Preview::None => "",
     }
 }
 
@@ -4650,6 +4681,39 @@ async fn build_preview(state: &AppState, rec: &FileRec) -> String {
     }
 }
 
+/// Inspector preview variant. It uses the same owner-only byte routes and safe preview classifier as
+/// the full detail page, but the image is not wrapped in the detail page's lightbox trigger: the
+/// Inspector itself is already the overlay and owns the close/focus contract.
+async fn build_inspector_preview(state: &AppState, rec: &FileRec) -> String {
+    match preview_kind(rec) {
+        Preview::Image => format!(
+            "<img class=\"preview-img\" src=\"/f/{id}/raw\" alt=\"{alt}\">",
+            id = esc(&rec.id),
+            alt = esc(&rec.name),
+        ),
+        Preview::Video => format!(
+            "<video class=\"ap-player\" controls preload=\"metadata\" playsinline src=\"/f/{id}/raw\" title=\"{alt}\"></video>",
+            id = esc(&rec.id),
+            alt = esc(&rec.name),
+        ),
+        Preview::Audio => format!(
+            "<audio class=\"ap-player ap-player--audio\" controls preload=\"metadata\" src=\"/f/{id}/raw\" title=\"{alt}\"></audio>",
+            id = esc(&rec.id),
+            alt = esc(&rec.name),
+        ),
+        Preview::Pdf => format!(
+            "<iframe class=\"preview-pdf\" src=\"/f/{id}/preview-raw\" sandbox title=\"{alt}\"></iframe>",
+            id = esc(&rec.id),
+            alt = esc(&rec.name),
+        ),
+        Preview::Text => match state.blobs.get(&rec.object_key).await {
+            Ok(bytes) => render_text_preview(&bytes),
+            Err(_) => preview_none(rec),
+        },
+        Preview::None => preview_none(rec),
+    }
+}
+
 /// Render a text/markdown preview: the leading [`MAX_TEXT_PREVIEW_BYTES`] as ESCAPED text in a
 /// `<pre>` (never interpreted as HTML), with a truncation note when the file is larger.
 fn render_text_preview(bytes: &[u8]) -> String {
@@ -4682,6 +4746,196 @@ fn preview_none(rec: &FileRec) -> String {
         ext = esc(&ext_label(&rec.name)),
         ctype = esc(&rec.content_type),
         id = esc(&rec.id),
+    )
+}
+
+/// Explicit projection for the owner Inspector. Capability material and storage internals cannot be
+/// leaked accidentally because they are not fields of this view model: the renderer never receives
+/// a share token, password hash, object key, bucket, or owner subject.
+struct InspectorView {
+    id: String,
+    name: String,
+    content_type: String,
+    size: i64,
+    location_name: String,
+    location_href: String,
+    created_at: i64,
+    updated_at: i64,
+    preview: Preview,
+    share_enabled: bool,
+    share_expired: bool,
+    share_protected: bool,
+    share_expires_at: Option<i64>,
+    version_count: usize,
+    comment_count: usize,
+    activity: Vec<InspectorEvent>,
+}
+
+struct InspectorEvent {
+    at: i64,
+    label: String,
+    detail: String,
+}
+
+impl InspectorView {
+    fn from_file(
+        rec: &FileRec,
+        folder: Option<&FolderRec>,
+        versions: &[VersionRec],
+        comments: &[FileComment],
+    ) -> Self {
+        let mut activity = Vec::with_capacity(versions.len() + comments.len() + 2);
+        if rec.updated_at > rec.created_at {
+            activity.push(InspectorEvent {
+                at: rec.updated_at,
+                label: "Last changed".to_string(),
+                detail: "Owner-visible metadata or content changed.".to_string(),
+            });
+        }
+        activity.extend(versions.iter().map(|version| InspectorEvent {
+            at: version.created_at,
+            label: "Version saved".to_string(),
+            detail: format!("{} · {}", human_size(version.size), version.content_type),
+        }));
+        activity.extend(comments.iter().map(|comment| InspectorEvent {
+            at: comment.created_at,
+            label: "Comment added".to_string(),
+            detail: format!("By {}", comment.author_sub),
+        }));
+        activity.push(InspectorEvent {
+            at: rec.created_at,
+            label: "Uploaded".to_string(),
+            detail: "Current file created in Drive.".to_string(),
+        });
+        activity.sort_by(|left, right| {
+            right
+                .at
+                .cmp(&left.at)
+                .then_with(|| left.label.cmp(&right.label))
+        });
+        activity.truncate(12);
+
+        let (location_name, location_href) = folder
+            .map(|folder| (folder.name.clone(), format!("/?folder={}", folder.id)))
+            .unwrap_or_else(|| ("My Drive".to_string(), "/".to_string()));
+        let share_enabled = rec.share_token.is_some();
+        Self {
+            id: rec.id.clone(),
+            name: rec.name.clone(),
+            content_type: rec.content_type.clone(),
+            size: rec.size,
+            location_name,
+            location_href,
+            created_at: rec.created_at,
+            updated_at: rec.updated_at,
+            preview: preview_kind(rec),
+            share_enabled,
+            share_expired: share_enabled && rec.share_expired(now_secs()),
+            share_protected: share_enabled && rec.share_has_password(),
+            share_expires_at: if share_enabled { rec.expires_at } else { None },
+            version_count: versions.len(),
+            comment_count: comments.len(),
+            activity,
+        }
+    }
+}
+
+fn render_inspector(view: &InspectorView, preview: &str) -> String {
+    let uploaded = fmt_ts(view.created_at);
+    let changed = fmt_ts(view.updated_at);
+    let access_state = if !view.share_enabled {
+        "Private"
+    } else if view.share_expired {
+        "Link expired"
+    } else {
+        "Link sharing on"
+    };
+    let mut access_facts = Vec::new();
+    if view.share_protected {
+        access_facts.push("Password protected".to_string());
+    }
+    if let Some(expires_at) = view.share_expires_at {
+        access_facts.push(format!("Expires {}", fmt_ts(expires_at)));
+    }
+    let access_detail = if access_facts.is_empty() {
+        if view.share_enabled {
+            "Manage the capability from the full detail page.".to_string()
+        } else {
+            "Only you can open this file in Drive.".to_string()
+        }
+    } else {
+        access_facts.join(" · ")
+    };
+    let activity = view
+        .activity
+        .iter()
+        .map(|event| {
+            let date = fmt_ts(event.at);
+            format!(
+                "<li class=\"ap-inspector__event\">\
+                   <span class=\"ap-inspector__event-dot\" aria-hidden=\"true\"></span>\
+                   <div><strong>{label}</strong><span>{detail}</span>\
+                     <time data-spark-reltime data-ts=\"{at}\" title=\"{date}\">{date}</time>\
+                   </div>\
+                 </li>",
+                label = esc(&event.label),
+                detail = esc(&event.detail),
+                at = event.at,
+                date = esc(&date),
+            )
+        })
+        .collect::<String>();
+    let tone = ap_tone_class(&view.content_type);
+    format!(
+        "<article class=\"ap-inspector-fragment\" data-inspector-fragment \
+           data-inspector-id=\"{id}\" data-inspector-name=\"{name}\">\
+           <div class=\"ap-inspector__stage ap-stage {stage}\">\
+             <div class=\"ap-stage__body\">{preview}</div>\
+           </div>\
+           <div class=\"ap-inspector__content\">\
+             <div class=\"ap-inspector__identity\">\
+               <span class=\"letter-tile ap-type-tile {tone}\" aria-hidden=\"true\">{ext}</span>\
+               <div><strong>{name}</strong><span>{ctype} · {size}</span></div>\
+             </div>\
+             <section class=\"ap-inspector__section\">\
+               <h3>Details</h3>\
+               <dl class=\"ap-inspector__facts\">\
+                 <div><dt>Location</dt><dd><a href=\"{location_href}\">{location}</a></dd></div>\
+                 <div><dt>Last changed</dt><dd><time data-spark-reltime data-ts=\"{updated_ts}\" title=\"{changed}\">{changed}</time></dd></div>\
+                 <div><dt>Uploaded</dt><dd><time data-spark-reltime data-ts=\"{created_ts}\" title=\"{uploaded}\">{uploaded}</time></dd></div>\
+                 <div><dt>Versions</dt><dd>{versions}</dd></div>\
+                 <div><dt>Comments</dt><dd>{comments}</dd></div>\
+               </dl>\
+             </section>\
+             <section class=\"ap-inspector__section ap-inspector__access\">\
+               <h3>Access</h3><strong>{access_state}</strong><p>{access_detail}</p>\
+             </section>\
+             <section class=\"ap-inspector__section\">\
+               <h3>Activity</h3>\
+               <p class=\"ap-inspector__note\">Known file events only. Rename, move, content and sharing changes roll up into Last changed.</p>\
+               <ol class=\"ap-inspector__events\">{activity}</ol>\
+             </section>\
+           </div>\
+         </article>",
+        id = esc(&view.id),
+        name = esc(&view.name),
+        stage = preview_stage_mod(view.preview),
+        preview = preview,
+        tone = tone,
+        ext = esc(&ext_label(&view.name)),
+        ctype = esc(&view.content_type),
+        size = esc(&human_size(view.size)),
+        location_href = esc(&view.location_href),
+        location = esc(&view.location_name),
+        updated_ts = view.updated_at,
+        changed = esc(&changed),
+        created_ts = view.created_at,
+        uploaded = esc(&uploaded),
+        versions = view.version_count,
+        comments = view.comment_count,
+        access_state = access_state,
+        access_detail = esc(&access_detail),
+        activity = activity,
     )
 }
 
@@ -4753,13 +5007,7 @@ fn render_detail(ctx: DetailRender<'_>) -> String {
         created_ts = rec.created_at,
         date = esc(&uploaded),
     );
-    let stage_mod = match preview_kind(rec) {
-        Preview::Image => "ap-stage--checker",
-        Preview::Video => "ap-stage--player ap-stage--video",
-        Preview::Audio => "ap-stage--player ap-stage--audio",
-        Preview::Text | Preview::Pdf => "ap-stage--doc",
-        Preview::None => "",
-    };
+    let stage_mod = preview_stage_mod(preview_kind(rec));
 
     let delete = format!(
         "<form class=\"delete-form\" method=\"post\" action=\"/delete/{id}\" \

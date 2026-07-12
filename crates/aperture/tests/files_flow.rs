@@ -195,6 +195,14 @@ fn get(path: &str, subject: Option<&str>) -> Request<Body> {
     b.body(Body::empty()).unwrap()
 }
 
+fn get_inspector(path: &str, subject: Option<&str>) -> Request<Body> {
+    let mut request = get(path, subject);
+    request
+        .headers_mut()
+        .insert("x-aperture-surface", "inspector".parse().unwrap());
+    request
+}
+
 fn get_with_cookie(path: &str, subject: Option<&str>, cookie: &str) -> Request<Body> {
     let mut request = get(path, subject);
     request.headers_mut().insert(
@@ -1375,6 +1383,99 @@ async fn ownership_is_enforced_with_403() {
 }
 
 #[tokio::test]
+async fn inspector_fragment_reuses_file_authority_and_never_projects_capabilities() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let (id, csrf) = upload_file(
+        &app,
+        "alice",
+        "roadmap <img src=x>.png",
+        "image/png",
+        &png_bytes(),
+    )
+    .await;
+    let token = enable_file_share(&app, &store, &id, "alice", &csrf).await;
+
+    // Header-less navigation stays the canonical, fully functional no-JS detail page.
+    let full = send(&app, get(&format!("/f/{id}"), Some("alice"))).await;
+    assert_eq!(full.status, StatusCode::OK);
+    assert!(full.text().contains("<!DOCTYPE html>"));
+    assert!(full.text().contains(&token));
+    assert_eq!(full.header(header::VARY), "X-Aperture-Surface");
+    assert!(full.csrf_cookie().is_some());
+
+    // The same owner route negotiates a narrow fragment whose DTO has no capability/storage/CSRF
+    // fields. File ids are not capabilities and remain the authority for owner-only raw routes.
+    let inspector = send(&app, get_inspector(&format!("/f/{id}"), Some("alice"))).await;
+    assert_eq!(inspector.status, StatusCode::OK);
+    assert_eq!(inspector.header(header::VARY), "X-Aperture-Surface");
+    assert!(inspector.csrf_cookie().is_none());
+    let html = inspector.text();
+    assert!(html.contains("data-inspector-fragment"));
+    assert!(html.contains(&format!("data-inspector-id=\"{id}\"")));
+    assert!(html.contains(&format!("/f/{id}/raw")));
+    assert!(html.contains("Details"));
+    assert!(html.contains("Activity"));
+    assert!(html.contains("Link sharing on"));
+    assert!(html.contains("roadmap &lt;img src=x&gt;.png"));
+    assert!(!html.contains("<!DOCTYPE html>"));
+    assert!(!html.contains(&token));
+    assert!(!html.contains("/s/"));
+    assert!(!html.contains("csrf_token"));
+    assert!(!html.contains("Embed &amp; links"));
+    assert!(!html.contains("Storage</dt>"));
+
+    // The fragment cannot bypass the exact authority used by the full page.
+    let foreign = send(&app, get_inspector(&format!("/f/{id}"), Some("bob"))).await;
+    assert_eq!(foreign.status, StatusCode::FORBIDDEN);
+    let missing = send(&app, get_inspector("/f/doesnotexist", Some("alice"))).await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+
+    // Both ordinary and cross-tree library cards retain a real /f link and opt into the Inspector.
+    let gallery = send(&app, get("/", Some("alice"))).await;
+    let gallery_html = gallery.text();
+    assert!(gallery_html.contains(&format!(
+        "href=\"/f/{id}\" data-wire-off data-inspector-link"
+    )));
+    assert!(gallery_html.contains("'X-Aperture-Surface':'inspector'"));
+    assert!(gallery_html.contains("history.pushState({ apertureInspector:"));
+    assert!(gallery_html.contains("window.addEventListener('popstate'"));
+    assert!(gallery_html.contains("event.key === 'Escape'"));
+    assert!(gallery_html.contains("event.key !== 'Tab'"));
+    assert!(gallery_html.contains(
+        "button:not([disabled]):not([tabindex=\"-1\"]), iframe:not([tabindex=\"-1\"])"
+    ));
+    assert!(gallery_html.contains(
+        "closeInspector(true, !!(event.state && event.state.odysseyWire))"
+    ));
+    assert!(gallery_html.contains("closeInspector(false, !!pendingRestoreId)"));
+    assert!(gallery_html.contains("pendingRestoreId = waitForSwap ? closingId : ''"));
+    assert!(gallery_html.contains("node.inert = true"));
+    assert!(gallery_html.contains("window.location.assign(url.href)"));
+    assert!(!gallery_html.contains("Object.assign({}, history.state"));
+    let recent = send(&app, get("/?view=recent", Some("alice"))).await;
+    assert!(recent.text().contains(&format!(
+        "href=\"/f/{id}\" data-wire-off data-inspector-link"
+    )));
+
+    // Trash revokes the owner-live authority for both representations.
+    let deleted = send(
+        &app,
+        post_form(
+            &format!("/delete/{id}"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::FOUND);
+    let trashed = send(&app, get_inspector(&format!("/f/{id}"), Some("alice"))).await;
+    assert_eq!(trashed.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn non_image_is_served_as_download() {
     let (app, _store, _blobs) = {
         let state = build_dev_state();
@@ -1419,8 +1520,10 @@ async fn video_raw_supports_range_and_inline_playback() {
     let home = send(&app, get("/", Some("alice"))).await;
     assert!(home.text().contains("id=\"apPreview\""));
     assert!(home.text().contains("data-preview-body"));
-    assert!(home.text().contains(&format!("data-preview-id=\"{id}\"")));
-    assert!(home.text().contains("data-preview-kind=\"video\""));
+    assert!(home.text().contains(&format!(
+        "href=\"/f/{id}\" data-wire-off data-inspector-link"
+    )));
+    assert!(home.text().contains("X-Aperture-Surface"));
     assert!(home.text().contains("thumb__play"));
 
     let full = send(&app, get(&format!("/f/{id}/raw"), Some("alice"))).await;
@@ -4903,6 +5006,9 @@ async fn preview_routing_by_content_type() {
     let di = send(&app, get(&format!("/f/{imgid}"), Some("alice"))).await;
     assert!(di.text().contains("preview-img"));
     assert!(di.text().contains("lightbox-trigger"));
+    let ii = send(&app, get_inspector(&format!("/f/{imgid}"), Some("alice"))).await;
+    assert!(ii.text().contains("preview-img"));
+    assert!(!ii.text().contains("lightbox-trigger"));
 
     // Text -> escaped <pre> preview (never raw HTML).
     let ut = send(
@@ -4928,6 +5034,9 @@ async fn preview_routing_by_content_type() {
         !dt.text().contains("<script>alert(1)</script>"),
         "no raw script survives"
     );
+    let it = send(&app, get_inspector(&format!("/f/{tid}"), Some("alice"))).await;
+    assert!(it.text().contains("preview-text"));
+    assert!(it.text().contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
 
     // PDF -> sandboxed <iframe> of the inline preview bytes.
     let (pdfid, _c) = upload_pdf(&app, "alice").await;
@@ -4935,6 +5044,10 @@ async fn preview_routing_by_content_type() {
     assert!(dp.text().contains("preview-pdf"));
     assert!(dp.text().contains(&format!("/f/{pdfid}/preview-raw")));
     assert!(dp.text().contains("sandbox"));
+    let ip = send(&app, get_inspector(&format!("/f/{pdfid}"), Some("alice"))).await;
+    assert!(ip.text().contains("preview-pdf"));
+    assert!(ip.text().contains(&format!("/f/{pdfid}/preview-raw")));
+    assert!(ip.text().contains("sandbox"));
     // The preview-raw route serves the PDF inline, sandboxed, nosniff.
     let pr = send(&app, get(&format!("/f/{pdfid}/preview-raw"), Some("alice"))).await;
     assert_eq!(pr.status, StatusCode::OK);
@@ -4963,6 +5076,8 @@ async fn preview_routing_by_content_type() {
         .text()
         .contains("controls preload=\"metadata\" playsinline"));
     assert!(dv.text().contains(&format!("src=\"/f/{vid}/raw\"")));
+    let iv = send(&app, get_inspector(&format!("/f/{vid}"), Some("alice"))).await;
+    assert!(iv.text().contains("<video class=\"ap-player\""));
 
     let ua = send(
         &app,
@@ -4983,6 +5098,10 @@ async fn preview_routing_by_content_type() {
         .contains("<audio class=\"ap-player ap-player--audio\""));
     assert!(da.text().contains("controls preload=\"metadata\""));
     assert!(da.text().contains(&format!("src=\"/f/{aid}/raw\"")));
+    let ia = send(&app, get_inspector(&format!("/f/{aid}"), Some("alice"))).await;
+    assert!(ia
+        .text()
+        .contains("<audio class=\"ap-player ap-player--audio\""));
 
     // Non-previewable binary -> the type icon + "No inline preview".
     let ub = send(
@@ -5000,6 +5119,8 @@ async fn preview_routing_by_content_type() {
     let bid = ub.location().trim_start_matches("/f/").to_string();
     let db = send(&app, get(&format!("/f/{bid}"), Some("alice"))).await;
     assert!(db.text().contains("No inline preview"));
+    let ib = send(&app, get_inspector(&format!("/f/{bid}"), Some("alice"))).await;
+    assert!(ib.text().contains("No inline preview"));
 
     // preview-raw on a NON-pdf falls back to the safe attachment path (never inline execution).
     let prb = send(&app, get(&format!("/f/{bid}/preview-raw"), Some("alice"))).await;

@@ -2060,7 +2060,117 @@ body.page {
 
 .draftbar__spacer { margin-left:auto; }
 
-/* S15 AUTHOR CONTENT LIBRARY ---------------------------------------------- */
+/* S15 REVIEW & PUBLISH ----------------------------------------------------- */
+.ink-preflight { max-width:980px; }
+
+.ink-preflight__head { margin-bottom:var(--sp-5); }
+
+.ink-preflight__eyebrow {
+  margin:0 0 6px;
+  color:var(--brand-ink);
+  font-size:12px;
+  font-weight:700;
+  letter-spacing:.1em;
+  text-transform:uppercase;
+}
+
+.ink-preflight__decision {
+  margin-bottom:var(--sp-5);
+  border-color:var(--accent-border);
+  background:linear-gradient(135deg,var(--brand-soft),var(--surface) 58%);
+}
+
+.ink-preflight__decision h2,
+.ink-preflight__decision p { margin-top:0; }
+
+.ink-preflight__facts,
+.ink-preflight__metadata {
+  display:grid;
+  gap:0;
+  margin:var(--sp-4) 0 0;
+}
+
+.ink-preflight__facts > div,
+.ink-preflight__metadata > div {
+  display:grid;
+  grid-template-columns:minmax(110px,.35fr) minmax(0,1fr);
+  gap:var(--sp-4);
+  padding:10px 0;
+  border-top:1px solid var(--hairline);
+}
+
+.ink-preflight dt {
+  color:var(--ink-3);
+  font-size:12.5px;
+  font-weight:650;
+}
+
+.ink-preflight dd {
+  min-width:0;
+  margin:0;
+  overflow-wrap:anywhere;
+  color:var(--ink);
+  font-size:13px;
+}
+
+.ink-preflight__grid {
+  display:grid;
+  grid-template-columns:minmax(0,.8fr) minmax(0,1.2fr);
+  gap:var(--sp-5);
+  margin-bottom:var(--sp-5);
+}
+
+.ink-preflight__checks {
+  display:grid;
+  gap:10px;
+  margin:var(--sp-4) 0 0;
+  padding:0;
+  list-style:none;
+}
+
+.ink-preflight__check {
+  display:grid;
+  grid-template-columns:70px minmax(0,1fr);
+  gap:10px;
+  align-items:start;
+  padding:10px 12px;
+  border:1px solid var(--border);
+  border-radius:var(--r-sm);
+  background:var(--surface-2);
+  font-size:12.5px;
+}
+
+.ink-preflight__check.is-ready strong { color:var(--ok-ink); }
+.ink-preflight__check.is-warning strong { color:var(--warn-ink); }
+.ink-preflight__check span { color:var(--ink-2); line-height:1.45; }
+
+.ink-preflight__body {
+  max-height:520px;
+  overflow:auto;
+  margin-top:var(--sp-4);
+  padding:var(--sp-5);
+  border:1px solid var(--border);
+  border-radius:var(--r);
+  background:var(--surface-2);
+}
+
+.ink-preflight__actions {
+  position:sticky;
+  bottom:12px;
+  z-index:20;
+  display:flex;
+  justify-content:flex-end;
+  gap:var(--sp-3);
+  margin-top:var(--sp-5);
+  padding:12px;
+  border:1px solid var(--accent-border);
+  border-radius:var(--r);
+  background:color-mix(in srgb,var(--surface) 95%,transparent);
+  box-shadow:var(--sh-md);
+  backdrop-filter:blur(10px);
+}
+
+/* S16 AUTHOR CONTENT LIBRARY ---------------------------------------------- */
 .ink-library { max-width:1180px; }
 
 .ink-library__head {
@@ -2285,7 +2395,7 @@ body.page {
 .ink-library__pager { display:flex; justify-content:center; padding-top:var(--sp-5); }
 .ink-library__empty { border-bottom:1px solid var(--hairline); }
 
-/* S16 RESPONSIVE ---------------------------------------------------------- */
+/* S17 RESPONSIVE ---------------------------------------------------------- */
 @media (max-width:960px) {
   .ink-editor { grid-template-columns:1fr; }
   .ink-editor__rail { position:static; }
@@ -2323,10 +2433,33 @@ body.page {
   .ink-search { flex-direction:column; }
   .ink-search .btn { width:100%; }
   .ink-ask__foot { flex-wrap:wrap; }
+  .editor__bodybar {
+    align-items:stretch;
+    flex-direction:column;
+    gap:6px;
+  }
+  .editor__tabs {
+    display:grid;
+    grid-template-columns:repeat(3,minmax(0,1fr));
+    width:100%;
+  }
+  .editor__tabs .tab {
+    min-width:0;
+    height:auto;
+    min-height:30px;
+    padding:4px 6px;
+    line-height:1.15;
+    white-space:normal;
+  }
   .ink-editor__actionbar { flex-wrap:wrap; }
   .ink-editor__actionbar .spacer { display:none; }
   .writer-state { width:100%; }
   .ink-editor__actionbar .btn { flex:1 1 auto; }
+  .ink-preflight__grid { grid-template-columns:1fr; }
+  .ink-preflight__facts > div,
+  .ink-preflight__metadata > div { grid-template-columns:1fr; gap:3px; }
+  .ink-preflight__actions { display:grid; grid-template-columns:1fr; bottom:8px; }
+  .ink-preflight__actions .btn { width:100%; }
   .ink-library__head { flex-direction:column; }
   .ink-library__head .btn { width:100%; }
   .ink-library__status-tabs { width:100%; border-radius:var(--r); }
@@ -2355,7 +2488,7 @@ body.page {
   .ink-library__titleline { align-items:flex-start; flex-direction:column; }
 }
 
-/* S17 DARK RAMP ----------------------------------------------------------- */
+/* S18 DARK RAMP ----------------------------------------------------------- */
 /* Odyssey's canonical dark ramp (tokens.css :root[data-theme="dark"]) already remaps every
    --accent/--ink/--surface/--border token this service leans on, so no --accent* remap is needed
    here. The one gap is Inkwell's own brand family: it is a teal defined at the BODY scope
