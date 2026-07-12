@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use aperture::blobs::{BlobError, Blobs, MemoryBlobs};
 use aperture::model::{
-    FileRec, FolderRec, LibraryItemKind, LibraryQuery, LibraryType, LibraryView,
+    FileRec, FolderRec, LibraryItemKind, LibraryQuery, LibraryType, LibraryView, UploadDelivery,
     UploadRequestInboxCounts, UploadRequestInboxView, UploadRequestRec, UploadSubmission,
     VersionRec, UPLOAD_REQUEST_EXPIRING_WINDOW_SECS,
 };
@@ -193,6 +193,7 @@ async fn pg_store_full_integration() {
         "blob_key_guards",
         "trash_entries",
         "upload_submissions",
+        "upload_deliveries",
         "upload_reservations",
         "upload_requests",
         "owner_storage_guards",
@@ -207,6 +208,21 @@ async fn pg_store_full_integration() {
             .await
             .unwrap();
     }
+
+    // Simulate a v7 database whose flat submissions table predates delivery tracking. The v8
+    // migration must add both the delivery table and nullable reference, and remain idempotent.
+    sqlx::query("ALTER TABLE upload_submissions DROP COLUMN IF EXISTS delivery_id")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE upload_deliveries")
+        .execute(&raw)
+        .await
+        .unwrap();
+    pg.migrate().await.expect("v7 delivery upgrade");
+    pg.migrate()
+        .await
+        .expect("v7 delivery upgrade is idempotent");
 
     let pg = Arc::new(pg);
     let store: Arc<dyn Store> = pg.clone();
@@ -1872,6 +1888,7 @@ async fn pg_store_full_integration() {
     let transition_submission = UploadSubmission {
         id: "quota-transition-receipt".to_string(),
         request_id: "request-transition-a".to_string(),
+        delivery_id: None,
         file_id: transition_file.id.clone(),
         name: transition_file.name.clone(),
         content_type: transition_file.content_type.clone(),
@@ -1929,6 +1946,7 @@ async fn pg_store_full_integration() {
                 "quota-transition-a",
                 &transition_file,
                 &transition_submission,
+                None,
             )
             .await
     });
@@ -1985,18 +2003,43 @@ async fn pg_store_full_integration() {
     let receipt = UploadSubmission {
         id: "receipt-one".to_string(),
         request_id: "request-room-a".to_string(),
+        delivery_id: Some("pg-delivery-one".to_string()),
         file_id: received.id.clone(),
         name: received.name.clone(),
         content_type: received.content_type.clone(),
         size: received.size,
         created_at: now + 204,
     };
+    let raw_receipt_capability = "a".repeat(64);
+    let delivery = UploadDelivery {
+        id: "pg-delivery-one".to_string(),
+        request_id: "request-room-a".to_string(),
+        receipt_token_hash: "e".repeat(64),
+        created_at: now + 204,
+        acknowledged_at: None,
+        receipt_expires_at: now + 30 * 24 * 60 * 60,
+    };
     let mut wrong_blob = received.clone();
     wrong_blob.object_key = "wrong-receipt-object".to_string();
     assert!(!store
-        .commit_request_upload("receiptfile", &wrong_blob, &receipt)
+        .commit_request_upload("receiptfile", &wrong_blob, &receipt, Some(&delivery))
         .await
         .unwrap());
+    assert!(store
+        .upload_delivery_by_receipt_hash(&delivery.receipt_token_hash, now + 204)
+        .await
+        .unwrap()
+        .is_none());
+    let rolled_back_deliveries: i64 = sqlx::query(
+        "SELECT CAST(COUNT(*) AS BIGINT) AS count FROM upload_deliveries \
+         WHERE id = 'pg-delivery-one'",
+    )
+    .fetch_one(&raw)
+    .await
+    .unwrap()
+    .try_get("count")
+    .unwrap();
+    assert_eq!(rolled_back_deliveries, 0);
     let retained_reservation: i64 = sqlx::query(
         "SELECT CAST(COUNT(*) AS BIGINT) AS count FROM upload_reservations WHERE id = 'receiptfile'",
     )
@@ -2007,7 +2050,7 @@ async fn pg_store_full_integration() {
     .unwrap();
     assert_eq!(retained_reservation, 1);
     assert!(store
-        .commit_request_upload("receiptfile", &received, &receipt)
+        .commit_request_upload("receiptfile", &received, &receipt, Some(&delivery))
         .await
         .unwrap());
     assert_eq!(
@@ -2017,6 +2060,341 @@ async fn pg_store_full_integration() {
             .unwrap(),
         vec![receipt]
     );
+    let owner_deliveries = store
+        .list_upload_deliveries("request-room-a", "alice")
+        .await
+        .unwrap();
+    assert_eq!(owner_deliveries.len(), 1);
+    assert_eq!(owner_deliveries[0].delivery, delivery);
+    assert_eq!(owner_deliveries[0].submissions.len(), 1);
+    assert!(store
+        .list_upload_deliveries("request-room-a", "bob")
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(!store
+        .acknowledge_upload_delivery("request-room-a", "pg-delivery-one", "bob", now + 205,)
+        .await
+        .unwrap());
+    assert!(store
+        .acknowledge_upload_delivery("request-room-a", "pg-delivery-one", "alice", now + 205,)
+        .await
+        .unwrap());
+    assert!(store
+        .acknowledge_upload_delivery("request-room-a", "pg-delivery-one", "alice", now + 206,)
+        .await
+        .unwrap());
+    let acknowledged = store
+        .upload_delivery_by_receipt_hash(&delivery.receipt_token_hash, now + 206)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(acknowledged.delivery.acknowledged_at, Some(now + 205));
+
+    // A stale public precheck may reserve + write its blob before the owner acknowledges. The
+    // transaction is the authority: an append observed after acknowledgement must roll back all
+    // metadata, retain its reservation for compensation, and leave the receipt readable.
+    assert_eq!(
+        store
+            .reserve_request_upload(UploadReserveInput {
+                request_id: "request-room-a",
+                expected_token: "request-token-a",
+                reservation_id: "receiptfile-after-ack",
+                size: 4,
+                content_type: "image/png",
+                content_type_verified: true,
+                owner_quota: None,
+                now: now + 206,
+            })
+            .await
+            .unwrap(),
+        UploadReserve::Reserved
+    );
+    let mut after_ack_file = file(
+        "receiptfile-after-ack",
+        "alice",
+        "unused-after-ack-token",
+        now + 206,
+    );
+    after_ack_file.share_token = None;
+    after_ack_file.folder_id = Some("legacyfold".to_string());
+    after_ack_file.size = 4;
+    let after_ack_submission = UploadSubmission {
+        id: "receipt-after-ack".to_string(),
+        request_id: "request-room-a".to_string(),
+        delivery_id: Some(delivery.id.clone()),
+        file_id: after_ack_file.id.clone(),
+        name: after_ack_file.name.clone(),
+        content_type: after_ack_file.content_type.clone(),
+        size: after_ack_file.size,
+        created_at: now + 206,
+    };
+    assert!(!store
+        .commit_request_upload(
+            &after_ack_file.id,
+            &after_ack_file,
+            &after_ack_submission,
+            None,
+        )
+        .await
+        .unwrap());
+    let rejected_file_count: i64 =
+        sqlx::query("SELECT CAST(COUNT(*) AS BIGINT) AS count FROM files WHERE id = $1")
+            .bind(&after_ack_file.id)
+            .fetch_one(&raw)
+            .await
+            .unwrap()
+            .try_get("count")
+            .unwrap();
+    assert_eq!(rejected_file_count, 0);
+    let rejected_submission_count: i64 = sqlx::query(
+        "SELECT CAST(COUNT(*) AS BIGINT) AS count FROM upload_submissions WHERE id = $1",
+    )
+    .bind(&after_ack_submission.id)
+    .fetch_one(&raw)
+    .await
+    .unwrap()
+    .try_get("count")
+    .unwrap();
+    assert_eq!(rejected_submission_count, 0);
+    let retained_after_ack_reservation: i64 = sqlx::query(
+        "SELECT CAST(COUNT(*) AS BIGINT) AS count FROM upload_reservations WHERE id = $1",
+    )
+    .bind(&after_ack_file.id)
+    .fetch_one(&raw)
+    .await
+    .unwrap()
+    .try_get("count")
+    .unwrap();
+    assert_eq!(retained_after_ack_reservation, 1);
+    assert!(store
+        .release_request_upload(&after_ack_file.id)
+        .await
+        .unwrap());
+    let after_compensation = store
+        .get_upload_request("request-room-a", "alice")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_compensation.used_files, 1);
+    assert_eq!(after_compensation.used_bytes, 5);
+    let after_rejected_append = store
+        .upload_delivery_by_receipt_hash(&delivery.receipt_token_hash, now + 206)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after_rejected_append.delivery.acknowledged_at,
+        Some(now + 205)
+    );
+    assert_eq!(after_rejected_append.submissions.len(), 1);
+
+    // Exercise the delivery row lock with the real PgStore pool. Whichever operation locks the
+    // row first defines one complete serial outcome: append then acknowledge, or acknowledge then
+    // a fully rolled-back append. Both must terminate without a lock cycle.
+    let ack_race_request = request(
+        "request-ack-race",
+        "request-token-ack-race",
+        "legacyfold",
+        3,
+    );
+    assert!(store
+        .create_upload_request(&ack_race_request)
+        .await
+        .unwrap());
+    assert_eq!(
+        store
+            .reserve_request_upload(UploadReserveInput {
+                request_id: &ack_race_request.id,
+                expected_token: &ack_race_request.token,
+                reservation_id: "ack-race-first",
+                size: 5,
+                content_type: "image/png",
+                content_type_verified: true,
+                owner_quota: None,
+                now: now + 207,
+            })
+            .await
+            .unwrap(),
+        UploadReserve::Reserved
+    );
+    let mut ack_race_first_file = file(
+        "ack-race-first",
+        "alice",
+        "unused-ack-race-first",
+        now + 207,
+    );
+    ack_race_first_file.share_token = None;
+    ack_race_first_file.folder_id = Some("legacyfold".to_string());
+    ack_race_first_file.size = 5;
+    let ack_race_delivery = UploadDelivery {
+        id: "pg-delivery-ack-race".to_string(),
+        request_id: ack_race_request.id.clone(),
+        receipt_token_hash: "d".repeat(64),
+        created_at: now + 207,
+        acknowledged_at: None,
+        receipt_expires_at: now + 30 * 24 * 60 * 60,
+    };
+    let ack_race_first_submission = UploadSubmission {
+        id: "ack-race-submission-first".to_string(),
+        request_id: ack_race_request.id.clone(),
+        delivery_id: Some(ack_race_delivery.id.clone()),
+        file_id: ack_race_first_file.id.clone(),
+        name: ack_race_first_file.name.clone(),
+        content_type: ack_race_first_file.content_type.clone(),
+        size: ack_race_first_file.size,
+        created_at: now + 207,
+    };
+    assert!(store
+        .commit_request_upload(
+            &ack_race_first_file.id,
+            &ack_race_first_file,
+            &ack_race_first_submission,
+            Some(&ack_race_delivery),
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        store
+            .reserve_request_upload(UploadReserveInput {
+                request_id: &ack_race_request.id,
+                expected_token: &ack_race_request.token,
+                reservation_id: "ack-race-append",
+                size: 4,
+                content_type: "image/png",
+                content_type_verified: true,
+                owner_quota: None,
+                now: now + 208,
+            })
+            .await
+            .unwrap(),
+        UploadReserve::Reserved
+    );
+    let mut ack_race_append_file = file(
+        "ack-race-append",
+        "alice",
+        "unused-ack-race-append",
+        now + 208,
+    );
+    ack_race_append_file.share_token = None;
+    ack_race_append_file.folder_id = Some("legacyfold".to_string());
+    ack_race_append_file.size = 4;
+    let ack_race_append_submission = UploadSubmission {
+        id: "ack-race-submission-append".to_string(),
+        request_id: ack_race_request.id.clone(),
+        delivery_id: Some(ack_race_delivery.id.clone()),
+        file_id: ack_race_append_file.id.clone(),
+        name: ack_race_append_file.name.clone(),
+        content_type: ack_race_append_file.content_type.clone(),
+        size: ack_race_append_file.size,
+        created_at: now + 208,
+    };
+    let commit_store = store.clone();
+    let acknowledge_store = store.clone();
+    let commit_file = ack_race_append_file.clone();
+    let commit_submission = ack_race_append_submission.clone();
+    let acknowledge_request_id = ack_race_request.id.clone();
+    let acknowledge_delivery_id = ack_race_delivery.id.clone();
+    let (committed, race_acknowledged) = tokio::time::timeout(Duration::from_secs(5), async move {
+        tokio::join!(
+            commit_store.commit_request_upload(
+                &commit_file.id,
+                &commit_file,
+                &commit_submission,
+                None,
+            ),
+            acknowledge_store.acknowledge_upload_delivery(
+                &acknowledge_request_id,
+                &acknowledge_delivery_id,
+                "alice",
+                now + 208,
+            )
+        )
+    })
+    .await
+    .expect("concurrent append/acknowledge deadlocked");
+    let committed = committed.unwrap();
+    assert!(race_acknowledged.unwrap());
+    if !committed {
+        assert!(store
+            .release_request_upload(&ack_race_append_file.id)
+            .await
+            .unwrap());
+    }
+    let final_race_request = store
+        .get_upload_request(&ack_race_request.id, "alice")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(final_race_request.used_files, if committed { 2 } else { 1 });
+    assert_eq!(final_race_request.used_bytes, if committed { 9 } else { 5 });
+    let final_race_file_count: i64 =
+        sqlx::query("SELECT CAST(COUNT(*) AS BIGINT) AS count FROM files WHERE id = $1")
+            .bind(&ack_race_append_file.id)
+            .fetch_one(&raw)
+            .await
+            .unwrap()
+            .try_get("count")
+            .unwrap();
+    assert_eq!(final_race_file_count, i64::from(committed));
+    let final_race_submission_count: i64 = sqlx::query(
+        "SELECT CAST(COUNT(*) AS BIGINT) AS count FROM upload_submissions WHERE id = $1",
+    )
+    .bind(&ack_race_append_submission.id)
+    .fetch_one(&raw)
+    .await
+    .unwrap()
+    .try_get("count")
+    .unwrap();
+    assert_eq!(final_race_submission_count, i64::from(committed));
+    let final_race_reservation_count: i64 = sqlx::query(
+        "SELECT CAST(COUNT(*) AS BIGINT) AS count FROM upload_reservations WHERE id = $1",
+    )
+    .bind(&ack_race_append_file.id)
+    .fetch_one(&raw)
+    .await
+    .unwrap()
+    .try_get("count")
+    .unwrap();
+    assert_eq!(final_race_reservation_count, 0);
+    let final_race_receipt = store
+        .upload_delivery_by_receipt_hash(&ack_race_delivery.receipt_token_hash, now + 208)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(final_race_receipt.delivery.acknowledged_at, Some(now + 208));
+    assert_eq!(
+        final_race_receipt.submissions.len(),
+        if committed { 2 } else { 1 }
+    );
+    assert!(store
+        .upload_delivery_by_receipt_hash(&delivery.receipt_token_hash, delivery.receipt_expires_at,)
+        .await
+        .unwrap()
+        .is_none());
+    let persisted_digest: String =
+        sqlx::query("SELECT receipt_token_hash FROM upload_deliveries WHERE id = $1")
+            .bind(&delivery.id)
+            .fetch_one(&raw)
+            .await
+            .unwrap()
+            .try_get("receipt_token_hash")
+            .unwrap();
+    assert_eq!(persisted_digest, delivery.receipt_token_hash);
+    assert_ne!(persisted_digest, raw_receipt_capability);
+    assert!(store
+        .set_upload_request_status("request-room-a", "alice", "closed", now + 207,)
+        .await
+        .unwrap());
+    sqlx::query("UPDATE upload_requests SET expires_at = 1 WHERE id = 'request-room-a'")
+        .execute(&raw)
+        .await
+        .unwrap();
+    assert!(store
+        .upload_delivery_by_receipt_hash(&delivery.receipt_token_hash, now + 207)
+        .await
+        .unwrap()
+        .is_some());
     assert!(store
         .get("receiptfile")
         .await
@@ -2024,6 +2402,25 @@ async fn pg_store_full_integration() {
         .unwrap()
         .share_token
         .is_none());
+    sqlx::query("DELETE FROM upload_requests WHERE id = 'request-room-a'")
+        .execute(&raw)
+        .await
+        .unwrap();
+    assert!(store
+        .upload_delivery_by_receipt_hash(&delivery.receipt_token_hash, now + 207)
+        .await
+        .unwrap()
+        .is_none());
+    let cascaded_submissions: i64 = sqlx::query(
+        "SELECT CAST(COUNT(*) AS BIGINT) AS count FROM upload_submissions \
+         WHERE id = 'receipt-one'",
+    )
+    .fetch_one(&raw)
+    .await
+    .unwrap()
+    .try_get("count")
+    .unwrap();
+    assert_eq!(cascaded_submissions, 0);
 
     // Reserve reaches its durable INSERT while holding owner/request/folder locks. Folder purge
     // must wait, then win before commit; commit returns a business conflict and compensation can
@@ -2183,6 +2580,7 @@ async fn pg_store_full_integration() {
     let losing_receipt = UploadSubmission {
         id: "purge-reserve-receipt".into(),
         request_id: "purge-reserve-request".into(),
+        delivery_id: None,
         file_id: losing_file.id.clone(),
         name: losing_file.name.clone(),
         content_type: losing_file.content_type.clone(),
@@ -2190,7 +2588,7 @@ async fn pg_store_full_integration() {
         created_at: now + 205,
     };
     assert!(!store
-        .commit_request_upload("purge-reserve-blob", &losing_file, &losing_receipt)
+        .commit_request_upload("purge-reserve-blob", &losing_file, &losing_receipt, None,)
         .await
         .unwrap());
     race_blobs.delete("purge-reserve-blob").await.unwrap();
@@ -2265,6 +2663,7 @@ async fn pg_store_full_integration() {
     let winning_receipt = UploadSubmission {
         id: "purge-commit-receipt".into(),
         request_id: "purge-commit-request".into(),
+        delivery_id: None,
         file_id: winning_file.id.clone(),
         name: winning_file.name.clone(),
         content_type: winning_file.content_type.clone(),
@@ -2298,7 +2697,7 @@ async fn pg_store_full_integration() {
     let commit_store = store.clone();
     let committing = tokio::spawn(async move {
         commit_store
-            .commit_request_upload("purge-commit-blob", &winning_file, &winning_receipt)
+            .commit_request_upload("purge-commit-blob", &winning_file, &winning_receipt, None)
             .await
     });
     let mut commit_at_barrier = false;

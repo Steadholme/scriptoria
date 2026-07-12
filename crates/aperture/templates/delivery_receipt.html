@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <link rel="icon" href="data:,">
+  <title>Delivery receipt · Aperture</title>
+  <link rel="stylesheet" href="/s/share-room.css">
+</head>
+<body data-ap-share-room data-ap-surface="receipt">
+  <header class="sr-topbar">
+    <a class="sr-brand" href="https://w33d.xyz" aria-label="HOLDFAST home">
+      <span class="sr-brand__mark" aria-hidden="true"></span>
+      <span>Aperture<small>DELIVERY RECEIPT</small></span>
+    </a>
+    <span class="sr-topbar__state">{{STATUS}}</span>
+  </header>
+
+  <main class="sr-shell">
+    <section class="sr-card" aria-labelledby="receiptTitle">
+      <div class="sr-card__icon" aria-hidden="true">✓</div>
+      <p class="sr-eyebrow">Delivery receipt</p>
+      <h1 id="receiptTitle">{{STATUS}}</h1>
+      <p class="sr-summary">This page records the files in this delivery.</p>
+      <div class="sr-chips" aria-label="Receipt timeline">
+        <span class="sr-chip">First received {{CREATED_AT}}</span>
+        <span class="sr-chip">Available until {{EXPIRES_AT}}</span>
+      </div>
+      <ul class="sr-file-list" aria-label="Delivered files">{{FILES}}</ul>
+    </section>
+  </main>
+
+  <footer class="sr-foot">Served by HOLDFAST Aperture · Receipt capability</footer>
+</body>
+</html>

@@ -35,6 +35,10 @@ pub const REVISION_KEEP_LIMIT: usize = 100;
 pub const REVISION_PAGE_LIMIT: i64 = 50;
 /// Server-side edit autosaves are private recovery data, retained for seven days.
 pub const AUTOSAVE_TTL_SECS: i64 = 7 * 24 * 60 * 60;
+/// Default lifetime offered for a version-pinned external review link.
+pub const REVIEW_LINK_SHORT_TTL_SECS: i64 = 48 * 60 * 60;
+/// Hard review-link lifetime. The owner UI deliberately offers no arbitrary expiry input.
+pub const REVIEW_LINK_MAX_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 /// Default number of author-owned posts in one Content Library page.
 pub const LIBRARY_DEFAULT_PAGE: i64 = 30;
 /// Hard ceiling for a Content Library read. Keyset navigation keeps older work reachable.

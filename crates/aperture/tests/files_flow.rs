@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use aperture::blobs::{BlobError, Blobs, MemoryBlobs};
 use aperture::config::Config;
-use aperture::model::{FileRec, FolderRec, LibraryItemKind, UploadRequestRec};
+use aperture::model::{
+    FileRec, FolderRec, LibraryItemKind, UploadDelivery, UploadRequestRec, UploadSubmission,
+};
 use aperture::store::{
     BulkMutation, DriveItemRef, InMemoryStore, OwnerBlobCommit, OwnerBlobWriteIntent, Store,
     TrashRootInput, UploadRecoveryClaim, UploadReserve, UploadReserveInput, OWNER_WRITE_FRESH,
@@ -22,6 +24,7 @@ use aperture::{
 };
 use axum::body::Body;
 use axum::http::{header, HeaderMap, Request, StatusCode};
+use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
 const BOUNDARY: &str = "----apertureTESTboundary7MA4YWxkTrZu0gW";
@@ -34,6 +37,41 @@ struct FailingPutBlobs {
 struct ToggleDeleteBlobs {
     inner: Arc<MemoryBlobs>,
     fail_delete: AtomicBool,
+}
+
+/// Writes the blob, then pauses one armed `put` before the upload handler can commit metadata.
+/// This opens the exact precheck -> acknowledgement -> atomic-commit race without mocking Store
+/// authority or weakening the real Router path.
+struct GatedPutBlobs {
+    inner: Arc<MemoryBlobs>,
+    armed: AtomicBool,
+    puts: AtomicUsize,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl GatedPutBlobs {
+    fn new(inner: Arc<MemoryBlobs>) -> Self {
+        Self {
+            inner,
+            armed: AtomicBool::new(false),
+            puts: AtomicUsize::new(0),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn arm_next_put(&self) {
+        assert!(!self.armed.swap(true, Ordering::SeqCst));
+    }
+
+    async fn wait_until_put_is_blocked(&self) {
+        self.entered.notified().await;
+    }
+
+    fn release_blocked_put(&self) {
+        self.release.notify_one();
+    }
 }
 
 #[async_trait::async_trait]
@@ -67,6 +105,40 @@ impl Blobs for ToggleDeleteBlobs {
         } else {
             self.inner.delete(key).await
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl Blobs for GatedPutBlobs {
+    fn bucket(&self) -> &str {
+        self.inner.bucket()
+    }
+
+    async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), BlobError> {
+        self.puts.fetch_add(1, Ordering::SeqCst);
+        self.inner.put(key, bytes).await?;
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        Ok(())
+    }
+
+    async fn get(&self, key: &str) -> Result<Vec<u8>, BlobError> {
+        self.inner.get(key).await
+    }
+
+    async fn get_range(
+        &self,
+        key: &str,
+        start: u64,
+        end_inclusive: u64,
+    ) -> Result<Vec<u8>, BlobError> {
+        self.inner.get_range(key, start, end_inclusive).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), BlobError> {
+        self.inner.delete(key).await
     }
 }
 
@@ -244,6 +316,34 @@ fn multipart(csrf: &str, filename: &str, content_type: &str, data: &[u8]) -> Vec
     body
 }
 
+fn multipart_with_delivery(
+    csrf: &str,
+    delivery_token: &str,
+    filename: &str,
+    content_type: &str,
+    data: &[u8],
+) -> Vec<u8> {
+    let mut body: Vec<u8> = Vec::new();
+    body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+    body.extend_from_slice(b"Content-Disposition: form-data; name=\"csrf_token\"\r\n\r\n");
+    body.extend_from_slice(csrf.as_bytes());
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+    body.extend_from_slice(b"Content-Disposition: form-data; name=\"delivery_token\"\r\n\r\n");
+    body.extend_from_slice(delivery_token.as_bytes());
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!("Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n")
+            .as_bytes(),
+    );
+    body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
+    body.extend_from_slice(data);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+    body
+}
+
 fn upload_req(
     csrf: &str,
     cookie: &str,
@@ -339,6 +439,49 @@ fn public_upload_req(
         .header(header::COOKIE, format!("__Host-csrf={cookie}"))
         .body(Body::from(multipart(csrf, filename, ctype, data)))
         .unwrap()
+}
+
+fn public_upload_req_with_delivery(
+    csrf: &str,
+    cookie: &str,
+    token: &str,
+    delivery_token: &str,
+    filename: &str,
+    ctype: &str,
+    data: &[u8],
+) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(format!("/u/{token}"))
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .header(header::COOKIE, format!("__Host-csrf={cookie}"))
+        .body(Body::from(multipart_with_delivery(
+            csrf,
+            delivery_token,
+            filename,
+            ctype,
+            data,
+        )))
+        .unwrap()
+}
+
+fn delivery_token_from_html(html: &str) -> String {
+    let marker = "name=\"delivery_token\" value=\"";
+    html.split_once(marker)
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(token, _)| token.to_string())
+        .filter(|token| token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .expect("response contains a 256-bit delivery capability")
+}
+
+fn receipt_hash(token: &str) -> String {
+    Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// A CSRF-cookie'd, SSO-identified `application/x-www-form-urlencoded` POST (share config / revoke).
@@ -446,6 +589,11 @@ async fn production_owner_routes_fail_closed_but_capabilities_remain_anonymous()
         assert!(html.contains("Share not found"));
         assert!(!html.contains("GENERATED FROM odyssey"));
     }
+    let receipt = send(&locked, get(&format!("/receipts/{}", "0".repeat(64)), None)).await;
+    assert_eq!(receipt.status, StatusCode::NOT_FOUND);
+    assert_eq!(receipt.header(header::CACHE_CONTROL), "private, no-store");
+    assert_eq!(receipt.header(header::REFERRER_POLICY), "no-referrer");
+    assert!(receipt.text().contains("Receipt unavailable"));
 
     // Strict-CSP Share Room assets are also anonymous, read-only routes.
     for path in ["/s/share-room.css", "/s/share-room.js"] {
@@ -4135,7 +4283,7 @@ async fn public_upload_inbox_accepts_uploads_without_listing_files() {
     )
     .await;
     assert_eq!(up.status, StatusCode::OK, "{}", up.text());
-    assert!(up.text().contains("Uploaded"));
+    assert!(up.text().contains("Received"));
     assert_eq!(up.csrf_cookie().as_deref(), Some(public_csrf.as_str()));
     let files = store.list_files_in_folder(&fid, "alice").await.unwrap();
     let names: Vec<String> = files.iter().map(|f| f.name.clone()).collect();
@@ -4306,7 +4454,7 @@ async fn request_rooms_owner_lifecycle_rotation_and_receipts() {
     assert_eq!(detail.status, StatusCode::OK);
     assert_eq!(detail.header(header::CACHE_CONTROL), "private, no-store");
     assert!(detail.text().contains("Request limits"));
-    assert!(detail.text().contains("Files received"));
+    assert!(detail.text().contains("Deliveries received"));
     assert!(detail.text().contains("Public upload capability"));
     assert!(detail.text().contains("copy-btn"));
     assert!(detail.text().contains(&format!(
@@ -4334,16 +4482,107 @@ async fn request_rooms_owner_lifecycle_rotation_and_receipts() {
     )
     .await;
     assert_eq!(received.status, StatusCode::OK, "{}", received.text());
+    let delivery_token = delivery_token_from_html(&received.text());
+    assert!(received
+        .text()
+        .contains(&format!("href=\"/receipts/{delivery_token}\"")));
     let submissions = store
         .list_upload_submissions(&request.id, "alice")
         .await
         .unwrap();
     assert_eq!(submissions.len(), 1);
+    let deliveries = store
+        .list_upload_deliveries(&request.id, "alice")
+        .await
+        .unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].submissions, submissions);
+    assert_eq!(
+        deliveries[0].delivery.receipt_expires_at - deliveries[0].delivery.created_at,
+        30 * 24 * 60 * 60
+    );
     let received_file = store.get(&submissions[0].file_id).await.unwrap().unwrap();
     assert!(
         received_file.share_token.is_none(),
         "upload capability must not mint a read capability"
     );
+    let receipt_path = format!("/receipts/{delivery_token}");
+    let receipt = send(&app, get(&receipt_path, None)).await;
+    assert_eq!(receipt.status, StatusCode::OK);
+    assert_eq!(receipt.header(header::CACHE_CONTROL), "private, no-store");
+    assert_eq!(receipt.header(header::REFERRER_POLICY), "no-referrer");
+    let receipt_html = receipt.text();
+    assert!(receipt_html.contains("Received"));
+    assert!(receipt_html.contains("proof.png"));
+    assert!(receipt_html.contains("Available until"));
+    for secret in [
+        request.id.as_str(),
+        request.token.as_str(),
+        request.folder_id.as_str(),
+        received_file.id.as_str(),
+        received_file.object_key.as_str(),
+        received_file.owner_sub.as_str(),
+    ] {
+        assert!(!receipt_html.contains(secret), "receipt leaked {secret}");
+    }
+    assert!(!receipt_html.contains(&delivery_token));
+
+    let owner_receipt = send(
+        &app,
+        get(&format!("/requests/{}", request.id), Some("alice")),
+    )
+    .await;
+    assert!(owner_receipt.text().contains("Delivery ·"));
+    assert!(owner_receipt.text().contains("Acknowledge"));
+    assert!(!owner_receipt.text().contains(&delivery_token));
+    let bob_home = send(&app, get("/", Some("bob"))).await;
+    let bob_csrf = bob_home.csrf_cookie().unwrap();
+    let foreign_ack = send(
+        &app,
+        post_form(
+            &format!(
+                "/requests/{}/deliveries/{}/acknowledge",
+                request.id, deliveries[0].delivery.id
+            ),
+            &bob_csrf,
+            "bob",
+            format!("csrf_token={bob_csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(foreign_ack.status, StatusCode::NOT_FOUND);
+    assert!(!foreign_ack.text().contains(&delivery_token));
+    let acknowledge_path = format!(
+        "/requests/{}/deliveries/{}/acknowledge",
+        request.id, deliveries[0].delivery.id
+    );
+    let rejected_ack = send(
+        &app,
+        post_form(
+            &acknowledge_path,
+            &csrf,
+            "alice",
+            "csrf_token=wrong".to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(rejected_ack.status, StatusCode::BAD_REQUEST);
+    for _ in 0..2 {
+        let acknowledged = send(
+            &app,
+            post_form(
+                &acknowledge_path,
+                &csrf,
+                "alice",
+                format!("csrf_token={csrf}"),
+            ),
+        )
+        .await;
+        assert_eq!(acknowledged.status, StatusCode::FOUND);
+    }
+    let acknowledged_receipt = send(&app, get(&receipt_path, None)).await;
+    assert_eq!(acknowledged_receipt.status, StatusCode::OK);
+    assert!(acknowledged_receipt.text().contains("Acknowledged"));
 
     // Full owner update keeps consumed counters but changes the public policy.
     let updated = send(
@@ -4377,6 +4616,11 @@ async fn request_rooms_owner_lifecycle_rotation_and_receipts() {
     )
     .await;
     assert_eq!(closed.status, StatusCode::FOUND);
+    assert_eq!(
+        send(&app, get(&receipt_path, None)).await.status,
+        StatusCode::OK,
+        "closing the upload capability must not revoke an issued receipt"
+    );
     let closed_list = send(&app, get("/requests?view=closed", Some("alice"))).await;
     assert_eq!(closed_list.status, StatusCode::OK);
     assert!(closed_list.text().contains("Updated request"));
@@ -4454,6 +4698,479 @@ async fn request_rooms_owner_lifecycle_rotation_and_receipts() {
             .status,
         StatusCode::OK
     );
+    let mut expired_request = store
+        .get_upload_request(&request.id, "alice")
+        .await
+        .unwrap()
+        .unwrap();
+    expired_request.expires_at = Some(1);
+    expired_request.updated_at = expired_request.updated_at.saturating_add(1);
+    assert!(store.update_upload_request(&expired_request).await.unwrap());
+    assert_eq!(
+        send(&app, get(&receipt_path, None)).await.status,
+        StatusCode::OK,
+        "request expiry must not revoke an issued receipt"
+    );
+}
+
+#[tokio::test]
+async fn request_delivery_queue_reuses_the_first_receipt_capability() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let home = send(&app, get("/", Some("alice"))).await;
+    let csrf = home.csrf_cookie().unwrap();
+    let made = send(
+        &app,
+        post_form(
+            "/folders",
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&name=Queue"),
+        ),
+    )
+    .await;
+    let folder_id = folder_from_location(&made.location());
+    let request = create_upload_request(
+        &app,
+        &store,
+        &folder_id,
+        &csrf,
+        "&max_files=4&allowed_types=image%2F*",
+    )
+    .await;
+    let room = send(&app, get(&format!("/u/{}", request.token), None)).await;
+    let public_csrf = room.csrf_cookie().unwrap();
+
+    // No-JS submits the ordinary one-file form and naturally creates the delivery.
+    let first = send(
+        &app,
+        public_upload_req(
+            &public_csrf,
+            &public_csrf,
+            &request.token,
+            "first.png",
+            "image/png",
+            &png_bytes(),
+        ),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.text());
+    let delivery_token = delivery_token_from_html(&first.text());
+
+    // The browser queue sends the returned capability with every later POST.
+    let second = send(
+        &app,
+        public_upload_req_with_delivery(
+            &public_csrf,
+            &public_csrf,
+            &request.token,
+            &delivery_token,
+            "second.png",
+            "image/png",
+            &png_bytes(),
+        ),
+    )
+    .await;
+    assert_eq!(second.status, StatusCode::OK, "{}", second.text());
+    assert_eq!(delivery_token_from_html(&second.text()), delivery_token);
+    let deliveries = store
+        .list_upload_deliveries(&request.id, "alice")
+        .await
+        .unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].submissions.len(), 2);
+    let mut delivered_names = deliveries[0]
+        .submissions
+        .iter()
+        .map(|submission| submission.name.as_str())
+        .collect::<Vec<_>>();
+    delivered_names.sort_unstable();
+    assert_eq!(delivered_names, vec!["first.png", "second.png"]);
+    assert_eq!(
+        deliveries[0].delivery.receipt_token_hash,
+        receipt_hash(&delivery_token)
+    );
+    assert_ne!(deliveries[0].delivery.receipt_token_hash, delivery_token);
+    let receipt = send(&app, get(&format!("/receipts/{delivery_token}"), None)).await;
+    assert_eq!(receipt.status, StatusCode::OK);
+    assert!(receipt.text().contains("first.png"));
+    assert!(receipt.text().contains("second.png"));
+    let inbox = send(&app, get("/requests", Some("alice"))).await;
+    assert!(!inbox.text().contains(&delivery_token));
+    assert!(!inbox
+        .text()
+        .contains(&deliveries[0].delivery.receipt_token_hash));
+
+    let queue_js = send(&app, get("/s/share-room.js", None)).await;
+    assert_eq!(queue_js.status, StatusCode::OK);
+    assert!(queue_js
+        .text()
+        .contains("data.append(\"delivery_token\", deliveryToken)"));
+    assert!(queue_js.text().contains("new DOMParser()"));
+}
+
+#[tokio::test]
+async fn acknowledged_delivery_is_terminal_across_public_precheck_commit_race() {
+    let base = build_dev_state();
+    let store: Arc<dyn Store> = base.store.clone();
+    let inner_blobs = Arc::new(MemoryBlobs::new());
+    let gated_blobs = Arc::new(GatedPutBlobs::new(inner_blobs.clone()));
+    let state = AppState {
+        config: base.config,
+        store: base.store,
+        blobs: gated_blobs.clone(),
+        audit: base.audit,
+    };
+    let app = app(state);
+    let home = send(&app, get("/", Some("alice"))).await;
+    let owner_csrf = home.csrf_cookie().unwrap();
+    let made = send(
+        &app,
+        post_form(
+            "/folders",
+            &owner_csrf,
+            "alice",
+            format!("csrf_token={owner_csrf}&name=Terminal"),
+        ),
+    )
+    .await;
+    let folder_id = folder_from_location(&made.location());
+    let request = create_upload_request(
+        &app,
+        &store,
+        &folder_id,
+        &owner_csrf,
+        "&max_files=4&allowed_types=image%2F*",
+    )
+    .await;
+    let room = send(&app, get(&format!("/u/{}", request.token), None)).await;
+    let public_csrf = room.csrf_cookie().unwrap();
+
+    let first = send(
+        &app,
+        public_upload_req(
+            &public_csrf,
+            &public_csrf,
+            &request.token,
+            "first.png",
+            "image/png",
+            &png_bytes(),
+        ),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.text());
+    let delivery_token = delivery_token_from_html(&first.text());
+    let receipt_path = format!("/receipts/{delivery_token}");
+    let deliveries = store
+        .list_upload_deliveries(&request.id, "alice")
+        .await
+        .unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].submissions.len(), 1);
+    let delivery_id = deliveries[0].delivery.id.clone();
+    let first_submission = deliveries[0].submissions[0].clone();
+    let baseline_request = store
+        .get_upload_request(&request.id, "alice")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(baseline_request.used_files, 1);
+    assert_eq!(inner_blobs.object_count(), 1);
+    assert_eq!(gated_blobs.puts.load(Ordering::SeqCst), 1);
+
+    gated_blobs.arm_next_put();
+    let racing_request = public_upload_req_with_delivery(
+        &public_csrf,
+        &public_csrf,
+        &request.token,
+        &delivery_token,
+        "racing.png",
+        "image/png",
+        &png_bytes(),
+    );
+    let racing_app = app.clone();
+    let racing_upload = tokio::spawn(async move { send(&racing_app, racing_request).await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        gated_blobs.wait_until_put_is_blocked(),
+    )
+    .await
+    .expect("racing upload reached the blob/metadata boundary");
+
+    let acknowledged = send(
+        &app,
+        post_form(
+            &format!(
+                "/requests/{}/deliveries/{delivery_id}/acknowledge",
+                request.id
+            ),
+            &owner_csrf,
+            "alice",
+            format!("csrf_token={owner_csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(acknowledged.status, StatusCode::FOUND);
+    gated_blobs.release_blocked_put();
+    let rejected = tokio::time::timeout(std::time::Duration::from_secs(5), racing_upload)
+        .await
+        .expect("terminal commit race did not deadlock")
+        .unwrap();
+    assert_eq!(rejected.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(!rejected.text().contains(&delivery_token));
+
+    let after_race = store
+        .get_upload_request(&request.id, "alice")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_race.used_files, baseline_request.used_files);
+    assert_eq!(after_race.used_bytes, baseline_request.used_bytes);
+    assert_eq!(inner_blobs.object_count(), 1);
+    assert_eq!(gated_blobs.puts.load(Ordering::SeqCst), 2);
+    let files = store
+        .list_by_owner("alice", Some(&folder_id), None, 50)
+        .await
+        .unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].id, first_submission.file_id);
+    let submissions = store
+        .list_upload_submissions(&request.id, "alice")
+        .await
+        .unwrap();
+    assert_eq!(submissions, vec![first_submission.clone()]);
+    let deliveries = store
+        .list_upload_deliveries(&request.id, "alice")
+        .await
+        .unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].submissions, vec![first_submission]);
+    assert!(deliveries[0].delivery.acknowledged_at.is_some());
+
+    let receipt = send(&app, get(&receipt_path, None)).await;
+    assert_eq!(receipt.status, StatusCode::OK);
+    assert!(receipt.text().contains("Acknowledged"));
+    assert!(receipt.text().contains("first.png"));
+    assert!(!receipt.text().contains("racing.png"));
+
+    let puts_before_precheck = gated_blobs.puts.load(Ordering::SeqCst);
+    let rejected_before_blob = send(
+        &app,
+        public_upload_req_with_delivery(
+            &public_csrf,
+            &public_csrf,
+            &request.token,
+            &delivery_token,
+            "after-ack.png",
+            "image/png",
+            &png_bytes(),
+        ),
+    )
+    .await;
+    assert_eq!(rejected_before_blob.status, StatusCode::BAD_REQUEST);
+    assert!(rejected_before_blob
+        .text()
+        .contains("Aperture could not accept this request. Reload the room and try again."));
+    assert!(!rejected_before_blob.text().contains("acknowledged"));
+    assert!(!rejected_before_blob.text().contains(&delivery_token));
+    let unknown_delivery_token = "0".repeat(64);
+    let unknown_delivery = send(
+        &app,
+        public_upload_req_with_delivery(
+            &public_csrf,
+            &public_csrf,
+            &request.token,
+            &unknown_delivery_token,
+            "unknown.png",
+            "image/png",
+            &png_bytes(),
+        ),
+    )
+    .await;
+    assert_eq!(unknown_delivery.status, StatusCode::BAD_REQUEST);
+    assert_eq!(unknown_delivery.text(), rejected_before_blob.text());
+    assert_eq!(
+        gated_blobs.puts.load(Ordering::SeqCst),
+        puts_before_precheck
+    );
+    let final_request = store
+        .get_upload_request(&request.id, "alice")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(final_request.used_files, baseline_request.used_files);
+    assert_eq!(final_request.used_bytes, baseline_request.used_bytes);
+    assert_eq!(inner_blobs.object_count(), 1);
+}
+
+#[tokio::test]
+async fn expired_delivery_and_unknown_receipts_share_one_generic_404_and_legacy_rows_render() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    assert!(store
+        .create_folder(&FolderRec {
+            id: "receipt-folder".to_string(),
+            owner_sub: "alice".to_string(),
+            parent_id: None,
+            name: "Receipt destination".to_string(),
+            created_at: 1,
+            updated_at: 1,
+            share_token: None,
+            expires_at: None,
+            share_password_hash: None,
+            upload_token: None,
+            trashed_at: 0,
+            trash_entry_id: None,
+            trash_ancestor_id: None,
+        })
+        .await
+        .unwrap());
+    let request = UploadRequestRec {
+        id: "receipt-request".to_string(),
+        owner_sub: "alice".to_string(),
+        folder_id: "receipt-folder".to_string(),
+        token: "receipt-upload-capability".to_string(),
+        title: "Receipt request".to_string(),
+        description: String::new(),
+        status: "open".to_string(),
+        expires_at: None,
+        max_file_bytes: 1024,
+        max_total_bytes: 2048,
+        max_files: 4,
+        used_bytes: 0,
+        used_files: 0,
+        allowed_types: "image/*".to_string(),
+        created_at: 1,
+        updated_at: 1,
+    };
+    assert!(store.create_upload_request(&request).await.unwrap());
+    let expired_token = "ab".repeat(32);
+    assert_eq!(
+        store
+            .reserve_request_upload(UploadReserveInput {
+                request_id: &request.id,
+                expected_token: &request.token,
+                reservation_id: "expired-receipt-file",
+                size: 3,
+                content_type: "image/png",
+                content_type_verified: true,
+                owner_quota: None,
+                now: 1,
+            })
+            .await
+            .unwrap(),
+        UploadReserve::Reserved
+    );
+    let expired_file = FileRec {
+        id: "expired-receipt-file".to_string(),
+        owner_sub: "alice".to_string(),
+        name: "expired-secret.png".to_string(),
+        content_type: "image/png".to_string(),
+        size: 3,
+        bucket: "memory".to_string(),
+        object_key: "expired-receipt-file".to_string(),
+        share_token: None,
+        created_at: 1,
+        updated_at: 1,
+        expires_at: None,
+        share_password_hash: None,
+        folder_id: Some(request.folder_id.clone()),
+        trashed_at: 0,
+        trash_entry_id: None,
+        trash_ancestor_id: None,
+        view_count: 0,
+    };
+    let expired_delivery = UploadDelivery {
+        id: "expired-delivery".to_string(),
+        request_id: request.id.clone(),
+        receipt_token_hash: receipt_hash(&expired_token),
+        created_at: 1,
+        acknowledged_at: None,
+        receipt_expires_at: 2,
+    };
+    let expired_submission = UploadSubmission {
+        id: "expired-submission".to_string(),
+        request_id: request.id.clone(),
+        delivery_id: Some(expired_delivery.id.clone()),
+        file_id: expired_file.id.clone(),
+        name: expired_file.name.clone(),
+        content_type: expired_file.content_type.clone(),
+        size: expired_file.size,
+        created_at: 1,
+    };
+    assert!(store
+        .commit_request_upload(
+            &expired_file.id,
+            &expired_file,
+            &expired_submission,
+            Some(&expired_delivery),
+        )
+        .await
+        .unwrap());
+
+    assert_eq!(
+        store
+            .reserve_request_upload(UploadReserveInput {
+                request_id: &request.id,
+                expected_token: &request.token,
+                reservation_id: "legacy-receipt-file",
+                size: 4,
+                content_type: "image/png",
+                content_type_verified: true,
+                owner_quota: None,
+                now: 3,
+            })
+            .await
+            .unwrap(),
+        UploadReserve::Reserved
+    );
+    let mut legacy_file = expired_file.clone();
+    legacy_file.id = "legacy-receipt-file".to_string();
+    legacy_file.object_key = legacy_file.id.clone();
+    legacy_file.name = "legacy.png".to_string();
+    legacy_file.size = 4;
+    legacy_file.created_at = 3;
+    legacy_file.updated_at = 3;
+    let legacy_submission = UploadSubmission {
+        id: "legacy-submission".to_string(),
+        request_id: request.id.clone(),
+        delivery_id: None,
+        file_id: legacy_file.id.clone(),
+        name: legacy_file.name.clone(),
+        content_type: legacy_file.content_type.clone(),
+        size: legacy_file.size,
+        created_at: 3,
+    };
+    assert!(store
+        .commit_request_upload(&legacy_file.id, &legacy_file, &legacy_submission, None,)
+        .await
+        .unwrap());
+
+    let expired = send(&app, get(&format!("/receipts/{expired_token}"), None)).await;
+    let unknown = send(&app, get(&format!("/receipts/{}", "cd".repeat(32)), None)).await;
+    let malformed = send(&app, get("/receipts/not-a-capability", None)).await;
+    assert_eq!(expired.status, StatusCode::NOT_FOUND);
+    assert_eq!(unknown.status, StatusCode::NOT_FOUND);
+    assert_eq!(malformed.status, StatusCode::NOT_FOUND);
+    assert_eq!(expired.text(), unknown.text());
+    assert_eq!(expired.text(), malformed.text());
+    assert_eq!(expired.header(header::CACHE_CONTROL), "private, no-store");
+    assert_eq!(expired.header(header::REFERRER_POLICY), "no-referrer");
+    assert!(!expired.text().contains("expired-secret.png"));
+    assert!(!expired.text().contains(&request.token));
+
+    let detail = send(
+        &app,
+        get(&format!("/requests/{}", request.id), Some("alice")),
+    )
+    .await;
+    assert_eq!(detail.status, StatusCode::OK);
+    assert!(detail.text().contains("Legacy receipts"));
+    assert!(detail.text().contains("Recorded before delivery tracking"));
+    assert!(detail.text().contains("legacy.png"));
+    assert!(!detail.text().contains(&expired_token));
 }
 
 #[tokio::test]
@@ -4516,6 +5233,11 @@ async fn request_rooms_enforce_type_file_total_count_and_expiry_without_leaks() 
     assert_eq!(forged_image.status, StatusCode::BAD_REQUEST);
     assert!(store
         .list_upload_submissions(&request.id, "alice")
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .list_upload_deliveries(&request.id, "alice")
         .await
         .unwrap()
         .is_empty());

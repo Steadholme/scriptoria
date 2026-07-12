@@ -19,9 +19,9 @@ use crate::config::clamp_page;
 use crate::model::{
     library_type_for, FileComment, FileRec, FolderRec, LibraryCursor, LibraryItem, LibraryItemKind,
     LibraryPage, LibraryQuery, LibraryType, LibraryView, OwnerUsage, TrashEntry, TrashItem,
-    TrashPage, UploadRequestInbox, UploadRequestInboxCounts, UploadRequestInboxState,
-    UploadRequestInboxView, UploadRequestRec, UploadRequestSummary, UploadSubmission, VersionRec,
-    UPLOAD_REQUEST_EXPIRING_WINDOW_SECS, UPLOAD_REQUEST_INBOX_CAP,
+    TrashPage, UploadDelivery, UploadDeliveryBundle, UploadRequestInbox, UploadRequestInboxCounts,
+    UploadRequestInboxState, UploadRequestInboxView, UploadRequestRec, UploadRequestSummary,
+    UploadSubmission, VersionRec, UPLOAD_REQUEST_EXPIRING_WINDOW_SECS, UPLOAD_REQUEST_INBOX_CAP,
 };
 
 const DEFAULT_TRASH_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
@@ -833,6 +833,31 @@ pub trait Store: Send + Sync {
         owner_sub: &str,
     ) -> Result<Vec<UploadSubmission>, StoreError>;
 
+    /// Resolve one unexpired receipt capability by its SHA-256 digest. The returned projection has
+    /// no request token, owner identity, destination folder, file id, or storage metadata.
+    async fn upload_delivery_by_receipt_hash(
+        &self,
+        receipt_token_hash: &str,
+        as_of: i64,
+    ) -> Result<Option<UploadDeliveryBundle>, StoreError>;
+
+    /// Owner-scoped delivery history for one request. Legacy submissions remain available through
+    /// `list_upload_submissions` with `delivery_id=None`.
+    async fn list_upload_deliveries(
+        &self,
+        request_id: &str,
+        owner_sub: &str,
+    ) -> Result<Vec<UploadDeliveryBundle>, StoreError>;
+
+    /// Idempotently acknowledge one exact delivery under its request owner authority.
+    async fn acknowledge_upload_delivery(
+        &self,
+        request_id: &str,
+        delivery_id: &str,
+        owner_sub: &str,
+        acknowledged_at: i64,
+    ) -> Result<bool, StoreError>;
+
     /// Atomically reserve one request/file slot and owner quota before touching the blob store.
     /// `owner_quota=None` means the owner has no configured global limit; the request's own finite
     /// budgets are always enforced. A reservation counts toward both request and owner usage.
@@ -847,6 +872,7 @@ pub trait Store: Send + Sync {
         reservation_id: &str,
         file: &FileRec,
         submission: &UploadSubmission,
+        new_delivery: Option<&UploadDelivery>,
     ) -> Result<bool, StoreError>;
 
     /// Release a failed reservation and return its bytes/file slot to the request budget.
@@ -911,6 +937,7 @@ pub struct InMemoryStore {
 #[derive(Default)]
 struct MemoryRequestState {
     requests: Vec<UploadRequestRec>,
+    deliveries: Vec<UploadDelivery>,
     submissions: Vec<UploadSubmission>,
     reservations: Vec<MemoryUploadReservation>,
 }
@@ -1880,6 +1907,119 @@ impl Store for InMemoryStore {
                 .then_with(|| b.id.cmp(&a.id))
         });
         Ok(out)
+    }
+
+    async fn upload_delivery_by_receipt_hash(
+        &self,
+        receipt_token_hash: &str,
+        as_of: i64,
+    ) -> Result<Option<UploadDeliveryBundle>, StoreError> {
+        let state = self
+            .request_state
+            .lock()
+            .expect("request state lock poisoned");
+        let Some(delivery) = state.deliveries.iter().find(|delivery| {
+            delivery.receipt_token_hash == receipt_token_hash && delivery.receipt_expires_at > as_of
+        }) else {
+            return Ok(None);
+        };
+        let mut submissions: Vec<_> = state
+            .submissions
+            .iter()
+            .filter(|submission| submission.delivery_id.as_deref() == Some(delivery.id.as_str()))
+            .cloned()
+            .collect();
+        submissions.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(Some(UploadDeliveryBundle {
+            delivery: delivery.clone(),
+            submissions,
+        }))
+    }
+
+    async fn list_upload_deliveries(
+        &self,
+        request_id: &str,
+        owner_sub: &str,
+    ) -> Result<Vec<UploadDeliveryBundle>, StoreError> {
+        let state = self
+            .request_state
+            .lock()
+            .expect("request state lock poisoned");
+        if !state
+            .requests
+            .iter()
+            .any(|request| request.id == request_id && request.owner_sub == owner_sub)
+        {
+            return Ok(Vec::new());
+        }
+        let mut deliveries: Vec<_> = state
+            .deliveries
+            .iter()
+            .filter(|delivery| delivery.request_id == request_id)
+            .cloned()
+            .collect();
+        deliveries.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        Ok(deliveries
+            .into_iter()
+            .map(|delivery| {
+                let mut submissions: Vec<_> = state
+                    .submissions
+                    .iter()
+                    .filter(|submission| {
+                        submission.delivery_id.as_deref() == Some(delivery.id.as_str())
+                    })
+                    .cloned()
+                    .collect();
+                submissions.sort_by(|a, b| {
+                    a.created_at
+                        .cmp(&b.created_at)
+                        .then_with(|| a.id.cmp(&b.id))
+                });
+                UploadDeliveryBundle {
+                    delivery,
+                    submissions,
+                }
+            })
+            .collect())
+    }
+
+    async fn acknowledge_upload_delivery(
+        &self,
+        request_id: &str,
+        delivery_id: &str,
+        owner_sub: &str,
+        acknowledged_at: i64,
+    ) -> Result<bool, StoreError> {
+        let mut state = self
+            .request_state
+            .lock()
+            .expect("request state lock poisoned");
+        if !state
+            .requests
+            .iter()
+            .any(|request| request.id == request_id && request.owner_sub == owner_sub)
+        {
+            return Ok(false);
+        }
+        let Some(delivery) = state
+            .deliveries
+            .iter_mut()
+            .find(|delivery| delivery.id == delivery_id && delivery.request_id == request_id)
+        else {
+            return Ok(false);
+        };
+        if delivery.acknowledged_at.is_none() {
+            delivery.acknowledged_at = Some(acknowledged_at);
+        }
+        Ok(true)
     }
 
     async fn query_trash(
@@ -3500,6 +3640,7 @@ impl Store for InMemoryStore {
         reservation_id: &str,
         file: &FileRec,
         submission: &UploadSubmission,
+        new_delivery: Option<&UploadDelivery>,
     ) -> Result<bool, StoreError> {
         let _lifecycle = self
             .lifecycle_guard
@@ -3540,6 +3681,26 @@ impl Store for InMemoryStore {
         {
             return Ok(false);
         }
+        match (new_delivery, submission.delivery_id.as_deref()) {
+            (Some(delivery), Some(delivery_id))
+                if delivery.id == delivery_id
+                    && delivery.request_id == reservation.request_id
+                    && delivery.acknowledged_at.is_none()
+                    && delivery.receipt_expires_at > delivery.created_at
+                    && !state.deliveries.iter().any(|item| {
+                        item.id == delivery.id
+                            || item.receipt_token_hash == delivery.receipt_token_hash
+                    }) => {}
+            (None, Some(delivery_id))
+                if state.deliveries.iter().any(|delivery| {
+                    delivery.id == delivery_id
+                        && delivery.request_id == reservation.request_id
+                        && delivery.acknowledged_at.is_none()
+                        && delivery.receipt_expires_at > submission.created_at
+                }) => {}
+            (None, None) => {}
+            _ => return Ok(false),
+        }
         if !self
             .folders
             .lock()
@@ -3561,6 +3722,9 @@ impl Store for InMemoryStore {
             return Ok(false);
         }
         files.push(file.clone());
+        if let Some(delivery) = new_delivery {
+            state.deliveries.push(delivery.clone());
+        }
         state.submissions.push(submission.clone());
         state
             .reservations
@@ -4352,12 +4516,35 @@ impl PgStore {
         .execute(&self.pool)
         .await?;
 
-        // Immutable owner receipts. Snapshotting display metadata keeps request history useful even
-        // after the destination file is moved, renamed or purged.
+        // One delivery groups every file sent by the same browser queue. Only a SHA-256 digest of
+        // the public receipt capability is persisted; deleting a request also removes its delivery
+        // capabilities. Issued receipts otherwise remain independent from request close/expiry.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS upload_deliveries (\
+                 id TEXT PRIMARY KEY, \
+                 request_id TEXT NOT NULL REFERENCES upload_requests(id) ON DELETE CASCADE, \
+                 receipt_token_hash TEXT NOT NULL UNIQUE, \
+                 created_at BIGINT NOT NULL, \
+                 acknowledged_at BIGINT, \
+                 receipt_expires_at BIGINT NOT NULL\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_upload_deliveries_request \
+             ON upload_deliveries (request_id, created_at)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Immutable file snapshots. `delivery_id` stays nullable so deployments upgraded from the
+        // flat v7 receipt history retain their legacy rows without inventing a capability.
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS upload_submissions (\
                  id TEXT PRIMARY KEY, \
                  request_id TEXT NOT NULL, \
+                 delivery_id TEXT REFERENCES upload_deliveries(id) ON DELETE CASCADE, \
                  file_id TEXT NOT NULL UNIQUE, \
                  name TEXT NOT NULL, \
                  content_type TEXT NOT NULL, \
@@ -4368,8 +4555,21 @@ impl PgStore {
         .execute(&self.pool)
         .await?;
         sqlx::query(
+            "ALTER TABLE upload_submissions \
+             ADD COLUMN IF NOT EXISTS delivery_id TEXT \
+             REFERENCES upload_deliveries(id) ON DELETE CASCADE",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_upload_submissions_request \
              ON upload_submissions (request_id, created_at)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_upload_submissions_delivery \
+             ON upload_submissions (delivery_id, created_at)",
         )
         .execute(&self.pool)
         .await?;
@@ -4626,11 +4826,25 @@ impl PgStore {
         Ok(UploadSubmission {
             id: row.try_get("id")?,
             request_id: row.try_get("request_id")?,
+            delivery_id: row.try_get("delivery_id")?,
             file_id: row.try_get("file_id")?,
             name: row.try_get("name")?,
             content_type: row.try_get("content_type")?,
             size: row.try_get("size")?,
             created_at: row.try_get("created_at")?,
+        })
+    }
+
+    fn upload_delivery_from_row(
+        row: &sqlx::postgres::PgRow,
+    ) -> Result<UploadDelivery, sqlx::Error> {
+        Ok(UploadDelivery {
+            id: row.try_get("id")?,
+            request_id: row.try_get("request_id")?,
+            receipt_token_hash: row.try_get("receipt_token_hash")?,
+            created_at: row.try_get("created_at")?,
+            acknowledged_at: row.try_get("acknowledged_at")?,
+            receipt_expires_at: row.try_get("receipt_expires_at")?,
         })
     }
 
@@ -7542,7 +7756,8 @@ impl PgStore {
         owner_sub: &str,
     ) -> Result<Vec<UploadSubmission>, sqlx::Error> {
         let rows = sqlx::query(
-            "SELECT s.id, s.request_id, s.file_id, s.name, s.content_type, s.size, s.created_at \
+            "SELECT s.id, s.request_id, s.delivery_id, s.file_id, s.name, s.content_type, \
+                    s.size, s.created_at \
              FROM upload_submissions s \
              JOIN upload_requests r ON r.id = s.request_id \
              WHERE s.request_id = $1 AND r.owner_sub = $2 \
@@ -7553,6 +7768,138 @@ impl PgStore {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(Self::upload_submission_from_row).collect()
+    }
+
+    async fn upload_delivery_by_receipt_hash_async(
+        &self,
+        receipt_token_hash: &str,
+        as_of: i64,
+    ) -> Result<Option<UploadDeliveryBundle>, sqlx::Error> {
+        // One statement gives the capability and its immutable file projection one PostgreSQL
+        // snapshot, including while a request deletion is cascading in another transaction.
+        let rows = sqlx::query(
+            "SELECT d.id AS delivery_pk, d.request_id AS delivery_request_id, \
+                    d.receipt_token_hash, d.created_at AS delivery_created_at, \
+                    d.acknowledged_at, d.receipt_expires_at, \
+                    s.id AS submission_id, s.request_id AS submission_request_id, \
+                    s.delivery_id, s.file_id, s.name, s.content_type, s.size, \
+                    s.created_at AS submission_created_at \
+             FROM upload_deliveries d \
+             JOIN upload_submissions s ON s.delivery_id = d.id \
+             WHERE d.receipt_token_hash = $1 AND d.receipt_expires_at > $2 \
+             ORDER BY s.created_at ASC, s.id ASC",
+        )
+        .bind(receipt_token_hash)
+        .bind(as_of)
+        .fetch_all(&self.pool)
+        .await?;
+        let Some(first) = rows.first() else {
+            return Ok(None);
+        };
+        let delivery = UploadDelivery {
+            id: first.try_get("delivery_pk")?,
+            request_id: first.try_get("delivery_request_id")?,
+            receipt_token_hash: first.try_get("receipt_token_hash")?,
+            created_at: first.try_get("delivery_created_at")?,
+            acknowledged_at: first.try_get("acknowledged_at")?,
+            receipt_expires_at: first.try_get("receipt_expires_at")?,
+        };
+        let submissions = rows
+            .iter()
+            .map(|row| {
+                Ok::<UploadSubmission, sqlx::Error>(UploadSubmission {
+                    id: row.try_get("submission_id")?,
+                    request_id: row.try_get("submission_request_id")?,
+                    delivery_id: row.try_get("delivery_id")?,
+                    file_id: row.try_get("file_id")?,
+                    name: row.try_get("name")?,
+                    content_type: row.try_get("content_type")?,
+                    size: row.try_get("size")?,
+                    created_at: row.try_get("submission_created_at")?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(UploadDeliveryBundle {
+            delivery,
+            submissions,
+        }))
+    }
+
+    async fn list_upload_deliveries_async(
+        &self,
+        request_id: &str,
+        owner_sub: &str,
+    ) -> Result<Vec<UploadDeliveryBundle>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT d.id, d.request_id, d.receipt_token_hash, d.created_at, d.acknowledged_at, \
+                    d.receipt_expires_at \
+             FROM upload_deliveries d \
+             JOIN upload_requests r ON r.id = d.request_id \
+             WHERE d.request_id = $1 AND r.owner_sub = $2 \
+             ORDER BY d.created_at DESC, d.id DESC",
+        )
+        .bind(request_id)
+        .bind(owner_sub)
+        .fetch_all(&self.pool)
+        .await?;
+        let deliveries = rows
+            .iter()
+            .map(Self::upload_delivery_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        if deliveries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let submission_rows = sqlx::query(
+            "SELECT s.id, s.request_id, s.delivery_id, s.file_id, s.name, s.content_type, \
+                    s.size, s.created_at \
+             FROM upload_submissions s \
+             JOIN upload_requests r ON r.id = s.request_id \
+             WHERE s.request_id = $1 AND r.owner_sub = $2 AND s.delivery_id IS NOT NULL \
+             ORDER BY s.created_at ASC, s.id ASC",
+        )
+        .bind(request_id)
+        .bind(owner_sub)
+        .fetch_all(&self.pool)
+        .await?;
+        let submissions = submission_rows
+            .iter()
+            .map(Self::upload_submission_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(deliveries
+            .into_iter()
+            .map(|delivery| UploadDeliveryBundle {
+                submissions: submissions
+                    .iter()
+                    .filter(|submission| {
+                        submission.delivery_id.as_deref() == Some(delivery.id.as_str())
+                    })
+                    .cloned()
+                    .collect(),
+                delivery,
+            })
+            .collect())
+    }
+
+    async fn acknowledge_upload_delivery_async(
+        &self,
+        request_id: &str,
+        delivery_id: &str,
+        owner_sub: &str,
+        acknowledged_at: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE upload_deliveries \
+             SET acknowledged_at = COALESCE(acknowledged_at, $1) \
+             WHERE id = $2 AND request_id = $3 \
+               AND request_id IN (SELECT id FROM upload_requests WHERE owner_sub = $4)",
+        )
+        .bind(acknowledged_at)
+        .bind(delivery_id)
+        .bind(request_id)
+        .bind(owner_sub)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     async fn reserve_request_upload_async(
@@ -7694,6 +8041,7 @@ impl PgStore {
         reservation_id: &str,
         file: &FileRec,
         submission: &UploadSubmission,
+        new_delivery: Option<&UploadDelivery>,
     ) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         // Peek only to discover immutable lock keys, then re-read every value under the canonical
@@ -7782,6 +8130,60 @@ impl PgStore {
             return Ok(false);
         }
 
+        match (new_delivery, submission.delivery_id.as_deref()) {
+            (Some(delivery), Some(delivery_id))
+                if delivery.id == delivery_id
+                    && delivery.request_id == request_id
+                    && delivery.acknowledged_at.is_none()
+                    && delivery.receipt_expires_at > delivery.created_at =>
+            {
+                let inserted = sqlx::query(
+                    "INSERT INTO upload_deliveries \
+                         (id, request_id, receipt_token_hash, created_at, acknowledged_at, \
+                          receipt_expires_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+                )
+                .bind(&delivery.id)
+                .bind(&delivery.request_id)
+                .bind(&delivery.receipt_token_hash)
+                .bind(delivery.created_at)
+                .bind(delivery.acknowledged_at)
+                .bind(delivery.receipt_expires_at)
+                .execute(&mut *tx)
+                .await?;
+                if inserted.rows_affected() != 1 {
+                    tx.rollback().await?;
+                    return Ok(false);
+                }
+            }
+            (None, Some(delivery_id)) => {
+                // This is the final append authority check. It runs after the canonical owner ->
+                // request -> reservation -> folder locks and locks the delivery in the same
+                // transaction as file + submission insertion. A concurrent acknowledgement
+                // therefore either waits for this append or makes this predicate fail.
+                if sqlx::query(
+                    "SELECT 1 FROM upload_deliveries \
+                     WHERE id = $1 AND request_id = $2 AND acknowledged_at IS NULL \
+                       AND receipt_expires_at > $3 FOR UPDATE",
+                )
+                .bind(delivery_id)
+                .bind(&request_id)
+                .bind(submission.created_at)
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_none()
+                {
+                    tx.rollback().await?;
+                    return Ok(false);
+                }
+            }
+            (None, None) => {}
+            _ => {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+        }
+
         let inserted_file = sqlx::query(
             "INSERT INTO files \
                  (id, owner_sub, name, content_type, size, bucket, object_key, share_token, \
@@ -7815,11 +8217,12 @@ impl PgStore {
         }
         let inserted_receipt = sqlx::query(
             "INSERT INTO upload_submissions \
-                 (id, request_id, file_id, name, content_type, size, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
+                 (id, request_id, delivery_id, file_id, name, content_type, size, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING",
         )
         .bind(&submission.id)
         .bind(&submission.request_id)
+        .bind(&submission.delivery_id)
         .bind(&submission.file_id)
         .bind(&submission.name)
         .bind(&submission.content_type)
@@ -8697,6 +9100,38 @@ impl Store for PgStore {
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
+    async fn upload_delivery_by_receipt_hash(
+        &self,
+        receipt_token_hash: &str,
+        as_of: i64,
+    ) -> Result<Option<UploadDeliveryBundle>, StoreError> {
+        self.upload_delivery_by_receipt_hash_async(receipt_token_hash, as_of)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn list_upload_deliveries(
+        &self,
+        request_id: &str,
+        owner_sub: &str,
+    ) -> Result<Vec<UploadDeliveryBundle>, StoreError> {
+        self.list_upload_deliveries_async(request_id, owner_sub)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn acknowledge_upload_delivery(
+        &self,
+        request_id: &str,
+        delivery_id: &str,
+        owner_sub: &str,
+        acknowledged_at: i64,
+    ) -> Result<bool, StoreError> {
+        self.acknowledge_upload_delivery_async(request_id, delivery_id, owner_sub, acknowledged_at)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
     async fn reserve_request_upload(
         &self,
         input: UploadReserveInput<'_>,
@@ -8711,8 +9146,9 @@ impl Store for PgStore {
         reservation_id: &str,
         file: &FileRec,
         submission: &UploadSubmission,
+        new_delivery: Option<&UploadDelivery>,
     ) -> Result<bool, StoreError> {
-        self.commit_request_upload_async(reservation_id, file, submission)
+        self.commit_request_upload_async(reservation_id, file, submission, new_delivery)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
@@ -10344,6 +10780,7 @@ mod tests {
         let receipt = UploadSubmission {
             id: "exactreceipt".into(),
             request_id: request.id.clone(),
+            delivery_id: None,
             file_id: exact.id.clone(),
             name: exact.name.clone(),
             content_type: exact.content_type.clone(),
@@ -10352,24 +10789,194 @@ mod tests {
         };
         let mut wrong_key = exact.clone();
         wrong_key.object_key = "different-blob".into();
+        let failed_delivery = UploadDelivery {
+            id: "failed-delivery".into(),
+            request_id: request.id.clone(),
+            receipt_token_hash: "f".repeat(64),
+            created_at: 2,
+            acknowledged_at: None,
+            receipt_expires_at: 3,
+        };
+        let mut failed_submission = receipt.clone();
+        failed_submission.delivery_id = Some(failed_delivery.id.clone());
         assert!(!s
-            .commit_request_upload("exactblob", &wrong_key, &receipt)
-            .await
-            .unwrap());
-        let mut wrong_receipt = receipt.clone();
-        wrong_receipt.size = 2;
-        assert!(!s
-            .commit_request_upload("exactblob", &exact, &wrong_receipt)
+            .commit_request_upload(
+                "exactblob",
+                &wrong_key,
+                &failed_submission,
+                Some(&failed_delivery),
+            )
             .await
             .unwrap());
         assert!(s
-            .commit_request_upload("exactblob", &exact, &receipt)
+            .upload_delivery_by_receipt_hash(&failed_delivery.receipt_token_hash, 2)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(s
+            .list_upload_deliveries(&request.id, &request.owner_sub)
+            .await
+            .unwrap()
+            .is_empty());
+        let mut wrong_receipt = receipt.clone();
+        wrong_receipt.size = 2;
+        assert!(!s
+            .commit_request_upload("exactblob", &exact, &wrong_receipt, None)
+            .await
+            .unwrap());
+        assert!(s
+            .commit_request_upload("exactblob", &exact, &receipt, None)
             .await
             .unwrap());
         assert_eq!(
             s.get("exactblob").await.unwrap().unwrap().object_key,
             "exactblob"
         );
+    }
+
+    #[tokio::test]
+    async fn acknowledged_delivery_is_terminal_for_memory_commit_authority() {
+        let s = InMemoryStore::new();
+        s.create_folder(&folder("terminalfolder", "u", "Terminal", 1))
+            .await
+            .unwrap();
+        let request = UploadRequestRec {
+            id: "terminalrequest".into(),
+            owner_sub: "u".into(),
+            folder_id: "terminalfolder".into(),
+            token: "terminal-token".into(),
+            title: "Terminal".into(),
+            description: String::new(),
+            status: "open".into(),
+            expires_at: None,
+            max_file_bytes: 10,
+            max_total_bytes: 30,
+            max_files: 3,
+            used_bytes: 0,
+            used_files: 0,
+            allowed_types: "image/*".into(),
+            created_at: 1,
+            updated_at: 1,
+        };
+        assert!(s.create_upload_request(&request).await.unwrap());
+        assert_eq!(
+            s.reserve_request_upload(UploadReserveInput {
+                request_id: &request.id,
+                expected_token: &request.token,
+                reservation_id: "terminal-first",
+                size: 3,
+                content_type: "image/png",
+                content_type_verified: true,
+                owner_quota: None,
+                now: 2,
+            })
+            .await
+            .unwrap(),
+            UploadReserve::Reserved
+        );
+        let mut first_file = file("terminal-first", "u", "unused", 2);
+        first_file.share_token = None;
+        first_file.folder_id = Some(request.folder_id.clone());
+        let delivery = UploadDelivery {
+            id: "terminal-delivery".into(),
+            request_id: request.id.clone(),
+            receipt_token_hash: "a".repeat(64),
+            created_at: 2,
+            acknowledged_at: None,
+            receipt_expires_at: 100,
+        };
+        let first_submission = UploadSubmission {
+            id: "terminal-submission-first".into(),
+            request_id: request.id.clone(),
+            delivery_id: Some(delivery.id.clone()),
+            file_id: first_file.id.clone(),
+            name: first_file.name.clone(),
+            content_type: first_file.content_type.clone(),
+            size: first_file.size,
+            created_at: 2,
+        };
+        assert!(s
+            .commit_request_upload(
+                &first_file.id,
+                &first_file,
+                &first_submission,
+                Some(&delivery),
+            )
+            .await
+            .unwrap());
+        assert!(s
+            .acknowledge_upload_delivery(&request.id, &delivery.id, "u", 3)
+            .await
+            .unwrap());
+
+        assert_eq!(
+            s.reserve_request_upload(UploadReserveInput {
+                request_id: &request.id,
+                expected_token: &request.token,
+                reservation_id: "terminal-after-ack",
+                size: 3,
+                content_type: "image/png",
+                content_type_verified: true,
+                owner_quota: None,
+                now: 4,
+            })
+            .await
+            .unwrap(),
+            UploadReserve::Reserved
+        );
+        let mut rejected_file = file("terminal-after-ack", "u", "unused-two", 4);
+        rejected_file.share_token = None;
+        rejected_file.folder_id = Some(request.folder_id.clone());
+        let rejected_submission = UploadSubmission {
+            id: "terminal-submission-after-ack".into(),
+            request_id: request.id.clone(),
+            delivery_id: Some(delivery.id.clone()),
+            file_id: rejected_file.id.clone(),
+            name: rejected_file.name.clone(),
+            content_type: rejected_file.content_type.clone(),
+            size: rejected_file.size,
+            created_at: 4,
+        };
+        assert!(!s
+            .commit_request_upload(
+                &rejected_file.id,
+                &rejected_file,
+                &rejected_submission,
+                None,
+            )
+            .await
+            .unwrap());
+        assert!(s.get(&rejected_file.id).await.unwrap().is_none());
+        assert_eq!(
+            s.list_upload_submissions(&request.id, "u").await.unwrap(),
+            vec![first_submission.clone()]
+        );
+        let deliveries = s.list_upload_deliveries(&request.id, "u").await.unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].submissions, vec![first_submission]);
+        assert_eq!(deliveries[0].delivery.acknowledged_at, Some(3));
+        let reserved = s
+            .get_upload_request(&request.id, "u")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reserved.used_files, 2);
+        assert_eq!(reserved.used_bytes, 6);
+        assert!(s.release_request_upload(&rejected_file.id).await.unwrap());
+        let compensated = s
+            .get_upload_request(&request.id, "u")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(compensated.used_files, 1);
+        assert_eq!(compensated.used_bytes, 3);
+        let receipt = s
+            .upload_delivery_by_receipt_hash(&delivery.receipt_token_hash, 4)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.delivery.acknowledged_at, Some(3));
+        assert_eq!(receipt.submissions.len(), 1);
     }
 
     #[tokio::test]

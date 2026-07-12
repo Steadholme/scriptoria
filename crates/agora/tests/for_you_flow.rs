@@ -5,10 +5,8 @@ use axum::http::{header, HeaderMap, Request, StatusCode};
 use tower::ServiceExt;
 
 use agora::model::{ActivityReason, Post, Thread, ThreadFollowLevel};
-use agora::store::{
-    AcceptedAnswerAction, ActivityFilter, ThreadSort, ThreadStatusFilter,
-};
-use agora::{app, build_dev_state, new_id, AppState};
+use agora::store::{AcceptedAnswerAction, ActivityFilter, ThreadSort, ThreadStatusFilter};
+use agora::{app, build_dev_state, new_id, now_secs, AppState};
 
 const ALICE_SUB: &str = "u_v7_alice";
 const ALICE_EMAIL: &str = "alice@holdfast.local";
@@ -16,6 +14,8 @@ const BOB_SUB: &str = "u_v7_bob";
 const BOB_EMAIL: &str = "bob@holdfast.local";
 const CAROL_SUB: &str = "u_v7_carol";
 const CAROL_EMAIL: &str = "carol@holdfast.local";
+const DAVE_SUB: &str = "u_v8_dave";
+const DAVE_EMAIL: &str = "dave@holdfast.local";
 const TOK: &str = "v7forumcsrftoken123";
 
 #[tokio::test]
@@ -272,172 +272,387 @@ async fn follow_levels_split_generic_activity_following_and_direct_authority() {
 }
 
 #[tokio::test]
-async fn for_you_is_private_bounded_explainable_and_mute_first() {
+async fn catch_up_views_are_private_native_complete_and_mute_first() {
     let state = build_dev_state().await;
+    let now = now_secs();
+    let base = now - 10_000;
     seed_thread(
         &state,
-        "t_fy_watch",
-        "Reason Watch",
+        "t_fy_old_follow",
+        "Old explicit relationship",
         ALICE_SUB,
         ALICE_EMAIL,
-        100,
+        base,
     )
     .await;
-    seed_thread(
-        &state,
-        "t_fy_follow",
-        "Reason Follow",
-        ALICE_SUB,
-        ALICE_EMAIL,
-        110,
-    )
-    .await;
-    seed_thread(
-        &state,
-        "t_fy_authored",
-        "Reason Authored",
-        CAROL_SUB,
-        CAROL_EMAIL,
-        120,
-    )
-    .await;
-    seed_thread(
-        &state,
-        "t_fy_bookmark",
-        "Reason Bookmark",
-        ALICE_SUB,
-        ALICE_EMAIL,
-        130,
-    )
-    .await;
-    seed_thread(
-        &state,
-        "t_fy_participated",
-        "Reason Participated",
-        ALICE_SUB,
-        ALICE_EMAIL,
-        140,
-    )
-    .await;
-    seed_thread(
-        &state,
-        "t_fy_reading",
-        "Reason Reading",
-        ALICE_SUB,
-        ALICE_EMAIL,
-        150,
-    )
-    .await;
-    seed_thread(
-        &state,
-        "t_fy_muted",
-        "Must Stay Hidden",
-        ALICE_SUB,
-        ALICE_EMAIL,
-        160,
-    )
-    .await;
-    seed_thread(
-        &state,
-        "t_fy_none",
-        "No Local Signal",
-        ALICE_SUB,
-        ALICE_EMAIL,
-        170,
-    )
-    .await;
-
     state
         .store
-        .set_thread_follow_level("t_fy_watch", CAROL_SUB, ThreadFollowLevel::Watch, 200)
-        .await
-        .unwrap();
-    state
-        .store
-        .set_thread_follow_level("t_fy_follow", CAROL_SUB, ThreadFollowLevel::Follow, 201)
-        .await
-        .unwrap();
-    state
-        .store
-        .set_thread_follow_level("t_fy_muted", CAROL_SUB, ThreadFollowLevel::Mute, 202)
-        .await
-        .unwrap();
-    state
-        .store
-        .ensure_bookmark(CAROL_SUB, "p_t_fy_bookmark_op", 203)
-        .await
-        .unwrap();
-    state
-        .store
-        .add_reply(&post(
-            "p_t_fy_participated_reply",
-            "t_fy_participated",
-            "Carol joined",
+        .set_thread_follow_level(
+            "t_fy_old_follow",
             CAROL_SUB,
-            CAROL_EMAIL,
-            204,
-        ))
+            ThreadFollowLevel::Follow,
+            base + 1,
+        )
         .await
         .unwrap();
     state
         .store
         .mark_thread_posts_read(
             CAROL_SUB,
-            "t_fy_reading",
-            &["p_t_fy_reading_op".to_string()],
-            205,
+            "t_fy_old_follow",
+            &["p_t_fy_old_follow_op".to_string()],
+            base + 1,
         )
         .await
         .unwrap();
     state
         .store
         .add_reply(&post(
-            "p_t_fy_reading_reply",
-            "t_fy_reading",
-            "Unread continuation",
+            "p_t_fy_old_follow_unread",
+            "t_fy_old_follow",
+            "An old relationship still has a current unread reply",
             BOB_SUB,
             BOB_EMAIL,
-            206,
+            base + 2,
         ))
         .await
         .unwrap();
 
-    let (status, headers, body) = send(&state, get_as("/for-you", CAROL_SUB, CAROL_EMAIL)).await;
+    // More than 200 unrelated, newer public threads must not evict an explicit relationship.
+    for index in 0..201 {
+        seed_thread(
+            &state,
+            &format!("t_fy_noise_{index:03}"),
+            &format!("Unrelated noise {index:03}"),
+            ALICE_SUB,
+            ALICE_EMAIL,
+            base + 100 + index,
+        )
+        .await;
+    }
+
+    seed_question(
+        &state,
+        "t_fy_waiting",
+        "Question waiting for a solution",
+        CAROL_SUB,
+        CAROL_EMAIL,
+        base + 500,
+    )
+    .await;
+    seed_question(
+        &state,
+        "t_fy_solved",
+        "Question solved for the asker",
+        CAROL_SUB,
+        CAROL_EMAIL,
+        base + 510,
+    )
+    .await;
+    let answer = post(
+        "p_t_fy_solved_answer",
+        "t_fy_solved",
+        "A live accepted reply",
+        BOB_SUB,
+        BOB_EMAIL,
+        base + 511,
+    );
+    state.store.add_reply(&answer).await.unwrap();
+    state
+        .store
+        .mutate_accepted_answer(
+            "t_fy_solved",
+            AcceptedAnswerAction::Accept {
+                post_id: answer.id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    seed_question(
+        &state,
+        "t_fy_muted_question",
+        "Muted question must stay hidden",
+        CAROL_SUB,
+        CAROL_EMAIL,
+        base + 520,
+    )
+    .await;
+    state
+        .store
+        .set_thread_follow_level(
+            "t_fy_muted_question",
+            CAROL_SUB,
+            ThreadFollowLevel::Mute,
+            base + 521,
+        )
+        .await
+        .unwrap();
+
+    let (status, headers, updates) = send(&state, get_as("/for-you", CAROL_SUB, CAROL_EMAIL)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         headers.get(header::CACHE_CONTROL).unwrap(),
         "private, no-store"
     );
-    for (title, reason) in [
-        ("Reason Watch", "watch"),
-        ("Reason Follow", "follow"),
-        ("Reason Authored", "authored"),
-        ("Reason Bookmark", "bookmarked"),
-        ("Reason Participated", "participated"),
-        ("Reason Reading", "reading"),
+    assert!(updates.contains(r#"data-catch-up-view="updates""#));
+    assert!(updates.contains("Old explicit relationship"));
+    assert!(updates.contains(r#"data-for-you-reason="follow""#));
+    assert!(updates.contains(r#"data-follow-level="follow""#));
+    assert!(!updates.contains("Unrelated noise"));
+    assert!(!updates.contains("Muted question must stay hidden"));
+    for href in [
+        "/for-you?view=updates",
+        "/for-you?view=following",
+        "/for-you?view=questions",
     ] {
-        assert!(body.contains(title), "missing {title}");
-        assert!(
-            body.contains(&format!(r#"data-for-you-reason="{reason}""#)),
-            "missing reason {reason}"
-        );
+        assert!(updates.contains(href), "missing native GET tab {href}");
     }
-    assert_eq!(body.matches("data-for-you-reason=").count(), 6);
-    assert!(!body.contains("Must Stay Hidden"));
-    assert!(!body.contains("No Local Signal"));
-    let positions = [
-        "Reason Watch",
-        "Reason Follow",
-        "Reason Authored",
-        "Reason Bookmark",
-        "Reason Participated",
-        "Reason Reading",
-    ]
-    .map(|title| body.find(title).unwrap());
-    assert!(positions.windows(2).all(|window| window[0] < window[1]));
 
+    let (status, _, following) = send(
+        &state,
+        get_as("/for-you?view=following", CAROL_SUB, CAROL_EMAIL),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(following.contains("Old explicit relationship"));
+    assert!(!following.contains("Unrelated noise"));
+    assert!(!following.contains("Muted question must stay hidden"));
+
+    let (status, _, questions) = send(
+        &state,
+        get_as("/for-you?view=questions", CAROL_SUB, CAROL_EMAIL),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(questions.contains("Question waiting for a solution"));
+    assert!(questions.contains("Question solved for the asker"));
+    assert!(questions.contains(r#"data-question-state="waiting""#));
+    assert!(questions.contains(r#"data-question-state="solved""#));
+    assert!(!questions.contains("Old explicit relationship"));
+    assert!(!questions.contains("Muted question must stay hidden"));
+
+    for uri in [
+        "/for-you?view=updates",
+        "/for-you?view=following",
+        "/for-you?view=questions",
+    ] {
+        let (_, _, body) = send(&state, get_as(uri, DAVE_SUB, DAVE_EMAIL)).await;
+        assert!(!body.contains("Question waiting for a solution"));
+        assert!(!body.contains("Question solved for the asker"));
+    }
+    let (status, _, _) = send(
+        &state,
+        get_as("/for-you?view=unknown", CAROL_SUB, CAROL_EMAIL),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     let (status, _, _) = send(&state, get("/for-you")).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn catch_up_updates_keep_unread_holes_live_excerpt_and_read_only_get() {
+    let state = build_dev_state().await;
+    let now = now_secs();
+    seed_thread(
+        &state,
+        "t_fy_holes",
+        "Exact unread holes",
+        ALICE_SUB,
+        ALICE_EMAIL,
+        now - 100,
+    )
+    .await;
+    for (id, body, created_at) in [
+        ("p_fy_hole_one", "First unread old copy", now - 90),
+        ("p_fy_hole_two", "Already read middle reply", now - 80),
+        ("p_fy_hole_three", "Second unread reply", now - 70),
+    ] {
+        state
+            .store
+            .add_reply(&post(
+                id,
+                "t_fy_holes",
+                body,
+                BOB_SUB,
+                BOB_EMAIL,
+                created_at,
+            ))
+            .await
+            .unwrap();
+    }
+    state
+        .store
+        .set_thread_follow_level("t_fy_holes", CAROL_SUB, ThreadFollowLevel::Watch, now - 60)
+        .await
+        .unwrap();
+    state
+        .store
+        .mark_thread_posts_read(
+            CAROL_SUB,
+            "t_fy_holes",
+            &["p_t_fy_holes_op".to_string(), "p_fy_hole_two".to_string()],
+            now - 50,
+        )
+        .await
+        .unwrap();
+    state
+        .store
+        .update_post(
+            "p_fy_hole_one",
+            "Current live first unread <script>must stay text</script>",
+        )
+        .await
+        .unwrap();
+
+    let before = state
+        .store
+        .thread_reading_state(CAROL_SUB, "t_fy_holes")
+        .await
+        .unwrap();
+    assert_eq!(before.unread_count, 2);
+    assert_eq!(before.first_unread.as_ref().unwrap().id, "p_fy_hole_one");
+    let uri = format!("/for-you?view=updates&as_of={now}");
+    let (status, _, body) = send(&state, get_as(&uri, CAROL_SUB, CAROL_EMAIL)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(r#"data-first-unread-id="p_fy_hole_one""#));
+    assert!(body.contains(r#"data-unread-count="2""#));
+    assert!(body.contains("Current live first unread &lt;script&gt;must stay text&lt;/script&gt;"));
+    assert!(!body.contains("First unread old copy"));
+    assert!(!body.contains("<script>must stay text</script>"));
+    assert!(body.contains("/t/t_fy_holes?resume=1#post-p_fy_hole_one"));
+    assert_eq!(body.matches(r#"data-catch-up-reason="watch""#).count(), 1);
+
+    let after = state
+        .store
+        .thread_reading_state(CAROL_SUB, "t_fy_holes")
+        .await
+        .unwrap();
+    assert_eq!(
+        after.unread_count, before.unread_count,
+        "GET must not write"
+    );
+    assert_eq!(
+        after.first_unread.unwrap().id,
+        before.first_unread.unwrap().id,
+        "GET must preserve the exact first-unread hole"
+    );
+}
+
+#[tokio::test]
+async fn catch_up_cursor_is_view_snapshot_and_tie_bound() {
+    let state = build_dev_state().await;
+    let now = now_secs();
+    let tied_at = now - 100;
+    for index in 0..32 {
+        let id = format!("t_fy_tie_{index:02}");
+        seed_thread(
+            &state,
+            &id,
+            &format!("Tie relationship {index:02}"),
+            ALICE_SUB,
+            ALICE_EMAIL,
+            tied_at,
+        )
+        .await;
+        state
+            .store
+            .set_thread_follow_level(&id, CAROL_SUB, ThreadFollowLevel::Follow, tied_at + 1)
+            .await
+            .unwrap();
+    }
+    state
+        .store
+        .add_reply(&post(
+            "p_fy_tie_deleted_latest",
+            "t_fy_tie_00",
+            "Deleted after page one",
+            BOB_SUB,
+            BOB_EMAIL,
+            tied_at + 10,
+        ))
+        .await
+        .unwrap();
+    let first_uri = format!("/for-you?view=following&as_of={now}");
+    let (status, _, first) = send(&state, get_as(&first_uri, CAROL_SUB, CAROL_EMAIL)).await;
+    assert_eq!(status, StatusCode::OK);
+    let first_ids = data_values(&first, "data-thread-id");
+    assert_eq!(first_ids.len(), 30);
+    assert_eq!(first_ids[0], "t_fy_tie_00");
+    assert_eq!(first_ids[29], "t_fy_tie_03");
+    let next = pagination_href(&first);
+
+    // Both mutations share the original wall-clock second. Their higher generation must keep the
+    // old cursor's post/read authority frozen, while deleting the former latest reply must retain
+    // its non-content sorting point so t00 cannot reappear below the cursor.
+    state
+        .store
+        .delete_post("p_fy_tie_deleted_latest")
+        .await
+        .unwrap();
+    state
+        .store
+        .mark_thread_posts_read(
+            CAROL_SUB,
+            "t_fy_tie_02",
+            &["p_t_fy_tie_02_op".to_string()],
+            tied_at,
+        )
+        .await
+        .unwrap();
+    state
+        .store
+        .add_reply(&post(
+            "p_fy_tie_same_second_late",
+            "t_fy_tie_02",
+            "Same-second reply after page one",
+            BOB_SUB,
+            BOB_EMAIL,
+            tied_at,
+        ))
+        .await
+        .unwrap();
+    let (status, _, second) = send(&state, get_as(&next, CAROL_SUB, CAROL_EMAIL)).await;
+    assert_eq!(status, StatusCode::OK);
+    let second_ids = data_values(&second, "data-thread-id");
+    assert_eq!(second_ids, vec!["t_fy_tie_02", "t_fy_tie_01"]);
+    let frozen_t02 = second
+        .split_once(r#"data-thread-id="t_fy_tie_02""#)
+        .unwrap()
+        .1
+        .split_once("</article>")
+        .unwrap()
+        .0;
+    assert!(frozen_t02.contains(r#"data-first-unread-id="p_t_fy_tie_02_op""#));
+    assert!(frozen_t02.contains("<span>0 replies</span>"));
+    let mut all = first_ids;
+    all.extend(second_ids);
+    all.sort();
+    all.dedup();
+    assert_eq!(all.len(), 32, "same-second keyset must have no holes");
+
+    let wrong_view = next.replacen("view=following", "view=updates", 1);
+    let (status, _, _) = send(&state, get_as(&wrong_view, CAROL_SUB, CAROL_EMAIL)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let wrong_snapshot = next.replacen(&format!("as_of={now}"), &format!("as_of={}", now - 1), 1);
+    let (status, _, _) = send(&state, get_as(&wrong_snapshot, CAROL_SUB, CAROL_EMAIL)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let without_snapshot = next.replacen(&format!("&as_of={now}"), "", 1);
+    let (status, _, _) = send(&state, get_as(&without_snapshot, CAROL_SUB, CAROL_EMAIL)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let legacy_v8_cursor = next.replacen("before=v8g-", "before=v8-", 1);
+    let (status, _, _) = send(&state, get_as(&legacy_v8_cursor, CAROL_SUB, CAROL_EMAIL)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _, _) = send(
+        &state,
+        get_as(
+            "/for-you?view=following&as_of=1&before=not-a-cursor",
+            CAROL_SUB,
+            CAROL_EMAIL,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -530,9 +745,50 @@ async fn seed_thread(
     author_email: &str,
     created_at: i64,
 ) {
+    seed_thread_in_category(
+        state,
+        id,
+        "general",
+        title,
+        author_sub,
+        author_email,
+        created_at,
+    )
+    .await;
+}
+
+async fn seed_question(
+    state: &AppState,
+    id: &str,
+    title: &str,
+    author_sub: &str,
+    author_email: &str,
+    created_at: i64,
+) {
+    seed_thread_in_category(
+        state,
+        id,
+        "support",
+        title,
+        author_sub,
+        author_email,
+        created_at,
+    )
+    .await;
+}
+
+async fn seed_thread_in_category(
+    state: &AppState,
+    id: &str,
+    category_id: &str,
+    title: &str,
+    author_sub: &str,
+    author_email: &str,
+    created_at: i64,
+) {
     let thread = Thread {
         id: id.to_string(),
-        category_id: "general".to_string(),
+        category_id: category_id.to_string(),
         title: title.to_string(),
         author_sub: author_sub.to_string(),
         author_email: author_email.to_string(),
@@ -672,4 +928,31 @@ fn encode(value: &str) -> String {
         }
     }
     out
+}
+
+fn data_values<'a>(body: &'a str, attribute: &str) -> Vec<&'a str> {
+    let marker = format!(r#"{attribute}=""#);
+    let mut values = Vec::new();
+    let mut rest = body;
+    while let Some(index) = rest.find(&marker) {
+        rest = &rest[index + marker.len()..];
+        let Some(end) = rest.find('"') else {
+            break;
+        };
+        values.push(&rest[..end]);
+        rest = &rest[end + 1..];
+    }
+    values
+}
+
+fn pagination_href(body: &str) -> String {
+    let marker = r#"<nav class="pagination ag-catch-up-pagination"><a class="btn btn-secondary btn-sm" href=""#;
+    let rest = body
+        .split_once(marker)
+        .expect("catch-up page has a pagination link")
+        .1;
+    rest.split_once('"')
+        .expect("pagination href closes")
+        .0
+        .replace("&amp;", "&")
 }

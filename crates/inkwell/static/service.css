@@ -2414,6 +2414,71 @@ body.page {
 .ink-library__pager { display:flex; justify-content:center; padding-top:var(--sp-5); }
 .ink-library__empty { border-bottom:1px solid var(--hairline); }
 
+/* S16 REVIEW CAPABILITY --------------------------------------------------- */
+.ink-review-manage { display:grid; gap:var(--sp-5); }
+.ink-review-manage .console__head { margin-bottom:0; }
+
+.ink-review-once {
+  padding:clamp(18px,3vw,28px);
+  border:1px solid color-mix(in srgb,var(--warn) 42%,var(--hairline));
+  border-radius:var(--r-lg);
+  background:linear-gradient(135deg,var(--warn-soft),var(--surface));
+  box-shadow:var(--shadow-sm);
+}
+.ink-review-once h2 { margin:10px 0 5px; font-size:20px; }
+.ink-review-once p { margin:0 0 14px; color:var(--ink-2); }
+.ink-review-once input { margin-top:6px; font-family:var(--font-mono); font-size:13px; }
+
+.ink-review-state .card__body { display:grid; gap:13px; }
+.ink-review-state h2,
+.ink-review-boundary h2 { margin:0; font-size:20px; }
+.ink-review-state p { margin:0; }
+
+.ink-review-facts {
+  display:grid;
+  grid-template-columns:repeat(3,minmax(0,1fr));
+  gap:10px;
+  margin:0;
+}
+.ink-review-facts > div {
+  min-width:0;
+  padding:12px;
+  border:1px solid var(--hairline);
+  border-radius:var(--r-sm);
+  background:var(--surface-2);
+}
+.ink-review-facts dt { color:var(--ink-3); font-size:11px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; }
+.ink-review-facts dd { margin:4px 0 0; overflow-wrap:anywhere; font-size:13px; font-weight:650; }
+
+.ink-review-actions { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px; align-items:end; }
+.ink-review-actions form,
+.ink-review-issue { display:flex; gap:10px; align-items:end; flex-wrap:wrap; }
+.ink-review-actions label,
+.ink-review-issue label { width:100%; font-size:12px; font-weight:700; }
+.ink-review-actions select,
+.ink-review-issue select { width:auto; min-width:130px; }
+.ink-review-schedule { margin:0; padding:12px 14px; border-left:3px solid var(--warn); background:var(--warn-soft); }
+.ink-review-boundary { padding:18px 20px; border:1px dashed var(--hairline); border-radius:var(--r); }
+.ink-review-boundary ul { margin:10px 0 0; padding-left:20px; color:var(--ink-2); }
+
+.ink-review-banner {
+  display:grid;
+  grid-template-columns:minmax(0,1fr) minmax(240px,auto);
+  gap:18px;
+  align-items:center;
+  width:min(760px,calc(100% - 48px));
+  margin:24px auto 0;
+  padding:14px 16px;
+  border:1px solid color-mix(in srgb,var(--brand) 36%,var(--hairline));
+  border-radius:var(--r);
+  background:linear-gradient(120deg,var(--brand-soft),var(--surface));
+}
+.ink-review-banner > div { display:flex; flex-direction:column; gap:3px; }
+.ink-review-banner strong { color:var(--brand-ink); font-size:14px; }
+.ink-review-banner span,
+.ink-review-banner p { margin:0; color:var(--ink-2); font-size:12.5px; line-height:1.45; }
+.ink-review-unavailable { min-height:55vh; display:grid; place-items:center; }
+
 /* S17 RESPONSIVE ---------------------------------------------------------- */
 @media (max-width:960px) {
   .ink-editor { grid-template-columns:1fr; }
@@ -2509,6 +2574,15 @@ body.page {
   .ink-library__row { grid-template-columns:28px minmax(0,1fr); }
   .ink-library__rowactions { grid-column:2; justify-content:flex-start; }
   .ink-library__titleline { align-items:flex-start; flex-direction:column; }
+  .ink-review-facts { grid-template-columns:1fr; }
+  .ink-review-actions { grid-template-columns:1fr; }
+  .ink-review-actions form,
+  .ink-review-issue { align-items:stretch; flex-direction:column; }
+  .ink-review-actions select,
+  .ink-review-actions .btn,
+  .ink-review-issue select,
+  .ink-review-issue .btn { width:100%; }
+  .ink-review-banner { grid-template-columns:1fr; width:calc(100% - 32px); }
 }
 
 /* S18 DARK RAMP ----------------------------------------------------------- */

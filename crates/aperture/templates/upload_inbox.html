@@ -32,10 +32,12 @@
       </div>
 
       {{STATUS}}
+      {{RECEIPT}}
       <p class="sr-status" data-upload-summary role="status" aria-live="polite">Choose one file. With JavaScript enabled, you can queue several files and track each upload.</p>
 
       <form class="sr-dropzone" method="post" action="{{ACTION}}" enctype="multipart/form-data" data-upload-form>
         <input type="hidden" name="csrf_token" value="{{CSRF}}">
+        <input type="hidden" name="delivery_token" value="{{DELIVERY_TOKEN}}">
         <input id="fileInput" class="sr-dropzone__input" type="file" name="file"{{ACCEPT}} required>
         <label class="sr-dropzone__pick" for="fileInput">
           <span class="sr-dropzone__mark" aria-hidden="true">+</span>
@@ -48,7 +50,7 @@
       </form>
 
       <section class="sr-queue" data-upload-queue hidden aria-labelledby="queueTitle">
-        <div class="sr-queue__head"><h2 id="queueTitle">Transfer queue</h2><span class="sr-chip">One secure POST per file</span></div>
+        <div class="sr-queue__head"><h2 id="queueTitle">Transfer queue</h2><span class="sr-chip">One POST per file</span></div>
         <ul class="sr-queue__list" data-upload-list></ul>
       </section>
 

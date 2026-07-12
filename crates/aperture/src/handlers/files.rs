@@ -17,7 +17,10 @@ use axum::extract::{Multipart, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Form;
+use rand::rngs::OsRng;
+use rand::RngCore;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::audit::AuditEvent;
 use crate::auth::{self, Identity};
@@ -30,8 +33,8 @@ use crate::handlers::{
 };
 use crate::model::{
     library_type_for, FileComment, FileRec, FolderRec, LibraryCursor, LibraryItem, LibraryItemKind,
-    LibraryQuery, LibraryType, LibraryView, TrashItem, UploadRequestRec, UploadSubmission,
-    VersionRec,
+    LibraryQuery, LibraryType, LibraryView, TrashItem, UploadDelivery, UploadRequestRec,
+    UploadSubmission, VersionRec,
 };
 use crate::store::{
     BulkMutation, DriveItemRef, OwnerBlobCommit, OwnerBlobWriteIntent, OwnerReuploadInput,
@@ -56,6 +59,13 @@ const UPLOAD_TOKEN_LEN: usize = 32;
 const COMMENT_ID_LEN: usize = 10;
 /// Length of an immutable upload-request receipt id.
 const SUBMISSION_ID_LEN: usize = 12;
+/// Internal delivery id; it is never rendered into the public receipt.
+const DELIVERY_ID_LEN: usize = 16;
+/// Receipt capabilities are 32 random bytes encoded as 64 lowercase hex characters.
+const RECEIPT_TOKEN_BYTES: usize = 32;
+const RECEIPT_TOKEN_HEX_LEN: usize = RECEIPT_TOKEN_BYTES * 2;
+/// Issued receipts remain available for 30 days, independent from request close/expiry.
+const RECEIPT_TTL_SECS: i64 = 30 * 24 * 60 * 60;
 const TRASH_ENTRY_ID_LEN: usize = 20;
 const TRASH_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 /// Hard cap on a stored display file name (characters).
@@ -84,6 +94,7 @@ const SHARE_LANDING_HTML: &str = include_str!("../../templates/share_landing.htm
 const SHARE_PW_HTML: &str = include_str!("../../templates/share_password.html");
 const SHARE_FOLDER_HTML: &str = include_str!("../../templates/share_folder.html");
 const UPLOAD_INBOX_HTML: &str = include_str!("../../templates/upload_inbox.html");
+const DELIVERY_RECEIPT_HTML: &str = include_str!("../../templates/delivery_receipt.html");
 
 /// Folder glyph for the drive's subfolder tiles (trusted, server-owned markup).
 const FOLDER_SVG: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h5l2 2.5h9a1 1 0 0 1 1 1V18a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Z"/></svg>"##;
@@ -1718,7 +1729,7 @@ async fn upload_inbox_inner(
 ) -> Result<Response, AppError> {
     let request = load_upload_request(&state, &token).await?;
     let csrf = auth::existing_or_new_csrf_token(&headers);
-    let html = render_upload_inbox(&state.config, &request, &token, &csrf, None);
+    let html = render_upload_inbox(&state.config, &request, &token, &csrf, None, None);
     Ok(share_room_html_with_csrf(StatusCode::OK, html, &csrf))
 }
 
@@ -1742,6 +1753,77 @@ pub async fn upload_inbox_submit(
     share_room_response(result)
 }
 
+/// `GET /receipts/{token}` — read-only delivery capability. The URL resolves from a SHA-256
+/// digest and deliberately projects only receipt-safe display fields.
+pub async fn delivery_receipt(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> Response {
+    if !valid_receipt_token(&token) {
+        return delivery_receipt_unavailable();
+    }
+    let bundle = match state
+        .store
+        .upload_delivery_by_receipt_hash(&receipt_token_hash(&token), now_secs())
+        .await
+    {
+        Ok(Some(bundle)) => bundle,
+        Ok(None) => return delivery_receipt_unavailable(),
+        Err(error) => {
+            tracing::error!(error = %error, "delivery receipt lookup failed");
+            return share_room_html(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                delivery_receipt_message("Receipt unavailable", "Please try again later."),
+            );
+        }
+    };
+    let files = bundle
+        .submissions
+        .iter()
+        .map(|submission| {
+            format!(
+                "<li class=\"sr-file-row\"><span class=\"sr-file-row__icon\" aria-hidden=\"true\">File</span><span><strong class=\"sr-file-row__name\">{name}</strong><small class=\"sr-file-row__meta\">{size}</small></span><time class=\"sr-receipt-time\">{time}</time></li>",
+                name = esc(&submission.name),
+                size = esc(&human_size(submission.size)),
+                time = esc(&fmt_ts(submission.created_at)),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let status = if bundle.delivery.acknowledged_at.is_some() {
+        "Acknowledged"
+    } else {
+        "Received"
+    };
+    let html = DELIVERY_RECEIPT_HTML
+        .replace("{{STATUS}}", status)
+        .replace("{{CREATED_AT}}", &esc(&fmt_ts(bundle.delivery.created_at)))
+        .replace(
+            "{{EXPIRES_AT}}",
+            &esc(&fmt_ts(bundle.delivery.receipt_expires_at)),
+        )
+        .replace("{{FILES}}", &files);
+    share_room_html(StatusCode::OK, html)
+}
+
+fn delivery_receipt_unavailable() -> Response {
+    share_room_html(
+        StatusCode::NOT_FOUND,
+        delivery_receipt_message(
+            "Receipt unavailable",
+            "This receipt does not exist or is no longer available.",
+        ),
+    )
+}
+
+fn delivery_receipt_message(title: &str, message: &str) -> String {
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><link rel=\"icon\" href=\"data:,\"><link rel=\"stylesheet\" href=\"/s/share-room.css\"><title>{title} · Aperture</title></head><body data-ap-share-room data-ap-surface=\"receipt\"><main class=\"sr-shell\"><section class=\"sr-card\"><p class=\"sr-eyebrow\">Delivery receipt</p><h1>{title}</h1><p class=\"sr-summary\">{message}</p></section></main></body></html>",
+        title = esc(title),
+        message = esc(message),
+    )
+}
+
 async fn upload_inbox_submit_inner(
     state: AppState,
     headers: HeaderMap,
@@ -1757,6 +1839,7 @@ async fn upload_inbox_submit_inner(
         .await?
         .ok_or_else(|| AppError::NotFound("The upload destination is unavailable.".to_string()))?;
     let mut csrf_field = String::new();
+    let mut delivery_token_field = String::new();
     let mut file: Option<(String, String, Vec<u8>)> = None;
 
     loop {
@@ -1772,6 +1855,12 @@ async fn upload_inbox_submit_inner(
         match field.name().unwrap_or("") {
             "csrf_token" => {
                 csrf_field = field
+                    .text()
+                    .await
+                    .map_err(|e| AppError::BadRequest(e.to_string()))?;
+            }
+            "delivery_token" => {
+                delivery_token_field = field
                     .text()
                     .await
                     .map_err(|e| AppError::BadRequest(e.to_string()))?;
@@ -1826,6 +1915,31 @@ async fn upload_inbox_submit_inner(
     let unique_name =
         unique_upload_name(&state, &request.owner_sub, &request.folder_id, &name).await?;
     let now = now_secs();
+    let supplied_delivery_token = delivery_token_field.trim();
+    let existing_delivery = if supplied_delivery_token.is_empty() {
+        None
+    } else {
+        if !valid_receipt_token(supplied_delivery_token) {
+            return Err(AppError::BadRequest(
+                "The delivery session is unavailable. Reload the upload room.".to_string(),
+            ));
+        }
+        let bundle = state
+            .store
+            .upload_delivery_by_receipt_hash(&receipt_token_hash(supplied_delivery_token), now)
+            .await?
+            .ok_or_else(|| {
+                AppError::BadRequest(
+                    "The delivery session is unavailable. Reload the upload room.".to_string(),
+                )
+            })?;
+        if bundle.delivery.request_id != request.id || bundle.delivery.acknowledged_at.is_some() {
+            return Err(AppError::BadRequest(
+                "The delivery session is unavailable. Reload the upload room.".to_string(),
+            ));
+        }
+        Some(bundle.delivery)
+    };
     let mut rec = FileRec {
         id: String::new(),
         owner_sub: request.owner_sub.clone(),
@@ -1913,11 +2027,31 @@ async fn upload_inbox_submit_inner(
         return Err(e.into());
     }
 
-    let mut committed = false;
+    let mut committed_delivery_token = None;
     for _ in 0..6 {
+        let (delivery_token, new_delivery) = match existing_delivery.as_ref() {
+            Some(_) => (supplied_delivery_token.to_string(), None),
+            None => {
+                let receipt_token = random_receipt_token();
+                let delivery = UploadDelivery {
+                    id: random_alnum(DELIVERY_ID_LEN),
+                    request_id: request.id.clone(),
+                    receipt_token_hash: receipt_token_hash(&receipt_token),
+                    created_at: now,
+                    acknowledged_at: None,
+                    receipt_expires_at: now.saturating_add(RECEIPT_TTL_SECS),
+                };
+                (receipt_token, Some(delivery))
+            }
+        };
+        let delivery_id = existing_delivery
+            .as_ref()
+            .map(|delivery| delivery.id.clone())
+            .or_else(|| new_delivery.as_ref().map(|delivery| delivery.id.clone()));
         let submission = UploadSubmission {
             id: random_alnum(SUBMISSION_ID_LEN),
             request_id: request.id.clone(),
+            delivery_id,
             file_id: rec.id.clone(),
             name: rec.name.clone(),
             content_type: rec.content_type.clone(),
@@ -1926,11 +2060,11 @@ async fn upload_inbox_submit_inner(
         };
         match state
             .store
-            .commit_request_upload(&rec.id, &rec, &submission)
+            .commit_request_upload(&rec.id, &rec, &submission, new_delivery.as_ref())
             .await
         {
             Ok(true) => {
-                committed = true;
+                committed_delivery_token = Some(delivery_token);
                 break;
             }
             Ok(false) => continue,
@@ -1940,12 +2074,12 @@ async fn upload_inbox_submit_inner(
             }
         }
     }
-    if !committed {
+    let Some(delivery_token) = committed_delivery_token else {
         compensate_failed_request_upload(&state, &rec.object_key, &rec.id).await;
         return Err(AppError::Internal(
             "could not commit public upload receipt".to_string(),
         ));
-    }
+    };
 
     tracing::info!(
         id = rec.id,
@@ -1960,13 +2094,14 @@ async fn upload_inbox_submit_inner(
         &request.id,
         "file",
     ));
-    let status = Some(format!("Uploaded {}.", rec.name));
+    let status = Some(format!("Received {}.", rec.name));
     let html = render_upload_inbox(
         &state.config,
         &request,
         &token,
         &csrf_field,
         status.as_deref(),
+        Some(&delivery_token),
     );
     Ok(share_room_html_with_csrf(StatusCode::OK, html, &csrf_field))
 }
@@ -2051,6 +2186,7 @@ fn render_upload_inbox(
     token: &str,
     csrf: &str,
     status: Option<&str>,
+    delivery_token: Option<&str>,
 ) -> String {
     let status_html = match status {
         Some(msg) => format!("<p class=\"sr-status\" role=\"status\">{}</p>", esc(msg)),
@@ -2060,6 +2196,15 @@ fn render_upload_inbox(
         String::new()
     } else {
         format!(" accept=\"{}\"", esc(&request.allowed_types))
+    };
+    let delivery_token = delivery_token.unwrap_or("");
+    let receipt = if delivery_token.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<section class=\"sr-status\" data-delivery-receipt><strong>Delivery receipt ready.</strong> <a data-delivery-receipt-link href=\"/receipts/{token}\">Open receipt</a><br><small>Keep this separate link if you want to check acknowledgement. It expires 30 days after the first file was received.</small></section>",
+            token = esc(delivery_token),
+        )
     };
     UPLOAD_INBOX_HTML
         .replace("{{HEADING}}", &esc(&request.title))
@@ -2090,8 +2235,45 @@ fn render_upload_inbox(
         .replace("{{ALLOWED_TYPES}}", &esc(&request.allowed_types))
         .replace("{{ACCEPT}}", &accept)
         .replace("{{STATUS}}", &status_html)
+        .replace("{{RECEIPT}}", &receipt)
         .replace("{{ACTION}}", &format!("/u/{}", esc(token)))
         .replace("{{CSRF}}", &esc(csrf))
+        .replace("{{DELIVERY_TOKEN}}", &esc(delivery_token))
+}
+
+fn random_receipt_token() -> String {
+    let mut bytes = [0_u8; RECEIPT_TOKEN_BYTES];
+    OsRng.fill_bytes(&mut bytes);
+    bytes
+        .iter()
+        .flat_map(|byte| {
+            let alphabet = b"0123456789abcdef";
+            [
+                alphabet[(byte >> 4) as usize] as char,
+                alphabet[(byte & 0x0f) as usize] as char,
+            ]
+        })
+        .collect()
+}
+
+fn valid_receipt_token(token: &str) -> bool {
+    token.len() == RECEIPT_TOKEN_HEX_LEN
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn receipt_token_hash(token: &str) -> String {
+    Sha256::digest(token.as_bytes())
+        .iter()
+        .flat_map(|byte| {
+            let alphabet = b"0123456789abcdef";
+            [
+                alphabet[(byte >> 4) as usize] as char,
+                alphabet[(byte & 0x0f) as usize] as char,
+            ]
+        })
+        .collect()
 }
 
 async fn unique_upload_name(

@@ -111,6 +111,72 @@ pub struct PostRevisionSummary {
     pub created_at: i64,
 }
 
+/// One active, version-pinned bearer capability for an unpublished post. `token_hash` is the
+/// SHA-256 digest of a 256-bit random token; the raw token never crosses the Store seam.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PostReviewLink {
+    pub post_id: String,
+    pub revision_version: i64,
+    /// Last authoritative post version observed by review-link-aware code. A rollback image can
+    /// still write `posts`, but it cannot advance this guard; resolution then fails closed.
+    pub guard_edit_version: i64,
+    pub token_hash: String,
+    pub generation: i64,
+    pub expires_at: i64,
+    pub issued_at: i64,
+    pub issued_by_sub: String,
+}
+
+/// Authoritative input shared by first issue and refresh-to-current. `expected_generation=None`
+/// means create only; `Some(n)` rotates only generation `n` and advances it exactly once.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavePostReviewLinkCommand {
+    pub post_id: String,
+    pub owner_sub: String,
+    pub expected_post_version: i64,
+    pub expected_generation: Option<i64>,
+    pub token_hash: String,
+    pub requested_expires_at: i64,
+    pub now: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SavePostReviewLinkOutcome {
+    Saved(PostReviewLink),
+    /// Stale post version, stale generation, an already-active first issue, and a token collision
+    /// deliberately share one result.
+    Conflict,
+    /// Missing and foreign post identities deliberately share one result.
+    NotFound,
+    /// Public posts and invalid expiry requests cannot receive review capabilities.
+    NotEligible,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevokePostReviewLinkCommand {
+    pub post_id: String,
+    pub owner_sub: String,
+    pub expected_post_version: i64,
+    pub expected_generation: i64,
+    pub now: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RevokePostReviewLinkOutcome {
+    Revoked,
+    Conflict,
+    NotFound,
+}
+
+/// Immutable public resolution. Stable post identity supplies slug/author/creation fields while
+/// every editable presentation field comes from the pinned revision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedPostReview {
+    pub post: Post,
+    pub revision: PostRevision,
+    pub link: PostReviewLink,
+}
+
 /// Private, replace-in-place recovery copy for one existing-post editor session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WriterAutosave {
@@ -625,6 +691,31 @@ pub trait Store: Send + Sync {
         post_id: &str,
         revision_id: &str,
     ) -> Result<Option<PostRevision>, StoreError>;
+    /// Current non-expired capability state for one exact owner/post pair. The raw token is never
+    /// persisted and therefore cannot be recovered by this read.
+    async fn get_post_review_link(
+        &self,
+        post_id: &str,
+        owner_sub: &str,
+        now: i64,
+    ) -> Result<Option<PostReviewLink>, StoreError>;
+    /// Issue or atomically rotate a review link, always binding it to the post's current committed
+    /// revision. Implementations serialize against publication-state changes on the post row.
+    async fn save_post_review_link(
+        &self,
+        command: SavePostReviewLinkCommand,
+    ) -> Result<SavePostReviewLinkOutcome, StoreError>;
+    async fn revoke_post_review_link(
+        &self,
+        command: RevokePostReviewLinkCommand,
+    ) -> Result<RevokePostReviewLinkOutcome, StoreError>;
+    /// Resolve a bearer digest to one immutable revision. Expired, revoked, published, scheduled-
+    /// due, deleted and malformed/unknown digests all resolve to `None`.
+    async fn resolve_post_review(
+        &self,
+        token_hash: &str,
+        now: i64,
+    ) -> Result<Option<ResolvedPostReview>, StoreError>;
     async fn put_writer_autosave(
         &self,
         autosave: WriterAutosave,
@@ -705,6 +796,7 @@ pub struct InMemoryStore {
     /// `None` until an admin saves settings; reads then fall back to [`Settings::default`].
     settings: Mutex<Option<Settings>>,
     revisions: Mutex<Vec<PostRevision>>,
+    review_links: Mutex<Vec<PostReviewLink>>,
     autosaves: Mutex<Vec<WriterAutosave>>,
     /// Serializes multi-collection authoring commands. The post lock is held until the associated
     /// revision/autosave work completes, so readers cannot observe half a command.
@@ -842,6 +934,10 @@ impl Store for InMemoryStore {
         }
 
         let mut revisions = self.revisions.lock().expect("revisions lock poisoned");
+        let mut review_links = self
+            .review_links
+            .lock()
+            .expect("review links lock poisoned");
         let mut changed_posts = Vec::new();
         for (index, current, saved, changed) in updates {
             if !changed {
@@ -860,7 +956,12 @@ impl Store for InMemoryStore {
                 command.action.revision_source(),
                 None,
             ));
-            prune_mem_revisions(&mut revisions, &saved.id);
+            reconcile_mem_review_link_after_save(&mut review_links, &current, &saved);
+            let protected_version = review_links
+                .iter()
+                .find(|link| link.post_id == saved.id)
+                .map(|link| link.revision_version);
+            prune_mem_revisions(&mut revisions, &saved.id, protected_version);
             posts[index] = saved.clone();
             changed_posts.push(saved);
         }
@@ -1043,7 +1144,16 @@ impl Store for InMemoryStore {
             &command.source,
             command.restored_from,
         ));
-        prune_mem_revisions(&mut revisions, &saved.id);
+        let mut review_links = self
+            .review_links
+            .lock()
+            .expect("review links lock poisoned");
+        reconcile_mem_review_link_after_save(&mut review_links, &current, &saved);
+        let protected_version = review_links
+            .iter()
+            .find(|link| link.post_id == saved.id)
+            .map(|link| link.revision_version);
+        prune_mem_revisions(&mut revisions, &saved.id, protected_version);
 
         let mut autosaves = self.autosaves.lock().expect("autosaves lock poisoned");
         if let Some(session_id) = command.consume_autosave_session {
@@ -1091,6 +1201,207 @@ impl Store for InMemoryStore {
             .iter()
             .find(|revision| revision.post_id == post_id && revision.id == revision_id)
             .cloned())
+    }
+
+    async fn get_post_review_link(
+        &self,
+        post_id: &str,
+        owner_sub: &str,
+        now: i64,
+    ) -> Result<Option<PostReviewLink>, StoreError> {
+        let _mutation = self.mutation_lock.lock().expect("mutation lock poisoned");
+        let posts = self.posts.lock().expect("posts lock poisoned");
+        let Some(post) = posts
+            .iter()
+            .find(|post| post.id == post_id && post.author_sub == owner_sub)
+        else {
+            return Ok(None);
+        };
+        if post.is_public_at(now) {
+            return Ok(None);
+        }
+        let revisions = self.revisions.lock().expect("revisions lock poisoned");
+        let links = self
+            .review_links
+            .lock()
+            .expect("review links lock poisoned");
+        Ok(links
+            .iter()
+            .find(|link| {
+                link.post_id == post_id
+                    && link.expires_at > now
+                    && link.guard_edit_version == post.edit_version
+                    && revisions.iter().any(|revision| {
+                        revision.post_id == link.post_id
+                            && revision.edit_version == link.revision_version
+                    })
+            })
+            .cloned())
+    }
+
+    async fn save_post_review_link(
+        &self,
+        command: SavePostReviewLinkCommand,
+    ) -> Result<SavePostReviewLinkOutcome, StoreError> {
+        if !review_token_hash_is_valid(&command.token_hash) {
+            return Ok(SavePostReviewLinkOutcome::NotEligible);
+        }
+        let _mutation = self.mutation_lock.lock().expect("mutation lock poisoned");
+        let posts = self.posts.lock().expect("posts lock poisoned");
+        let Some(post) = posts
+            .iter()
+            .find(|post| post.id == command.post_id && post.author_sub == command.owner_sub)
+        else {
+            return Ok(SavePostReviewLinkOutcome::NotFound);
+        };
+        if post.edit_version != command.expected_post_version {
+            return Ok(SavePostReviewLinkOutcome::Conflict);
+        }
+        let Some(expires_at) = review_link_expiry(post, command.requested_expires_at, command.now)
+        else {
+            return Ok(SavePostReviewLinkOutcome::NotEligible);
+        };
+        let revisions = self.revisions.lock().expect("revisions lock poisoned");
+        if !revisions.iter().any(|revision| {
+            revision.post_id == post.id && revision.edit_version == post.edit_version
+        }) {
+            return Err(StoreError::Backend(
+                "current post revision is missing".to_string(),
+            ));
+        }
+        let mut links = self
+            .review_links
+            .lock()
+            .expect("review links lock poisoned");
+        // A guard mismatch means an older image changed the post without review-link awareness.
+        // Delete that capability. Expired/revoked rows remain as generation tombstones so a stale
+        // form can never win an ABA race against a later issue for the same post version.
+        links
+            .retain(|link| link.post_id != post.id || link.guard_edit_version == post.edit_version);
+        let existing = links.iter().position(|link| link.post_id == post.id);
+        let generation = match (command.expected_generation, existing) {
+            (None, None) => 1,
+            (None, Some(index)) if links[index].expires_at <= command.now => {
+                let Some(next) = links[index].generation.checked_add(1) else {
+                    return Ok(SavePostReviewLinkOutcome::Conflict);
+                };
+                next
+            }
+            (Some(expected), Some(index))
+                if links[index].generation == expected && links[index].expires_at > command.now =>
+            {
+                if links[index].token_hash == command.token_hash {
+                    return Ok(SavePostReviewLinkOutcome::Conflict);
+                }
+                let Some(next) = expected.checked_add(1) else {
+                    return Ok(SavePostReviewLinkOutcome::Conflict);
+                };
+                next
+            }
+            _ => return Ok(SavePostReviewLinkOutcome::Conflict),
+        };
+        if links
+            .iter()
+            .any(|link| link.token_hash == command.token_hash)
+        {
+            return Ok(SavePostReviewLinkOutcome::Conflict);
+        }
+        let saved = PostReviewLink {
+            post_id: post.id.clone(),
+            revision_version: post.edit_version,
+            guard_edit_version: post.edit_version,
+            token_hash: command.token_hash,
+            generation,
+            expires_at,
+            issued_at: command.now,
+            issued_by_sub: command.owner_sub,
+        };
+        if let Some(index) = existing {
+            links[index] = saved.clone();
+        } else {
+            links.push(saved.clone());
+        }
+        Ok(SavePostReviewLinkOutcome::Saved(saved))
+    }
+
+    async fn revoke_post_review_link(
+        &self,
+        command: RevokePostReviewLinkCommand,
+    ) -> Result<RevokePostReviewLinkOutcome, StoreError> {
+        let _mutation = self.mutation_lock.lock().expect("mutation lock poisoned");
+        let posts = self.posts.lock().expect("posts lock poisoned");
+        let Some(post) = posts
+            .iter()
+            .find(|post| post.id == command.post_id && post.author_sub == command.owner_sub)
+        else {
+            return Ok(RevokePostReviewLinkOutcome::NotFound);
+        };
+        if post.edit_version != command.expected_post_version {
+            return Ok(RevokePostReviewLinkOutcome::Conflict);
+        }
+        let mut links = self
+            .review_links
+            .lock()
+            .expect("review links lock poisoned");
+        let Some(index) = links.iter().position(|link| {
+            link.post_id == command.post_id
+                && link.generation == command.expected_generation
+                && link.guard_edit_version == command.expected_post_version
+                && link.expires_at > command.now
+        }) else {
+            return Ok(RevokePostReviewLinkOutcome::Conflict);
+        };
+        let Some(next_generation) = links[index].generation.checked_add(1) else {
+            return Ok(RevokePostReviewLinkOutcome::Conflict);
+        };
+        links[index].generation = next_generation;
+        links[index].expires_at = 0;
+        Ok(RevokePostReviewLinkOutcome::Revoked)
+    }
+
+    async fn resolve_post_review(
+        &self,
+        token_hash: &str,
+        now: i64,
+    ) -> Result<Option<ResolvedPostReview>, StoreError> {
+        if !review_token_hash_is_valid(token_hash) {
+            return Ok(None);
+        }
+        let _mutation = self.mutation_lock.lock().expect("mutation lock poisoned");
+        let posts = self.posts.lock().expect("posts lock poisoned");
+        let revisions = self.revisions.lock().expect("revisions lock poisoned");
+        let links = self
+            .review_links
+            .lock()
+            .expect("review links lock poisoned");
+        let Some(link) = links
+            .iter()
+            .find(|link| link.token_hash == token_hash && link.expires_at > now)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let Some(post) = posts.iter().find(|post| {
+            post.id == link.post_id
+                && post.edit_version == link.guard_edit_version
+                && !post.is_public_at(now)
+        }) else {
+            return Ok(None);
+        };
+        let Some(revision) = revisions
+            .iter()
+            .find(|revision| {
+                revision.post_id == link.post_id && revision.edit_version == link.revision_version
+            })
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        Ok(Some(ResolvedPostReview {
+            post: review_post_from_revision(post, &revision),
+            revision,
+            link,
+        }))
     }
 
     async fn put_writer_autosave(
@@ -1185,6 +1496,10 @@ impl Store for InMemoryStore {
             .lock()
             .expect("autosaves lock poisoned")
             .retain(|autosave| autosave.post_id != deleted.id);
+        self.review_links
+            .lock()
+            .expect("review links lock poisoned")
+            .retain(|link| link.post_id != deleted.id);
         Ok(DeletePostOutcome::Deleted(Box::new(deleted)))
     }
 
@@ -1212,6 +1527,10 @@ impl Store for InMemoryStore {
         let mut posts = self.posts.lock().expect("posts lock poisoned");
         let mut revisions = self.revisions.lock().expect("revisions lock poisoned");
         let mut autosaves = self.autosaves.lock().expect("autosaves lock poisoned");
+        let mut review_links = self
+            .review_links
+            .lock()
+            .expect("review links lock poisoned");
 
         let mut deleted = Vec::with_capacity(command.selections.len());
         for selection in &command.selections {
@@ -1233,6 +1552,7 @@ impl Store for InMemoryStore {
         posts.retain(|post| !deleted_ids.contains(post.id.as_str()));
         revisions.retain(|revision| !deleted_ids.contains(revision.post_id.as_str()));
         autosaves.retain(|autosave| !deleted_ids.contains(autosave.post_id.as_str()));
+        review_links.retain(|link| !deleted_ids.contains(link.post_id.as_str()));
         Ok(DeletePostsOutcome::Deleted(deleted))
     }
 
@@ -1253,6 +1573,10 @@ impl Store for InMemoryStore {
                 .lock()
                 .expect("autosaves lock poisoned")
                 .retain(|autosave| autosave.post_id != post_id);
+            self.review_links
+                .lock()
+                .expect("review links lock poisoned")
+                .retain(|link| link.post_id != post_id);
         }
         Ok(())
     }
@@ -1523,19 +1847,114 @@ fn ensure_current_revision(
     }
 }
 
-fn prune_mem_revisions(revisions: &mut Vec<PostRevision>, post_id: &str) {
+fn review_token_hash_is_valid(token_hash: &str) -> bool {
+    token_hash.len() == 64
+        && token_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn review_link_expiry(post: &Post, requested_expires_at: i64, now: i64) -> Option<i64> {
+    if post.is_public_at(now)
+        || requested_expires_at <= now
+        || requested_expires_at > now.saturating_add(crate::config::REVIEW_LINK_MAX_TTL_SECS)
+    {
+        return None;
+    }
+    Some(if post.is_scheduled_at(now) {
+        requested_expires_at.min(post.publish_at)
+    } else {
+        requested_expires_at
+    })
+}
+
+/// Visibility transitions never make an old capability usable again. A legacy immediate-public
+/// row has no future boundary and deletes the link; every timestamped publication clamps expiry
+/// to that instant. Publish-now uses `publish_at=now`, so it expires in the same transaction.
+fn reconcile_mem_review_link_after_save(
+    links: &mut Vec<PostReviewLink>,
+    current: &Post,
+    saved: &Post,
+) {
+    let Some(index) = links.iter().position(|link| link.post_id == saved.id) else {
+        return;
+    };
+    if links[index].guard_edit_version != current.edit_version {
+        links.remove(index);
+        return;
+    }
+
+    let visibility_changed =
+        current.published != saved.published || current.publish_at != saved.publish_at;
+    if visibility_changed && (!saved.published || saved.publish_at <= 0) {
+        let link = &mut links[index];
+        link.guard_edit_version = saved.edit_version;
+        link.revision_version = saved.edit_version;
+        link.expires_at = 0;
+        return;
+    }
+
+    let link = &mut links[index];
+    link.guard_edit_version = saved.edit_version;
+    if link.expires_at <= saved.updated_at {
+        link.revision_version = saved.edit_version;
+    }
+    if visibility_changed {
+        link.expires_at = link.expires_at.min(saved.publish_at);
+        if link.expires_at <= saved.updated_at {
+            link.revision_version = saved.edit_version;
+        }
+    }
+}
+
+fn review_post_from_revision(post: &Post, revision: &PostRevision) -> Post {
+    Post {
+        id: post.id.clone(),
+        slug: post.slug.clone(),
+        title: revision.title.clone(),
+        body_md: revision.body_md.clone(),
+        author_sub: post.author_sub.clone(),
+        author_email: post.author_email.clone(),
+        created_at: post.created_at,
+        updated_at: revision.created_at,
+        edit_version: revision.edit_version,
+        published: revision.published,
+        publish_at: revision.publish_at,
+        featured: revision.featured,
+        pinned: revision.pinned,
+        tags: revision.tags.clone(),
+        cover_url: revision.cover_url.clone(),
+        custom_excerpt: revision.custom_excerpt.clone(),
+        meta_title: revision.meta_title.clone(),
+        meta_description: revision.meta_description.clone(),
+        canonical_url: revision.canonical_url.clone(),
+        social_title: revision.social_title.clone(),
+        social_description: revision.social_description.clone(),
+        social_image: revision.social_image.clone(),
+    }
+}
+
+fn prune_mem_revisions(
+    revisions: &mut Vec<PostRevision>,
+    post_id: &str,
+    protected_version: Option<i64>,
+) {
     let mut versions: Vec<i64> = revisions
         .iter()
         .filter(|revision| revision.post_id == post_id)
         .map(|revision| revision.edit_version)
         .collect();
     versions.sort_unstable_by(|a, b| b.cmp(a));
-    if versions.len() <= crate::config::REVISION_KEEP_LIMIT {
-        return;
+    versions.dedup();
+    let mut kept: HashSet<i64> = versions
+        .into_iter()
+        .take(crate::config::REVISION_KEEP_LIMIT)
+        .collect();
+    if let Some(version) = protected_version {
+        kept.insert(version);
     }
-    let oldest_kept = versions[crate::config::REVISION_KEEP_LIMIT - 1];
     revisions
-        .retain(|revision| revision.post_id != post_id || revision.edit_version >= oldest_kept);
+        .retain(|revision| revision.post_id != post_id || kept.contains(&revision.edit_version));
 }
 
 fn cleanup_expired_mem_autosaves(autosaves: &mut Vec<WriterAutosave>, now: i64) {
@@ -1571,6 +1990,9 @@ const REVISION_COLS: &str = "SELECT id, post_id, edit_version, title, body_md, p
                              meta_title, meta_description, canonical_url, social_title, \
                              social_description, social_image, editor_sub, editor_email, source, \
                              restored_from, created_at FROM post_revisions";
+const REVIEW_LINK_COLS: &str = "SELECT post_id, revision_version, guard_edit_version, token_hash, \
+                                generation, expires_at, issued_at, issued_by_sub \
+                                FROM post_review_links";
 const AUTOSAVE_COLS: &str = "SELECT session_id, post_id, owner_sub, base_version, client_seq, \
                              title, body_md, tags, cover_url, custom_excerpt, meta_title, \
                              meta_description, canonical_url, social_title, social_description, \
@@ -1695,6 +2117,44 @@ impl PgStore {
         .execute(&self.pool)
         .await?;
         sqlx::query(
+            "CREATE TABLE IF NOT EXISTS post_review_links (\
+                 post_id TEXT PRIMARY KEY REFERENCES posts(id) ON DELETE CASCADE, \
+                 revision_version BIGINT NOT NULL, \
+                 guard_edit_version BIGINT NOT NULL, \
+                 token_hash TEXT UNIQUE NOT NULL, \
+                 generation BIGINT NOT NULL CHECK (generation > 0), \
+                 expires_at BIGINT NOT NULL, issued_at BIGINT NOT NULL, \
+                 issued_by_sub TEXT NOT NULL, \
+                 FOREIGN KEY (post_id, revision_version) \
+                     REFERENCES post_revisions(post_id, edit_version) ON DELETE CASCADE\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        // An interim schema may predate the rollback guard. Existing capabilities are invalidated
+        // conservatively instead of guessing whether a rollback image changed their posts.
+        sqlx::query(
+            "ALTER TABLE post_review_links \
+             ADD COLUMN IF NOT EXISTS guard_edit_version BIGINT",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "UPDATE post_review_links SET guard_edit_version = 0 \
+             WHERE guard_edit_version IS NULL",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("ALTER TABLE post_review_links ALTER COLUMN guard_edit_version SET NOT NULL")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_post_review_links_expiry \
+             ON post_review_links (expires_at, post_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS writer_autosaves (\
                  session_id TEXT PRIMARY KEY, \
                  post_id TEXT NOT NULL REFERENCES posts(id) ON DELETE CASCADE, \
@@ -1783,6 +2243,13 @@ impl PgStore {
                     CASE WHEN EXISTS (SELECT 1 FROM post_revisions prior WHERE prior.post_id = posts.id) \
                          THEN 'forward-repair' ELSE 'baseline' END, NULL, updated_at \
              FROM posts ON CONFLICT (post_id, edit_version) DO NOTHING",
+        )
+        .execute(&mut *repair)
+        .await?;
+        sqlx::query(
+            "DELETE FROM post_review_links AS link USING posts AS post \
+             WHERE link.post_id = post.id \
+               AND link.guard_edit_version <> post.edit_version",
         )
         .execute(&mut *repair)
         .await?;
@@ -2073,6 +2540,19 @@ impl PgStore {
         })
     }
 
+    fn review_link_from_row(row: &sqlx::postgres::PgRow) -> Result<PostReviewLink, sqlx::Error> {
+        Ok(PostReviewLink {
+            post_id: row.try_get("post_id")?,
+            revision_version: row.try_get("revision_version")?,
+            guard_edit_version: row.try_get("guard_edit_version")?,
+            token_hash: row.try_get("token_hash")?,
+            generation: row.try_get("generation")?,
+            expires_at: row.try_get("expires_at")?,
+            issued_at: row.try_get("issued_at")?,
+            issued_by_sub: row.try_get("issued_by_sub")?,
+        })
+    }
+
     fn autosave_from_row(row: &sqlx::postgres::PgRow) -> Result<WriterAutosave, sqlx::Error> {
         Ok(WriterAutosave {
             session_id: row.try_get("session_id")?,
@@ -2322,16 +2802,8 @@ impl PgStore {
                 None,
             );
             Self::insert_revision_tx(&mut tx, &revision).await?;
-            sqlx::query(
-                "DELETE FROM post_revisions WHERE post_id = $1 AND id IN (\
-                     SELECT id FROM post_revisions WHERE post_id = $1 \
-                     ORDER BY edit_version DESC, id DESC OFFSET $2\
-                 )",
-            )
-            .bind(&saved.id)
-            .bind(crate::config::REVISION_KEEP_LIMIT as i64)
-            .execute(&mut *tx)
-            .await?;
+            Self::reconcile_review_link_after_save_tx(&mut tx, &current, &saved).await?;
+            Self::prune_revisions_tx(&mut tx, &saved.id).await?;
             changed_posts.push(saved);
         }
         tx.commit().await?;
@@ -2599,6 +3071,100 @@ impl PgStore {
         Ok(())
     }
 
+    async fn reconcile_review_link_after_save_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        current: &Post,
+        saved: &Post,
+    ) -> Result<(), sqlx::Error> {
+        // A v7 image can update `posts` without knowing this table. Its edit version then outruns
+        // the guard. The next v8 write deletes the stale capability instead of advancing it and
+        // accidentally reviving the bearer URL.
+        sqlx::query(
+            "DELETE FROM post_review_links \
+             WHERE post_id = $1 AND guard_edit_version <> $2",
+        )
+        .bind(&saved.id)
+        .bind(current.edit_version)
+        .execute(&mut **tx)
+        .await?;
+
+        let visibility_changed =
+            current.published != saved.published || current.publish_at != saved.publish_at;
+        if visibility_changed && (!saved.published || saved.publish_at <= 0) {
+            sqlx::query(
+                "UPDATE post_review_links \
+                 SET guard_edit_version = $2, revision_version = $2, expires_at = 0 \
+                 WHERE post_id = $1 AND guard_edit_version = $3",
+            )
+            .bind(&saved.id)
+            .bind(saved.edit_version)
+            .bind(current.edit_version)
+            .execute(&mut **tx)
+            .await?;
+        } else if visibility_changed {
+            sqlx::query(
+                "UPDATE post_review_links \
+                 SET guard_edit_version = $2, \
+                     expires_at = CASE WHEN expires_at > $3 THEN $3 ELSE expires_at END, \
+                     revision_version = CASE \
+                         WHEN expires_at <= $4 OR $3 <= $4 THEN $2 ELSE revision_version END \
+                 WHERE post_id = $1 AND guard_edit_version = $5",
+            )
+            .bind(&saved.id)
+            .bind(saved.edit_version)
+            .bind(saved.publish_at)
+            .bind(saved.updated_at)
+            .bind(current.edit_version)
+            .execute(&mut **tx)
+            .await?;
+        } else {
+            sqlx::query(
+                "UPDATE post_review_links \
+                 SET guard_edit_version = $2, \
+                     revision_version = CASE WHEN expires_at <= $3 THEN $2 \
+                                             ELSE revision_version END \
+                 WHERE post_id = $1 AND guard_edit_version = $4",
+            )
+            .bind(&saved.id)
+            .bind(saved.edit_version)
+            .bind(saved.updated_at)
+            .bind(current.edit_version)
+            .execute(&mut **tx)
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn prune_revisions_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        post_id: &str,
+    ) -> Result<(), sqlx::Error> {
+        // Select the ordinary newest-N window before applying review-link protection, matching
+        // Memory exactly. A pinned revision inside that window must not enlarge it; one older
+        // pinned snapshot may be retained in addition so an unexpired review remains resolvable.
+        sqlx::query(
+            "DELETE FROM post_revisions AS revision \
+             WHERE revision.post_id = $1 \
+               AND NOT EXISTS (\
+                   SELECT 1 FROM (\
+                       SELECT kept.id FROM post_revisions AS kept \
+                       WHERE kept.post_id = $1 \
+                       ORDER BY kept.edit_version DESC, kept.id DESC LIMIT $2\
+                   ) AS newest WHERE newest.id = revision.id\
+               ) \
+               AND NOT EXISTS (\
+                   SELECT 1 FROM post_review_links AS link \
+                   WHERE link.post_id = revision.post_id \
+                     AND link.revision_version = revision.edit_version\
+               )",
+        )
+        .bind(post_id)
+        .bind(crate::config::REVISION_KEEP_LIMIT as i64)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
     async fn save_post_async(
         &self,
         command: SavePostCommand,
@@ -2703,16 +3269,8 @@ impl PgStore {
             .execute(&mut *tx)
             .await?;
         }
-        sqlx::query(
-            "DELETE FROM post_revisions WHERE post_id = $1 AND id IN (\
-                 SELECT id FROM post_revisions WHERE post_id = $1 \
-                 ORDER BY edit_version DESC, id DESC OFFSET $2\
-             )",
-        )
-        .bind(&saved.id)
-        .bind(crate::config::REVISION_KEEP_LIMIT as i64)
-        .execute(&mut *tx)
-        .await?;
+        Self::reconcile_review_link_after_save_tx(&mut tx, &current, &saved).await?;
+        Self::prune_revisions_tx(&mut tx, &saved.id).await?;
         tx.commit().await?;
         Ok(SavePostOutcome::Saved(Box::new(saved)))
     }
@@ -2758,6 +3316,299 @@ impl PgStore {
             .fetch_optional(&self.pool)
             .await?;
         row.as_ref().map(Self::revision_from_row).transpose()
+    }
+
+    async fn get_post_review_link_async(
+        &self,
+        post_id: &str,
+        owner_sub: &str,
+        now: i64,
+    ) -> Result<Option<PostReviewLink>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT link.post_id, link.revision_version, link.guard_edit_version, \
+                    link.token_hash, link.generation, link.expires_at, link.issued_at, \
+                    link.issued_by_sub \
+             FROM post_review_links AS link \
+             JOIN posts AS post ON post.id = link.post_id \
+             JOIN post_revisions AS revision \
+               ON revision.post_id = link.post_id \
+              AND revision.edit_version = link.revision_version \
+             WHERE link.post_id = $1 AND post.author_sub = $2 AND link.expires_at > $3 \
+               AND link.guard_edit_version = post.edit_version \
+               AND NOT (post.published = TRUE \
+                        AND (post.publish_at = 0 OR post.publish_at <= $3))",
+        )
+        .bind(post_id)
+        .bind(owner_sub)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(Self::review_link_from_row).transpose()
+    }
+
+    async fn save_post_review_link_async(
+        &self,
+        command: &SavePostReviewLinkCommand,
+    ) -> Result<SavePostReviewLinkOutcome, sqlx::Error> {
+        if !review_token_hash_is_valid(&command.token_hash) {
+            return Ok(SavePostReviewLinkOutcome::NotEligible);
+        }
+        let mut tx = self.pool.begin().await?;
+        let post = sqlx::query(&format!(
+            "{POST_COLS} WHERE id = $1 AND author_sub = $2 FOR UPDATE"
+        ))
+        .bind(&command.post_id)
+        .bind(&command.owner_sub)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(post) = post else {
+            return Ok(SavePostReviewLinkOutcome::NotFound);
+        };
+        let post = Self::post_from_row(&post)?;
+        if post.edit_version != command.expected_post_version {
+            return Ok(SavePostReviewLinkOutcome::Conflict);
+        }
+        let Some(expires_at) = review_link_expiry(&post, command.requested_expires_at, command.now)
+        else {
+            return Ok(SavePostReviewLinkOutcome::NotEligible);
+        };
+        let revision_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(\
+                 SELECT 1 FROM post_revisions \
+                 WHERE post_id = $1 AND edit_version = $2\
+             )",
+        )
+        .bind(&post.id)
+        .bind(post.edit_version)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !revision_exists {
+            return Err(sqlx::Error::Protocol(
+                "current post revision is missing".to_string(),
+            ));
+        }
+        sqlx::query(
+            "DELETE FROM post_review_links \
+             WHERE post_id = $1 AND guard_edit_version <> $2",
+        )
+        .bind(&post.id)
+        .bind(post.edit_version)
+        .execute(&mut *tx)
+        .await?;
+        let existing = sqlx::query(&format!("{REVIEW_LINK_COLS} WHERE post_id = $1 FOR UPDATE"))
+            .bind(&post.id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .as_ref()
+            .map(Self::review_link_from_row)
+            .transpose()?;
+        let generation = match (command.expected_generation, existing.as_ref()) {
+            (None, None) => 1,
+            (None, Some(link)) if link.expires_at <= command.now => {
+                let Some(next) = link.generation.checked_add(1) else {
+                    return Ok(SavePostReviewLinkOutcome::Conflict);
+                };
+                next
+            }
+            (Some(expected), Some(link))
+                if link.generation == expected && link.expires_at > command.now =>
+            {
+                if link.token_hash == command.token_hash {
+                    return Ok(SavePostReviewLinkOutcome::Conflict);
+                }
+                let Some(next) = expected.checked_add(1) else {
+                    return Ok(SavePostReviewLinkOutcome::Conflict);
+                };
+                next
+            }
+            _ => return Ok(SavePostReviewLinkOutcome::Conflict),
+        };
+        let token_in_use = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM post_review_links WHERE token_hash = $1)",
+        )
+        .bind(&command.token_hash)
+        .fetch_one(&mut *tx)
+        .await?;
+        if token_in_use {
+            return Ok(SavePostReviewLinkOutcome::Conflict);
+        }
+        let saved = PostReviewLink {
+            post_id: post.id.clone(),
+            revision_version: post.edit_version,
+            guard_edit_version: post.edit_version,
+            token_hash: command.token_hash.clone(),
+            generation,
+            expires_at,
+            issued_at: command.now,
+            issued_by_sub: command.owner_sub.clone(),
+        };
+        let write = if let Some(existing) = existing.as_ref() {
+            sqlx::query(
+                "UPDATE post_review_links \
+                 SET revision_version = $2, guard_edit_version = $3, token_hash = $4, \
+                     generation = $5, expires_at = $6, issued_at = $7, issued_by_sub = $8 \
+                 WHERE post_id = $1 AND generation = $9",
+            )
+            .bind(&saved.post_id)
+            .bind(saved.revision_version)
+            .bind(saved.guard_edit_version)
+            .bind(&saved.token_hash)
+            .bind(saved.generation)
+            .bind(saved.expires_at)
+            .bind(saved.issued_at)
+            .bind(&saved.issued_by_sub)
+            .bind(existing.generation)
+            .execute(&mut *tx)
+            .await
+        } else {
+            sqlx::query(
+                "INSERT INTO post_review_links \
+                     (post_id, revision_version, guard_edit_version, token_hash, generation, \
+                      expires_at, issued_at, issued_by_sub) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            )
+            .bind(&saved.post_id)
+            .bind(saved.revision_version)
+            .bind(saved.guard_edit_version)
+            .bind(&saved.token_hash)
+            .bind(saved.generation)
+            .bind(saved.expires_at)
+            .bind(saved.issued_at)
+            .bind(&saved.issued_by_sub)
+            .execute(&mut *tx)
+            .await
+        };
+        match write {
+            Ok(result) if result.rows_affected() == 1 => {}
+            Ok(_) => return Ok(SavePostReviewLinkOutcome::Conflict),
+            Err(error) if is_unique_violation(&error) => {
+                return Ok(SavePostReviewLinkOutcome::Conflict);
+            }
+            Err(error) => return Err(error),
+        }
+        tx.commit().await?;
+        Ok(SavePostReviewLinkOutcome::Saved(saved))
+    }
+
+    async fn revoke_post_review_link_async(
+        &self,
+        command: &RevokePostReviewLinkCommand,
+    ) -> Result<RevokePostReviewLinkOutcome, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let post_version = sqlx::query_scalar::<_, i64>(
+            "SELECT edit_version FROM posts \
+             WHERE id = $1 AND author_sub = $2 FOR UPDATE",
+        )
+        .bind(&command.post_id)
+        .bind(&command.owner_sub)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(post_version) = post_version else {
+            return Ok(RevokePostReviewLinkOutcome::NotFound);
+        };
+        if post_version != command.expected_post_version {
+            return Ok(RevokePostReviewLinkOutcome::Conflict);
+        }
+        let updated = sqlx::query(
+            "UPDATE post_review_links SET generation = generation + 1, expires_at = 0 \
+             WHERE post_id = $1 AND generation = $2 AND guard_edit_version = $3 \
+               AND expires_at > $4 AND generation < 9223372036854775807",
+        )
+        .bind(&command.post_id)
+        .bind(command.expected_generation)
+        .bind(command.expected_post_version)
+        .bind(command.now)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Ok(RevokePostReviewLinkOutcome::Conflict);
+        }
+        tx.commit().await?;
+        Ok(RevokePostReviewLinkOutcome::Revoked)
+    }
+
+    async fn resolve_post_review_async(
+        &self,
+        token_hash: &str,
+        now: i64,
+    ) -> Result<Option<ResolvedPostReview>, sqlx::Error> {
+        if !review_token_hash_is_valid(token_hash) {
+            return Ok(None);
+        }
+        // One statement snapshot keeps capability, guard, visibility, and pinned revision
+        // mutually consistent while a concurrent author save publishes, rotates, or deletes.
+        let row = sqlx::query(
+            "SELECT post.id AS stable_id, post.slug AS stable_slug, \
+                    post.author_sub AS stable_author_sub, \
+                    post.author_email AS stable_author_email, \
+                    post.created_at AS stable_created_at, \
+                    link.post_id AS link_post_id, link.revision_version, \
+                    link.guard_edit_version, link.token_hash, link.generation, \
+                    link.expires_at, link.issued_at, link.issued_by_sub, \
+                    revision.id, revision.post_id, revision.edit_version, revision.title, \
+                    revision.body_md, revision.published, revision.publish_at, \
+                    revision.featured, revision.pinned, revision.tags, revision.cover_url, \
+                    revision.custom_excerpt, revision.meta_title, revision.meta_description, \
+                    revision.canonical_url, revision.social_title, revision.social_description, \
+                    revision.social_image, revision.editor_sub, revision.editor_email, \
+                    revision.source, revision.restored_from, revision.created_at \
+             FROM post_review_links AS link \
+             JOIN posts AS post ON post.id = link.post_id \
+             JOIN post_revisions AS revision \
+               ON revision.post_id = link.post_id \
+              AND revision.edit_version = link.revision_version \
+             WHERE link.token_hash = $1 AND link.expires_at > $2 \
+               AND link.guard_edit_version = post.edit_version \
+               AND NOT (post.published = TRUE \
+                        AND (post.publish_at = 0 OR post.publish_at <= $2))",
+        )
+        .bind(token_hash)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let revision = Self::revision_from_row(&row)?;
+        let link = PostReviewLink {
+            post_id: row.try_get("link_post_id")?,
+            revision_version: row.try_get("revision_version")?,
+            guard_edit_version: row.try_get("guard_edit_version")?,
+            token_hash: row.try_get("token_hash")?,
+            generation: row.try_get("generation")?,
+            expires_at: row.try_get("expires_at")?,
+            issued_at: row.try_get("issued_at")?,
+            issued_by_sub: row.try_get("issued_by_sub")?,
+        };
+        let stable = Post {
+            id: row.try_get("stable_id")?,
+            slug: row.try_get("stable_slug")?,
+            title: String::new(),
+            body_md: String::new(),
+            author_sub: row.try_get("stable_author_sub")?,
+            author_email: row.try_get("stable_author_email")?,
+            created_at: row.try_get("stable_created_at")?,
+            updated_at: 0,
+            edit_version: link.guard_edit_version,
+            published: false,
+            publish_at: 0,
+            featured: false,
+            pinned: false,
+            tags: String::new(),
+            cover_url: String::new(),
+            custom_excerpt: String::new(),
+            meta_title: String::new(),
+            meta_description: String::new(),
+            canonical_url: String::new(),
+            social_title: String::new(),
+            social_description: String::new(),
+            social_image: String::new(),
+        };
+        Ok(Some(ResolvedPostReview {
+            post: review_post_from_revision(&stable, &revision),
+            revision,
+            link,
+        }))
     }
 
     async fn put_writer_autosave_async(
@@ -3192,6 +4043,45 @@ impl Store for PgStore {
         revision_id: &str,
     ) -> Result<Option<PostRevision>, StoreError> {
         self.get_post_revision_async(post_id, revision_id)
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))
+    }
+
+    async fn get_post_review_link(
+        &self,
+        post_id: &str,
+        owner_sub: &str,
+        now: i64,
+    ) -> Result<Option<PostReviewLink>, StoreError> {
+        self.get_post_review_link_async(post_id, owner_sub, now)
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))
+    }
+
+    async fn save_post_review_link(
+        &self,
+        command: SavePostReviewLinkCommand,
+    ) -> Result<SavePostReviewLinkOutcome, StoreError> {
+        self.save_post_review_link_async(&command)
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))
+    }
+
+    async fn revoke_post_review_link(
+        &self,
+        command: RevokePostReviewLinkCommand,
+    ) -> Result<RevokePostReviewLinkOutcome, StoreError> {
+        self.revoke_post_review_link_async(&command)
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))
+    }
+
+    async fn resolve_post_review(
+        &self,
+        token_hash: &str,
+        now: i64,
+    ) -> Result<Option<ResolvedPostReview>, StoreError> {
+        self.resolve_post_review_async(token_hash, now)
             .await
             .map_err(|error| StoreError::Backend(error.to_string()))
     }
@@ -4408,5 +5298,133 @@ mod tests {
             store.get_post("timestamp-exhausted").await.unwrap().body_md,
             timestamp_exhausted.body_md
         );
+    }
+
+    #[test]
+    fn memory_revision_prune_keeps_newest_window_then_one_older_pinned_snapshot() {
+        let revisions = |post_id: &str, count: i64| {
+            let mut fixture = post(post_id, 100);
+            (1..=count)
+                .map(|version| {
+                    fixture.edit_version = version;
+                    fixture.updated_at = version;
+                    revision_from_post(&fixture, "u", "u@hf", "test", None)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut pinned_inside = revisions("review-prune-inside", 101);
+        prune_mem_revisions(&mut pinned_inside, "review-prune-inside", Some(100));
+        assert_eq!(pinned_inside.len(), crate::config::REVISION_KEEP_LIMIT);
+        assert!(pinned_inside
+            .iter()
+            .any(|revision| revision.edit_version == 100));
+        assert!(!pinned_inside
+            .iter()
+            .any(|revision| revision.edit_version == 1));
+
+        let mut pinned_outside = revisions("review-prune-outside", 102);
+        prune_mem_revisions(&mut pinned_outside, "review-prune-outside", Some(1));
+        assert_eq!(pinned_outside.len(), crate::config::REVISION_KEEP_LIMIT + 1);
+        assert!(pinned_outside
+            .iter()
+            .any(|revision| revision.edit_version == 1));
+        assert!(!pinned_outside
+            .iter()
+            .any(|revision| revision.edit_version == 2));
+    }
+
+    #[tokio::test]
+    async fn rollback_version_advance_invalidates_guard_and_v8_save_never_revives_link() {
+        let store = InMemoryStore::new();
+        let mut fixture = post("review-rollback-guard", 100);
+        fixture.published = false;
+        fixture.body_md = "v8 pinned body".to_string();
+        store.create_post(&fixture).await.unwrap();
+        let issued = store
+            .save_post_review_link(SavePostReviewLinkCommand {
+                post_id: fixture.id.clone(),
+                owner_sub: fixture.author_sub.clone(),
+                expected_post_version: 1,
+                expected_generation: None,
+                token_hash: "a".repeat(64),
+                requested_expires_at: 1_000,
+                now: 100,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(issued, SavePostReviewLinkOutcome::Saved(_)));
+        assert!(store
+            .resolve_post_review(&"a".repeat(64), 101)
+            .await
+            .unwrap()
+            .is_some());
+
+        // Simulate a rollback image that knows `posts.edit_version` but not review-link guards.
+        // It advances the post row directly and leaves the capability row untouched.
+        {
+            let _mutation = store.mutation_lock.lock().unwrap();
+            let mut posts = store.posts.lock().unwrap();
+            let current = posts.iter_mut().find(|post| post.id == fixture.id).unwrap();
+            current.edit_version = 2;
+            current.updated_at = 101;
+            current.body_md = "rollback image body".to_string();
+        }
+        assert!(store
+            .resolve_post_review(&"a".repeat(64), 102)
+            .await
+            .unwrap()
+            .is_none());
+
+        let current = store.get_post(&fixture.slug).await.unwrap();
+        let mut v8_edit = current.clone();
+        v8_edit.body_md = "v8 after rollback".to_string();
+        v8_edit.updated_at = 102;
+        assert!(matches!(
+            store
+                .save_post(SavePostCommand {
+                    post: v8_edit,
+                    expected_version: 2,
+                    editor_sub: fixture.author_sub.clone(),
+                    editor_email: fixture.author_email.clone(),
+                    source: "v8-after-rollback".to_string(),
+                    restored_from: None,
+                    consume_autosave_session: None,
+                })
+                .await
+                .unwrap(),
+            SavePostOutcome::Saved(_)
+        ));
+        assert!(store.review_links.lock().unwrap().is_empty());
+        assert!(store
+            .resolve_post_review(&"a".repeat(64), 103)
+            .await
+            .unwrap()
+            .is_none());
+
+        let current = store.get_post(&fixture.slug).await.unwrap();
+        let replacement = store
+            .save_post_review_link(SavePostReviewLinkCommand {
+                post_id: current.id,
+                owner_sub: current.author_sub,
+                expected_post_version: current.edit_version,
+                expected_generation: None,
+                token_hash: "b".repeat(64),
+                requested_expires_at: 1_000,
+                now: 103,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(replacement, SavePostReviewLinkOutcome::Saved(_)));
+        assert!(store
+            .resolve_post_review(&"a".repeat(64), 104)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .resolve_post_review(&"b".repeat(64), 104)
+            .await
+            .unwrap()
+            .is_some());
     }
 }

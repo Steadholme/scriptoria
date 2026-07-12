@@ -12,8 +12,8 @@ use crate::error::AppError;
 use crate::handlers::files::{html_with_csrf, redirect_found};
 use crate::handlers::{app_css, dynamic_js, esc, fmt_ts, human_size, userbox};
 use crate::model::{
-    FolderRec, UploadRequestInbox, UploadRequestInboxView, UploadRequestRec, UploadRequestSummary,
-    UploadSubmission, UPLOAD_REQUEST_INBOX_CAP,
+    FolderRec, UploadDeliveryBundle, UploadRequestInbox, UploadRequestInboxView, UploadRequestRec,
+    UploadRequestSummary, UploadSubmission, UPLOAD_REQUEST_INBOX_CAP,
 };
 use crate::store::{
     DEFAULT_REQUEST_ALLOWED_TYPES, DEFAULT_REQUEST_MAX_FILES, DEFAULT_REQUEST_MAX_FILE_BYTES,
@@ -114,16 +114,23 @@ pub async fn detail(
         .store
         .list_upload_submissions(&request.id, &actor.subject)
         .await?;
+    let deliveries = state
+        .store
+        .list_upload_deliveries(&request.id, &actor.subject)
+        .await?;
     let csrf = auth::new_csrf_token();
     let as_of = now_secs();
     let html = render_detail(
         &actor.email,
         &csrf,
-        &request,
-        folder.as_ref(),
-        &submissions,
-        &state.config.public_base,
-        as_of,
+        RequestDetailContext {
+            request: &request,
+            folder: folder.as_ref(),
+            deliveries: &deliveries,
+            submissions: &submissions,
+            public_base: &state.config.public_base,
+            as_of,
+        },
     );
     Ok(html_with_csrf(StatusCode::OK, html, &csrf))
 }
@@ -303,6 +310,30 @@ pub async fn rotate(
         &actor.subject,
         &id,
         "upload request",
+    ));
+    Ok(redirect_found(&format!("/requests/{id}")))
+}
+
+pub async fn acknowledge_delivery(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, delivery_id)): Path<(String, String)>,
+    Form(form): Form<RequestActionForm>,
+) -> Result<Response, AppError> {
+    verify_csrf(&headers, &form.csrf_token)?;
+    let actor = auth::identity(&headers);
+    if !state
+        .store
+        .acknowledge_upload_delivery(&id, &delivery_id, &actor.subject, now_secs())
+        .await?
+    {
+        return Err(AppError::NotFound("No such delivery.".to_string()));
+    }
+    state.audit.emit(AuditEvent::notice(
+        "upload_delivery.acknowledge",
+        &actor.subject,
+        &id,
+        "delivery",
     ));
     Ok(redirect_found(&format!("/requests/{id}")))
 }
@@ -613,20 +644,72 @@ fn render_inbox_row(request: &UploadRequestSummary, as_of: i64) -> String {
     )
 }
 
-fn render_detail(
-    email: &str,
-    csrf: &str,
-    request: &UploadRequestRec,
-    folder: Option<&FolderRec>,
-    submissions: &[UploadSubmission],
-    public_base: &str,
+struct RequestDetailContext<'a> {
+    request: &'a UploadRequestRec,
+    folder: Option<&'a FolderRec>,
+    deliveries: &'a [UploadDeliveryBundle],
+    submissions: &'a [UploadSubmission],
+    public_base: &'a str,
     as_of: i64,
-) -> String {
+}
+
+fn render_detail(email: &str, csrf: &str, detail: RequestDetailContext<'_>) -> String {
+    let RequestDetailContext {
+        request,
+        folder,
+        deliveries,
+        submissions,
+        public_base,
+        as_of,
+    } = detail;
     let url = format!("{}/u/{}", public_base, request.token);
-    let receipts = if submissions.is_empty() {
-        "<li class=\"muted\">No files received yet.</li>".to_string()
-    } else {
-        submissions
+    let mut receipts = deliveries
+        .iter()
+        .map(|bundle| {
+            let files = bundle
+                .submissions
+                .iter()
+                .map(|submission| {
+                    format!(
+                        "<li class=\"request-receipt\"><a href=\"/f/{file_id}\">{name}</a><span>{size} · {kind} · {date}</span></li>",
+                        file_id = esc(&submission.file_id),
+                        name = esc(&submission.name),
+                        size = esc(&human_size(submission.size)),
+                        kind = esc(&submission.content_type),
+                        date = esc(&fmt_ts(submission.created_at)),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            let (status, acknowledgement) = match bundle.delivery.acknowledged_at {
+                Some(at) => (
+                    "Acknowledged",
+                    format!("<span class=\"muted\">Acknowledged {}</span>", esc(&fmt_ts(at))),
+                ),
+                None => (
+                    "Received",
+                    format!(
+                        "<form method=\"post\" action=\"/requests/{request_id}/deliveries/{delivery_id}/acknowledge\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\"><button class=\"btn btn-secondary btn-sm\" type=\"submit\">Acknowledge</button></form>",
+                        request_id = esc(&request.id),
+                        delivery_id = esc(&bundle.delivery.id),
+                        csrf = esc(csrf),
+                    ),
+                ),
+            };
+            format!(
+                "<article class=\"request-delivery\"><div class=\"card__head\"><div><p class=\"eyebrow\">Delivery · {created}</p><h3>{status}</h3></div>{acknowledgement}</div><ol class=\"request-receipts\">{files}</ol><p class=\"muted\">Receipt available until {expiry}</p></article>",
+                created = esc(&fmt_ts(bundle.delivery.created_at)),
+                expiry = esc(&fmt_ts(bundle.delivery.receipt_expires_at)),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let legacy: Vec<_> = submissions
+        .iter()
+        .filter(|submission| submission.delivery_id.is_none())
+        .collect();
+    if !legacy.is_empty() {
+        let files = legacy
             .iter()
             .map(|submission| {
                 format!(
@@ -639,8 +722,14 @@ fn render_detail(
                 )
             })
             .collect::<Vec<_>>()
-            .join("")
-    };
+            .join("");
+        receipts.push_str(&format!(
+            "<article class=\"request-delivery request-delivery--legacy\"><div><p class=\"eyebrow\">Legacy receipts</p><h3>Recorded before delivery tracking</h3></div><ol class=\"request-receipts\">{files}</ol></article>"
+        ));
+    }
+    if receipts.is_empty() {
+        receipts = "<p class=\"muted\">No files received yet.</p>".to_string();
+    }
     let action = if request.is_open() && !request.is_expired(as_of) {
         format!(
             "<form method=\"post\" action=\"/requests/{id}/close\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\"><button class=\"btn btn-danger\" type=\"submit\">Close request</button></form>",

@@ -1880,6 +1880,12 @@ body.has-preview { overflow:hidden; }
 .request-policy select { width:100%; }
 .request-policy textarea { min-height:92px; resize:vertical; }
 .request-policy__wide { grid-column:1/-1; }
+.request-deliveries { display:grid; gap:14px; }
+.request-delivery { padding:16px; border:1px solid var(--border); border-radius:14px; background:var(--surface-soft); }
+.request-delivery .card__head { margin-bottom:4px; }
+.request-delivery h3 { margin:0; font-size:1rem; }
+.request-delivery > .muted { margin:10px 0 0; font-size:.78rem; }
+.request-delivery--legacy { border-style:dashed; }
 .request-receipts { display:grid; gap:0; margin:0; padding:0; list-style:none; }
 .request-receipt { display:flex; justify-content:space-between; gap:14px; padding:12px 0; border-top:1px solid var(--border); }
 .request-receipt span { color:var(--muted); font-size:.82rem; text-align:right; }

@@ -470,6 +470,27 @@ pub struct UploadRequestInbox {
     pub truncated: bool,
 }
 
+/// One anonymous delivery session created by the first successfully committed request upload.
+/// `receipt_token_hash` is the SHA-256 digest of an independently generated receipt capability;
+/// the raw token is returned only to the submitter and is never stored in metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UploadDelivery {
+    pub id: String,
+    pub request_id: String,
+    pub receipt_token_hash: String,
+    pub created_at: i64,
+    pub acknowledged_at: Option<i64>,
+    pub receipt_expires_at: i64,
+}
+
+/// A delivery plus the immutable file snapshots that belong to it. Owner and public receipt
+/// renderers share this value, while authorization remains in the Store query that constructs it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UploadDeliveryBundle {
+    pub delivery: UploadDelivery,
+    pub submissions: Vec<UploadSubmission>,
+}
+
 /// Immutable receipt for one file accepted through an [`UploadRequestRec`]. File metadata is
 /// snapshotted here so the request history remains intelligible after the file is moved or purged.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -481,6 +502,8 @@ pub struct UploadSubmission {
     pub content_type: String,
     pub size: i64,
     pub created_at: i64,
+    /// `None` for pre-v8 legacy rows. New uploads always bind to one delivery session.
+    pub delivery_id: Option<String>,
 }
 
 /// Owner-library view selected by the URL. `All` is the global search/filter result set;

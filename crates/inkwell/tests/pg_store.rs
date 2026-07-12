@@ -22,7 +22,9 @@ use inkwell::store::{
     AutosaveOutcome, Chunk, DeletePostCommand, DeletePostOutcome, DeletePostScope,
     DeletePostSelection, DeletePostsCommand, DeletePostsOutcome, LibraryBulkAction,
     LibraryBulkCommand, LibraryBulkOutcome, LibraryQuery, LibrarySelection, LibrarySort,
-    LibraryStatus, PgStore, Post, SavePostCommand, SavePostOutcome, Store, WriterAutosave,
+    LibraryStatus, PgStore, Post, RevokePostReviewLinkCommand, RevokePostReviewLinkOutcome,
+    SavePostCommand, SavePostOutcome, SavePostReviewLinkCommand, SavePostReviewLinkOutcome, Store,
+    WriterAutosave,
 };
 use inkwell::{app, build_dev_state, now_secs, AppState};
 use tower::ServiceExt;
@@ -42,13 +44,19 @@ async fn pg_store_full_integration() {
         .await
         .expect("connect TEST_DATABASE_URL");
     let raw = sqlx::PgPool::connect(&url).await.expect("raw test pool");
-    sqlx::query("DROP TABLE IF EXISTS writer_autosaves, post_revisions")
+    sqlx::query("DROP TABLE IF EXISTS post_review_links, writer_autosaves, post_revisions")
         .execute(&raw)
         .await
         .expect("reset child tables for a fresh-schema migration");
     pg.migrate().await.expect("migrate");
     pg.migrate().await.expect("migrate is idempotent");
-    for table in ["writer_autosaves", "post_revisions", "chunks", "posts"] {
+    for table in [
+        "post_review_links",
+        "writer_autosaves",
+        "post_revisions",
+        "chunks",
+        "posts",
+    ] {
         sqlx::query(&format!("DELETE FROM {table}"))
             .execute(&raw)
             .await
@@ -58,15 +66,15 @@ async fn pg_store_full_integration() {
         "SELECT count(*) FROM pg_constraint c \
          JOIN pg_class child ON child.oid = c.conrelid \
          WHERE c.contype = 'f' AND c.confdeltype = 'c' \
-           AND child.relname IN ('post_revisions', 'writer_autosaves') \
+           AND child.relname IN ('post_revisions', 'writer_autosaves', 'post_review_links') \
            AND child.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema())",
     )
     .fetch_one(&raw)
     .await
     .expect("inspect fresh-schema foreign keys");
     assert_eq!(
-        cascading_foreign_keys, 2,
-        "fresh revision and autosave tables both cascade with their post"
+        cascading_foreign_keys, 4,
+        "fresh revisions, autosaves, and both review-link relationships cascade"
     );
     let pg = Arc::new(pg);
 
@@ -634,21 +642,13 @@ async fn pg_store_full_integration() {
     );
     let created_cursor = library_created.next.clone().unwrap();
     let library_created_second = pg
-        .list_library(library_query(
-            library_created.next,
-            1,
-            LibrarySort::Created,
-        ))
+        .list_library(library_query(library_created.next, 1, LibrarySort::Created))
         .await
         .expect("PG library created continuation");
     assert_eq!(library_created_second.posts[0].id, library_one.id);
     assert!(library_created_second.next.is_none());
     let mismatched_cursor = pg
-        .list_library(library_query(
-            Some(created_cursor),
-            2,
-            LibrarySort::Updated,
-        ))
+        .list_library(library_query(Some(created_cursor), 2, LibrarySort::Updated))
         .await
         .expect("PG mismatched cursor fails closed");
     assert!(mismatched_cursor.posts.is_empty());
@@ -1194,6 +1194,515 @@ async fn pg_store_full_integration() {
         "scheduled post joins an already non-empty cache at its instant"
     );
 
+    // --- version-pinned external review capability -------------------------
+    let mut review_post = post2.clone();
+    review_post.id = "post_pg_review_link".to_string();
+    review_post.slug = "pg-review-link".to_string();
+    review_post.title = "PG review draft".to_string();
+    review_post.body_md = "pinned revision one".to_string();
+    review_post.created_at = now - 750;
+    review_post.updated_at = now - 750;
+    review_post.published = false;
+    review_post.publish_at = 0;
+    pg.create_post(&review_post)
+        .await
+        .expect("create PG review-link fixture");
+
+    let raw_review_token = "pg-raw-review-token-never-persisted";
+    let first_hash = review_digest(raw_review_token);
+    let first = pg
+        .save_post_review_link(SavePostReviewLinkCommand {
+            post_id: review_post.id.clone(),
+            owner_sub: review_post.author_sub.clone(),
+            expected_post_version: 1,
+            expected_generation: None,
+            token_hash: first_hash.clone(),
+            requested_expires_at: now + inkwell::config::REVIEW_LINK_SHORT_TTL_SECS,
+            now,
+        })
+        .await
+        .expect("issue PG review link");
+    let first = match first {
+        SavePostReviewLinkOutcome::Saved(link) => link,
+        other => panic!("unexpected PG issue outcome: {other:?}"),
+    };
+    assert_eq!(first.revision_version, 1);
+    assert_eq!(first.guard_edit_version, 1);
+    assert_ne!(first.token_hash, raw_review_token);
+    let persisted: (String, i64, i64) = sqlx::query_as(
+        "SELECT token_hash, revision_version, guard_edit_version \
+         FROM post_review_links WHERE post_id = $1",
+    )
+    .bind(&review_post.id)
+    .fetch_one(&raw)
+    .await
+    .expect("inspect hashed PG capability");
+    assert_eq!(persisted, (first_hash.clone(), 1, 1));
+    assert!(!persisted.0.contains(raw_review_token));
+    assert!(pg
+        .get_post_review_link(&review_post.id, "u_foreign", now)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        pg.save_post_review_link(SavePostReviewLinkCommand {
+            post_id: review_post.id.clone(),
+            owner_sub: "u_foreign".to_string(),
+            expected_post_version: 1,
+            expected_generation: None,
+            token_hash: "8".repeat(64),
+            requested_expires_at: now + 100,
+            now,
+        })
+        .await
+        .unwrap(),
+        SavePostReviewLinkOutcome::NotFound
+    );
+
+    let mut review_v2 = review_post.clone();
+    review_v2.body_md = "current revision two".to_string();
+    review_v2.updated_at = now - 700;
+    let review_v2 = match pg
+        .save_post(SavePostCommand {
+            post: review_v2,
+            expected_version: 1,
+            editor_sub: review_post.author_sub.clone(),
+            editor_email: review_post.author_email.clone(),
+            source: "review-v2".to_string(),
+            restored_from: None,
+            consume_autosave_session: None,
+        })
+        .await
+        .unwrap()
+    {
+        SavePostOutcome::Saved(post) => *post,
+        other => panic!("unexpected PG review edit outcome: {other:?}"),
+    };
+    let pinned = pg
+        .resolve_post_review(&first_hash, now)
+        .await
+        .unwrap()
+        .expect("v8 edit preserves pinned PG review");
+    assert_eq!(pinned.post.body_md, "pinned revision one");
+    assert_eq!(pinned.link.guard_edit_version, 2);
+
+    let rotate_a = SavePostReviewLinkCommand {
+        post_id: review_v2.id.clone(),
+        owner_sub: review_v2.author_sub.clone(),
+        expected_post_version: 2,
+        expected_generation: Some(first.generation),
+        token_hash: "9".repeat(64),
+        requested_expires_at: now + inkwell::config::REVIEW_LINK_MAX_TTL_SECS,
+        now,
+    };
+    let rotate_b = SavePostReviewLinkCommand {
+        token_hash: "a".repeat(64),
+        ..rotate_a.clone()
+    };
+    let pg_a = pg.clone();
+    let pg_b = pg.clone();
+    let (rotated_a, rotated_b) = tokio::join!(
+        pg_a.save_post_review_link(rotate_a),
+        pg_b.save_post_review_link(rotate_b)
+    );
+    let rotations = [rotated_a.unwrap(), rotated_b.unwrap()];
+    assert_eq!(
+        rotations
+            .iter()
+            .filter(|outcome| matches!(outcome, SavePostReviewLinkOutcome::Saved(_)))
+            .count(),
+        1,
+        "one PG refresh CAS wins"
+    );
+    assert_eq!(
+        rotations
+            .iter()
+            .filter(|outcome| matches!(outcome, SavePostReviewLinkOutcome::Conflict))
+            .count(),
+        1,
+        "one PG refresh CAS loses"
+    );
+    assert!(pg
+        .resolve_post_review(&first_hash, now)
+        .await
+        .unwrap()
+        .is_none());
+    let rotated = pg
+        .get_post_review_link(&review_v2.id, &review_v2.author_sub, now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rotated.generation, first.generation + 1);
+    assert_eq!(rotated.revision_version, 2);
+    assert_eq!(
+        pg.revoke_post_review_link(RevokePostReviewLinkCommand {
+            post_id: review_v2.id.clone(),
+            owner_sub: "u_foreign".to_string(),
+            expected_post_version: 2,
+            expected_generation: rotated.generation,
+            now,
+        })
+        .await
+        .unwrap(),
+        RevokePostReviewLinkOutcome::NotFound
+    );
+    assert_eq!(
+        pg.revoke_post_review_link(RevokePostReviewLinkCommand {
+            post_id: review_v2.id.clone(),
+            owner_sub: review_v2.author_sub.clone(),
+            expected_post_version: 2,
+            expected_generation: rotated.generation,
+            now,
+        })
+        .await
+        .unwrap(),
+        RevokePostReviewLinkOutcome::Revoked
+    );
+    let after_revoke = pg
+        .save_post_review_link(SavePostReviewLinkCommand {
+            post_id: review_v2.id.clone(),
+            owner_sub: review_v2.author_sub.clone(),
+            expected_post_version: 2,
+            expected_generation: None,
+            token_hash: "b".repeat(64),
+            requested_expires_at: now + 600,
+            now,
+        })
+        .await
+        .unwrap();
+    let after_revoke = match after_revoke {
+        SavePostReviewLinkOutcome::Saved(link) => link,
+        other => panic!("unexpected PG reissue outcome: {other:?}"),
+    };
+    assert!(after_revoke.generation > rotated.generation);
+
+    // A rollback image advances posts directly but cannot advance the v8-only guard. Resolution
+    // fails immediately, and the next v8 edit deletes the stale capability instead of reviving it.
+    sqlx::query(
+        "UPDATE posts SET body_md = $2, edit_version = edit_version + 1, \
+                          updated_at = updated_at + 1 WHERE id = $1",
+    )
+    .bind(&review_v2.id)
+    .bind("rollback image version three")
+    .execute(&raw)
+    .await
+    .expect("simulate rollback image version advance");
+    assert!(pg
+        .resolve_post_review(&after_revoke.token_hash, now)
+        .await
+        .unwrap()
+        .is_none());
+    let rollback_current = pg.get_post(&review_v2.slug).await.unwrap();
+    assert_eq!(rollback_current.edit_version, 3);
+    let mut forward_edit = rollback_current.clone();
+    forward_edit.body_md = "v8 after rollback".to_string();
+    forward_edit.updated_at += 1;
+    assert!(matches!(
+        pg.save_post(SavePostCommand {
+            post: forward_edit,
+            expected_version: 3,
+            editor_sub: review_v2.author_sub.clone(),
+            editor_email: review_v2.author_email.clone(),
+            source: "v8-after-rollback".to_string(),
+            restored_from: None,
+            consume_autosave_session: None,
+        })
+        .await
+        .unwrap(),
+        SavePostOutcome::Saved(_)
+    ));
+    let review_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM post_review_links WHERE post_id = $1")
+            .bind(&review_v2.id)
+            .fetch_one(&raw)
+            .await
+            .unwrap();
+    assert_eq!(review_rows, 0, "v8 write removes a lagging guard");
+    assert!(pg
+        .resolve_post_review(&after_revoke.token_hash, now)
+        .await
+        .unwrap()
+        .is_none());
+
+    // Also cover a true old-image same-version write followed by startup migration. Forward
+    // repair advances the post version and removes the guard mismatch in the same transaction.
+    let review_v4 = pg.get_post(&review_v2.slug).await.unwrap();
+    let pre_migration = pg
+        .save_post_review_link(SavePostReviewLinkCommand {
+            post_id: review_v4.id.clone(),
+            owner_sub: review_v4.author_sub.clone(),
+            expected_post_version: review_v4.edit_version,
+            expected_generation: None,
+            token_hash: "c".repeat(64),
+            requested_expires_at: now + 600,
+            now,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(pre_migration, SavePostReviewLinkOutcome::Saved(_)));
+    sqlx::query("UPDATE posts SET body_md = $2 WHERE id = $1")
+        .bind(&review_v4.id)
+        .bind("same-version rollback write")
+        .execute(&raw)
+        .await
+        .unwrap();
+    pg.migrate()
+        .await
+        .expect("forward repair review-link guard");
+    let repaired_review_post = pg.get_post(&review_v4.slug).await.unwrap();
+    assert_eq!(
+        repaired_review_post.edit_version,
+        review_v4.edit_version + 1
+    );
+    assert!(pg
+        .resolve_post_review(&"c".repeat(64), now)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM post_review_links WHERE post_id = $1")
+            .bind(&review_v4.id)
+            .fetch_one(&raw)
+            .await
+            .unwrap(),
+        0
+    );
+
+    let final_link = pg
+        .save_post_review_link(SavePostReviewLinkCommand {
+            post_id: repaired_review_post.id.clone(),
+            owner_sub: repaired_review_post.author_sub.clone(),
+            expected_post_version: repaired_review_post.edit_version,
+            expected_generation: None,
+            token_hash: "d".repeat(64),
+            requested_expires_at: now + 600,
+            now,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(final_link, SavePostReviewLinkOutcome::Saved(_)));
+    assert!(matches!(
+        pg.delete_post_cas(DeletePostCommand {
+            post_id: repaired_review_post.id.clone(),
+            slug: repaired_review_post.slug.clone(),
+            expected_version: repaired_review_post.edit_version,
+            scope: DeletePostScope::Owner(repaired_review_post.author_sub.clone()),
+        })
+        .await
+        .unwrap(),
+        DeletePostOutcome::Deleted(_)
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM post_review_links WHERE post_id = $1")
+            .bind(&repaired_review_post.id)
+            .fetch_one(&raw)
+            .await
+            .unwrap(),
+        0,
+        "review capability cascades with deletion"
+    );
+
+    let mut scheduled_review = post2.clone();
+    scheduled_review.id = "post_pg_scheduled_review".to_string();
+    scheduled_review.slug = "pg-scheduled-review".to_string();
+    scheduled_review.body_md = "scheduled review snapshot".to_string();
+    scheduled_review.published = false;
+    scheduled_review.publish_at = 0;
+    scheduled_review.created_at = now - 740;
+    scheduled_review.updated_at = now - 740;
+    pg.create_post(&scheduled_review).await.unwrap();
+    let scheduled_capability = match pg
+        .save_post_review_link(SavePostReviewLinkCommand {
+            post_id: scheduled_review.id.clone(),
+            owner_sub: scheduled_review.author_sub.clone(),
+            expected_post_version: 1,
+            expected_generation: None,
+            token_hash: "e".repeat(64),
+            requested_expires_at: now + inkwell::config::REVIEW_LINK_MAX_TTL_SECS,
+            now,
+        })
+        .await
+        .unwrap()
+    {
+        SavePostReviewLinkOutcome::Saved(link) => link,
+        other => panic!("unexpected PG scheduled capability issue: {other:?}"),
+    };
+    let publish_at = now + 3_600;
+    let mut schedule = scheduled_review.clone();
+    schedule.published = true;
+    schedule.publish_at = publish_at;
+    schedule.updated_at = now;
+    let scheduled_v2 = match pg
+        .save_post(SavePostCommand {
+            post: schedule,
+            expected_version: 1,
+            editor_sub: scheduled_review.author_sub.clone(),
+            editor_email: scheduled_review.author_email.clone(),
+            source: "review-schedule".to_string(),
+            restored_from: None,
+            consume_autosave_session: None,
+        })
+        .await
+        .unwrap()
+    {
+        SavePostOutcome::Saved(post) => *post,
+        other => panic!("unexpected PG scheduled review save: {other:?}"),
+    };
+    let clamped = pg
+        .get_post_review_link(&scheduled_v2.id, &scheduled_v2.author_sub, now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(clamped.expires_at, publish_at);
+    assert_eq!(clamped.guard_edit_version, 2);
+    assert!(pg
+        .resolve_post_review(&scheduled_capability.token_hash, publish_at)
+        .await
+        .unwrap()
+        .is_none());
+    let mut unschedule = scheduled_v2.clone();
+    unschedule.published = false;
+    unschedule.publish_at = 0;
+    unschedule.updated_at = now + 1;
+    assert!(matches!(
+        pg.save_post(SavePostCommand {
+            post: unschedule,
+            expected_version: 2,
+            editor_sub: scheduled_review.author_sub.clone(),
+            editor_email: scheduled_review.author_email.clone(),
+            source: "review-unschedule".to_string(),
+            restored_from: None,
+            consume_autosave_session: None,
+        })
+        .await
+        .unwrap(),
+        SavePostOutcome::Saved(_)
+    ));
+    assert!(pg
+        .resolve_post_review(&scheduled_capability.token_hash, now + 2)
+        .await
+        .unwrap()
+        .is_none());
+    pg.delete_post(&scheduled_review.slug).await.unwrap();
+
+    // Retention parity: a pinned revision already inside the ordinary newest-100 window does not
+    // enlarge it. The pre-fix PG query excluded the pin before OFFSET and retained 101 rows here.
+    let mut prune_inside = post2.clone();
+    prune_inside.id = "post_pg_review_prune_inside".to_string();
+    prune_inside.slug = "pg-review-prune-inside".to_string();
+    prune_inside.body_md = "review prune inside v1".to_string();
+    prune_inside.created_at = now - 730;
+    prune_inside.updated_at = now - 730;
+    prune_inside.published = false;
+    prune_inside.publish_at = 0;
+    pg.create_post(&prune_inside).await.unwrap();
+    let prune_inside = advance_review_fixture(pg.as_ref(), prune_inside, 100).await;
+    let inside_link = match pg
+        .save_post_review_link(SavePostReviewLinkCommand {
+            post_id: prune_inside.id.clone(),
+            owner_sub: prune_inside.author_sub.clone(),
+            expected_post_version: prune_inside.edit_version,
+            expected_generation: None,
+            token_hash: "f".repeat(64),
+            requested_expires_at: now + inkwell::config::REVIEW_LINK_MAX_TTL_SECS,
+            now,
+        })
+        .await
+        .unwrap()
+    {
+        SavePostReviewLinkOutcome::Saved(link) => link,
+        other => panic!("unexpected inside-window review issue: {other:?}"),
+    };
+    assert_eq!(inside_link.revision_version, 100);
+    let prune_inside = advance_review_fixture(pg.as_ref(), prune_inside, 101).await;
+    let inside_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM post_revisions WHERE post_id = $1")
+            .bind(&prune_inside.id)
+            .fetch_one(&raw)
+            .await
+            .unwrap();
+    assert_eq!(inside_count, inkwell::config::REVISION_KEEP_LIMIT as i64);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM post_revisions \
+             WHERE post_id = $1 AND edit_version IN (1, 100)",
+        )
+        .bind(&prune_inside.id)
+        .fetch_one(&raw)
+        .await
+        .unwrap(),
+        1,
+        "v100 remains pinned inside the window while v1 is pruned"
+    );
+    assert_eq!(
+        pg.resolve_post_review(&inside_link.token_hash, now)
+            .await
+            .unwrap()
+            .unwrap()
+            .revision
+            .edit_version,
+        100
+    );
+    pg.delete_post(&prune_inside.slug).await.unwrap();
+
+    // A pinned revision outside the newest-100 window is the one permitted extra row. A second
+    // unprotected old revision is still pruned, proving the keep set is exactly 100 + the pin.
+    let mut prune_outside = post2.clone();
+    prune_outside.id = "post_pg_review_prune_outside".to_string();
+    prune_outside.slug = "pg-review-prune-outside".to_string();
+    prune_outside.body_md = "review prune outside v1".to_string();
+    prune_outside.created_at = now - 720;
+    prune_outside.updated_at = now - 720;
+    prune_outside.published = false;
+    prune_outside.publish_at = 0;
+    pg.create_post(&prune_outside).await.unwrap();
+    let outside_link = match pg
+        .save_post_review_link(SavePostReviewLinkCommand {
+            post_id: prune_outside.id.clone(),
+            owner_sub: prune_outside.author_sub.clone(),
+            expected_post_version: prune_outside.edit_version,
+            expected_generation: None,
+            token_hash: "0".repeat(64),
+            requested_expires_at: now + inkwell::config::REVIEW_LINK_MAX_TTL_SECS,
+            now,
+        })
+        .await
+        .unwrap()
+    {
+        SavePostReviewLinkOutcome::Saved(link) => link,
+        other => panic!("unexpected outside-window review issue: {other:?}"),
+    };
+    let prune_outside = advance_review_fixture(pg.as_ref(), prune_outside, 102).await;
+    let outside_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM post_revisions WHERE post_id = $1")
+            .bind(&prune_outside.id)
+            .fetch_one(&raw)
+            .await
+            .unwrap();
+    assert_eq!(
+        outside_count,
+        inkwell::config::REVISION_KEEP_LIMIT as i64 + 1
+    );
+    let outside_versions: Vec<i64> = sqlx::query_scalar(
+        "SELECT edit_version FROM post_revisions \
+         WHERE post_id = $1 AND edit_version IN (1, 2) ORDER BY edit_version",
+    )
+    .bind(&prune_outside.id)
+    .fetch_all(&raw)
+    .await
+    .unwrap();
+    assert_eq!(outside_versions, vec![1]);
+    assert_eq!(
+        pg.resolve_post_review(&outside_link.token_hash, now)
+            .await
+            .unwrap()
+            .unwrap()
+            .revision
+            .edit_version,
+        1
+    );
+    pg.delete_post(&prune_outside.slug).await.unwrap();
+
     // Simulate an old rollback image writing every authoring field without advancing the new CAS
     // token. The forward migration must preserve that row as a new immutable version, then become
     // idempotent once its current snapshot matches.
@@ -1460,6 +1969,37 @@ async fn raw_call(state: &AppState, req: Request<Body>) -> (StatusCode, Vec<u8>)
 
 fn get(uri: &str) -> Request<Body> {
     Request::builder().uri(uri).body(Body::empty()).unwrap()
+}
+
+async fn advance_review_fixture(store: &dyn Store, mut post: Post, target_version: i64) -> Post {
+    while post.edit_version < target_version {
+        let mut next = post.clone();
+        next.body_md = format!("review retention v{}", post.edit_version + 1);
+        next.updated_at = post.updated_at + 1;
+        post = match store
+            .save_post(SavePostCommand {
+                post: next,
+                expected_version: post.edit_version,
+                editor_sub: post.author_sub.clone(),
+                editor_email: post.author_email.clone(),
+                source: "review-retention".to_string(),
+                restored_from: None,
+                consume_autosave_session: None,
+            })
+            .await
+            .unwrap()
+        {
+            SavePostOutcome::Saved(saved) => *saved,
+            other => panic!("unexpected review retention save: {other:?}"),
+        };
+    }
+    post
+}
+
+fn review_digest(raw: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    hex::encode(Sha256::digest(raw.as_bytes()))
 }
 
 fn assert_revision_matches_post(revision: &inkwell::store::PostRevision, post: &Post) {

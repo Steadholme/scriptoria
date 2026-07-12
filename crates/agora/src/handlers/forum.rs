@@ -24,8 +24,9 @@ use crate::handlers::{
 };
 use crate::model::{Bookmark, Post, ReactionCount, Thread, ThreadFollowLevel, ThreadReadingState};
 use crate::store::{
-    AcceptedAnswerAction, ReplyAnchor, ThreadPersonalSignals, ThreadSort, ThreadStatusFilter,
-    MAX_FOR_YOU_CANDIDATES, MAX_KLAXON_RECIPIENTS_PER_REPLY,
+    AcceptedAnswerAction, CatchUpCursor, CatchUpItem, CatchUpQuestionState, CatchUpReason,
+    CatchUpView, ReplyAnchor, ThreadSort, ThreadStatusFilter, MAX_CATCH_UP_PAGE,
+    MAX_KLAXON_RECIPIENTS_PER_REPLY,
 };
 use crate::{markdown, new_id, now_secs, AppState};
 
@@ -36,8 +37,6 @@ const RECENT_LIMIT: i64 = 20;
 pub const REPLIES_PER_PAGE: i64 = 20;
 /// Threads listed on a category page.
 const CATEGORY_LIMIT: i64 = 200;
-/// Final `/for-you` surface bound after a larger authoritative candidate set is projected.
-const FOR_YOU_LIMIT: usize = 30;
 /// Caps on user input (defense against absurd payloads; the store columns are TEXT).
 const MAX_TITLE: usize = 200;
 const MAX_BODY: usize = 20_000;
@@ -329,162 +328,221 @@ pub async fn home(
 }
 
 // ===========================================================================
-// GET /for-you — private, explainable personal feed
+// GET /for-you — private, task-oriented catch-up desk
 // ===========================================================================
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ForYouReason {
-    Watch,
-    Follow,
-    Authored,
-    Bookmarked,
-    Participated,
-    ContinueReading,
+#[derive(Debug, Default, Deserialize)]
+pub struct CatchUpQuery {
+    #[serde(default)]
+    view: Option<String>,
+    #[serde(default)]
+    as_of: Option<i64>,
+    #[serde(default)]
+    before: Option<String>,
 }
 
-impl ForYouReason {
-    const fn key(self) -> &'static str {
-        match self {
-            Self::Watch => "watch",
-            Self::Follow => "follow",
-            Self::Authored => "authored",
-            Self::Bookmarked => "bookmarked",
-            Self::Participated => "participated",
-            Self::ContinueReading => "reading",
+impl CatchUpQuery {
+    fn view(&self) -> Result<CatchUpView, AppError> {
+        match self.view.as_deref().unwrap_or("updates") {
+            "updates" => Ok(CatchUpView::Updates),
+            "following" => Ok(CatchUpView::Following),
+            "questions" => Ok(CatchUpView::Questions),
+            _ => Err(AppError::InvalidRequest(
+                "catch-up view must be updates, following, or questions".to_string(),
+            )),
         }
     }
 
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Watch => "Watching · new replies also enter Activity",
-            Self::Follow => "Following · kept in your personal feeds",
-            Self::Authored => "You started this thread",
-            Self::Bookmarked => "You bookmarked a post here",
-            Self::Participated => "You joined this conversation",
-            Self::ContinueReading => "Continue reading · unread posts remain",
+    fn page(&self, view: CatchUpView, now: i64) -> Result<(i64, Option<CatchUpCursor>), AppError> {
+        let as_of = self.as_of.unwrap_or(now);
+        if as_of < 0 || as_of > now {
+            return Err(AppError::InvalidRequest(
+                "catch-up as_of must be a current or past epoch".to_string(),
+            ));
         }
-    }
-
-    const fn priority(self) -> u8 {
-        match self {
-            Self::Watch => 0,
-            Self::Follow => 1,
-            Self::Authored => 2,
-            Self::Bookmarked => 3,
-            Self::Participated => 4,
-            Self::ContinueReading => 5,
+        let Some(raw_cursor) = self.before.as_deref() else {
+            return Ok((as_of, None));
+        };
+        if self.as_of.is_none() {
+            return Err(AppError::InvalidRequest(
+                "catch-up pagination requires its as_of snapshot".to_string(),
+            ));
         }
+        let cursor = parse_catch_up_cursor(raw_cursor)
+            .ok_or_else(|| AppError::InvalidRequest("catch-up cursor is malformed".to_string()))?;
+        if cursor.view != view || cursor.as_of != as_of {
+            return Err(AppError::InvalidRequest(
+                "catch-up cursor does not belong to this view and snapshot".to_string(),
+            ));
+        }
+        Ok((as_of, Some(cursor)))
     }
 }
 
-fn explain_personal_candidate(signals: ThreadPersonalSignals) -> Option<ForYouReason> {
-    if signals.follow_level == ThreadFollowLevel::Mute {
+fn encode_catch_up_cursor(cursor: &CatchUpCursor) -> String {
+    format!(
+        "v8g-{}-{}-{}-{}-{}",
+        cursor.view.as_str(),
+        cursor.as_of,
+        cursor.snapshot_generation,
+        cursor.activity_at,
+        hex::encode(cursor.thread_id.as_bytes()),
+    )
+}
+
+fn parse_catch_up_cursor(raw: &str) -> Option<CatchUpCursor> {
+    let mut parts = raw.trim().splitn(6, '-');
+    // The generation field is a semantic cursor upgrade. Pre-fix `v8-*` cursors fail closed
+    // instead of silently continuing on their weaker second-granularity boundary.
+    if parts.next()? != "v8g" {
         return None;
     }
-    match signals.follow_level {
-        ThreadFollowLevel::Watch => Some(ForYouReason::Watch),
-        ThreadFollowLevel::Follow => Some(ForYouReason::Follow),
-        ThreadFollowLevel::None | ThreadFollowLevel::Mute if signals.authored => {
-            Some(ForYouReason::Authored)
-        }
-        ThreadFollowLevel::None | ThreadFollowLevel::Mute if signals.bookmarked => {
-            Some(ForYouReason::Bookmarked)
-        }
-        ThreadFollowLevel::None | ThreadFollowLevel::Mute if signals.participated => {
-            Some(ForYouReason::Participated)
-        }
-        ThreadFollowLevel::None | ThreadFollowLevel::Mute
-            if signals.reading_started && signals.has_unread =>
-        {
-            Some(ForYouReason::ContinueReading)
-        }
-        ThreadFollowLevel::None | ThreadFollowLevel::Mute => None,
+    let view = match parts.next()? {
+        "updates" => CatchUpView::Updates,
+        "following" => CatchUpView::Following,
+        "questions" => CatchUpView::Questions,
+        _ => return None,
+    };
+    let as_of = parts.next()?.parse::<i64>().ok()?;
+    let snapshot_generation = parts.next()?.parse::<i64>().ok()?;
+    let activity_at = parts.next()?.parse::<i64>().ok()?;
+    let thread_id = String::from_utf8(hex::decode(parts.next()?).ok()?).ok()?;
+    if as_of < 0
+        || snapshot_generation < 0
+        || activity_at < 0
+        || activity_at > as_of
+        || thread_id.trim().is_empty()
+    {
+        return None;
     }
+    Some(CatchUpCursor {
+        view,
+        as_of,
+        snapshot_generation,
+        activity_at,
+        thread_id,
+    })
+}
+
+fn catch_up_href(view: CatchUpView, as_of: Option<i64>, before: Option<&CatchUpCursor>) -> String {
+    let mut href = format!("/for-you?view={}", view.as_str());
+    if let Some(as_of) = as_of {
+        href.push_str(&format!("&amp;as_of={as_of}"));
+    }
+    if let Some(cursor) = before {
+        href.push_str("&amp;before=");
+        href.push_str(&encode_catch_up_cursor(cursor));
+    }
+    href
+}
+
+fn render_catch_up_tabs(active: CatchUpView) -> String {
+    let tab = |view: CatchUpView, label: &str| {
+        format!(
+            r#"<a class="tab{active}" href="{href}"{current}>{label}</a>"#,
+            active = if view == active { " is-active" } else { "" },
+            href = catch_up_href(view, None, None),
+            current = if view == active {
+                r#" aria-current="page""#
+            } else {
+                ""
+            },
+            label = esc(label),
+        )
+    };
+    format!(
+        r#"<nav class="tabs ag-catch-up-tabs" aria-label="Catch-up views">{}{}{}</nav>"#,
+        tab(CatchUpView::Updates, "Updates"),
+        tab(CatchUpView::Following, "Following"),
+        tab(CatchUpView::Questions, "Your questions"),
+    )
 }
 
 pub async fn for_you(
     State(state): State<AppState>,
+    Query(query): Query<CatchUpQuery>,
     headers: HeaderMap,
 ) -> Result<Html<String>, AppError> {
     let identity = auth::require_author(&headers)?;
     let now = now_secs();
-
-    // Authorization comes first. The personal projection can only score ids returned by the
-    // same authoritative list path used by Latest; it can never introduce an otherwise-hidden
-    // thread through a bookmark, receipt, or stale preference row.
-    let candidates = state
+    let view = query.view()?;
+    let (as_of, before) = query.page(view, now)?;
+    let snapshot_generation = match before.as_ref() {
+        Some(cursor) => cursor.snapshot_generation,
+        None => state.store.catch_up_snapshot_generation().await?,
+    };
+    let mut items = state
         .store
-        .list_threads(
-            None,
-            ThreadSort::Latest,
-            None,
-            ThreadStatusFilter::Any,
-            MAX_FOR_YOU_CANDIDATES as i64,
-            now,
+        .catch_up_page(
+            &identity.sub,
+            view,
+            as_of,
+            snapshot_generation,
+            before.as_ref(),
+            MAX_CATCH_UP_PAGE + 1,
         )
         .await?;
-    let candidate_ids: Vec<String> = candidates.iter().map(|thread| thread.id.clone()).collect();
-    let signals = state
-        .store
-        .thread_personal_signals(&identity.sub, &candidate_ids)
-        .await?;
-    let mut personalized: Vec<(Thread, ForYouReason)> = candidates
-        .into_iter()
-        .filter_map(|thread| {
-            signals
-                .get(&thread.id)
-                .copied()
-                .and_then(explain_personal_candidate)
-                .map(|reason| (thread, reason))
-        })
-        .collect();
-    // `sort_by_key` is stable: within one explainable reason the authoritative Latest order is
-    // preserved, including its pinned semantics and deterministic id tie-break.
-    personalized.sort_by_key(|(_, reason)| reason.priority());
-    personalized.truncate(FOR_YOU_LIMIT);
-    let reasons: HashMap<String, ForYouReason> = personalized
-        .iter()
-        .map(|(thread, reason)| (thread.id.clone(), *reason))
-        .collect();
-    let threads: Vec<Thread> = personalized.into_iter().map(|(thread, _)| thread).collect();
-
-    let categories = state.store.list_categories().await?;
-    let category_names: HashMap<&str, &str> = categories
-        .iter()
-        .map(|category| (category.id.as_str(), category.name.as_str()))
-        .collect();
-    let question_categories: HashSet<&str> = categories
-        .iter()
-        .filter(|category| category.format.is_question())
-        .map(|category| category.id.as_str())
-        .collect();
-    // Exact unread details are loaded once only for the final rendered page, not for the larger
-    // candidate set. Candidate reading signals were already projected in the bounded batch.
-    let reading_states = load_reading_states(&state, Some(&identity.sub), &threads).await?;
-    let rows = render_for_you_rows(
-        &threads,
-        now,
-        &category_names,
-        &question_categories,
-        &reading_states,
-        &reasons,
-    );
+    let has_more = items.len() as i64 > MAX_CATCH_UP_PAGE;
+    items.truncate(MAX_CATCH_UP_PAGE as usize);
+    let rows = render_for_you_rows(&items, now, view);
+    let pagination = if has_more {
+        items
+            .last()
+            .map(|item| CatchUpCursor {
+                view,
+                as_of,
+                snapshot_generation,
+                activity_at: item.activity_at,
+                thread_id: item.thread.id.clone(),
+            })
+            .map(|cursor| {
+                format!(
+                    r#"<nav class="pagination ag-catch-up-pagination"><a class="btn btn-secondary btn-sm" href="{}">More threads →</a></nav>"#,
+                    catch_up_href(view, Some(as_of), Some(&cursor)),
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let (heading, description) = match view {
+        CatchUpView::Updates => (
+            "Updates",
+            "Only related threads with posts you have not read yet.",
+        ),
+        CatchUpView::Following => (
+            "Following",
+            "Every Watch and Follow relationship, including older conversations.",
+        ),
+        CatchUpView::Questions => (
+            "Your questions",
+            "Questions you started, separated by waiting and solved outcomes.",
+        ),
+    };
     let content = format!(
         r#"<nav class="crumbs"><a href="/">Home</a><span class="crumbs__sep">/</span><span>For You</span></nav>
 <div class="page-head ag-for-you-head">
-  <div><p class="ag-for-you-eyebrow">Private · explainable</p><h1>For You</h1><p class="muted">A bounded view built only from your Forum relationships — never from hidden content or an external recommender.</p></div>
-  <a class="btn btn-secondary" href="/?filter=subscribed">Open Following</a>
+  <div><p class="ag-for-you-eyebrow">Private · exact · explainable</p><h1>Catch up</h1><p class="muted">{description}</p></div>
+  <a class="btn btn-secondary" href="/activity">Open Activity</a>
 </div>
-<aside class="ag-for-you-note" role="note"><strong>Why these threads?</strong><span>Every row names one authoritative reason. Watch, Follow, Mute or reset a thread from its page; Mute always wins here.</span></aside>
+{tabs}
+<aside class="ag-for-you-note" role="note"><strong>{heading}</strong><span>Catch up lists threads to return to; Activity lists delivered events. Every row has one reason, and Mute always wins without suppressing a direct reply, mention, or accepted answer.</span><time>Snapshot {snapshot}</time></aside>
 <section class="section ag-for-you-feed" aria-labelledby="for-you-heading">
-  <h2 id="for-you-heading" class="section__title">Your current threads</h2>
-  <div class="thread-list">{rows}</div>
-</section>"#,
+  <h2 id="for-you-heading" class="section__title">{heading}</h2>
+  <div class="ag-catch-up-list" data-catch-up-view="{view}">{rows}</div>
+</section>
+{pagination}"#,
+        description = esc(description),
+        tabs = render_catch_up_tabs(view),
+        heading = esc(heading),
+        snapshot = esc(&fmt_ts(as_of)),
+        view = view.as_str(),
         rows = rows,
+        pagination = pagination,
     );
     let counts = personal_counts(&state, &headers, now).await?;
     Ok(Html(render_page_with_personal_counts(
-        "For You",
+        "Catch up",
         &email_display(&headers),
         &content,
         counts,
@@ -1140,12 +1198,8 @@ pub async fn thread(
     );
 
     let counts = personal_counts(&state, &headers, now).await?;
-    let html = render_page_with_personal_counts(
-        &thread.title,
-        &email_display(&headers),
-        &content,
-        counts,
-    );
+    let html =
+        render_page_with_personal_counts(&thread.title, &email_display(&headers), &content, counts);
     Ok(html_response(html, set_cookie))
 }
 
@@ -1562,12 +1616,8 @@ pub async fn edit_thread_form(
         &headers,
     );
     let counts = personal_counts(&state, &headers, now).await?;
-    let html = render_page_with_personal_counts(
-        "Edit thread",
-        &email_display(&headers),
-        &content,
-        counts,
-    );
+    let html =
+        render_page_with_personal_counts("Edit thread", &email_display(&headers), &content, counts);
     Ok(html_response(html, set_cookie))
 }
 
@@ -1739,12 +1789,8 @@ pub async fn edit_reply_form(
         &headers,
     );
     let counts = personal_counts(&state, &headers, now).await?;
-    let html = render_page_with_personal_counts(
-        "Edit reply",
-        &email_display(&headers),
-        &content,
-        counts,
-    );
+    let html =
+        render_page_with_personal_counts("Edit reply", &email_display(&headers), &content, counts);
     Ok(html_response(html, set_cookie))
 }
 
@@ -2710,47 +2756,144 @@ fn render_thread_rows(
     question_categories: &HashSet<&str>,
     reading_states: &HashMap<String, ThreadReadingState>,
 ) -> String {
-    render_thread_rows_with_reasons(
+    render_thread_rows_impl(
         threads,
         now,
         cat_names,
         counts,
         question_categories,
         reading_states,
-        None,
     )
 }
 
-fn render_for_you_rows(
-    threads: &[Thread],
-    now: i64,
-    cat_names: &HashMap<&str, &str>,
-    question_categories: &HashSet<&str>,
-    reading_states: &HashMap<String, ThreadReadingState>,
-    reasons: &HashMap<String, ForYouReason>,
-) -> String {
-    if threads.is_empty() {
-        return r#"<div class="empty ag-for-you-empty"><div class="empty__ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 1.7 5.3L19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7L12 3z"/><path d="M19 15v4"/><path d="M21 17h-4"/></svg></div><h3>Your personal feed is ready when you are.</h3><p>Watch or Follow a thread, bookmark a post, join a conversation, or begin reading. Muted threads stay out.</p><a class="btn btn-primary btn-sm" href="/">Explore Latest</a></div>"#.to_string();
+fn render_for_you_rows(items: &[CatchUpItem], now: i64, view: CatchUpView) -> String {
+    if items.is_empty() {
+        let (heading, detail, href, action) = match view {
+            CatchUpView::Updates => (
+                "You are caught up.",
+                "No related thread has an unread post in this snapshot.",
+                "/",
+                "Explore Latest",
+            ),
+            CatchUpView::Following => (
+                "No followed threads yet.",
+                "Choose Watch or Follow on a thread to keep it here, however old it becomes.",
+                "/",
+                "Find a thread",
+            ),
+            CatchUpView::Questions => (
+                "You have not asked a question yet.",
+                "Question categories keep waiting and solved outcomes separate.",
+                "/questions",
+                "Open the answer desk",
+            ),
+        };
+        return format!(
+            r#"<div class="empty ag-for-you-empty"><div class="empty__ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 1.7 5.3L19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7L12 3z"/><path d="M19 15v4"/><path d="M21 17h-4"/></svg></div><h3>{heading}</h3><p>{detail}</p><a class="btn btn-primary btn-sm" href="{href}">{action}</a></div>"#,
+            heading = esc(heading),
+            detail = esc(detail),
+            href = href,
+            action = esc(action),
+        );
     }
-    render_thread_rows_with_reasons(
-        threads,
-        now,
-        Some(cat_names),
-        None,
-        question_categories,
-        reading_states,
-        Some(reasons),
-    )
+    let mut out = String::new();
+    for item in items {
+        let reason_label = match item.reason {
+            CatchUpReason::Watch => "Watching · replies also enter Activity",
+            CatchUpReason::Follow => "Following · personal feed only",
+            CatchUpReason::Authored => "You started this thread",
+            CatchUpReason::Bookmarked => "You bookmarked a post here",
+            CatchUpReason::Participated => "You joined this conversation",
+            CatchUpReason::ContinueReading => "You started reading this thread",
+        };
+        let follow_label = match item.follow_level {
+            ThreadFollowLevel::None => "No preference",
+            ThreadFollowLevel::Watch => "Watch",
+            ThreadFollowLevel::Follow => "Follow",
+            ThreadFollowLevel::Mute => "Mute",
+        };
+        let question_state = match item.question_state {
+            Some(CatchUpQuestionState::Waiting) => format!(
+                r#"<span class="ag-catch-up-question ag-catch-up-question--waiting" data-question-state="{}">Waiting for a solution</span>"#,
+                CatchUpQuestionState::Waiting.as_str(),
+            ),
+            Some(CatchUpQuestionState::Solved) => format!(
+                r#"<span class="ag-catch-up-question ag-catch-up-question--solved" data-question-state="{}">Solved for the asker</span>"#,
+                CatchUpQuestionState::Solved.as_str(),
+            ),
+            None => String::new(),
+        };
+        let canonical_href = format!("/t/{}", esc(&item.thread.id));
+        let unread = if let Some(post) = item.first_unread.as_ref() {
+            let target = format!(
+                "/t/{}?resume=1#post-{}",
+                esc(&item.thread.id),
+                esc(&post.id),
+            );
+            format!(
+                r#"<a class="ag-catch-up-unread" href="{target}" data-first-unread-id="{post_id}" data-unread-count="{count}">
+  <span class="ag-catch-up-unread__label">First unread · {count} {noun}</span>
+  <span class="ag-catch-up-unread__excerpt">{excerpt}</span>
+  <span class="ag-catch-up-unread__action">Continue from here →</span>
+</a>"#,
+                target = target,
+                post_id = esc(&post.id),
+                count = item.unread_count,
+                noun = if item.unread_count == 1 {
+                    "post"
+                } else {
+                    "posts"
+                },
+                excerpt = esc(&compact_snippet(&post.body_md, 180)),
+            )
+        } else {
+            r#"<div class="ag-catch-up-caught" data-unread-count="0"><span aria-hidden="true"></span>0 unread · Caught up</div>"#.to_string()
+        };
+        out.push_str(&format!(
+            r#"<article class="ag-catch-up-card" data-thread-id="{thread_id}" data-catch-up-reason="{reason}" data-for-you-reason="{reason}" data-follow-level="{follow_level}">
+  <div class="ag-catch-up-card__signals">
+    <span class="ag-for-you-reason">{reason_label}</span>
+    <span class="ag-catch-up-level ag-catch-up-level--{follow_level}">{follow_label}</span>
+    {question_state}
+  </div>
+  <div class="ag-catch-up-card__body">
+    <div class="ag-catch-up-card__identity">
+      <span class="avatar ag-avatar ag-tone-{tone}" aria-hidden="true">{initial}</span>
+      <div><h3><a href="{canonical_href}">{title}</a></h3><p><span class="ag-chip ag-tone-{cat_tone}">{category}</span><span>{replies}</span><span>started by {author}</span></p></div>
+    </div>
+    {unread}
+  </div>
+  <footer><time title="{absolute}">{relative}</time><span>Snapshot activity</span></footer>
+</article>"#,
+            thread_id = esc(&item.thread.id),
+            reason = item.reason.as_str(),
+            follow_level = item.follow_level.as_str(),
+            reason_label = esc(reason_label),
+            follow_label = esc(follow_label),
+            question_state = question_state,
+            tone = ag_tone(&item.thread.author_sub),
+            initial = esc(&ag_initial(&item.thread.author_email)),
+            canonical_href = canonical_href,
+            title = esc(&item.thread.title),
+            cat_tone = ag_tone(&item.thread.category_id),
+            category = esc(&item.category_name),
+            replies = esc(&replies_label(item.reply_count + 1)),
+            author = esc(&item.thread.author_email),
+            unread = unread,
+            absolute = esc(&fmt_ts(item.activity_at)),
+            relative = esc(&rel_time(item.activity_at, now)),
+        ));
+    }
+    out
 }
 
-fn render_thread_rows_with_reasons(
+fn render_thread_rows_impl(
     threads: &[Thread],
     now: i64,
     cat_names: Option<&HashMap<&str, &str>>,
     counts: Option<&HashMap<String, i64>>,
     question_categories: &HashSet<&str>,
     reading_states: &HashMap<String, ThreadReadingState>,
-    reasons: Option<&HashMap<String, ForYouReason>>,
 ) -> String {
     if threads.is_empty() {
         return r#"<div class="empty"><div class="empty__ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div><h3>No threads yet — start the conversation.</h3><p>Every thread supports Markdown, reactions and @mentions.</p><a class="btn btn-primary btn-sm" href="/new">New thread</a></div>"#.to_string();
@@ -2801,16 +2944,6 @@ fn render_thread_rows_with_reasons(
         } else {
             String::new()
         };
-        let personal_reason = reasons
-            .and_then(|reasons| reasons.get(&t.id))
-            .map(|reason| {
-                format!(
-                    r#"<span class="ag-for-you-reason" data-for-you-reason="{key}">{label}</span>"#,
-                    key = reason.key(),
-                    label = esc(reason.label()),
-                )
-            })
-            .unwrap_or_default();
         let replies = counts
             .and_then(|map| map.get(&t.id))
             .map(|count| {
@@ -2827,7 +2960,7 @@ fn render_thread_rows_with_reasons(
   <span class="avatar ag-avatar ag-tone-{tone}" aria-hidden="true">{initial}</span>
   <span class="thread-row__main">
     <span class="thread-row__title">{glyphs}<span class="ag-title">{title}</span></span>
-    <span class="thread-row__sub">{personal_reason}{cat}{answer_state}{reading_badge}<span class="ag-row__by">started by {author}</span></span>
+    <span class="thread-row__sub">{cat}{answer_state}{reading_badge}<span class="ag-row__by">started by {author}</span></span>
   </span>
   <span class="ag-row__side">{replies}<span class="thread-row__time" title="{abs}">{when}</span></span>
 </a>"#,
@@ -2838,7 +2971,6 @@ fn render_thread_rows_with_reasons(
             glyphs = glyphs,
             title = esc(&t.title),
             cat = cat_part,
-            personal_reason = personal_reason,
             answer_state = answer_state,
             reading_badge = reading_badge,
             author = esc(&t.author_email),

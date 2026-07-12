@@ -55,12 +55,22 @@ pub const APP_ICON: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="curr
 
 /// Render the shared Odyssey v2 app-bar: the Blog app-tile + name on the left, reader navigation
 /// followed by one stable Studio entry, then an "All apps" waffle back to the apex portal and the
-/// avatar user-menu (Account / All apps / the preserved gateway Sign-out) on the right. Studio is
-/// deliberately rendered for every representation: the public chrome never varies merely to hint
-/// that a private author session exists. `page_title` selects the active nav item; `email` is the
-/// gateway-injected address (empty or the neutral `—` placeholder on public, no-session reading
-/// pages → a minimal, no-identity avatar).
+/// avatar user-menu (Account / All apps / the preserved gateway Sign-out) on the right. Ordinary
+/// Reader pages keep Studio representation-stable; the separate bearer-review shell suppresses it
+/// for capability readers. `page_title` selects the active nav item; `email` is the gateway-injected
+/// address (empty or the neutral `—` placeholder on public, no-session reading pages → a minimal,
+/// no-identity avatar).
 pub fn topbar(page_title: &str, email: &str, is_admin: bool, theme: &str) -> String {
+    topbar_with_studio(page_title, email, is_admin, theme, true)
+}
+
+fn topbar_with_studio(
+    page_title: &str,
+    email: &str,
+    is_admin: bool,
+    theme: &str,
+    show_studio: bool,
+) -> String {
     let active = match page_title {
         "Search" => "search",
         "Ask" => "ask",
@@ -72,20 +82,32 @@ pub fn topbar(page_title: &str, email: &str, is_admin: bool, theme: &str) -> Str
     } else {
         ""
     };
+    let studio_nav = if show_studio {
+        format!(
+            r#"<a class="appnav appnav--studio{active}" href="/library"{current}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z"/></svg>Studio</a>"#,
+            active = if active == "studio" { " is-active" } else { "" },
+            current = if active == "studio" {
+                r#" aria-current="page""#
+            } else {
+                ""
+            },
+        )
+    } else {
+        String::new()
+    };
     let nav = format!(
         concat!(
             r#"<nav class="appbar__nav" aria-label="Blog sections">"#,
             r#"<a class="appnav{a_posts}" href="/"{c_posts}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 22V12h6v10"/></svg>Posts</a>"#,
             r#"<a class="appnav{a_search}" href="/search"{c_search}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>Search</a>"#,
             r#"<a class="appnav{a_ask}" href="/ask"{c_ask}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/></svg>Ask</a>"#,
-            r#"<a class="appnav appnav--studio{a_studio}" href="/library"{c_studio}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z"/></svg>Studio</a>"#,
+            r#"{studio_nav}"#,
             r#"{admin_nav}"#,
             r#"</nav>"#,
         ),
         a_posts = if active == "posts" { " is-active" } else { "" },
         a_search = if active == "search" { " is-active" } else { "" },
         a_ask = if active == "ask" { " is-active" } else { "" },
-        a_studio = if active == "studio" { " is-active" } else { "" },
         c_posts = if active == "posts" {
             r#" aria-current="page""#
         } else {
@@ -101,11 +123,7 @@ pub fn topbar(page_title: &str, email: &str, is_admin: bool, theme: &str) -> Str
         } else {
             ""
         },
-        c_studio = if active == "studio" {
-            r#" aria-current="page""#
-        } else {
-            ""
-        },
+        studio_nav = studio_nav,
         admin_nav = admin_nav,
     );
     format!(
@@ -213,6 +231,34 @@ pub fn page_shell(page: PageShell<'_>) -> String {
         body_class = page.body_class,
         topbar = topbar(page.nav_title, page.email, page.is_admin, page.theme),
         fragment = page.fragment,
+    )
+}
+
+/// Public review capabilities use the familiar Reader chrome without exposing Studio navigation
+/// or identity-dependent controls. Product CSS remains inline, so the public `/review/` edge
+/// prefix needs no additional anonymous asset routes.
+pub fn review_page_shell(
+    head_title: &str,
+    theme: &str,
+    fragment: &str,
+    metadata: &PageMeta,
+) -> String {
+    let head_meta = render_page_meta(metadata);
+    format!(
+        r#"<!DOCTYPE html><html lang="en"{theme_attr}><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="{color_scheme}">
+<meta name="referrer" content="no-referrer">
+<link rel="icon" href="data:,">
+<title>{title}</title>{head_meta}<style>{css}</style></head><body class="page-reading page-review-link">
+{topbar}{fragment}</body></html>"#,
+        theme_attr = odyssey::html_theme_attr(theme),
+        color_scheme = odyssey::color_scheme_meta(theme),
+        title = esc(head_title),
+        head_meta = head_meta,
+        css = app_css(),
+        topbar = topbar_with_studio("Reading", "—", false, theme, false),
+        fragment = fragment,
     )
 }
 

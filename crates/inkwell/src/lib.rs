@@ -12,6 +12,7 @@
 //! - `GET  /healthz`        liveness (container HEALTHCHECK)
 //! - `GET  /`               index: posts newest-first (title + excerpt + date + author)
 //! - `GET  /p/{slug}`       full post (body markdown rendered to sanitized HTML)
+//! - `GET  /review/{token}` immutable unpublished revision via expiring bearer capability
 //! - `GET  /tag/{slug}`     posts carrying a tag (keyset-paginated like the index)
 //! - `GET  /search?q=`      full-text search over published posts (title + body), highlighted
 //! - `GET  /feed.xml`       RSS 2.0 of the published posts (newest-first)
@@ -58,6 +59,7 @@ pub fn app(state: AppState) -> Router {
         .route("/healthz", get(handlers::health::healthz))
         .route("/", get(handlers::posts::index))
         .route("/p/{slug}", get(handlers::posts::view))
+        .route("/review/{token}", get(handlers::posts::review_link_public))
         // Tag listing: published posts (plus the viewer's own drafts) carrying a given tag,
         // keyset-paginated exactly like the index.
         .route("/tag/{slug}", get(handlers::posts::tag_index))
@@ -78,6 +80,10 @@ pub fn app(state: AppState) -> Router {
             get(handlers::posts::edit_form).post(handlers::posts::update),
         )
         .route("/edit/{slug}/review", post(handlers::posts::review_edit))
+        .route(
+            "/edit/{slug}/review-link",
+            get(handlers::posts::review_link_manage).post(handlers::posts::review_link_command),
+        )
         .route("/edit/{slug}/history", get(handlers::posts::history))
         .route(
             "/edit/{slug}/history/{revision_id}/restore",

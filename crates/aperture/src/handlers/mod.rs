@@ -31,7 +31,7 @@ pub const SHARE_ROOM_JS: &str = include_str!("../../static/share-room.js");
 
 /// Executable policy for every anonymous Share Room HTML response. Assets are same-origin routes;
 /// uploads use same-origin XHR, and no inline script/style is permitted.
-pub const SHARE_ROOM_CSP: &str = "default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+pub const SHARE_ROOM_CSP: &str = "default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 
 static APP_CSS: OnceLock<String> = OnceLock::new();
 static DYNAMIC_JS: OnceLock<String> = OnceLock::new();

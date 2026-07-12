@@ -26,7 +26,9 @@
 //! - `forum_activity_deliveries(activity_id TEXT, recipient_kind TEXT, recipient_key TEXT,
 //!    reason TEXT)`
 //! - `forum_activity_receipts(activity_id TEXT, viewer_sub TEXT, read_at BIGINT)`
-//! - `forum_post_read_receipts(viewer_sub TEXT, post_id TEXT, read_at BIGINT)`
+//! - `forum_catch_up_clock(id BIGINT PK, generation BIGINT)`
+//! - `forum_catch_up_post_points(post_id TEXT PK, thread_id TEXT, activity_at BIGINT, seq BIGINT)`
+//! - `forum_post_read_receipts(viewer_sub TEXT, post_id TEXT, read_at BIGINT, read_seq BIGINT)`
 //! - `forum_bookmarks(bookmark_id TEXT, owner_sub TEXT, post_id TEXT, note TEXT, remind_at BIGINT,
 //!    created_at BIGINT, updated_at BIGINT, version BIGINT)`
 
@@ -126,9 +128,9 @@ pub struct ActivityMutation {
     pub delivery_subjects: Vec<String>,
 }
 
-/// One bounded, owner-scoped projection used to explain a `/for-you` candidate. The candidate
-/// thread itself is deliberately not returned here: the handler must obtain its authoritative,
-/// visible candidate set first and then pass only those ids into this projection.
+/// Legacy bounded owner projection retained for v7 callers and compatibility tests. The v8
+/// catch-up handler uses [`Store::catch_up_page`] so explicit relationships are never intersected
+/// with a bounded Latest window.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ThreadPersonalSignals {
     pub follow_level: ThreadFollowLevel,
@@ -137,6 +139,95 @@ pub struct ThreadPersonalSignals {
     pub bookmarked: bool,
     pub reading_started: bool,
     pub has_unread: bool,
+}
+
+/// One task-oriented view of the private Forum catch-up desk. The value is also bound into the
+/// keyset cursor so a pagination token can never silently change meaning between views.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CatchUpView {
+    #[default]
+    Updates,
+    Following,
+    Questions,
+}
+
+impl CatchUpView {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Updates => "updates",
+            Self::Following => "following",
+            Self::Questions => "questions",
+        }
+    }
+}
+
+/// The single strongest authoritative reason a thread belongs on the catch-up desk. Ordering is
+/// deliberate and matches the v7 explainable feed when several signals apply to one thread.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CatchUpReason {
+    Watch,
+    Follow,
+    Authored,
+    Bookmarked,
+    Participated,
+    ContinueReading,
+}
+
+impl CatchUpReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Watch => "watch",
+            Self::Follow => "follow",
+            Self::Authored => "authored",
+            Self::Bookmarked => "bookmarked",
+            Self::Participated => "participated",
+            Self::ContinueReading => "reading",
+        }
+    }
+}
+
+/// A question is solved only when its category is currently a Question and its accepted pointer
+/// resolves to a live reply in the same thread. It is not a claim of objective correctness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CatchUpQuestionState {
+    Waiting,
+    Solved,
+}
+
+impl CatchUpQuestionState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Waiting => "waiting",
+            Self::Solved => "solved",
+        }
+    }
+}
+
+/// Descending `(activity_at, thread_id)` keyset bound to one view and one content snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatchUpCursor {
+    pub view: CatchUpView,
+    pub as_of: i64,
+    /// Commit-ordered post/read boundary. Unlike second-granularity wall time, this cannot admit a
+    /// same-second mutation that committed after the first page was rendered.
+    pub snapshot_generation: i64,
+    pub activity_at: i64,
+    pub thread_id: String,
+}
+
+/// Complete owner-scoped Store projection for one catch-up row. Handlers render this value
+/// without per-thread reads; `first_unread` is the current live post row, never a stale copy.
+#[derive(Clone, Debug)]
+pub struct CatchUpItem {
+    pub thread: Thread,
+    pub category_name: String,
+    pub reason: CatchUpReason,
+    pub follow_level: ThreadFollowLevel,
+    pub unread_count: i64,
+    pub first_unread: Option<Post>,
+    pub question_state: Option<CatchUpQuestionState>,
+    pub activity_at: i64,
+    pub reply_count: i64,
 }
 
 /// Keyset cursor for the personal activity stream.
@@ -197,9 +288,11 @@ pub const MAX_THREAD_READING_STATE_BATCH: usize = 200;
 /// A thread cannot accumulate an unbounded generic Watch reply fan-out. Follow and Mute
 /// preferences do not create generic deliveries and therefore do not consume this budget.
 pub const MAX_THREAD_FOLLOWERS: usize = 256;
-/// `/for-you` first obtains at most this many authoritative list candidates, then performs one
-/// owner-scoped signal projection over the same bounded id set.
+/// Legacy v7 personal-signal batch bound. New catch-up reads do not use this candidate window.
 pub const MAX_FOR_YOU_CANDIDATES: usize = 200;
+/// Catch-up renders 30 task rows and may request one sentinel row to decide whether a keyset link
+/// is needed. Both Store implementations reject a larger request.
+pub const MAX_CATCH_UP_PAGE: i64 = 30;
 /// Parsed aliases are deduplicated before this per-post bound is enforced.
 pub const MAX_MENTIONS_PER_POST: usize = 32;
 /// OP + quoted author + followers + mentions. Klaxon is best-effort and never exceeds this bound.
@@ -428,6 +521,83 @@ fn reading_state_from_posts(posts: &[Post], read_post_ids: &HashSet<String>) -> 
     }
 }
 
+fn catch_up_reason(
+    view: CatchUpView,
+    follow_level: ThreadFollowLevel,
+    authored: bool,
+    bookmarked: bool,
+    participated: bool,
+    reading_started: bool,
+) -> Option<CatchUpReason> {
+    if follow_level == ThreadFollowLevel::Mute {
+        return None;
+    }
+    match view {
+        CatchUpView::Questions => authored.then_some(CatchUpReason::Authored),
+        CatchUpView::Following => match follow_level {
+            ThreadFollowLevel::Watch => Some(CatchUpReason::Watch),
+            ThreadFollowLevel::Follow => Some(CatchUpReason::Follow),
+            ThreadFollowLevel::None | ThreadFollowLevel::Mute => None,
+        },
+        CatchUpView::Updates => match follow_level {
+            ThreadFollowLevel::Watch => Some(CatchUpReason::Watch),
+            ThreadFollowLevel::Follow => Some(CatchUpReason::Follow),
+            ThreadFollowLevel::None | ThreadFollowLevel::Mute if authored => {
+                Some(CatchUpReason::Authored)
+            }
+            ThreadFollowLevel::None | ThreadFollowLevel::Mute if bookmarked => {
+                Some(CatchUpReason::Bookmarked)
+            }
+            ThreadFollowLevel::None | ThreadFollowLevel::Mute if participated => {
+                Some(CatchUpReason::Participated)
+            }
+            ThreadFollowLevel::None | ThreadFollowLevel::Mute if reading_started => {
+                Some(CatchUpReason::ContinueReading)
+            }
+            ThreadFollowLevel::None | ThreadFollowLevel::Mute => None,
+        },
+    }
+}
+
+fn validate_catch_up_page(
+    view: CatchUpView,
+    as_of: i64,
+    snapshot_generation: i64,
+    cursor: Option<&CatchUpCursor>,
+    limit: i64,
+) -> Result<usize, StoreError> {
+    if as_of < 0 || snapshot_generation < 0 {
+        return Err(StoreError::InvalidOperation(
+            "catch-up snapshot bounds must be non-negative".to_string(),
+        ));
+    }
+    if !(0..=MAX_CATCH_UP_PAGE + 1).contains(&limit) {
+        return Err(StoreError::InvalidOperation(format!(
+            "catch-up page may request at most {} rows",
+            MAX_CATCH_UP_PAGE + 1
+        )));
+    }
+    if let Some(cursor) = cursor {
+        if cursor.view != view
+            || cursor.as_of != as_of
+            || cursor.snapshot_generation != snapshot_generation
+        {
+            return Err(StoreError::InvalidOperation(
+                "catch-up cursor does not belong to this view and snapshot".to_string(),
+            ));
+        }
+        if cursor.thread_id.trim().is_empty()
+            || cursor.activity_at < 0
+            || cursor.activity_at > as_of
+        {
+            return Err(StoreError::InvalidOperation(
+                "catch-up cursor is malformed".to_string(),
+            ));
+        }
+    }
+    Ok(limit as usize)
+}
+
 /// Pluggable forum store. All methods are `async` and `.await`ed on the serving runtime.
 #[async_trait]
 pub trait Store: Send + Sync {
@@ -639,6 +809,23 @@ pub trait Store: Send + Sync {
         viewer_sub: &str,
         thread_ids: &[String],
     ) -> Result<HashMap<String, ThreadPersonalSignals>, StoreError>;
+    /// Read the current commit-ordered post/read boundary without advancing it. PostgreSQL takes a
+    /// shared lock on the singleton clock so a writer that already allocated a generation must
+    /// commit or roll back before this returns; GET remains write-free.
+    async fn catch_up_snapshot_generation(&self) -> Result<i64, StoreError>;
+    /// Complete private catch-up page, selected directly from full relationship/content
+    /// authority rather than from a bounded public Latest candidate window. `snapshot_generation`
+    /// freezes post/read authority even for same-second writes; `as_of` retains the wall-time bound
+    /// for legacy bookmark/relationship projections. Current Mute always wins.
+    async fn catch_up_page(
+        &self,
+        viewer_sub: &str,
+        view: CatchUpView,
+        as_of: i64,
+        snapshot_generation: i64,
+        before: Option<&CatchUpCursor>,
+        limit: i64,
+    ) -> Result<Vec<CatchUpItem>, StoreError>;
 
     /// Compatibility seam for older callers: the historical boolean subscription maps to Watch.
     /// New product code must use [`Store::set_thread_follow_level`].
@@ -840,11 +1027,62 @@ pub struct InMemoryStore {
     activity_events: Mutex<Vec<ActivityEvent>>,
     activity_deliveries: Mutex<Vec<StoredActivityDelivery>>,
     activity_receipts: Mutex<Vec<ActivityReceipt>>,
-    post_read_receipts: Mutex<HashMap<(String, String), i64>>,
+    catch_up_state: Mutex<MemoryCatchUpState>,
     bookmarks: Mutex<Vec<Bookmark>>,
     banned: Mutex<Vec<BannedAuthor>>,
     /// One row per `(post_id, user_sub, kind)` — the in-memory mirror of `post_reactions`.
     reactions: Mutex<Vec<Reaction>>,
+}
+
+#[derive(Default)]
+struct MemoryCatchUpState {
+    generation: i64,
+    post_points: Vec<CatchUpPostPoint>,
+    read_receipts: HashMap<(String, String), MemoryPostReadReceipt>,
+}
+
+#[derive(Clone, Debug)]
+struct CatchUpPostPoint {
+    post_id: String,
+    thread_id: String,
+    activity_at: i64,
+    seq: i64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MemoryPostReadReceipt {
+    read_at: i64,
+    read_seq: i64,
+}
+
+impl MemoryCatchUpState {
+    fn next_generation(&mut self) -> Result<i64, StoreError> {
+        let next = self.generation.checked_add(1).ok_or_else(|| {
+            StoreError::InvalidOperation("catch-up generation is exhausted".to_string())
+        })?;
+        self.generation = next;
+        Ok(next)
+    }
+
+    fn append_post(&mut self, post: &Post) -> Result<(), StoreError> {
+        if self
+            .post_points
+            .iter()
+            .any(|point| point.post_id == post.id)
+        {
+            return Err(StoreError::Conflict(
+                "catch-up post point already exists".to_string(),
+            ));
+        }
+        let seq = self.next_generation()?;
+        self.post_points.push(CatchUpPostPoint {
+            post_id: post.id.clone(),
+            thread_id: post.thread_id.clone(),
+            activity_at: post.created_at,
+            seq,
+        });
+        Ok(())
+    }
 }
 
 /// A single stored reaction (in-memory mirror of a `post_reactions` row).
@@ -1468,6 +1706,10 @@ impl Store for InMemoryStore {
             &first_post.author_email,
             first_post.created_at,
         );
+        self.catch_up_state
+            .lock()
+            .expect("catch_up_state lock poisoned")
+            .append_post(first_post)?;
         threads.push(thread.clone());
         original_posts.insert(thread.id.clone(), first_post.id.clone());
         posts.push(first_post.clone());
@@ -1512,6 +1754,10 @@ impl Store for InMemoryStore {
             self.resolve_mention_deliveries(&mentioned_aliases, &first_post.author_sub);
         dedupe_deliveries(&mut deliveries);
 
+        self.catch_up_state
+            .lock()
+            .expect("catch_up_state lock poisoned")
+            .append_post(first_post)?;
         threads.push(thread.clone());
         original_posts.insert(thread.id.clone(), first_post.id.clone());
         posts.push(first_post.clone());
@@ -1588,6 +1834,10 @@ impl Store for InMemoryStore {
             ));
         }
         self.register_identity_alias(&post.author_sub, &post.author_email, post.created_at);
+        self.catch_up_state
+            .lock()
+            .expect("catch_up_state lock poisoned")
+            .append_post(post)?;
         posts.push(post.clone());
         thread.last_at = post.created_at;
         Ok(())
@@ -1685,6 +1935,10 @@ impl Store for InMemoryStore {
         deliveries.extend(self.resolve_mention_deliveries(&mentioned_aliases, &post.author_sub));
         dedupe_deliveries(&mut deliveries);
 
+        self.catch_up_state
+            .lock()
+            .expect("catch_up_state lock poisoned")
+            .append_post(post)?;
         posts.push(post.clone());
         thread.last_at = post.created_at;
         let mut mentions = self.mentions.lock().expect("mentions lock poisoned");
@@ -1877,9 +2131,15 @@ impl Store for InMemoryStore {
             .lock()
             .expect("activity_receipts lock poisoned")
             .retain(|receipt| !removed_activity_ids.contains(&receipt.activity_id));
-        self.post_read_receipts
+        let mut catch_up = self
+            .catch_up_state
             .lock()
-            .expect("post_read_receipts lock poisoned")
+            .expect("catch_up_state lock poisoned");
+        catch_up
+            .post_points
+            .retain(|point| point.thread_id != thread_id);
+        catch_up
+            .read_receipts
             .retain(|(_, post_id), _| !removed_ids.contains(post_id));
         Ok(())
     }
@@ -1989,9 +2249,13 @@ impl Store for InMemoryStore {
             .lock()
             .expect("activity_receipts lock poisoned")
             .retain(|receipt| !removed_activity_ids.contains(&receipt.activity_id));
-        self.post_read_receipts
+        // The read authority is live-post scoped and disappears with the post. Its append-only
+        // activity point deliberately remains so deleting the newest reply cannot move the thread
+        // backward between pages of an already-issued snapshot.
+        self.catch_up_state
             .lock()
-            .expect("post_read_receipts lock poisoned")
+            .expect("catch_up_state lock poisoned")
+            .read_receipts
             .retain(|(_, receipt_post_id), _| receipt_post_id != post_id);
         Ok(())
     }
@@ -2397,9 +2661,10 @@ impl Store for InMemoryStore {
             .expect("bookmarks lock poisoned")
             .clone();
         let receipts = self
-            .post_read_receipts
+            .catch_up_state
             .lock()
-            .expect("post_read_receipts lock poisoned")
+            .expect("catch_up_state lock poisoned")
+            .read_receipts
             .clone();
         let bookmarked_posts: HashSet<&str> = bookmarks
             .iter()
@@ -2445,6 +2710,225 @@ impl Store for InMemoryStore {
         Ok(signals)
     }
 
+    async fn catch_up_snapshot_generation(&self) -> Result<i64, StoreError> {
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        Ok(self
+            .catch_up_state
+            .lock()
+            .expect("catch_up_state lock poisoned")
+            .generation)
+    }
+
+    async fn catch_up_page(
+        &self,
+        viewer_sub: &str,
+        view: CatchUpView,
+        as_of: i64,
+        snapshot_generation: i64,
+        before: Option<&CatchUpCursor>,
+        limit: i64,
+    ) -> Result<Vec<CatchUpItem>, StoreError> {
+        let limit = validate_catch_up_page(view, as_of, snapshot_generation, before, limit)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let (
+            categories,
+            threads,
+            original_posts,
+            posts,
+            subscriptions,
+            bookmarks,
+            current_generation,
+            points,
+            receipts,
+        ) = {
+            let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+            // Keep one Memory lock order everywhere: category/thread/post/relationship authority
+            // first, Catch-up generation/receipts last. `thread_reading_states` and post/read
+            // commands use the same outer domain, so no reader can hold thread/post locks while
+            // waiting on Catch-up state that this projection already owns.
+            let categories = self
+                .categories
+                .lock()
+                .expect("categories lock poisoned")
+                .clone();
+            let threads = self.threads.lock().expect("threads lock poisoned").clone();
+            let original_posts = self
+                .original_posts
+                .lock()
+                .expect("original_posts lock poisoned")
+                .clone();
+            let posts = self.posts.lock().expect("posts lock poisoned").clone();
+            let subscriptions = self
+                .subscriptions
+                .lock()
+                .expect("subscriptions lock poisoned")
+                .clone();
+            let bookmarks = self
+                .bookmarks
+                .lock()
+                .expect("bookmarks lock poisoned")
+                .clone();
+            let catch_up = self
+                .catch_up_state
+                .lock()
+                .expect("catch_up_state lock poisoned");
+            (
+                categories,
+                threads,
+                original_posts,
+                posts,
+                subscriptions,
+                bookmarks,
+                catch_up.generation,
+                catch_up.post_points.clone(),
+                catch_up.read_receipts.clone(),
+            )
+        };
+        if snapshot_generation > current_generation {
+            return Err(StoreError::InvalidOperation(
+                "catch-up snapshot generation is in the future".to_string(),
+            ));
+        }
+        let snapshot_points: Vec<_> = points
+            .iter()
+            .filter(|point| point.seq <= snapshot_generation && point.activity_at <= as_of)
+            .collect();
+        let snapshot_post_ids: HashSet<&str> = snapshot_points
+            .iter()
+            .map(|point| point.post_id.as_str())
+            .collect();
+        let read_post_ids: HashSet<String> = receipts
+            .iter()
+            .filter(|((subject, post_id), receipt)| {
+                subject == viewer_sub
+                    && receipt.read_at <= as_of
+                    && receipt.read_seq <= snapshot_generation
+                    && snapshot_post_ids.contains(post_id.as_str())
+            })
+            .map(|((_, post_id), _)| post_id.clone())
+            .collect();
+        let bookmarked_post_ids: HashSet<String> = bookmarks
+            .iter()
+            .filter(|bookmark| bookmark.owner_sub == viewer_sub && bookmark.created_at <= as_of)
+            .map(|bookmark| bookmark.post_id.clone())
+            .collect();
+        let mut items = Vec::new();
+        for thread in threads
+            .into_iter()
+            .filter(|thread| thread.created_at <= as_of)
+        {
+            let Some(category) = categories
+                .iter()
+                .find(|category| category.id == thread.category_id)
+            else {
+                continue;
+            };
+            let Some(op_id) = original_posts.get(&thread.id).map(String::as_str) else {
+                continue;
+            };
+            if !snapshot_post_ids.contains(op_id) {
+                continue;
+            }
+            let mut thread_posts = posts
+                .iter()
+                .filter(|post| {
+                    post.thread_id == thread.id && snapshot_post_ids.contains(post.id.as_str())
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if thread_posts.is_empty() {
+                continue;
+            }
+            thread_posts.sort_by(|left, right| {
+                (op_id != left.id.as_str())
+                    .cmp(&(op_id != right.id.as_str()))
+                    .then_with(|| {
+                        left.created_at
+                            .cmp(&right.created_at)
+                            .then_with(|| left.id.cmp(&right.id))
+                    })
+            });
+            // Points survive a reply deletion, so current live-content fail-closed behaviour can
+            // remove that reply without moving the thread across an already-issued page keyset.
+            let activity_at = snapshot_points
+                .iter()
+                .filter(|point| point.thread_id == thread.id)
+                .map(|point| point.activity_at)
+                .max()
+                .unwrap_or(thread.created_at);
+            if before.is_some_and(|cursor| {
+                activity_at > cursor.activity_at
+                    || (activity_at == cursor.activity_at && thread.id >= cursor.thread_id)
+            }) {
+                continue;
+            }
+            let follow_level = subscriptions
+                .iter()
+                .find(|row| row.thread_id == thread.id && row.subscriber_sub == viewer_sub)
+                .map(|row| row.level)
+                .unwrap_or_default();
+            if follow_level == ThreadFollowLevel::Mute {
+                continue;
+            }
+            let authored = thread.author_sub == viewer_sub;
+            let participated = thread_posts
+                .iter()
+                .any(|post| post.author_sub == viewer_sub);
+            let bookmarked = thread_posts
+                .iter()
+                .any(|post| bookmarked_post_ids.contains(&post.id));
+            let reading = reading_state_from_posts(&thread_posts, &read_post_ids);
+            let reason = catch_up_reason(
+                view,
+                follow_level,
+                authored,
+                bookmarked,
+                participated,
+                reading.started,
+            );
+            let solved = category.format.is_question()
+                && valid_accepted_post(&thread, &original_posts, &posts)
+                    .is_some_and(|post| snapshot_post_ids.contains(post.id.as_str()));
+            let eligible = match view {
+                CatchUpView::Updates => reading.unread_count > 0 && reason.is_some(),
+                CatchUpView::Following => reason.is_some(),
+                CatchUpView::Questions => authored && category.format.is_question(),
+            };
+            if !eligible {
+                continue;
+            }
+            let mut public_thread = thread;
+            if !solved {
+                public_thread.accepted_post_id.clear();
+            }
+            items.push(CatchUpItem {
+                thread: public_thread,
+                category_name: category.name.clone(),
+                reason: reason.expect("eligible catch-up row has one reason"),
+                follow_level,
+                unread_count: reading.unread_count,
+                first_unread: reading.first_unread,
+                question_state: category.format.is_question().then_some(if solved {
+                    CatchUpQuestionState::Solved
+                } else {
+                    CatchUpQuestionState::Waiting
+                }),
+                activity_at,
+                reply_count: (thread_posts.len() as i64 - 1).max(0),
+            });
+        }
+        items.sort_by(|left, right| {
+            right
+                .activity_at
+                .cmp(&left.activity_at)
+                .then_with(|| right.thread.id.cmp(&left.thread.id))
+        });
+        items.truncate(limit);
+        Ok(items)
+    }
+
     async fn thread_reading_state(
         &self,
         viewer_sub: &str,
@@ -2462,17 +2946,22 @@ impl Store for InMemoryStore {
         thread_ids: &[String],
     ) -> Result<HashMap<String, ThreadReadingState>, StoreError> {
         let thread_ids = bounded_thread_ids(thread_ids)?;
+        // This projection spans live posts and Catch-up receipts. Share the same outer domain and
+        // inner thread -> original-post -> post -> Catch-up order as every related Memory command;
+        // otherwise a Catch-up page and a thread page can acquire the two ends in reverse order.
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
         let threads = self.threads.lock().expect("threads lock poisoned");
         let original_posts = self
             .original_posts
             .lock()
             .expect("original_posts lock poisoned");
         let posts = self.posts.lock().expect("posts lock poisoned");
-        let receipts = self
-            .post_read_receipts
+        let catch_up = self
+            .catch_up_state
             .lock()
-            .expect("post_read_receipts lock poisoned");
-        let read_post_ids: HashSet<String> = receipts
+            .expect("catch_up_state lock poisoned");
+        let read_post_ids: HashSet<String> = catch_up
+            .read_receipts
             .keys()
             .filter(|(subject, _)| subject == viewer_sub)
             .map(|(_, post_id)| post_id.clone())
@@ -2514,6 +3003,11 @@ impl Store for InMemoryStore {
     ) -> Result<(), StoreError> {
         let post_ids = bounded_post_ids(post_ids)?;
         let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        if viewer_sub.trim().is_empty() || read_at < 0 {
+            return Err(StoreError::InvalidOperation(
+                "invalid thread reading receipt".to_string(),
+            ));
+        }
         if self
             .threads
             .lock()
@@ -2531,14 +3025,27 @@ impl Store for InMemoryStore {
         }) {
             return Err(StoreError::NotFound("thread post not found".to_string()));
         }
-        let mut receipts = self
-            .post_read_receipts
+        let mut catch_up = self
+            .catch_up_state
             .lock()
-            .expect("post_read_receipts lock poisoned");
-        for post_id in post_ids {
-            receipts
-                .entry((viewer_sub.to_string(), post_id))
-                .or_insert(read_at);
+            .expect("catch_up_state lock poisoned");
+        let missing: Vec<_> = post_ids
+            .into_iter()
+            .filter(|post_id| {
+                !catch_up
+                    .read_receipts
+                    .contains_key(&(viewer_sub.to_string(), post_id.clone()))
+            })
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let read_seq = catch_up.next_generation()?;
+        for post_id in missing {
+            catch_up.read_receipts.insert(
+                (viewer_sub.to_string(), post_id),
+                MemoryPostReadReceipt { read_at, read_seq },
+            );
         }
         Ok(())
     }
@@ -3356,6 +3863,60 @@ impl PgStore {
         Self { pool }
     }
 
+    /// Allocate one commit-ordered Catch-up generation. Every v8 post/read writer holds the
+    /// singleton row lock until its surrounding transaction commits; a snapshot's `FOR SHARE`
+    /// therefore cannot observe a generation whose authority rows are still uncommitted.
+    async fn next_catch_up_generation_tx(
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> Result<i64, StoreError> {
+        let current = sqlx::query_scalar::<_, i64>(
+            "SELECT generation FROM forum_catch_up_clock WHERE id = 1 FOR UPDATE",
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(backend)?;
+        let next = current.checked_add(1).ok_or_else(|| {
+            StoreError::InvalidOperation("catch-up generation is exhausted".to_string())
+        })?;
+        sqlx::query("UPDATE forum_catch_up_clock SET generation = $1 WHERE id = 1")
+            .bind(next)
+            .execute(&mut **tx)
+            .await
+            .map_err(backend)?;
+        Ok(next)
+    }
+
+    async fn insert_catch_up_post_point_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        post: &Post,
+    ) -> Result<(), StoreError> {
+        let seq = Self::next_catch_up_generation_tx(tx).await?;
+        sqlx::query(
+            "INSERT INTO forum_catch_up_post_points (post_id, thread_id, activity_at, seq) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(&post.id)
+        .bind(&post.thread_id)
+        .bind(post.created_at)
+        .bind(seq)
+        .execute(&mut **tx)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn catch_up_snapshot_generation_async(&self) -> Result<i64, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        let generation = sqlx::query_scalar::<_, i64>(
+            "SELECT generation FROM forum_catch_up_clock WHERE id = 1 FOR SHARE",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
+        Ok(generation)
+    }
+
     async fn register_identity_alias_tx(
         tx: &mut Transaction<'_, Postgres>,
         subject: &str,
@@ -3732,6 +4293,12 @@ impl PgStore {
             .execute(&self.pool)
             .await?;
         sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_threads_author_snapshot \
+             ON threads (author_sub, created_at, id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS posts (\
                  id TEXT PRIMARY KEY, \
                  thread_id TEXT NOT NULL, \
@@ -3752,6 +4319,20 @@ impl PgStore {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_posts_thread ON posts (thread_id)")
             .execute(&self.pool)
             .await?;
+        // Catch-up begins from subject-owned candidate ids, then walks one content snapshot. The
+        // composite indexes keep both sides bounded without introducing a new authority table.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_posts_author_snapshot \
+             ON posts (author_sub, created_at, thread_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_posts_thread_snapshot \
+             ON posts (thread_id, created_at, id)",
+        )
+        .execute(&self.pool)
+        .await?;
         // Subject-scoped reading continuity is stored per post rather than as a high-water
         // cursor. This preserves unread holes after Latest/activity jumps and after the accepted
         // answer is floated out of natural chronology. The FK lets every old/new delete path
@@ -3771,6 +4352,12 @@ impl PgStore {
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_forum_post_read_receipts_post \
              ON forum_post_read_receipts (post_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_forum_post_read_receipts_viewer_snapshot \
+             ON forum_post_read_receipts (viewer_sub, read_at, post_id)",
         )
         .execute(&self.pool)
         .await?;
@@ -3903,6 +4490,130 @@ impl PgStore {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_posts_quote ON posts (quoted_post_id)")
             .execute(&self.pool)
             .await?;
+        // Catch-up snapshots use one commit-ordered clock instead of second-granularity wall time.
+        // `post_id` deliberately has no Post FK: deleting a reply removes its content authority but
+        // retains the non-content ordering point. The Thread FK still makes a thread deletion erase
+        // the whole history, including when a v7 image performs the delete during rollback.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS forum_catch_up_clock (\
+                 id BIGINT PRIMARY KEY, \
+                 generation BIGINT NOT NULL, \
+                 CHECK (id = 1), \
+                 CHECK (generation >= 0)\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO forum_catch_up_clock (id, generation) VALUES (1, 0) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS forum_catch_up_post_points (\
+                 post_id TEXT PRIMARY KEY, \
+                 thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE, \
+                 activity_at BIGINT NOT NULL, \
+                 seq BIGINT NOT NULL UNIQUE, \
+                 CHECK (activity_at >= 0), \
+                 CHECK (seq > 0)\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_catch_up_points_thread_snapshot \
+             ON forum_catch_up_post_points (thread_id, seq, activity_at, post_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Nullable is intentional rollback protocol: v7 keeps inserting its three historical
+        // columns. The next v8 quiescent boot assigns those rows a deterministic first-read seq.
+        sqlx::query(
+            "ALTER TABLE forum_post_read_receipts ADD COLUMN IF NOT EXISTS read_seq BIGINT",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_post_read_receipts_viewer_generation \
+             ON forum_post_read_receipts (viewer_sub, read_seq, post_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Deterministic, idempotent forward backfill. Existing point/read sequences are never
+        // rewritten; missing v7 rows append in a stable order after the greatest durable value.
+        // Holding the singleton clock lock makes accidental current-version writers serialize
+        // behind the migration, while normal deployment remains single-active and quiescent.
+        let mut catch_up_tx = self.pool.begin().await?;
+        let stored_generation = sqlx::query_scalar::<_, i64>(
+            "SELECT generation FROM forum_catch_up_clock WHERE id = 1 FOR UPDATE",
+        )
+        .fetch_one(&mut *catch_up_tx)
+        .await?;
+        let point_max =
+            sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(seq) FROM forum_catch_up_post_points")
+                .fetch_one(&mut *catch_up_tx)
+                .await?
+                .unwrap_or(0);
+        let receipt_max = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT MAX(read_seq) FROM forum_post_read_receipts",
+        )
+        .fetch_one(&mut *catch_up_tx)
+        .await?
+        .unwrap_or(0);
+        let mut generation = stored_generation.max(point_max).max(receipt_max);
+        let missing_posts = sqlx::query(
+            "SELECT p.id, p.thread_id, p.created_at \
+             FROM posts AS p \
+             JOIN threads AS t ON t.id = p.thread_id \
+             LEFT JOIN forum_catch_up_post_points AS point ON point.post_id = p.id \
+             WHERE point.post_id IS NULL \
+             ORDER BY p.created_at ASC, p.thread_id ASC, p.id ASC",
+        )
+        .fetch_all(&mut *catch_up_tx)
+        .await?;
+        for row in missing_posts {
+            generation = generation.checked_add(1).ok_or_else(|| {
+                sqlx::Error::Protocol("catch-up generation is exhausted".to_string())
+            })?;
+            sqlx::query(
+                "INSERT INTO forum_catch_up_post_points (post_id, thread_id, activity_at, seq) \
+                 VALUES ($1, $2, $3, $4) ON CONFLICT (post_id) DO NOTHING",
+            )
+            .bind(row.try_get::<String, _>("id")?)
+            .bind(row.try_get::<String, _>("thread_id")?)
+            .bind(row.try_get::<i64, _>("created_at")?)
+            .bind(generation)
+            .execute(&mut *catch_up_tx)
+            .await?;
+        }
+        let missing_receipts = sqlx::query(
+            "SELECT viewer_sub, post_id FROM forum_post_read_receipts \
+             WHERE read_seq IS NULL ORDER BY read_at ASC, viewer_sub ASC, post_id ASC",
+        )
+        .fetch_all(&mut *catch_up_tx)
+        .await?;
+        for row in missing_receipts {
+            generation = generation.checked_add(1).ok_or_else(|| {
+                sqlx::Error::Protocol("catch-up generation is exhausted".to_string())
+            })?;
+            sqlx::query(
+                "UPDATE forum_post_read_receipts SET read_seq = $1 \
+                 WHERE viewer_sub = $2 AND post_id = $3 AND read_seq IS NULL",
+            )
+            .bind(generation)
+            .bind(row.try_get::<String, _>("viewer_sub")?)
+            .bind(row.try_get::<String, _>("post_id")?)
+            .execute(&mut *catch_up_tx)
+            .await?;
+        }
+        sqlx::query("UPDATE forum_catch_up_clock SET generation = $1 WHERE id = 1")
+            .bind(generation)
+            .execute(&mut *catch_up_tx)
+            .await?;
+        catch_up_tx.commit().await?;
         // Parsed @mentions. One row per post + mentioned username; usernames are normalised by the
         // handler before write. No cross-service notification is attempted here.
         sqlx::query(
@@ -4070,6 +4781,12 @@ impl PgStore {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_subscriptions_user ON thread_subscriptions (subscriber_sub)")
             .execute(&self.pool)
             .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_subscriptions_user_thread \
+             ON thread_subscriptions (subscriber_sub, thread_id)",
+        )
+        .execute(&self.pool)
+        .await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_follow_preferences_user \
              ON thread_follow_preferences (subscriber_sub, thread_id)",
@@ -5039,6 +5756,7 @@ impl PgStore {
         .execute(&mut *tx)
         .await
         .map_err(backend)?;
+        Self::insert_catch_up_post_point_tx(&mut tx, first_post).await?;
         tx.commit().await.map_err(backend)?;
         Ok(())
     }
@@ -5114,6 +5832,7 @@ impl PgStore {
         .execute(&mut *tx)
         .await
         .map_err(backend)?;
+        Self::insert_catch_up_post_point_tx(&mut tx, first_post).await?;
         Self::replace_mentions_tx(
             &mut tx,
             &first_post.id,
@@ -5215,6 +5934,7 @@ impl PgStore {
             .execute(&mut *tx)
             .await
             .map_err(backend)?;
+            Self::insert_catch_up_post_point_tx(&mut tx, post).await?;
             sqlx::query("UPDATE threads SET last_at = $1 WHERE id = $2")
                 .bind(post.created_at)
                 .bind(&post.thread_id)
@@ -5363,6 +6083,7 @@ impl PgStore {
             .execute(&mut *tx)
             .await
             .map_err(backend)?;
+            Self::insert_catch_up_post_point_tx(&mut tx, post).await?;
             sqlx::query("UPDATE threads SET last_at = $1 WHERE id = $2")
                 .bind(post.created_at)
                 .bind(&post.thread_id)
@@ -6249,6 +6970,302 @@ impl PgStore {
         Ok(signals)
     }
 
+    async fn catch_up_page_async(
+        &self,
+        viewer_sub: &str,
+        view: CatchUpView,
+        as_of: i64,
+        snapshot_generation: i64,
+        before: Option<&CatchUpCursor>,
+        limit: i64,
+    ) -> Result<Vec<CatchUpItem>, StoreError> {
+        let limit = validate_catch_up_page(view, as_of, snapshot_generation, before, limit)? as i64;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let current_generation = self.catch_up_snapshot_generation_async().await?;
+        if snapshot_generation > current_generation {
+            return Err(StoreError::InvalidOperation(
+                "catch-up snapshot generation is in the future".to_string(),
+            ));
+        }
+        let view_scope = match view {
+            CatchUpView::Updates => {
+                "unread_count > 0 AND (follow_level IN ('watch', 'follow') OR authored \
+                 OR participated OR bookmarked OR reading_started)"
+            }
+            CatchUpView::Following => "follow_level IN ('watch', 'follow')",
+            CatchUpView::Questions => "authored AND category_format = 'question'",
+        };
+        let candidate_sources = match view {
+            CatchUpView::Following => {
+                "SELECT thread_id FROM thread_subscriptions WHERE subscriber_sub = $1 \
+                 UNION \
+                 SELECT thread_id FROM thread_follow_preferences \
+                  WHERE subscriber_sub = $1 AND level = 'follow'"
+            }
+            CatchUpView::Questions => {
+                "SELECT id AS thread_id FROM threads \
+                  WHERE author_sub = $1 AND created_at <= $2"
+            }
+            CatchUpView::Updates => {
+                "SELECT thread_id FROM thread_subscriptions WHERE subscriber_sub = $1 \
+                 UNION \
+                 SELECT thread_id FROM thread_follow_preferences \
+                  WHERE subscriber_sub = $1 AND level = 'follow' \
+                 UNION \
+                 SELECT id AS thread_id FROM threads WHERE author_sub = $1 \
+                 UNION \
+                 SELECT thread_id FROM snapshot_posts WHERE author_sub = $1 \
+                 UNION \
+                 SELECT saved_post.thread_id \
+                   FROM forum_bookmarks AS bookmark \
+                   JOIN snapshot_posts AS saved_post ON saved_post.id = bookmark.post_id \
+                  WHERE bookmark.owner_sub = $1 AND bookmark.created_at <= $2 \
+                 UNION \
+                 SELECT read_post.thread_id \
+                   FROM forum_post_read_receipts AS receipt \
+                   JOIN snapshot_posts AS read_post ON read_post.id = receipt.post_id \
+                  WHERE receipt.viewer_sub = $1 AND receipt.read_at <= $2 \
+                    AND receipt.read_seq <= $3"
+            }
+        };
+        // Candidate ids come directly from every personal authority. In particular, explicit
+        // Watch/Follow rows are not intersected with Latest and therefore cannot fall out after
+        // 200 newer public threads. Post/read authority is bounded by one commit-ordered generation;
+        // wall time remains an additional fail-closed guard for malformed future-dated rows.
+        let sql = format!(
+            r#"WITH snapshot_points AS (
+                 SELECT post_id, thread_id, activity_at, seq
+                   FROM forum_catch_up_post_points
+                  WHERE seq <= $3 AND activity_at <= $2
+             ), snapshot_posts AS (
+                 SELECT p.id, p.thread_id, p.body_md, p.quoted_post_id,
+                        p.author_sub, p.author_email, p.created_at
+                   FROM posts AS p
+                   JOIN snapshot_points AS point ON point.post_id = p.id
+             ), personal_thread_ids AS (
+                 {candidate_sources}
+             ), projected AS (
+                 SELECT t.id AS id, t.category_id AS category_id, t.title AS title,
+                        t.author_sub AS author_sub, t.author_email AS author_email,
+                        t.created_at AS created_at, t.last_at AS last_at,
+                        t.locked AS locked, t.pinned AS pinned,
+                        CASE WHEN c.format = 'question' AND accepted.id IS NOT NULL
+                             THEN t.accepted_post_id ELSE '' END AS accepted_post_id,
+                        t.first_post_id AS first_post_id,
+                        c.name AS category_name, c.format AS category_format,
+                        CASE WHEN watcher.subscriber_sub IS NOT NULL THEN 'watch'
+                             ELSE COALESCE(preference.level, 'none') END AS follow_level,
+                        CASE WHEN t.author_sub = $1 THEN TRUE ELSE FALSE END AS authored,
+                        EXISTS (
+                            SELECT 1 FROM snapshot_posts AS participant
+                             WHERE participant.thread_id = t.id
+                               AND participant.author_sub = $1
+                        ) AS participated,
+                        EXISTS (
+                            SELECT 1
+                              FROM forum_bookmarks AS bookmark
+                              JOIN snapshot_posts AS bookmarked_post
+                                ON bookmarked_post.id = bookmark.post_id
+                             WHERE bookmark.owner_sub = $1
+                               AND bookmark.created_at <= $2
+                               AND bookmarked_post.thread_id = t.id
+                        ) AS bookmarked,
+                        EXISTS (
+                            SELECT 1
+                              FROM forum_post_read_receipts AS receipt
+                              JOIN snapshot_posts AS read_post ON read_post.id = receipt.post_id
+                             WHERE receipt.viewer_sub = $1 AND receipt.read_at <= $2
+                               AND read_post.thread_id = t.id
+                               AND receipt.read_seq <= $3
+                        ) AS reading_started,
+                        (SELECT COUNT(*)
+                           FROM snapshot_posts AS unread_post
+                          WHERE unread_post.thread_id = t.id
+                            AND NOT EXISTS (
+                                SELECT 1 FROM forum_post_read_receipts AS receipt
+                                 WHERE receipt.viewer_sub = $1
+                                   AND receipt.post_id = unread_post.id
+                                   AND receipt.read_at <= $2
+                                   AND receipt.read_seq <= $3
+                            )) AS unread_count,
+                        COALESCE((SELECT MAX(point.activity_at)
+                                    FROM snapshot_points AS point
+                                   WHERE point.thread_id = t.id), t.created_at)
+                            AS activity_at,
+                        (SELECT COUNT(*) FROM snapshot_posts AS counted_post
+                          WHERE counted_post.thread_id = t.id) AS post_count,
+                        CASE WHEN c.format = 'question' AND accepted.id IS NOT NULL
+                             THEN TRUE ELSE FALSE END AS solved
+                   FROM personal_thread_ids AS personal
+                   JOIN threads AS t ON t.id = personal.thread_id
+                   JOIN categories AS c ON c.id = t.category_id
+                   JOIN snapshot_points AS initial_point
+                     ON initial_point.post_id = t.first_post_id
+                   LEFT JOIN thread_subscriptions AS watcher
+                     ON watcher.thread_id = t.id AND watcher.subscriber_sub = $1
+                   LEFT JOIN thread_follow_preferences AS preference
+                     ON preference.thread_id = t.id AND preference.subscriber_sub = $1
+                   LEFT JOIN snapshot_posts AS accepted
+                     ON accepted.id = t.accepted_post_id
+                    AND accepted.thread_id = t.id
+                    AND accepted.id <> t.first_post_id
+                  WHERE t.created_at <= $2
+             ), eligible AS (
+                 SELECT * FROM projected
+                  WHERE follow_level <> 'mute' AND {view_scope}
+             ), page AS (
+                 SELECT * FROM eligible
+                  WHERE ($4 = FALSE OR activity_at < $5
+                         OR (activity_at = $5 AND id < $6))
+                  ORDER BY activity_at DESC, id DESC
+                  LIMIT $7
+             )
+             SELECT page.*,
+                    first_unread.id AS unread_id,
+                    first_unread.thread_id AS unread_thread_id,
+                    first_unread.body_md AS unread_body_md,
+                    first_unread.quoted_post_id AS unread_quoted_post_id,
+                    first_unread.author_sub AS unread_author_sub,
+                    first_unread.author_email AS unread_author_email,
+                    first_unread.created_at AS unread_created_at
+               FROM page
+               LEFT JOIN snapshot_posts AS first_unread ON first_unread.id = (
+                    SELECT candidate.id
+                      FROM snapshot_posts AS candidate
+                     WHERE candidate.thread_id = page.id
+                       AND NOT EXISTS (
+                           SELECT 1 FROM forum_post_read_receipts AS receipt
+                            WHERE receipt.viewer_sub = $1
+                              AND receipt.post_id = candidate.id
+                              AND receipt.read_at <= $2
+                              AND receipt.read_seq <= $3
+                       )
+                     ORDER BY CASE WHEN candidate.id = page.first_post_id THEN 0 ELSE 1 END,
+                              candidate.created_at ASC, candidate.id ASC
+                     LIMIT 1
+               )
+              ORDER BY page.activity_at DESC, page.id DESC"#
+        );
+        let has_cursor = before.is_some();
+        let cursor_at = before.map(|cursor| cursor.activity_at).unwrap_or_default();
+        let cursor_id = before
+            .map(|cursor| cursor.thread_id.as_str())
+            .unwrap_or_default();
+        let rows = sqlx::query(&sql)
+            .bind(viewer_sub)
+            .bind(as_of)
+            .bind(snapshot_generation)
+            .bind(has_cursor)
+            .bind(cursor_at)
+            .bind(cursor_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(backend)?;
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            let thread_id: String = row.try_get("id").map_err(backend)?;
+            let stored_level: String = row.try_get("follow_level").map_err(backend)?;
+            let follow_level = ThreadFollowLevel::parse(&stored_level).ok_or_else(|| {
+                StoreError::Backend(format!(
+                    "unknown catch-up follow level for {thread_id}: {stored_level}"
+                ))
+            })?;
+            let authored: bool = row.try_get("authored").map_err(backend)?;
+            let bookmarked: bool = row.try_get("bookmarked").map_err(backend)?;
+            let participated: bool = row.try_get("participated").map_err(backend)?;
+            let reading_started: bool = row.try_get("reading_started").map_err(backend)?;
+            let reason = catch_up_reason(
+                view,
+                follow_level,
+                authored,
+                bookmarked,
+                participated,
+                reading_started,
+            )
+            .ok_or_else(|| {
+                StoreError::Backend(format!(
+                    "catch-up query returned an unexplained thread: {thread_id}"
+                ))
+            })?;
+            let category_format: String = row.try_get("category_format").map_err(backend)?;
+            // Match every other public read: manually-corrupted/forward format values are the
+            // conservative Discussion mode and can never enter the Questions view.
+            let category_format = CategoryFormat::parse(&category_format).unwrap_or_default();
+            let solved: bool = row.try_get("solved").map_err(backend)?;
+            let unread_count: i64 = row.try_get("unread_count").map_err(backend)?;
+            let unread_id: Option<String> = row.try_get("unread_id").map_err(backend)?;
+            let first_unread = if let Some(id) = unread_id {
+                Some(Post {
+                    id,
+                    thread_id: row
+                        .try_get::<Option<String>, _>("unread_thread_id")
+                        .map_err(backend)?
+                        .ok_or_else(|| {
+                            StoreError::Backend("catch-up unread thread is missing".to_string())
+                        })?,
+                    body_md: row
+                        .try_get::<Option<String>, _>("unread_body_md")
+                        .map_err(backend)?
+                        .ok_or_else(|| {
+                            StoreError::Backend("catch-up unread body is missing".to_string())
+                        })?,
+                    quoted_post_id: row
+                        .try_get::<Option<String>, _>("unread_quoted_post_id")
+                        .map_err(backend)?
+                        .unwrap_or_default(),
+                    author_sub: row
+                        .try_get::<Option<String>, _>("unread_author_sub")
+                        .map_err(backend)?
+                        .ok_or_else(|| {
+                            StoreError::Backend("catch-up unread author is missing".to_string())
+                        })?,
+                    author_email: row
+                        .try_get::<Option<String>, _>("unread_author_email")
+                        .map_err(backend)?
+                        .ok_or_else(|| {
+                            StoreError::Backend(
+                                "catch-up unread author email is missing".to_string(),
+                            )
+                        })?,
+                    created_at: row
+                        .try_get::<Option<i64>, _>("unread_created_at")
+                        .map_err(backend)?
+                        .ok_or_else(|| {
+                            StoreError::Backend("catch-up unread time is missing".to_string())
+                        })?,
+                })
+            } else {
+                None
+            };
+            if (unread_count > 0) != first_unread.is_some() {
+                return Err(StoreError::Backend(format!(
+                    "catch-up unread projection is inconsistent for {thread_id}"
+                )));
+            }
+            let thread = Self::thread_from_row(&row).map_err(backend)?;
+            let post_count: i64 = row.try_get("post_count").map_err(backend)?;
+            items.push(CatchUpItem {
+                thread,
+                category_name: row.try_get("category_name").map_err(backend)?,
+                reason,
+                follow_level,
+                unread_count,
+                first_unread,
+                question_state: category_format.is_question().then_some(if solved {
+                    CatchUpQuestionState::Solved
+                } else {
+                    CatchUpQuestionState::Waiting
+                }),
+                activity_at: row.try_get("activity_at").map_err(backend)?,
+                reply_count: (post_count - 1).max(0),
+            });
+        }
+        Ok(items)
+    }
+
     async fn thread_reading_states_async(
         &self,
         viewer_sub: &str,
@@ -6336,14 +7353,47 @@ impl PgStore {
                 return Err(StoreError::NotFound("thread post not found".to_string()));
             }
         }
-        for post_id in post_ids {
-            sqlx::query(
-                "INSERT INTO forum_post_read_receipts (viewer_sub, post_id, read_at) \
-                 VALUES ($1, $2, $3) ON CONFLICT (viewer_sub, post_id) DO NOTHING",
+        let mut needs_sequence = Vec::new();
+        for post_id in &post_ids {
+            let stored = sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT read_seq FROM forum_post_read_receipts \
+                 WHERE viewer_sub = $1 AND post_id = $2 FOR UPDATE",
             )
             .bind(viewer_sub)
             .bind(post_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(backend)?;
+            if !matches!(stored, Some(Some(_))) {
+                needs_sequence.push(post_id.clone());
+            }
+        }
+        if needs_sequence.is_empty() {
+            tx.commit().await.map_err(backend)?;
+            return Ok(());
+        }
+        let read_seq = Self::next_catch_up_generation_tx(&mut tx).await?;
+        for post_id in needs_sequence {
+            sqlx::query(
+                "INSERT INTO forum_post_read_receipts (viewer_sub, post_id, read_at, read_seq) \
+                 VALUES ($1, $2, $3, $4) ON CONFLICT (viewer_sub, post_id) DO NOTHING",
+            )
+            .bind(viewer_sub)
+            .bind(&post_id)
             .bind(read_at)
+            .bind(read_seq)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+            // A nullable row can only come from a rollback-era v7 writer. Preserve its original
+            // `read_at` and assign the first v8-visible generation exactly once.
+            sqlx::query(
+                "UPDATE forum_post_read_receipts SET read_seq = $1 \
+                 WHERE viewer_sub = $2 AND post_id = $3 AND read_seq IS NULL",
+            )
+            .bind(read_seq)
+            .bind(viewer_sub)
+            .bind(&post_id)
             .execute(&mut *tx)
             .await
             .map_err(backend)?;
@@ -6564,11 +7614,13 @@ impl PgStore {
         .execute(&mut *tx)
         .await
         .map_err(backend)?;
-        sqlx::query("SELECT owner_sub FROM forum_bookmark_owner_guards WHERE owner_sub = $1 FOR UPDATE")
-            .bind(owner_sub)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(backend)?;
+        sqlx::query(
+            "SELECT owner_sub FROM forum_bookmark_owner_guards WHERE owner_sub = $1 FOR UPDATE",
+        )
+        .bind(owner_sub)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(backend)?;
         if let Some(row) = sqlx::query(
             "SELECT bookmark_id, owner_sub, post_id, note, remind_at, created_at, updated_at, version \
              FROM forum_bookmarks WHERE owner_sub = $1 AND post_id = $2",
@@ -6648,11 +7700,7 @@ impl PgStore {
             ids.push_bind(post_id);
         }
         ids.push_unseparated(")");
-        let rows = query
-            .build()
-            .fetch_all(&self.pool)
-            .await
-            .map_err(backend)?;
+        let rows = query.build().fetch_all(&self.pool).await.map_err(backend)?;
         rows.iter()
             .map(|row| Self::bookmark_from_row(row).map_err(backend))
             .collect()
@@ -6667,9 +7715,12 @@ impl PgStore {
         now: i64,
     ) -> Result<Vec<BookmarkItem>, StoreError> {
         let cursor_at = cursor.map(|value| value.sort_at);
-        let cursor_id = cursor.map(|value| value.post_id.as_str()).unwrap_or_default();
+        let cursor_id = cursor
+            .map(|value| value.post_id.as_str())
+            .unwrap_or_default();
         let limit = limit.clamp(0, MAX_BOOKMARK_PAGE + 1);
-        let base = "SELECT b.bookmark_id, b.owner_sub, b.post_id, b.note, b.remind_at, b.created_at, \
+        let base =
+            "SELECT b.bookmark_id, b.owner_sub, b.post_id, b.note, b.remind_at, b.created_at, \
                            b.updated_at, b.version, p.thread_id, t.title AS thread_title, \
                            p.author_email AS post_author_email, p.body_md AS post_body_md, \
                            p.created_at AS post_created_at \
@@ -6697,21 +7748,25 @@ impl PgStore {
             ),
         };
         let rows = match state {
-            BookmarkState::All => sqlx::query(&sql)
-                .bind(owner_sub)
-                .bind(cursor_at)
-                .bind(cursor_id)
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await,
-            BookmarkState::Due | BookmarkState::Scheduled => sqlx::query(&sql)
-                .bind(owner_sub)
-                .bind(cursor_at)
-                .bind(cursor_id)
-                .bind(now)
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await,
+            BookmarkState::All => {
+                sqlx::query(&sql)
+                    .bind(owner_sub)
+                    .bind(cursor_at)
+                    .bind(cursor_id)
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await
+            }
+            BookmarkState::Due | BookmarkState::Scheduled => {
+                sqlx::query(&sql)
+                    .bind(owner_sub)
+                    .bind(cursor_at)
+                    .bind(cursor_id)
+                    .bind(now)
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await
+            }
         }
         .map_err(backend)?;
         rows.iter()
@@ -6851,12 +7906,12 @@ impl PgStore {
             "DELETE FROM forum_bookmarks \
              WHERE owner_sub = $1 AND post_id = $2 AND bookmark_id = $3",
         )
-            .bind(owner_sub)
-            .bind(post_id)
-            .bind(expected.bookmark_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(backend)?;
+        .bind(owner_sub)
+        .bind(post_id)
+        .bind(expected.bookmark_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
         tx.commit().await.map_err(backend)?;
         Ok(())
     }
@@ -7268,6 +8323,23 @@ impl Store for PgStore {
             .await
     }
 
+    async fn catch_up_snapshot_generation(&self) -> Result<i64, StoreError> {
+        self.catch_up_snapshot_generation_async().await
+    }
+
+    async fn catch_up_page(
+        &self,
+        viewer_sub: &str,
+        view: CatchUpView,
+        as_of: i64,
+        snapshot_generation: i64,
+        before: Option<&CatchUpCursor>,
+        limit: i64,
+    ) -> Result<Vec<CatchUpItem>, StoreError> {
+        self.catch_up_page_async(viewer_sub, view, as_of, snapshot_generation, before, limit)
+            .await
+    }
+
     async fn thread_reading_state(
         &self,
         viewer_sub: &str,
@@ -7391,15 +8463,8 @@ impl Store for PgStore {
         reminder: BookmarkReminderUpdate,
         changed_at: i64,
     ) -> Result<Bookmark, StoreError> {
-        self.update_bookmark_async(
-            owner_sub,
-            post_id,
-            expected,
-            note,
-            reminder,
-            changed_at,
-        )
-        .await
+        self.update_bookmark_async(owner_sub, post_id, expected, note, reminder, changed_at)
+            .await
     }
 
     async fn complete_due_bookmark(
@@ -7409,13 +8474,8 @@ impl Store for PgStore {
         expected: BookmarkCas<'_>,
         changed_at: i64,
     ) -> Result<Bookmark, StoreError> {
-        self.complete_due_bookmark_async(
-            owner_sub,
-            post_id,
-            expected,
-            changed_at,
-        )
-        .await
+        self.complete_due_bookmark_async(owner_sub, post_id, expected, changed_at)
+            .await
     }
 
     async fn snooze_bookmark(
@@ -7426,14 +8486,8 @@ impl Store for PgStore {
         remind_at: i64,
         changed_at: i64,
     ) -> Result<Bookmark, StoreError> {
-        self.snooze_bookmark_async(
-            owner_sub,
-            post_id,
-            expected,
-            remind_at,
-            changed_at,
-        )
-        .await
+        self.snooze_bookmark_async(owner_sub, post_id, expected, remind_at, changed_at)
+            .await
     }
 
     async fn remove_bookmark(
@@ -7443,7 +8497,7 @@ impl Store for PgStore {
         expected: BookmarkCas<'_>,
     ) -> Result<(), StoreError> {
         self.remove_bookmark_async(owner_sub, post_id, expected)
-        .await
+            .await
     }
 
     async fn toggle_reaction(
@@ -7493,7 +8547,7 @@ fn backend(e: sqlx::Error) -> StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use tokio::sync::Barrier;
 
@@ -7736,6 +8790,141 @@ mod tests {
                 .unwrap_err(),
             StoreError::InvalidOperation(_)
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn in_memory_catch_up_reading_and_receipt_writes_share_one_lock_order() {
+        let store = Arc::new(InMemoryStore::new());
+        seed_thread(&store, "t_catch_lock_order", "Catch-up lock order", 1).await;
+        store
+            .set_thread_follow_level(
+                "t_catch_lock_order",
+                "u_reader",
+                ThreadFollowLevel::Follow,
+                1,
+            )
+            .await
+            .unwrap();
+
+        for index in 0..64 {
+            let generation = store.catch_up_snapshot_generation().await.unwrap();
+            let reply = post(
+                &format!("p_catch_lock_order_{index}"),
+                "t_catch_lock_order",
+                "new reply",
+                "",
+                index + 2,
+            );
+            let start = Arc::new(Barrier::new(4));
+            let catch_task = {
+                let store = Arc::clone(&store);
+                let start = Arc::clone(&start);
+                tokio::spawn(async move {
+                    start.wait().await;
+                    store
+                        .catch_up_page(
+                            "u_reader",
+                            CatchUpView::Following,
+                            10_000,
+                            generation,
+                            None,
+                            MAX_CATCH_UP_PAGE + 1,
+                        )
+                        .await
+                })
+            };
+            let reading_task = {
+                let store = Arc::clone(&store);
+                let start = Arc::clone(&start);
+                tokio::spawn(async move {
+                    start.wait().await;
+                    store
+                        .thread_reading_states("u_reader", &["t_catch_lock_order".to_string()])
+                        .await
+                })
+            };
+            let reply_task = {
+                let store = Arc::clone(&store);
+                let start = Arc::clone(&start);
+                let reply = reply.clone();
+                tokio::spawn(async move {
+                    start.wait().await;
+                    store.add_reply(&reply).await
+                })
+            };
+            start.wait().await;
+            let (page, reading, reply_result) =
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    tokio::join!(catch_task, reading_task, reply_task)
+                })
+                .await
+                .expect("Catch-up, reading, and reply commands must make bounded progress");
+            let page = page.unwrap().unwrap();
+            reading.unwrap().unwrap();
+            reply_result.unwrap().unwrap();
+            assert_eq!(page.len(), 1);
+            assert_eq!(page[0].reply_count, index);
+
+            // Freeze the new post, then race its first receipt with both read projections. The
+            // frozen Catch-up page must keep the receipt unread regardless of winner order.
+            let receipt_generation = store.catch_up_snapshot_generation().await.unwrap();
+            let start = Arc::new(Barrier::new(4));
+            let catch_task = {
+                let store = Arc::clone(&store);
+                let start = Arc::clone(&start);
+                tokio::spawn(async move {
+                    start.wait().await;
+                    store
+                        .catch_up_page(
+                            "u_reader",
+                            CatchUpView::Updates,
+                            10_000,
+                            receipt_generation,
+                            None,
+                            MAX_CATCH_UP_PAGE + 1,
+                        )
+                        .await
+                })
+            };
+            let reading_task = {
+                let store = Arc::clone(&store);
+                let start = Arc::clone(&start);
+                tokio::spawn(async move {
+                    start.wait().await;
+                    store
+                        .thread_reading_states("u_reader", &["t_catch_lock_order".to_string()])
+                        .await
+                })
+            };
+            let receipt_task = {
+                let store = Arc::clone(&store);
+                let start = Arc::clone(&start);
+                let post_id = reply.id.clone();
+                tokio::spawn(async move {
+                    start.wait().await;
+                    store
+                        .mark_thread_posts_read(
+                            "u_reader",
+                            "t_catch_lock_order",
+                            &[post_id],
+                            10_000,
+                        )
+                        .await
+                })
+            };
+            start.wait().await;
+            let (page, reading, receipt_result) =
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    tokio::join!(catch_task, reading_task, receipt_task)
+                })
+                .await
+                .expect("Catch-up, reading, and receipt commands must make bounded progress");
+            let page = page.unwrap().unwrap();
+            reading.unwrap().unwrap();
+            receipt_result.unwrap().unwrap();
+            assert_eq!(page.len(), 1);
+            assert_eq!(page[0].unread_count, 2);
+        }
     }
 
     #[tokio::test]

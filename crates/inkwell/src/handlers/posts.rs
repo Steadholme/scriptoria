@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::{Form, Json};
 use serde::{Deserialize, Serialize};
@@ -17,11 +17,14 @@ use serde::{Deserialize, Serialize};
 use crate::audit::AuditEvent;
 use crate::auth;
 use crate::error::AppError;
-use crate::handlers::{esc, fmt_date, page_shell, post_excerpt, tag_chips, PageMeta, PageShell};
+use crate::handlers::{
+    esc, fmt_date, page_shell, post_excerpt, review_page_shell, tag_chips, PageMeta, PageShell,
+};
 use crate::markdown;
 use crate::store::{
     AutosaveOutcome, DeletePostCommand, DeletePostOutcome, DeletePostScope, Post, PostCursor,
-    SavePostCommand, SavePostOutcome, WriterAutosave,
+    PostReviewLink, RevokePostReviewLinkCommand, RevokePostReviewLinkOutcome, SavePostCommand,
+    SavePostOutcome, SavePostReviewLinkCommand, SavePostReviewLinkOutcome, WriterAutosave,
 };
 use crate::{now_nanos, now_secs, unique_slug, AppState};
 
@@ -211,6 +214,22 @@ pub struct RestoreForm {
     pub expected_post_id: String,
     #[serde(default)]
     pub return_to: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReviewLinkForm {
+    #[serde(default)]
+    csrf_token: String,
+    #[serde(default)]
+    action: String,
+    #[serde(default)]
+    ttl: String,
+    #[serde(default)]
+    expected_post_id: String,
+    #[serde(default)]
+    expected_post_version: String,
+    #[serde(default)]
+    expected_generation: String,
 }
 
 #[derive(Serialize)]
@@ -724,6 +743,348 @@ pub async fn view(
         viewer.as_deref(),
         is_admin,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Version-pinned external review links
+// ---------------------------------------------------------------------------
+
+/// Owner-only management state. The raw bearer token is intentionally absent from every GET;
+/// it is rendered exactly once by the successful Issue/Refresh POST response.
+pub async fn review_link_manage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+) -> Result<Response, AppError> {
+    let (owner_sub, email) = auth::require_author(&headers)?;
+    let post = state
+        .store
+        .get_post_authoritative(&slug)
+        .await?
+        .filter(|post| post.author_sub == owner_sub)
+        .ok_or_else(review_link_not_found_error)?;
+    let now = now_secs();
+    let link = state
+        .store
+        .get_post_review_link(&post.id, &owner_sub, now)
+        .await?;
+    let (csrf, set_cookie) = auth::ensure_csrf(&headers);
+    Ok(private_no_store(html_with_cookie(
+        render_review_link_management(&headers, &email, &post, link.as_ref(), &csrf, None, now),
+        set_cookie,
+    )))
+}
+
+/// Issue, rotate, or revoke the one active link for a post. Every action is a native form POST,
+/// protected by owner scope, immutable post identity/version, generation CAS, and CSRF.
+pub async fn review_link_command(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+    Form(form): Form<ReviewLinkForm>,
+) -> Result<Response, AppError> {
+    let (owner_sub, email) = auth::require_author(&headers)?;
+    auth::verify_csrf(&headers, &form.csrf_token)?;
+    let post = state
+        .store
+        .get_post_authoritative(&slug)
+        .await?
+        .filter(|post| post.author_sub == owner_sub)
+        .ok_or_else(review_link_not_found_error)?;
+    if form.expected_post_id.trim() != post.id {
+        return Err(review_link_not_found_error());
+    }
+    let expected_post_version = form
+        .expected_post_version
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| review_link_conflict_error())?;
+    let now = now_secs();
+
+    match form.action.trim() {
+        "issue" | "refresh" => {
+            let ttl = match form.ttl.trim() {
+                "48h" => crate::config::REVIEW_LINK_SHORT_TTL_SECS,
+                "7d" => crate::config::REVIEW_LINK_MAX_TTL_SECS,
+                _ => {
+                    return Err(AppError::InvalidRequest(
+                        "choose a 48-hour or 7-day review window".to_string(),
+                    ));
+                }
+            };
+            let expected_generation = if form.action.trim() == "issue" {
+                None
+            } else {
+                Some(parse_review_generation(&form.expected_generation)?)
+            };
+            let raw_token = auth::new_csrf_token();
+            let token_hash = review_token_hash(&raw_token);
+            let outcome = state
+                .store
+                .save_post_review_link(SavePostReviewLinkCommand {
+                    post_id: post.id.clone(),
+                    owner_sub: owner_sub.clone(),
+                    expected_post_version,
+                    expected_generation,
+                    token_hash,
+                    requested_expires_at: now.saturating_add(ttl),
+                    now,
+                })
+                .await?;
+            let saved = match outcome {
+                SavePostReviewLinkOutcome::Saved(saved) => saved,
+                SavePostReviewLinkOutcome::Conflict => {
+                    return Err(review_link_conflict_error());
+                }
+                SavePostReviewLinkOutcome::NotFound => {
+                    return Err(review_link_not_found_error());
+                }
+                SavePostReviewLinkOutcome::NotEligible => {
+                    return Err(AppError::InvalidRequest(
+                        "public posts cannot receive an external review link".to_string(),
+                    ));
+                }
+            };
+            let raw_url = format!("{}/review/{raw_token}", crate::config::SITE_BASE_URL);
+            Ok(private_no_store(
+                Html(render_review_link_management(
+                    &headers,
+                    &email,
+                    &post,
+                    Some(&saved),
+                    &form.csrf_token,
+                    Some(&raw_url),
+                    now,
+                ))
+                .into_response(),
+            ))
+        }
+        "revoke" => {
+            let expected_generation = parse_review_generation(&form.expected_generation)?;
+            match state
+                .store
+                .revoke_post_review_link(RevokePostReviewLinkCommand {
+                    post_id: post.id.clone(),
+                    owner_sub,
+                    expected_post_version,
+                    expected_generation,
+                    now,
+                })
+                .await?
+            {
+                RevokePostReviewLinkOutcome::Revoked => Ok(private_no_store(
+                    Html(render_review_link_management(
+                        &headers,
+                        &email,
+                        &post,
+                        None,
+                        &form.csrf_token,
+                        None,
+                        now,
+                    ))
+                    .into_response(),
+                )),
+                RevokePostReviewLinkOutcome::Conflict => Err(review_link_conflict_error()),
+                RevokePostReviewLinkOutcome::NotFound => Err(review_link_not_found_error()),
+            }
+        }
+        _ => Err(AppError::InvalidRequest(
+            "unknown review-link action".to_string(),
+        )),
+    }
+}
+
+/// Anonymous bearer resolution. All failure modes deliberately share one non-oracular 404 page;
+/// neither the raw token nor its digest is interpolated into HTML, errors, audit, or logs.
+pub async fn review_link_public(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(raw_token): Path<String>,
+) -> Response {
+    let theme = resolved_theme(&headers);
+    if !valid_review_token(&raw_token) {
+        return review_link_unavailable(theme, StatusCode::NOT_FOUND);
+    }
+    let token_hash = review_token_hash(&raw_token);
+    let resolved = match state
+        .store
+        .resolve_post_review(&token_hash, now_secs())
+        .await
+    {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => return review_link_unavailable(theme, StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::error!(error = %error, "review capability resolution failed");
+            return review_link_unavailable(theme, StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+
+    let post = resolved.post;
+    let link = resolved.link;
+    let byline = format!(
+        r#"<div class="ink-byline"><span class="ink-avatar ink-avatar--lg">{initial}</span><div class="ink-byline__col"><span class="ink-byline__author">{author}</span><span class="ink-byline__meta">{date} · {mins} min read</span></div></div>"#,
+        initial = esc(&author_initial(&post.author_email)),
+        author = esc(&post.author_email),
+        date = esc(&fmt_date(post.created_at)),
+        mins = read_minutes(&post.body_md),
+    );
+    let article = POST_HTML
+        .replace("{{TITLE}}", &esc(&post.title))
+        .replace(
+            "{{COVER}}",
+            &render_cover(&post.cover_url, "article__cover", &post.title),
+        )
+        .replace("{{META}}", &byline)
+        .replace("{{TAGS}}", &tag_chips(&post.tags))
+        .replace("{{ACTIONS}}", "")
+        .replace("{{BODY}}", &markdown::render_html(&post.body_md))
+        .replace("{{RELATED}}", "");
+    let banner = format!(
+        r#"<aside class="ink-review-banner" role="status"><div><strong>Saved review · v{version}</strong><span>Immutable revision · expires {expires}</span></div><p>Anyone with this bearer link can read this saved revision until it expires. Later edits are not reflected here.</p></aside>"#,
+        version = link.revision_version,
+        expires = esc(&format_utc_instant(link.expires_at)),
+    );
+    let fragment = format!("{banner}{article}");
+    let metadata = PageMeta {
+        robots: Some("noindex,nofollow,noarchive".to_string()),
+        ..PageMeta::default()
+    };
+    let page = review_page_shell(
+        &format!("Saved review · {} · Inkwell", post.title),
+        theme,
+        &fragment,
+        &metadata,
+    );
+    review_link_security_response((StatusCode::OK, Html(page)).into_response())
+}
+
+fn render_review_link_management(
+    headers: &HeaderMap,
+    email: &str,
+    post: &Post,
+    link: Option<&PostReviewLink>,
+    csrf: &str,
+    raw_url: Option<&str>,
+    now: i64,
+) -> String {
+    let action = format!("/edit/{}/review-link", esc(&post.slug));
+    let hidden = format!(
+        r#"<input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="expected_post_id" value="{post_id}"><input type="hidden" name="expected_post_version" value="{version}">"#,
+        csrf = esc(csrf),
+        post_id = esc(&post.id),
+        version = post.edit_version,
+    );
+    let one_time = raw_url
+        .map(|url| {
+            format!(
+                r#"<section class="ink-review-once" role="status"><span class="badge badge-warn">Shown once</span><h2>Copy this review URL now</h2><p>It cannot be recovered later. Store it only with the reviewer who needs access.</p><label for="issued-review-url">Review URL</label><input id="issued-review-url" type="text" value="{url}" readonly autocomplete="off" spellcheck="false"><noscript><p>Select the complete URL above and copy it with your browser or keyboard.</p></noscript></section>"#,
+                url = esc(url),
+            )
+        })
+        .unwrap_or_default();
+
+    let public_due = post.is_public_at(now);
+    let controls = if public_due {
+        r#"<section class="card ink-review-state"><div class="card__body"><span class="badge badge-published">Public</span><h2>No review link needed</h2><p>This post is already public. Save it as a draft before issuing a private review capability.</p></div></section>"#.to_string()
+    } else if let Some(link) = link {
+        format!(
+            r#"<section class="card ink-review-state"><div class="card__body"><span class="badge badge-draft">Active</span><h2>Saved review v{revision}</h2><dl class="ink-review-facts"><div><dt>Expires</dt><dd>{expires}</dd></div><div><dt>Generation</dt><dd>{generation}</dd></div><div><dt>Current saved post</dt><dd>v{post_version}</dd></div></dl><p class="muted">The URL is intentionally hidden after issue. Refresh binds a new URL to the current saved revision and invalidates the previous URL immediately.</p><div class="ink-review-actions"><form method="post" action="{action}">{hidden}<input type="hidden" name="action" value="refresh"><input type="hidden" name="expected_generation" value="{generation}"><label for="review-refresh-ttl">New lifetime</label><select id="review-refresh-ttl" name="ttl"><option value="48h">48 hours</option><option value="7d">7 days</option></select><button class="btn btn-primary" type="submit">Refresh to current saved revision</button></form><form method="post" action="{action}">{hidden}<input type="hidden" name="action" value="revoke"><input type="hidden" name="expected_generation" value="{generation}"><button class="btn btn-danger" type="submit">Revoke now</button></form></div></div></section>"#,
+            revision = link.revision_version,
+            expires = esc(&format_utc_instant(link.expires_at)),
+            generation = link.generation,
+            post_version = post.edit_version,
+            action = action,
+            hidden = hidden,
+        )
+    } else {
+        format!(
+            r#"<section class="card ink-review-state"><div class="card__body"><span class="badge badge-draft">Not shared</span><h2>Issue a version-pinned link</h2><p>The reviewer sees exactly the current saved revision. Editing this post later does not change an existing review URL.</p><form class="ink-review-issue" method="post" action="{action}">{hidden}<input type="hidden" name="action" value="issue"><label for="review-issue-ttl">Lifetime</label><select id="review-issue-ttl" name="ttl"><option value="48h">48 hours</option><option value="7d">7 days</option></select><button class="btn btn-primary" type="submit">Issue review link</button></form></div></section>"#,
+            action = action,
+            hidden = hidden,
+        )
+    };
+    let schedule_note = if post.is_scheduled_at(now) {
+        format!(
+            r#"<p class="ink-review-schedule"><strong>Scheduled:</strong> any chosen lifetime is capped at {}.</p>"#,
+            esc(&format_utc_instant(post.publish_at))
+        )
+    } else {
+        String::new()
+    };
+    let fragment = format!(
+        r#"<main class="console console--narrow ink-review-manage"><a class="back-link" href="/edit/{slug}">&larr; Back to editor</a><div class="console__head"><span class="eyebrow">External review</span><h1>{title}</h1><p class="sub">One expiring bearer link, pinned to one saved revision.</p></div>{one_time}{schedule_note}{controls}<section class="ink-review-boundary"><h2>Capability boundary</h2><ul><li>Read-only access to one saved revision.</li><li>Publishing, revoking, expiry, or deletion makes the URL unavailable.</li><li>The URL never appears in Studio lists and cannot be recovered from this page.</li></ul></section></main>"#,
+        slug = esc(&post.slug),
+        title = esc(&post.title),
+        one_time = one_time,
+        schedule_note = schedule_note,
+        controls = controls,
+    );
+    page_shell(PageShell {
+        head_title: "External review · Inkwell",
+        body_class: "page-console page-review-manage",
+        rss: false,
+        nav_title: "Studio",
+        email,
+        is_admin: auth::is_admin(headers),
+        theme: resolved_theme(headers),
+        fragment: &fragment,
+        metadata: None,
+    })
+}
+
+fn review_link_unavailable(theme: &str, status: StatusCode) -> Response {
+    let metadata = PageMeta {
+        robots: Some("noindex,nofollow,noarchive".to_string()),
+        ..PageMeta::default()
+    };
+    let fragment = r#"<main class="reader ink-review-unavailable"><section class="empty-state"><span class="eyebrow">External review</span><h1>Review unavailable</h1><p>This review link is invalid or no longer available.</p><a class="btn btn-secondary" href="/">Read public posts</a></section></main>"#;
+    let page = review_page_shell("Review unavailable · Inkwell", theme, fragment, &metadata);
+    review_link_security_response((status, Html(page)).into_response())
+}
+
+fn review_link_security_response(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-robots-tag"),
+        HeaderValue::from_static("noindex, nofollow, noarchive"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    response
+}
+
+fn parse_review_generation(raw: &str) -> Result<i64, AppError> {
+    raw.trim()
+        .parse::<i64>()
+        .ok()
+        .filter(|generation| *generation > 0)
+        .ok_or_else(review_link_conflict_error)
+}
+
+fn valid_review_token(raw: &str) -> bool {
+    raw.len() == 64
+        && raw
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn review_token_hash(raw: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    hex::encode(Sha256::digest(raw.as_bytes()))
+}
+
+fn review_link_not_found_error() -> AppError {
+    AppError::NotFound("no such review-link resource".to_string())
+}
+
+fn review_link_conflict_error() -> AppError {
+    AppError::Conflict("the review-link state changed; reload and try again".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -3001,7 +3362,7 @@ fn render_editor(v: EditorView<'_>) -> String {
     } else {
         ""
     };
-    let history_action = if v.history_href.is_empty() {
+    let mut history_action = if v.history_href.is_empty() {
         String::new()
     } else {
         format!(
@@ -3009,6 +3370,12 @@ fn render_editor(v: EditorView<'_>) -> String {
             esc(v.history_href)
         )
     };
+    if let Some(slug) = v.delete_slug {
+        history_action.push_str(&format!(
+            r#"<a class="btn btn-ghost" href="/edit/{}/review-link">Review link</a>"#,
+            esc(slug)
+        ));
+    }
     let delete_block = match v.delete_slug {
         Some(slug) => format!(
             r#"<div class="danger-zone">

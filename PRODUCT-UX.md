@@ -704,14 +704,161 @@ server-owned visibility, immutable identity and edit-version CAS.
   then found no remaining P0/P1 in Forum, Drive or Blog. Drive additionally locks capability detail
   cache/foreign-scope evidence; Blog locks preview metadata and real PostgreSQL keyset parity.
 
+## Iteration 8: catch-up, delivery acknowledgement, and review hand-off
+
+Iteration 8 turns three private control planes into complete hand-off workflows. Forum lets a
+returning reader finish what changed, Drive lets a submitter prove one delivery was received and
+later acknowledged, and Blog lets an author hand one immutable saved revision to an external
+reviewer. These workflows share no token or state model: Odyssey remains Foundation, while each
+product owns its own authority, URLs, persistence, expiry and recovery.
+
+### Forum: complete Catch-up views
+
+- `/for-you?view=updates|following|questions` is one private, stable Catch-up surface. `Updates`
+  contains related threads with exact unread posts, `Following` directly enumerates every explicit
+  Watch or Follow relationship, and `Questions` contains the viewer's own valid Question threads
+  with Waiting for solution or Solved state. Mute wins over every view while direct Activity
+  delivery remains independent.
+- Following starts from the complete relationship tables instead of first sampling Latest, so an
+  old explicit relationship cannot disappear at candidate 201. The other views union only
+  authoritative authored, participated, bookmarked, reading and relationship signals, then join
+  current live thread, category, accepted-answer and post visibility.
+- A page contains at most 30 threads. Its `v8g` keyset cursor binds view, fixed `as_of`, a
+  monotonic snapshot generation, effective activity time and immutable thread id; a cursor from
+  another view, generation or weak pre-v8 snapshot fails closed. Tied timestamps, same-second
+  replies/read receipts and deletion of the newest reply do not duplicate or skip a thread.
+- Every row has one deterministic reason, exact unread count, a current sanitized excerpt of the
+  first unread post and a `Continue from first unread` anchor. GET never writes a receipt and there
+  is no synthetic Mark all read command. Activity continues to mean an actually delivered Reply,
+  Mention, Answer or Watch event; Updates means a thread the viewer can return to.
+
+This uses the task separation shown by
+[Discourse's unified New views](https://meta.discourse.org/t/introducing-the-unified-new-view-for-the-topic-list/404728),
+[GitHub's notification filters](https://docs.github.com/en/subscriptions-and-notifications/reference/inbox-filters)
+and [GitHub's subscription management](https://docs.github.com/en/subscriptions-and-notifications/how-tos/managing-subscriptions-for-activity-on-github/managing-your-subscriptions),
+without importing their delivery systems or adding opaque ranking.
+
+Acceptance: Watch/Follow outside the Latest 200 window remains reachable; unread holes and floated
+solutions preserve the exact first-unread anchor; Questions only uses a valid Question category and
+accepted reply; Memory and PostgreSQL return the same keyset pages; the response is subject-scoped,
+`private, no-store`, SSR-first and usable without JavaScript. The Memory implementation uses one
+audited lock order for Catch-up, thread-reading and post/read mutations; PostgreSQL serializes the
+singleton generation clock so snapshot order follows transaction commit order.
+
+### Drive: capability-scoped Delivery Receipt
+
+- The first successfully committed file in one upload session atomically creates a Delivery. A
+  JavaScript multi-file queue reuses it, while the native single-file fallback naturally creates
+  one Delivery. A failed reservation, blob write or metadata commit cannot leave a receipt that
+  claims a file was received.
+- `/receipts/{token}` is a separate anonymous, read-only capability. It exposes only the file names,
+  sizes and receive times that submitter already supplied, plus `Received` or `Acknowledged` and a
+  30-day expiry. It cannot upload, enumerate the destination folder, read file bytes, disclose an
+  owner or inspect another delivery.
+- Receipt tokens are independent 256-bit secrets; PostgreSQL stores only SHA-256 digests. Raw
+  tokens appear only in the successful submitter response, never in Request Inbox, owner detail,
+  audit payload or storage metadata. Invalid, expired and unknown receipts share a generic 404.
+- Canonical owner request detail groups immutable `UploadSubmission` rows by Delivery. The owner
+  can perform one idempotent, CSRF-protected `Acknowledge delivery` command; a foreign owner sees a
+  generic 404. Acknowledgement is terminal: an upload that races it either commits completely
+  before the acknowledgement or rolls back its blob, metadata, reservation and budget. Existing
+  pre-v8 submissions remain visible as legacy ungrouped receipts.
+- `Acknowledged` means only that the owner marked the delivery seen. It never means verified
+  uploader identity, malware-safe content, approval, correctness or a communication channel.
+
+The flow keeps the upload-only privacy boundary documented by
+[OneDrive Request Files](https://support.microsoft.com/en-us/onedrive/create-a-file-request), while
+borrowing the explicit successful-upload posture of
+[Dropbox File Requests](https://help.dropbox.com/share/received-file-request) and
+[Box File Request](https://support.box.com/hc/en-us/articles/360045304913-How-Content-Submitters-View-and-Use-File-Request).
+Aperture deliberately does not collect an unverified name or email and call it identity.
+
+Acceptance: Memory and PostgreSQL commit file, submission and first Delivery atomically; multiple
+files can share one receipt without crossing request scope; acknowledgement is owner-only and
+idempotent and permanently closes that Delivery to appended files; closing or expiring a Request
+stops new uploads but does not rewrite an existing receipt; public receipt HTML is
+`private, no-store` with `Referrer-Policy: no-referrer` and contains no file id, folder id, object
+key, owner, upload token or download authority.
+
+### Blog: version-pinned Review Link
+
+- A Draft or not-yet-public Scheduled post can issue one Review Link for the current immutable
+  revision. The author chooses 48 hours or 7 days; a scheduled publication instant is an earlier
+  hard stop. The raw URL is shown exactly once, while later owner management shows only revision,
+  generation and expiry.
+- `/review/{token}` renders that saved revision in real Reader chrome. Later editing does not
+  silently change what the reviewer sees. `Refresh to current version` atomically rotates the
+  token and advances a generation CAS; concurrent stale refreshes conflict and the former token
+  immediately becomes a generic 404. Revoke, expiry, publication, scheduled publication and post
+  deletion also invalidate it.
+- The database stores a SHA-256 token digest, never the raw 256-bit capability. The link binds one
+  post id to one revision version with foreign keys and at most one active generation. Publishing
+  or changing publication identity invalidates the link inside the same Store transaction so a
+  later Unpublish cannot revive an old reviewer capability.
+- The reviewer page has a `Saved review · vN` banner and no Edit, Delete, Studio or owner identity
+  controls. It is `private, no-store`, sends `X-Robots-Tag: noindex, nofollow, noarchive` and
+  `Referrer-Policy: no-referrer`, emits matching robots metadata, and emits no canonical, Open
+  Graph or Twitter metadata. It never enters Reader indexes, tags, Search, Ask, RSS or sitemap.
+- v8 adds no reviewer account, comments, private notes, email preview, analytics or editorial
+  status. Those require separate roles, delivery and retention authorities rather than UI labels.
+
+The capability lifecycle follows the share-and-reset posture documented by
+[Ghost post previews](https://ghost.org/help/publishing-content/) and
+[Substack secret draft links](https://support.substack.com/hc/en-us/articles/360038433692-How-do-I-share-a-preview-of-my-post-with-others),
+while the immutable snapshot is an Inkwell-specific consequence of its existing revision and CAS
+authority. [WordPress revisions](https://wordpress.com/support/page-post-revisions/) remain a useful
+future reference for visual comparison, not an excuse to mix restore and external review.
+
+Acceptance: issue, pinned read, rotate, revoke, expiry, publication and deletion agree between
+Memory and PostgreSQL; the old link stays on its issued revision across ordinary edits; only one
+concurrent generation wins; anonymous readers cannot infer slug, post id, revision id or owner
+routes; the existing `?preview=1` path remains owner-only.
+
+### Iteration 8 exposure contract
+
+Sluice adds exactly two longest-prefix anonymous routes: `blog.w33d.xyz/review/` and
+`drive.w33d.xyz/receipts/`. The Blog and Drive root routes stay SSO-protected, Drive `/s/` and `/u/`
+retain their existing authority, and Forum receives no new anonymous route. The two new capability
+surfaces strip gateway identity, never set an SSO session, and rely on product-owned random token,
+digest lookup, expiry and revocation. Deployment must verify the more-specific public routes and
+the unchanged root redirects independently. Every `/review/`, `/receipts/`, `/s/` and `/u/`
+outcome—including router 404, method 405, proxy 502 and malformed Host—forces `private, no-store`
+and `no-referrer`; access, auth and WAF logs replace the complete bearer tail with `[capability]`.
+Only exact Share Room CSS/JavaScript assets retain public caching. Share Room CSP permits `data:`
+only for its explicit empty favicon, avoiding both a favicon request and a browser console error.
+
+### Iteration 8 candidate verification
+
+- The six public product crates pass 572/572 Rust tests: Forum 125, Blog 121, Wiki 71, Comments 41,
+  Paste 71 and Drive 143. Writer recovery passes 5/5 Node tests. All six crates and the composed
+  Scriptoria binary pass strict Clippy with `-D warnings`; the release build, `git diff --check` and
+  Odyssey stable consumer check pass.
+- Six isolated PostgreSQL 18 databases pass 19/19 real tests: fourteen Forum migration/activity/
+  bookmark/search/store paths and one complete store path for each other product. The matrix covers
+  commit-order snapshots, same-second reply/read ordering, deletion, legacy idempotent backfill,
+  terminal delivery acknowledgement, review-link generation/rollback guards and newest-100 plus
+  externally pinned revision retention.
+- Real Chromium passes the v8 workflows at 320 / 390 / 1440 px plus no-JavaScript at 390 px:
+  Updates/Following/Questions Catch-up, exact unread resume, JavaScript multi-file and native
+  single-file delivery, receipt acknowledgement and terminal append rejection, and Review Link
+  issue/pinned read/refresh/revoke. All six Host arms have no horizontal overflow, console warning/
+  error, page error or unexpected request failure.
+- The complete v7 matrix remains green, and the v6 matrix passes again from a clean database:
+  Watch/Follow/Mute, token-free Request Inbox, owner-only saved preview, exact five-unread resume,
+  Drive Inspector/PDF/no-JavaScript detail, Blog SSR review/edit/confirm and Europe/Berlin DST fold.
+- Independent read-only reviews found and closed the Forum seconds-snapshot and Memory lock-order
+  hazards, Drive post-ack append race, Blog revision-retention parity, and Share Room favicon CSP
+  noise. Final Forum, Drive, Blog, Sluice and CSP reviews report no remaining P0/P1/P2; Sluice's full
+  Go suite and capability-path privacy tests pass.
+
 ## Next iterations
 
-1. Forum: paginate or directly union old explicit relationships beyond the current 200-candidate
-   Latest window, then add user-controlled category/tag signals before any learned ranking.
-2. Drive: paginate beyond the newest 100 requests, then add a real owner event ledger, quarantine
-   state and request-specific abuse controls before presenting an Activity or security story.
-3. Blog: design a revocable anonymous preview capability and a bounded publication-identity model;
-   neither may reuse the private owner query parameter as public authority.
+1. Forum: add user-controlled category/tag intent only after defining its precedence against
+   thread Mute and Watch, then evaluate a bounded off-site digest as a separate delivery authority.
+2. Drive: add stable Request Inbox pagination beyond the newest 100, then request-specific rate
+   limits and quarantine state before presenting an Activity or security story.
+3. Blog: add revision detail and visual compare; reviewer notes or editorial states wait for an
+   explicit reviewer identity, authorization, notification and retention model.
 
 ## Rollout gate
 

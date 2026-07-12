@@ -175,6 +175,10 @@ pub fn app(state: AppState) -> Router {
         .route("/requests/{id}/reopen", post(handlers::requests::reopen))
         .route("/requests/{id}/rotate", post(handlers::requests::rotate))
         .route(
+            "/requests/{id}/deliveries/{delivery_id}/acknowledge",
+            post(handlers::requests::acknowledge_delivery),
+        )
+        .route(
             "/s/{token}",
             get(handlers::files::share).post(handlers::files::share_unlock),
         )
@@ -191,6 +195,7 @@ pub fn app(state: AppState) -> Router {
             "/u/{token}",
             get(handlers::files::upload_inbox).post(handlers::files::upload_inbox_submit),
         )
+        .route("/receipts/{token}", get(handlers::files::delivery_receipt))
         .merge(admin_router())
         .layer(DefaultBodyLimit::max(body_limit))
         // Verify injected identities and make owner routes fail closed when production receives no
@@ -400,8 +405,10 @@ async fn require_gateway_sig(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let path = req.uri().path();
-    let anonymous_capability =
-        path == "/healthz" || path.starts_with("/s/") || path.starts_with("/u/");
+    let anonymous_capability = path == "/healthz"
+        || path.starts_with("/s/")
+        || path.starts_with("/u/")
+        || path.starts_with("/receipts/");
     let has_identity = req
         .headers()
         .get(auth::HEADER_SUBJECT)
@@ -717,6 +724,7 @@ mod shell_contract_tests {
         let templates = [
             include_str!("../templates/admin.html"),
             include_str!("../templates/detail.html"),
+            include_str!("../templates/delivery_receipt.html"),
             include_str!("../templates/error.html"),
             include_str!("../templates/gallery.html"),
             include_str!("../templates/request_detail.html"),
@@ -733,5 +741,13 @@ mod shell_contract_tests {
                 "every Aperture HTML shell must prevent a browser-generated /favicon.ico request"
             );
         }
+    }
+
+    #[test]
+    fn share_room_csp_allows_its_explicit_empty_favicon() {
+        assert!(
+            crate::handlers::SHARE_ROOM_CSP.contains("img-src 'self' data:"),
+            "the explicit data:, favicon must not create a CSP console error"
+        );
     }
 }

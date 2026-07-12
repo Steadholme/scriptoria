@@ -67,7 +67,8 @@
     var list = queue && queue.querySelector("[data-upload-list]");
     var summary = root.querySelector("[data-upload-summary]");
     var csrf = form && form.querySelector("input[name=csrf_token]");
-    if (!form || !input || !queue || !list || !csrf || !window.FormData || !window.XMLHttpRequest) { return; }
+    var delivery = form && form.querySelector("input[name=delivery_token]");
+    if (!form || !input || !queue || !list || !csrf || !delivery || !window.FormData || !window.XMLHttpRequest || !window.DOMParser) { return; }
 
     // The server/no-JS contract intentionally accepts one file. Multiple selection is enabled only
     // after this queue owns submission and sends one existing POST per item.
@@ -75,6 +76,7 @@
     form.setAttribute("data-upload-enhanced", "true");
     var items = [];
     var running = false;
+    var deliveryToken = delivery.value || "";
 
     function size(bytes) {
       if (bytes < 1024) { return bytes + " B"; }
@@ -118,6 +120,7 @@
       return new Promise(function (resolve) {
         var data = new FormData();
         data.append("csrf_token", csrf.value);
+        if (deliveryToken) { data.append("delivery_token", deliveryToken); }
         data.append("file", item.file, item.file.name);
         var xhr = new XMLHttpRequest();
         item.status = "uploading";
@@ -135,10 +138,29 @@
         }
         xhr.addEventListener("load", function () {
           if (xhr.status >= 200 && xhr.status < 300) {
-            item.status = "done";
-            item.row.className = "sr-queue__item is-done";
-            item.progress.value = 100;
-            item.state.textContent = "Uploaded";
+            var response = new DOMParser().parseFromString(xhr.responseText, "text/html");
+            var returnedToken = response.querySelector("input[name=delivery_token]");
+            var returnedReceipt = response.querySelector("[data-delivery-receipt]");
+            if (returnedToken && /^[0-9a-f]{64}$/.test(returnedToken.value || "")) {
+              deliveryToken = returnedToken.value;
+              delivery.value = deliveryToken;
+              var currentReceipt = root.querySelector("[data-delivery-receipt]");
+              if (returnedReceipt && currentReceipt) {
+                currentReceipt.parentNode.replaceChild(returnedReceipt.cloneNode(true), currentReceipt);
+              } else if (returnedReceipt && summary && summary.parentNode) {
+                summary.parentNode.insertBefore(returnedReceipt.cloneNode(true), summary);
+              }
+              item.status = "done";
+              item.row.className = "sr-queue__item is-done";
+              item.progress.value = 100;
+              item.state.textContent = "Received";
+            } else {
+              item.status = "error";
+              item.row.className = "sr-queue__item is-error";
+              item.progress.value = 100;
+              item.state.textContent = "Receipt unavailable";
+              addRetry(item);
+            }
           } else {
             item.status = "error";
             item.row.className = "sr-queue__item is-error";
@@ -188,8 +210,8 @@
       running = false;
       var done = items.filter(function (candidate) { return candidate.status === "done"; }).length;
       var failed = items.filter(function (candidate) { return candidate.status === "error"; }).length;
-      if (failed) { announce(done + " uploaded, " + failed + " need attention."); }
-      else if (done) { announce(done + (done === 1 ? " file uploaded." : " files uploaded.")); }
+      if (failed) { announce(done + " received, " + failed + " need attention."); }
+      else if (done) { announce(done + (done === 1 ? " file received." : " files received.")); }
     }
 
     function enqueue(fileList) {
