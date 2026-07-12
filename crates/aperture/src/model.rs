@@ -288,9 +288,9 @@ impl UploadRequestRec {
     }
 }
 
-/// Fixed owner-Inbox ceiling. Counts remain exact, but the HTML surface deliberately renders only
-/// the newest bounded slice so one owner cannot turn a control-plane GET into an unbounded read.
-pub const UPLOAD_REQUEST_INBOX_CAP: i64 = 100;
+/// Fixed owner-Inbox page size. Store implementations read one additional sentinel row so the
+/// renderer can expose a no-JS keyset link without an unbounded owner control-plane read.
+pub const UPLOAD_REQUEST_INBOX_PAGE_SIZE: i64 = 30;
 
 /// A live request enters the attention-oriented Expiring bucket during its final 72 hours. The
 /// classification always receives an explicit `as_of`; callers must not sample the wall clock per
@@ -436,6 +436,24 @@ pub struct UploadRequestSummary {
     pub updated_at: i64,
 }
 
+impl UploadRequestSummary {
+    pub fn cursor(&self) -> UploadRequestInboxCursor {
+        UploadRequestInboxCursor {
+            updated_at: self.updated_at,
+            id: self.id.clone(),
+        }
+    }
+}
+
+/// Exclusive keyset boundary for the owner Request Inbox's fixed
+/// `(updated_at DESC, id DESC)` ordering. URL parsing additionally binds this boundary to the
+/// selected view and one fixed `as_of`; neither capability nor storage material enters it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UploadRequestInboxCursor {
+    pub updated_at: i64,
+    pub id: String,
+}
+
 /// Exact counts from the same owner query and `as_of` used to classify the bounded rows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UploadRequestInboxCounts {
@@ -458,8 +476,8 @@ impl UploadRequestInboxCounts {
     }
 }
 
-/// One bounded owner Inbox snapshot. `matched_total` can exceed `items.len()`; `truncated` makes
-/// that condition explicit to the renderer instead of silently hiding older requests.
+/// One bounded owner Inbox page. `matched_total` and tab counts are exact at the same `as_of` and
+/// owner snapshot used for `items`; `next` is present only when the Store observed a +1 sentinel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UploadRequestInbox {
     pub as_of: i64,
@@ -467,7 +485,7 @@ pub struct UploadRequestInbox {
     pub counts: UploadRequestInboxCounts,
     pub matched_total: i64,
     pub items: Vec<UploadRequestSummary>,
-    pub truncated: bool,
+    pub next: Option<UploadRequestInboxCursor>,
 }
 
 /// One anonymous delivery session created by the first successfully committed request upload.
@@ -504,6 +522,62 @@ pub struct UploadSubmission {
     pub created_at: i64,
     /// `None` for pre-v8 legacy rows. New uploads always bind to one delivery session.
     pub delivery_id: Option<String>,
+}
+
+/// Owner-controlled disposition for one file received through an upload request. This is an
+/// explicit manual Review Hold, not scanner output or a security decision. Rows are additive in v9:
+/// a pre-v9 submission with no disposition remains available for compatibility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UploadReviewDispositionState {
+    Held,
+    Released,
+}
+
+impl UploadReviewDispositionState {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Held => "held",
+            Self::Released => "released",
+        }
+    }
+
+    pub fn from_slug(value: &str) -> Option<Self> {
+        match value {
+            "held" => Some(Self::Held),
+            "released" => Some(Self::Released),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UploadReviewDisposition {
+    pub submission_id: String,
+    pub request_id: String,
+    pub file_id: String,
+    pub state: UploadReviewDispositionState,
+    pub held_at: i64,
+    pub released_at: Option<i64>,
+    /// Live projection only: false after the owner permanently purged the submitted file.
+    pub file_exists: bool,
+}
+
+impl UploadReviewDisposition {
+    pub fn held(submission: &UploadSubmission) -> Self {
+        Self {
+            submission_id: submission.id.clone(),
+            request_id: submission.request_id.clone(),
+            file_id: submission.file_id.clone(),
+            state: UploadReviewDispositionState::Held,
+            held_at: submission.created_at,
+            released_at: None,
+            file_exists: true,
+        }
+    }
+
+    pub fn is_held(&self) -> bool {
+        self.state == UploadReviewDispositionState::Held
+    }
 }
 
 /// Owner-library view selected by the URL. `All` is the global search/filter result set;

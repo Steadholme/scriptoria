@@ -22,10 +22,14 @@ use crate::handlers::{
     ag_initial, ag_tone, email_display, esc, fmt_ts, personal_counts, rel_time,
     render_page_with_personal_counts, replies_label,
 };
-use crate::model::{Bookmark, Post, ReactionCount, Thread, ThreadFollowLevel, ThreadReadingState};
+use crate::model::{
+    Bookmark, Category, CategoryFocusLevel, Post, ReactionCount, Thread, ThreadFollowLevel,
+    ThreadReadingState,
+};
 use crate::store::{
     AcceptedAnswerAction, CatchUpCursor, CatchUpItem, CatchUpQuestionState, CatchUpReason,
-    CatchUpView, ReplyAnchor, ThreadSort, ThreadStatusFilter, MAX_CATCH_UP_PAGE,
+    CatchUpView, CategoryFocusItem, CategoryFocusReason, CategoryFocusRuleItem, ReplyAnchor,
+    ThreadSort, ThreadStatusFilter, MAX_CATCH_UP_PAGE, MAX_CATEGORY_FOCUS_PAGE,
     MAX_KLAXON_RECIPIENTS_PER_REPLY,
 };
 use crate::{markdown, new_id, now_secs, AppState};
@@ -125,6 +129,8 @@ pub struct ThreadListQuery {
     pub filter: Option<String>,
     #[serde(default)]
     pub status: Option<String>,
+    #[serde(default)]
+    pub focus_saved: Option<String>,
 }
 
 impl ThreadListQuery {
@@ -271,6 +277,7 @@ pub async fn home(
       <p class="ag-rail__label">For you</p>
       <nav class="ag-rail__nav" aria-label="For you">
       <a class="ag-cat" href="/for-you"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 1.7 5.3L19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7L12 3z"/><path d="M19 15v4"/><path d="M21 17h-4"/></svg><span class="ag-cat__name">For You</span></a>
+      <a class="ag-cat" href="/focus"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2"/></svg><span class="ag-cat__name">Focus</span></a>
       <a class="ag-cat" href="/activity"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg><span class="ag-cat__name">Activity</span>{activity_count}</a>
       <a class="ag-cat" href="/bookmarks"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h12a1 1 0 0 1 1 1v17l-7-4-7 4V4a1 1 0 0 1 1-1z"/></svg><span class="ag-cat__name">Saved</span>{bookmark_count}</a>
       <a class="ag-cat{following_active}" href="/?filter=subscribed"{following_current}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 5h8"/><path d="M6 9h12"/><path d="M4 13h16"/><path d="m9 17 3 3 3-3"/></svg><span class="ag-cat__name">Following</span></a>
@@ -550,6 +557,54 @@ pub async fn for_you(
 }
 
 // ===========================================================================
+// GET /focus — private, bounded Category Focus desk
+// ===========================================================================
+
+pub async fn focus(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, AppError> {
+    let identity = auth::require_author(&headers)?;
+    let now = now_secs();
+    let items = state
+        .store
+        .category_focus_page(&identity.sub, MAX_CATEGORY_FOCUS_PAGE, now)
+        .await?;
+    let rules = state.store.category_focus_rules(&identity.sub).await?;
+    let threads: Vec<Thread> = items.iter().map(|item| item.thread.clone()).collect();
+    let reading_states = load_reading_states(&state, Some(&identity.sub), &threads).await?;
+    let rows = render_category_focus_rows(&items, !rules.is_empty(), now, &reading_states);
+    let rule_rows = render_category_focus_rule_rows(&rules);
+    let content = format!(
+        r#"<nav class="crumbs"><a href="/">Home</a><span class="crumbs__sep">/</span><span>Focus</span></nav>
+<div class="page-head ag-focus-head">
+  <div><p class="ag-for-you-eyebrow">Private · category intent · explainable</p><h1>Focus</h1><p class="muted">Priority categories come first, followed categories stay in view, and muted categories stay out unless you explicitly Watch or Follow a thread.</p></div>
+  <a class="btn btn-secondary" href="/for-you">Open Catch up</a>
+</div>
+<aside class="ag-for-you-note" role="note"><strong>Bounded desk</strong><span>Showing at most {limit} live threads. Category Focus changes only this private view and never creates Activity.</span></aside>
+<section class="section ag-focus-rules" aria-labelledby="focus-rules-heading">
+  <div class="section__head"><h2 id="focus-rules-heading" class="section__title">Category rules</h2><span class="muted">{rule_count} / 64</span></div>
+  <div class="ag-focus-rule-list">{rule_rows}</div>
+</section>
+<section class="section ag-focus-feed" aria-labelledby="focus-heading">
+  <h2 id="focus-heading" class="section__title">Focused threads</h2>
+  <div class="thread-list ag-focus-list">{rows}</div>
+</section>"#,
+        limit = MAX_CATEGORY_FOCUS_PAGE,
+        rule_count = rules.len(),
+        rule_rows = rule_rows,
+        rows = rows,
+    );
+    let counts = personal_counts(&state, &headers, now).await?;
+    Ok(Html(render_page_with_personal_counts(
+        "Focus",
+        &email_display(&headers),
+        &content,
+        counts,
+    )))
+}
+
+// ===========================================================================
 // GET /questions — all question categories, with a stable answer-status filter
 // ===========================================================================
 
@@ -643,7 +698,7 @@ pub async fn category(
     Path(id): Path<String>,
     Query(q): Query<ThreadListQuery>,
     headers: HeaderMap,
-) -> Result<Html<String>, AppError> {
+) -> Result<Response, AppError> {
     let now = now_secs();
     let category = state
         .store
@@ -697,6 +752,19 @@ pub async fn category(
         category.format.is_question(),
         status,
     );
+    let (focus_form, set_cookie) = if let Some(viewer_sub) = viewer_sub.as_deref() {
+        let current = state
+            .store
+            .category_focus_level(viewer_sub, &category.id)
+            .await?;
+        let (csrf, set_cookie) = auth::ensure_csrf(&headers);
+        (
+            render_category_focus_form(&category, &csrf, current, &q),
+            set_cookie,
+        )
+    } else {
+        (String::new(), None)
+    };
 
     let content = format!(
         r#"{crumbs}
@@ -707,6 +775,7 @@ pub async fn category(
   </div>
   <a class="btn btn-primary" href="/new?cat={id}">{new_label}</a>
 </div>
+{focus_form}
 <section class="section">
   {controls}
   <div class="thread-list">{list}</div>
@@ -738,16 +807,79 @@ pub async fn category(
             "New thread"
         },
         id = esc(&category.id),
+        focus_form = focus_form,
         controls = controls,
         list = list,
     );
 
     let counts = personal_counts(&state, &headers, now).await?;
-    Ok(Html(render_page_with_personal_counts(
-        &category.name,
-        &email_display(&headers),
-        &content,
-        counts,
+    Ok(html_response(
+        render_page_with_personal_counts(
+            &category.name,
+            &email_display(&headers),
+            &content,
+            counts,
+        ),
+        set_cookie,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CategoryFocusForm {
+    #[serde(default)]
+    pub csrf: String,
+    #[serde(default)]
+    pub level: String,
+    #[serde(default)]
+    pub sort: String,
+    #[serde(default)]
+    pub filter: String,
+    #[serde(default)]
+    pub status: String,
+}
+
+pub async fn set_category_focus(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<CategoryFocusForm>,
+) -> Result<Response, AppError> {
+    auth::verify_csrf(&headers, &form.csrf)?;
+    let author = auth::require_author(&headers)?;
+    let level = CategoryFocusLevel::parse(&form.level).ok_or_else(|| {
+        AppError::InvalidRequest(
+            "category focus level must be priority, follow, mute, or none".to_string(),
+        )
+    })?;
+    state
+        .store
+        .set_category_focus_level(&author.sub, &id, level, now_secs())
+        .await?;
+    let actor = if author.email.is_empty() {
+        &author.sub
+    } else {
+        &author.email
+    };
+    state.audit.emit(AuditEvent::info(
+        "category.focus_rule",
+        actor,
+        &id,
+        level.as_str(),
+    ));
+    let mut query = vec![format!("focus_saved={}", level.as_str())];
+    if matches!(form.sort.as_str(), "top" | "hot") {
+        query.push(format!("sort={}", form.sort));
+    }
+    if form.filter == "subscribed" {
+        query.push("filter=subscribed".to_string());
+    }
+    if matches!(form.status.as_str(), "answered" | "unanswered") {
+        query.push(format!("status={}", form.status));
+    }
+    Ok(redirect_to(&format!(
+        "/c/{}?{}#category-focus-heading",
+        esc(&id),
+        query.join("&")
     )))
 }
 
@@ -2763,7 +2895,178 @@ fn render_thread_rows(
         counts,
         question_categories,
         reading_states,
+        None,
     )
+}
+
+#[derive(Clone, Debug)]
+struct CategoryFocusSignal {
+    reason: CategoryFocusReason,
+    label: String,
+}
+
+fn render_category_focus_form(
+    category: &Category,
+    csrf: &str,
+    current: CategoryFocusLevel,
+    query: &ThreadListQuery,
+) -> String {
+    let option = |level: CategoryFocusLevel, label: &str| {
+        let selected = if level == current { " selected" } else { "" };
+        format!(
+            r#"<option value="{value}"{selected}>{label}</option>"#,
+            value = level.as_str(),
+            selected = selected,
+            label = esc(label),
+        )
+    };
+    let options = [
+        (CategoryFocusLevel::None, "No category rule"),
+        (CategoryFocusLevel::Priority, "Priority — show first"),
+        (CategoryFocusLevel::Follow, "Follow — keep in Focus"),
+        (CategoryFocusLevel::Mute, "Mute — keep out of Focus"),
+    ]
+    .into_iter()
+    .map(|(level, label)| option(level, label))
+    .collect::<String>();
+    let saved = if query.focus_saved.as_deref() == Some(current.as_str()) {
+        format!(
+            "<p class=\"ag-focus-rule__status\" role=\"status\">Saved as {}.</p>",
+            esc(current.as_str())
+        )
+    } else {
+        String::new()
+    };
+    let return_state = format!(
+        "<input type=\"hidden\" name=\"sort\" value=\"{}\"><input type=\"hidden\" name=\"filter\" value=\"{}\"><input type=\"hidden\" name=\"status\" value=\"{}\">",
+        query.sort_key(),
+        if query.subscribed_only() { "subscribed" } else { "" },
+        match query.status() {
+            ThreadStatusFilter::Answered => "answered",
+            ThreadStatusFilter::Unanswered => "unanswered",
+            ThreadStatusFilter::Any | ThreadStatusFilter::Questions => "",
+        },
+    );
+    format!(
+        r#"<section class="card ag-focus-rule" aria-labelledby="category-focus-heading">
+  <div class="ag-focus-rule__copy">
+    <p class="ag-for-you-eyebrow">Private category rule</p>
+    <h2 id="category-focus-heading">Place {category} in Focus</h2>
+    <p>Priority appears before Follow. Mute excludes this category unless a thread has an explicit Watch or Follow; thread Mute always excludes it. This does not create Activity.</p>
+  </div>
+  <form class="ag-focus-rule__form" method="post" action="/c/{id}/focus">
+    <input type="hidden" name="csrf" value="{csrf}">
+    {return_state}
+    <label class="label" for="category-focus-level">Category intent</label>
+    <div class="ag-focus-rule__controls">
+      <select id="category-focus-level" name="level">{options}</select>
+      <button class="btn btn-primary" type="submit">Save rule</button>
+    </div>
+    {saved}
+    <a class="ag-focus-rule__link" href="/focus">Open your private Focus →</a>
+  </form>
+</section>"#,
+        category = esc(&category.name),
+        id = esc(&category.id),
+        csrf = esc(csrf),
+        return_state = return_state,
+        saved = saved,
+        options = options,
+    )
+}
+
+fn render_category_focus_rows(
+    items: &[CategoryFocusItem],
+    has_rules: bool,
+    now: i64,
+    reading_states: &HashMap<String, ThreadReadingState>,
+) -> String {
+    if items.is_empty() {
+        let copy = if has_rules {
+            "Your rules are active, but no live thread currently matches. Muted categories remain listed above so you can review or change them."
+        } else {
+            "Choose Priority, Follow, or Mute on a category page to shape this private desk."
+        };
+        return format!(
+            r#"<div class="empty ag-for-you-empty"><div class="empty__ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M3 12h6"/><path d="M15 12h6"/><path d="m5.6 5.6 4.2 4.2"/><path d="m14.2 14.2 4.2 4.2"/></svg></div><h3>Your Focus is clear.</h3><p>{copy}</p><a class="btn btn-primary btn-sm" href="/">Browse categories</a></div>"#
+        );
+    }
+
+    let threads: Vec<Thread> = items.iter().map(|item| item.thread.clone()).collect();
+    let category_names: HashMap<&str, &str> = items
+        .iter()
+        .map(|item| (item.category.id.as_str(), item.category.name.as_str()))
+        .collect();
+    let question_categories: HashSet<&str> = items
+        .iter()
+        .filter(|item| item.category.format.is_question())
+        .map(|item| item.category.id.as_str())
+        .collect();
+    let signals: HashMap<String, CategoryFocusSignal> = items
+        .iter()
+        .map(|item| {
+            let label = match item.reason {
+                CategoryFocusReason::CategoryPriority => {
+                    format!("Priority · {}", item.category.name)
+                }
+                CategoryFocusReason::CategoryFollow => {
+                    format!("Follow · {}", item.category.name)
+                }
+                CategoryFocusReason::ThreadWatchOverride => {
+                    format!("Watch thread · overrides muted {}", item.category.name)
+                }
+                CategoryFocusReason::ThreadFollowOverride => {
+                    format!("Follow thread · overrides muted {}", item.category.name)
+                }
+            };
+            (
+                item.thread.id.clone(),
+                CategoryFocusSignal {
+                    reason: item.reason,
+                    label,
+                },
+            )
+        })
+        .collect();
+
+    render_thread_rows_impl(
+        &threads,
+        now,
+        Some(&category_names),
+        None,
+        &question_categories,
+        reading_states,
+        Some(&signals),
+    )
+}
+
+fn render_category_focus_rule_rows(rules: &[CategoryFocusRuleItem]) -> String {
+    if rules.is_empty() {
+        return "<p class=\"muted ag-focus-rules-empty\">No category rules yet. Open a category to add Priority, Follow, or Mute.</p>".to_string();
+    }
+    rules
+        .iter()
+        .map(|rule| {
+            format!(
+                "<a class=\"ag-focus-rule-row ag-focus-rule-row--{level}\" href=\"/c/{id}#category-focus-heading\"><span><strong>{name}</strong><small>{detail}</small></span><b>{label}</b></a>",
+                level = rule.level.as_str(),
+                id = esc(&rule.category.id),
+                name = esc(&rule.category.name),
+                detail = match rule.level {
+                    CategoryFocusLevel::Priority => "Shown before followed categories",
+                    CategoryFocusLevel::Follow => "Kept on the private Focus desk",
+                    CategoryFocusLevel::Mute => "Excluded unless a thread overrides it",
+                    CategoryFocusLevel::None => "No category rule",
+                },
+                label = match rule.level {
+                    CategoryFocusLevel::Priority => "Priority",
+                    CategoryFocusLevel::Follow => "Follow",
+                    CategoryFocusLevel::Mute => "Mute",
+                    CategoryFocusLevel::None => "None",
+                },
+            )
+        })
+        .collect()
 }
 
 fn render_for_you_rows(items: &[CatchUpItem], now: i64, view: CatchUpView) -> String {
@@ -2894,6 +3197,7 @@ fn render_thread_rows_impl(
     counts: Option<&HashMap<String, i64>>,
     question_categories: &HashSet<&str>,
     reading_states: &HashMap<String, ThreadReadingState>,
+    focus_signals: Option<&HashMap<String, CategoryFocusSignal>>,
 ) -> String {
     if threads.is_empty() {
         return r#"<div class="empty"><div class="empty__ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div><h3>No threads yet — start the conversation.</h3><p>Every thread supports Markdown, reactions and @mentions.</p><a class="btn btn-primary btn-sm" href="/new">New thread</a></div>"#.to_string();
@@ -2944,6 +3248,16 @@ fn render_thread_rows_impl(
         } else {
             String::new()
         };
+        let focus_signal = focus_signals
+            .and_then(|signals| signals.get(&t.id))
+            .map(|signal| {
+                format!(
+                    r#"<span class="ag-focus-signal ag-focus-signal--{reason}" data-focus-reason="{reason}">{label}</span>"#,
+                    reason = signal.reason.as_str(),
+                    label = esc(&signal.label),
+                )
+            })
+            .unwrap_or_default();
         let replies = counts
             .and_then(|map| map.get(&t.id))
             .map(|count| {
@@ -2960,7 +3274,7 @@ fn render_thread_rows_impl(
   <span class="avatar ag-avatar ag-tone-{tone}" aria-hidden="true">{initial}</span>
   <span class="thread-row__main">
     <span class="thread-row__title">{glyphs}<span class="ag-title">{title}</span></span>
-    <span class="thread-row__sub">{cat}{answer_state}{reading_badge}<span class="ag-row__by">started by {author}</span></span>
+    <span class="thread-row__sub">{focus_signal}{cat}{answer_state}{reading_badge}<span class="ag-row__by">started by {author}</span></span>
   </span>
   <span class="ag-row__side">{replies}<span class="thread-row__time" title="{abs}">{when}</span></span>
 </a>"#,
@@ -2971,6 +3285,7 @@ fn render_thread_rows_impl(
             glyphs = glyphs,
             title = esc(&t.title),
             cat = cat_part,
+            focus_signal = focus_signal,
             answer_state = answer_state,
             reading_badge = reading_badge,
             author = esc(&t.author_email),

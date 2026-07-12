@@ -24,6 +24,10 @@ pub enum AppError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// File bytes are intentionally unavailable until the owner completes Review Hold.
+    #[error("review_hold: {0}")]
+    ReviewHold(String),
+
     /// No such file, or no such share token.
     #[error("not_found: {0}")]
     NotFound(String),
@@ -48,9 +52,12 @@ impl AppError {
             AppError::BadRequest(d) => (StatusCode::BAD_REQUEST, "Request rejected", d.clone()),
             AppError::Forbidden(d) => (StatusCode::FORBIDDEN, "Not allowed", d.clone()),
             AppError::Conflict(d) => (StatusCode::CONFLICT, "Selection changed", d.clone()),
+            AppError::ReviewHold(d) => (StatusCode::CONFLICT, "Held for review", d.clone()),
             AppError::NotFound(d) => (StatusCode::NOT_FOUND, "Not found", d.clone()),
             AppError::Gone(d) => (StatusCode::GONE, "Link expired", d.clone()),
-            AppError::QuotaExceeded(d) => (StatusCode::PAYLOAD_TOO_LARGE, "Storage full", d.clone()),
+            AppError::QuotaExceeded(d) => {
+                (StatusCode::PAYLOAD_TOO_LARGE, "Storage full", d.clone())
+            }
             AppError::Internal(d) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Something went wrong",

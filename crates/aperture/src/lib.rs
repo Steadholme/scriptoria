@@ -179,6 +179,10 @@ pub fn app(state: AppState) -> Router {
             post(handlers::requests::acknowledge_delivery),
         )
         .route(
+            "/requests/{id}/submissions/{submission_id}/release",
+            post(handlers::requests::release_submission),
+        )
+        .route(
             "/s/{token}",
             get(handlers::files::share).post(handlers::files::share_unlock),
         )

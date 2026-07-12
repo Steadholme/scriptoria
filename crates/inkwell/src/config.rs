@@ -31,8 +31,11 @@ pub const TAG_SCAN_POST_LIMIT: usize = 2_000;
 /// Writer history is intentionally bounded per post. The newest snapshots are retained; restore
 /// always appends a fresh snapshot before pruning, so the pre-restore current state remains undoable.
 pub const REVISION_KEEP_LIMIT: usize = 100;
-/// One history page only carries lightweight summaries. Full bodies are fetched on demand.
-pub const REVISION_PAGE_LIMIT: i64 = 50;
+/// One history page only carries lightweight summaries. The retained set is the newest window
+/// plus at most one older revision pinned by an active external Review Link, so every retained
+/// immutable version stays selectable in the Revision Workbench while full bodies remain
+/// fetched only for the chosen pair.
+pub const REVISION_PAGE_LIMIT: i64 = (REVISION_KEEP_LIMIT + 1) as i64;
 /// Server-side edit autosaves are private recovery data, retained for seven days.
 pub const AUTOSAVE_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 /// Default lifetime offered for a version-pinned external review link.

@@ -12,7 +12,8 @@ use std::sync::Arc;
 use aperture::blobs::{BlobError, Blobs, MemoryBlobs};
 use aperture::config::Config;
 use aperture::model::{
-    FileRec, FolderRec, LibraryItemKind, UploadDelivery, UploadRequestRec, UploadSubmission,
+    FileRec, FolderRec, LibraryItemKind, UploadDelivery, UploadRequestRec,
+    UploadReviewDispositionState, UploadSubmission,
 };
 use aperture::store::{
     BulkMutation, DriveItemRef, InMemoryStore, OwnerBlobCommit, OwnerBlobWriteIntent, Store,
@@ -241,6 +242,31 @@ fn assert_drive_current(html: &str, href: &str) {
         current_link.contains("aria-current=\"page\""),
         "{href} is the one current Drive rail destination"
     );
+}
+
+fn more_requests_href(html: &str) -> String {
+    let before_label = html
+        .split_once(">More requests</a>")
+        .expect("Request Inbox continuation link")
+        .0;
+    let href_start = before_label.rfind("href=\"").expect("continuation href") + "href=\"".len();
+    before_label[href_start..]
+        .split_once('"')
+        .expect("continuation href close")
+        .0
+        .replace("&amp;", "&")
+}
+
+fn query_value(path: &str, name: &str) -> String {
+    path.split_once('?')
+        .expect("query string")
+        .1
+        .split('&')
+        .find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            (key == name).then(|| value.to_string())
+        })
+        .unwrap_or_else(|| panic!("query contains {name}"))
 }
 
 async fn send(app: &axum::Router, req: Request<Body>) -> Resp {
@@ -1592,12 +1618,11 @@ async fn inspector_fragment_reuses_file_authority_and_never_projects_capabilitie
     assert!(gallery_html.contains("window.addEventListener('popstate'"));
     assert!(gallery_html.contains("event.key === 'Escape'"));
     assert!(gallery_html.contains("event.key !== 'Tab'"));
-    assert!(gallery_html.contains(
-        "button:not([disabled]):not([tabindex=\"-1\"]), iframe:not([tabindex=\"-1\"])"
-    ));
-    assert!(gallery_html.contains(
-        "closeInspector(true, !!(event.state && event.state.odysseyWire))"
-    ));
+    assert!(gallery_html
+        .contains("button:not([disabled]):not([tabindex=\"-1\"]), iframe:not([tabindex=\"-1\"])"));
+    assert!(
+        gallery_html.contains("closeInspector(true, !!(event.state && event.state.odysseyWire))")
+    );
     assert!(gallery_html.contains("closeInspector(false, !!pendingRestoreId)"));
     assert!(gallery_html.contains("pendingRestoreId = waitForSwap ? closingId : ''"));
     assert!(gallery_html.contains("node.inert = true"));
@@ -2712,20 +2737,17 @@ async fn trash_restore_and_purge_lifecycle() {
     assert!(trash_html.contains("File ·"));
     assert!(trash_html.contains("Eligible for automatic deletion after <time"));
     assert!(!trash_html.contains("Permanently deleted <time"));
-    assert!(trash_html
-        .contains(".gallery-grid:not(.is-list) .file-card--trash .ap-trash-meta"));
+    assert!(trash_html.contains(".gallery-grid:not(.is-list) .file-card--trash .ap-trash-meta"));
     assert!(trash_html.contains(".file-card:has(.card-menu[open])"));
     assert!(trash_html.contains("z-index:25;"));
     assert!(trash_html.contains("overflow:visible;"));
     assert!(trash_html.contains("bottom:30px;"));
     assert!(trash_html.contains(".gallery-grid.is-list:has(.card-menu[open])"));
     assert!(!trash_html.contains("class=\"card-menu__pop\" role=\"menu\""));
-    assert!(trash_html.contains(
-        ".gallery-grid.is-list .file-card--trash .file-card__body"
-    ));
-    assert!(trash_html.contains(
-        ".gallery-grid.is-list .file-card--trash .ap-date { display:inline; }"
-    ));
+    assert!(trash_html.contains(".gallery-grid.is-list .file-card--trash .file-card__body"));
+    assert!(
+        trash_html.contains(".gallery-grid.is-list .file-card--trash .ap-date { display:inline; }")
+    );
     assert!(trash_html.contains(
         "Trashed files and folders stay in storage and count toward quota until deleted forever."
     ));
@@ -3457,11 +3479,9 @@ async fn folder_trash_restore_and_purge_preserves_then_frees_subtree_blobs() {
     let trash = send(&app, get("/?view=trash", Some("alice"))).await;
     assert!(trash.text().contains("Parent"));
     assert!(trash.text().contains("Folder · Contents recover together"));
-    assert!(
-        trash
-            .text()
-            .contains("Eligible for automatic deletion after <time")
-    );
+    assert!(trash
+        .text()
+        .contains("Eligible for automatic deletion after <time"));
     assert!(
         !trash.text().contains("Child</"),
         "descendants are deduplicated"
@@ -4404,11 +4424,7 @@ async fn request_rooms_owner_lifecycle_rotation_and_receipts() {
         .await
         .unwrap());
 
-    let foreign_detail = send(
-        &app,
-        get("/requests/foreign-request", Some("alice")),
-    )
-    .await;
+    let foreign_detail = send(&app, get("/requests/foreign-request", Some("alice"))).await;
     assert_eq!(foreign_detail.status, StatusCode::NOT_FOUND);
     assert_eq!(
         foreign_detail.header(header::CACHE_CONTROL),
@@ -4424,7 +4440,7 @@ async fn request_rooms_owner_lifecycle_rotation_and_receipts() {
     assert!(list_html.contains("Evidence intake"));
     assert!(list_html.contains("Create request"));
     assert!(list_html.contains("Request Inbox"));
-    assert!(list_html.contains("Inbox cap 100"));
+    assert!(list_html.contains("Page size 30"));
     assert!(list_html.contains("href=\"/requests?view=all\""));
     assert!(list_html.contains("href=\"/requests?view=open\""));
     assert!(list_html.contains("href=\"/requests?view=expiring\""));
@@ -4506,6 +4522,218 @@ async fn request_rooms_owner_lifecycle_rotation_and_receipts() {
         received_file.share_token.is_none(),
         "upload capability must not mint a read capability"
     );
+    let dispositions = store
+        .upload_review_dispositions("alice", std::slice::from_ref(&received_file.id))
+        .await
+        .unwrap();
+    assert_eq!(dispositions.len(), 1);
+    assert_eq!(dispositions[0].state, UploadReviewDispositionState::Held);
+    assert!(store
+        .upload_review_dispositions("bob", std::slice::from_ref(&received_file.id))
+        .await
+        .unwrap()
+        .is_empty());
+
+    let original_object_key = received_file.object_key.clone();
+    let held_reupload = send(
+        &app,
+        upload_req_folder(
+            &csrf,
+            &csrf,
+            "alice",
+            &folder_id,
+            "proof.png",
+            "image/png",
+            &png_bytes_alt(),
+        ),
+    )
+    .await;
+    assert_eq!(held_reupload.status, StatusCode::CONFLICT);
+    assert!(held_reupload.text().contains("held for owner review"));
+    assert_eq!(
+        store
+            .get(&received_file.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .object_key,
+        original_object_key,
+        "same-name owner upload cannot replace held evidence"
+    );
+    assert!(store
+        .list_versions(&received_file.id)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let held_detail = send(
+        &app,
+        get(&format!("/f/{}", received_file.id), Some("alice")),
+    )
+    .await;
+    assert_eq!(held_detail.status, StatusCode::OK);
+    assert!(held_detail.text().contains("Review Hold"));
+    assert!(held_detail
+        .text()
+        .contains("not a malware scan or security approval"));
+    assert!(!held_detail
+        .text()
+        .contains(&format!("action=\"/f/{}/share\"", received_file.id)));
+    let held_gallery = send(&app, get(&format!("/?folder={folder_id}"), Some("alice"))).await;
+    assert!(held_gallery.text().contains("ap-badge--held"));
+    assert!(held_gallery.text().contains("Held"));
+    assert!(!held_gallery
+        .text()
+        .contains(&format!("src=\"/d/{}/thumb\"", received_file.id)));
+    assert_eq!(
+        send(
+            &app,
+            get(&format!("/f/{}/raw", received_file.id), Some("alice")),
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        send(
+            &app,
+            get(
+                &format!("/f/{}/preview-raw", received_file.id),
+                Some("alice"),
+            ),
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        send(
+            &app,
+            get(&format!("/d/{}/thumb", received_file.id), Some("alice")),
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        send(
+            &app,
+            get(
+                &format!("/f/{}/versions/not-real/raw", received_file.id),
+                Some("alice"),
+            ),
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        send(
+            &app,
+            post_form(
+                &format!("/f/{}/versions/not-real/restore", received_file.id),
+                &csrf,
+                "alice",
+                format!("csrf_token={csrf}"),
+            ),
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        send(
+            &app,
+            post_form(
+                &format!("/f/{}/share", received_file.id),
+                &csrf,
+                "alice",
+                format!("csrf_token={csrf}&expiry=never"),
+            ),
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        send(
+            &app,
+            get(&format!("/f/{}/raw", received_file.id), Some("bob")),
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+
+    assert!(store
+        .configure_share(
+            &received_file.id,
+            "alice",
+            Some("held-direct-share-token".to_string()),
+            None,
+            None,
+        )
+        .await
+        .unwrap());
+    assert!(store
+        .configure_folder_share(
+            &folder_id,
+            "alice",
+            Some("held-folder-share-token".to_string()),
+            None,
+            None,
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        send(&app, get("/s/held-direct-share-token", None))
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        send(&app, get("/s/held-direct-share-token/view", None))
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    let held_folder_share = send(&app, get("/s/folder/held-folder-share-token", None)).await;
+    assert_eq!(held_folder_share.status, StatusCode::OK);
+    assert!(!held_folder_share.text().contains("proof.png"));
+    assert_eq!(
+        send(
+            &app,
+            get(
+                &format!("/s/folder/held-folder-share-token/f/{}", received_file.id),
+                None,
+            ),
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+    let rejected_to_trash = send(
+        &app,
+        post_form(
+            &format!("/delete/{}", received_file.id),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(rejected_to_trash.status, StatusCode::FOUND);
+    let held_restore = send(
+        &app,
+        post_form(
+            &format!("/trash/{}/restore", received_file.id),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(held_restore.status, StatusCode::CONFLICT);
     let receipt_path = format!("/receipts/{delivery_token}");
     let receipt = send(&app, get(&receipt_path, None)).await;
     assert_eq!(receipt.status, StatusCode::OK);
@@ -4515,6 +4743,9 @@ async fn request_rooms_owner_lifecycle_rotation_and_receipts() {
     assert!(receipt_html.contains("Received"));
     assert!(receipt_html.contains("proof.png"));
     assert!(receipt_html.contains("Available until"));
+    assert!(!receipt_html.contains("Review Hold"));
+    assert!(!receipt_html.contains("Held"));
+    assert!(!receipt_html.contains("Released"));
     for secret in [
         request.id.as_str(),
         request.token.as_str(),
@@ -4534,9 +4765,124 @@ async fn request_rooms_owner_lifecycle_rotation_and_receipts() {
     .await;
     assert!(owner_receipt.text().contains("Delivery ·"));
     assert!(owner_receipt.text().contains("Acknowledge"));
+    assert!(owner_receipt.text().contains("Held"));
+    assert!(owner_receipt.text().contains("Release for use"));
+    assert!(owner_receipt
+        .text()
+        .contains("not a malware scan or security approval"));
     assert!(!owner_receipt.text().contains(&delivery_token));
     let bob_home = send(&app, get("/", Some("bob"))).await;
     let bob_csrf = bob_home.csrf_cookie().unwrap();
+    let release_path = format!(
+        "/requests/{}/submissions/{}/release",
+        request.id, submissions[0].id
+    );
+    let foreign_release = send(
+        &app,
+        post_form(
+            &release_path,
+            &bob_csrf,
+            "bob",
+            format!("csrf_token={bob_csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(foreign_release.status, StatusCode::NOT_FOUND);
+    let bad_release = send(
+        &app,
+        post_form(
+            &release_path,
+            &csrf,
+            "alice",
+            "csrf_token=wrong".to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(bad_release.status, StatusCode::BAD_REQUEST);
+    let unconfirmed_release = send(
+        &app,
+        post_form(&release_path, &csrf, "alice", format!("csrf_token={csrf}")),
+    )
+    .await;
+    assert_eq!(unconfirmed_release.status, StatusCode::BAD_REQUEST);
+    for _ in 0..2 {
+        let released = send(
+            &app,
+            post_form(
+                &release_path,
+                &csrf,
+                "alice",
+                format!("csrf_token={csrf}&confirm_release=release"),
+            ),
+        )
+        .await;
+        assert_eq!(released.status, StatusCode::FOUND);
+    }
+    let released_dispositions = store
+        .upload_review_dispositions("alice", std::slice::from_ref(&received_file.id))
+        .await
+        .unwrap();
+    assert_eq!(
+        released_dispositions[0].state,
+        UploadReviewDispositionState::Released
+    );
+    let first_released_at = released_dispositions[0].released_at.unwrap();
+    assert!(store
+        .release_upload_review_hold(
+            &request.id,
+            &submissions[0].id,
+            "alice",
+            first_released_at.saturating_add(10_000),
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        store
+            .upload_review_dispositions("alice", std::slice::from_ref(&received_file.id))
+            .await
+            .unwrap()[0]
+            .released_at,
+        Some(first_released_at),
+        "release is a terminal desired state and preserves the first release time"
+    );
+    let released_detail = send(
+        &app,
+        get(&format!("/requests/{}", request.id), Some("alice")),
+    )
+    .await;
+    assert!(released_detail.text().contains("Released"));
+    assert!(!released_detail.text().contains("Release for use"));
+    let released_restore = send(
+        &app,
+        post_form(
+            &format!("/trash/{}/restore", received_file.id),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(released_restore.status, StatusCode::FOUND);
+    assert_eq!(
+        send(
+            &app,
+            get(&format!("/f/{}/raw", received_file.id), Some("alice")),
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(&app, get("/s/held-direct-share-token", None))
+            .await
+            .status,
+        StatusCode::OK
+    );
+    let released_folder_share = send(&app, get("/s/folder/held-folder-share-token", None)).await;
+    assert!(released_folder_share.text().contains("proof.png"));
+    let released_receipt = send(&app, get(&receipt_path, None)).await;
+    assert!(released_receipt.text().contains("Received"));
+    assert!(!released_receipt.text().contains("Released"));
     let foreign_ack = send(
         &app,
         post_form(
@@ -4711,6 +5057,205 @@ async fn request_rooms_owner_lifecycle_rotation_and_receipts() {
         StatusCode::OK,
         "request expiry must not revoke an issued receipt"
     );
+}
+
+#[tokio::test]
+async fn review_hold_keeps_trash_and_purge_as_owner_rejection_paths() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let home = send(&app, get("/", Some("alice"))).await;
+    let csrf = home.csrf_cookie().unwrap();
+    let made = send(
+        &app,
+        post_form(
+            "/folders",
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&name=Reject"),
+        ),
+    )
+    .await;
+    let folder_id = folder_from_location(&made.location());
+    let request = create_upload_request(&app, &store, &folder_id, &csrf, "&max_files=2").await;
+    let room = send(&app, get(&format!("/u/{}", request.token), None)).await;
+    let public_csrf = room.csrf_cookie().unwrap();
+    let received = send(
+        &app,
+        public_upload_req(
+            &public_csrf,
+            &public_csrf,
+            &request.token,
+            "reject.png",
+            "image/png",
+            &png_bytes(),
+        ),
+    )
+    .await;
+    assert_eq!(received.status, StatusCode::OK);
+    let receipt_token = delivery_token_from_html(&received.text());
+    let submission = store
+        .list_upload_submissions(&request.id, "alice")
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+
+    let trashed = send(
+        &app,
+        post_form(
+            &format!("/delete/{}", submission.file_id),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(trashed.status, StatusCode::FOUND);
+    let restore = send(
+        &app,
+        post_form(
+            &format!("/trash/{}/restore", submission.file_id),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(restore.status, StatusCode::CONFLICT);
+    let purged = send(
+        &app,
+        post_form(
+            &format!("/trash/{}/purge", submission.file_id),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(purged.status, StatusCode::FOUND);
+    assert!(store.get(&submission.file_id).await.unwrap().is_none());
+    let disposition = store
+        .upload_review_dispositions("alice", std::slice::from_ref(&submission.file_id))
+        .await
+        .unwrap();
+    assert_eq!(disposition[0].state, UploadReviewDispositionState::Held);
+    assert!(!disposition[0].file_exists);
+    let request_detail = send(
+        &app,
+        get(&format!("/requests/{}", request.id), Some("alice")),
+    )
+    .await;
+    assert!(request_detail.text().contains("reject.png"));
+    assert!(request_detail.text().contains("Removed"));
+    assert!(!request_detail.text().contains("Release for use"));
+    assert!(!request_detail
+        .text()
+        .contains(&format!("href=\"/f/{}\"", submission.file_id)));
+    let release_removed = send(
+        &app,
+        post_form(
+            &format!(
+                "/requests/{}/submissions/{}/release",
+                request.id, submission.id
+            ),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&confirm_release=release"),
+        ),
+    )
+    .await;
+    assert_eq!(release_removed.status, StatusCode::NOT_FOUND);
+    let receipt = send(&app, get(&format!("/receipts/{receipt_token}"), None)).await;
+    assert!(receipt.text().contains("Received"));
+    assert!(receipt.text().contains("reject.png"));
+    assert!(!receipt.text().contains("Held"));
+}
+
+#[tokio::test]
+async fn request_inbox_handler_pages_and_fails_closed_on_invalid_cursors() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let updated_at = now_secs().saturating_sub(1);
+    let folder = FolderRec {
+        id: "handler-inbox-folder".to_string(),
+        owner_sub: "alice".to_string(),
+        parent_id: None,
+        name: "Handler Inbox".to_string(),
+        created_at: updated_at,
+        updated_at,
+        share_token: None,
+        expires_at: None,
+        share_password_hash: None,
+        upload_token: None,
+        trashed_at: 0,
+        trash_entry_id: None,
+        trash_ancestor_id: None,
+    };
+    assert!(store.create_folder(&folder).await.unwrap());
+    for index in 0..105 {
+        let id = format!("handler-request-{index:03}");
+        assert!(store
+            .create_upload_request(&UploadRequestRec {
+                id: id.clone(),
+                owner_sub: folder.owner_sub.clone(),
+                folder_id: folder.id.clone(),
+                token: format!("handler-capability-secret-{index:03}"),
+                title: format!("Handler request {index:03}"),
+                description: "Token-free owner summary".to_string(),
+                status: "open".to_string(),
+                expires_at: None,
+                max_file_bytes: 1024,
+                max_total_bytes: 4096,
+                max_files: 4,
+                used_bytes: 0,
+                used_files: 0,
+                allowed_types: "*/*".to_string(),
+                created_at: updated_at,
+                updated_at,
+            })
+            .await
+            .unwrap());
+    }
+
+    let legacy_root = send(&app, get("/requests", Some("alice"))).await;
+    assert_eq!(legacy_root.status, StatusCode::OK);
+    let first = send(&app, get("/requests?view=all", Some("alice"))).await;
+    assert_eq!(first.status, StatusCode::OK);
+    let first_html = first.text();
+    assert!(first_html.contains("Showing 30 on this page of 105 matching requests"));
+    assert!(first_html.contains("handler-request-104"));
+    assert!(first_html.contains("handler-request-075"));
+    assert!(!first_html.contains("handler-request-074"));
+    assert!(!first_html.contains("handler-capability-secret"));
+    let more = more_requests_href(&first_html);
+    assert!(more.starts_with("/requests?view=all&as_of="));
+    let as_of = query_value(&more, "as_of");
+    let before = query_value(&more, "before");
+    let future_as_of = as_of.parse::<i64>().unwrap().saturating_add(3_600);
+
+    let second = send(&app, get(&more, Some("alice"))).await;
+    assert_eq!(second.status, StatusCode::OK);
+    let second_html = second.text();
+    assert!(second_html.contains("handler-request-074"));
+    assert!(!second_html.contains("handler-request-075"));
+    assert!(!second_html.contains("handler-capability-secret"));
+
+    for invalid in [
+        format!("/requests?view=all&before={before}"),
+        format!("/requests?as_of={as_of}&before={before}"),
+        format!("/requests?view=closed&as_of={as_of}&before={before}"),
+        format!("/requests?view=all&as_of={as_of}&before=malformed"),
+        format!("/requests?view=all&as_of={as_of}"),
+        format!("/requests?view=all&as_of={future_as_of}&before=v9.all.{future_as_of}.0.future"),
+    ] {
+        let response = send(&app, get(&invalid, Some("alice"))).await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST, "{invalid}");
+    }
+
+    let old_filtered = send(&app, get("/requests?view=open", Some("alice"))).await;
+    assert_eq!(old_filtered.status, StatusCode::OK);
 }
 
 #[tokio::test]
@@ -5106,6 +5651,7 @@ async fn expired_delivery_and_unknown_receipts_share_one_generic_404_and_legacy_
             &expired_file,
             &expired_submission,
             Some(&expired_delivery),
+            None,
         )
         .await
         .unwrap());
@@ -5144,7 +5690,13 @@ async fn expired_delivery_and_unknown_receipts_share_one_generic_404_and_legacy_
         created_at: 3,
     };
     assert!(store
-        .commit_request_upload(&legacy_file.id, &legacy_file, &legacy_submission, None,)
+        .commit_request_upload(
+            &legacy_file.id,
+            &legacy_file,
+            &legacy_submission,
+            None,
+            None,
+        )
         .await
         .unwrap());
 
@@ -5169,6 +5721,11 @@ async fn expired_delivery_and_unknown_receipts_share_one_generic_404_and_legacy_
     assert_eq!(detail.status, StatusCode::OK);
     assert!(detail.text().contains("Legacy receipts"));
     assert!(detail.text().contains("Recorded before delivery tracking"));
+    assert!(detail
+        .text()
+        .contains("Legacy submission recorded before Review Hold"));
+    assert!(detail.text().contains("Available"));
+    assert!(!detail.text().contains("Release for use"));
     assert!(detail.text().contains("legacy.png"));
     assert!(!detail.text().contains(&expired_token));
 }

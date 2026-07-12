@@ -191,6 +191,41 @@ impl ThreadFollowLevel {
     }
 }
 
+/// One user's explicit Catch-up intent for a whole category. Category intent is deliberately a
+/// private read projection: unlike thread-level [`ThreadFollowLevel::Watch`], it never creates
+/// Activity deliveries or claims that a notification was sent. `None` is represented by absence
+/// from persistence and remains useful as the desired-state form value that removes a rule.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CategoryFocusLevel {
+    #[default]
+    None,
+    Priority,
+    Follow,
+    Mute,
+}
+
+impl CategoryFocusLevel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Priority => "priority",
+            Self::Follow => "follow",
+            Self::Mute => "mute",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "none" => Some(Self::None),
+            "priority" => Some(Self::Priority),
+            "follow" => Some(Self::Follow),
+            "mute" => Some(Self::Mute),
+            _ => None,
+        }
+    }
+}
+
 /// One parsed `@username` occurrence for a post. Usernames are normalised to lowercase at write
 /// time and are matched against the viewer's gateway email local-part.
 #[derive(Clone, Debug, Serialize)]

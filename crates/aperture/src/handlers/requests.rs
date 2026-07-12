@@ -1,5 +1,7 @@
 //! Owner control plane for product-level public upload requests.
 
+use std::collections::HashMap;
+
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
@@ -12,8 +14,9 @@ use crate::error::AppError;
 use crate::handlers::files::{html_with_csrf, redirect_found};
 use crate::handlers::{app_css, dynamic_js, esc, fmt_ts, human_size, userbox};
 use crate::model::{
-    FolderRec, UploadDeliveryBundle, UploadRequestInbox, UploadRequestInboxView, UploadRequestRec,
-    UploadRequestSummary, UploadSubmission, UPLOAD_REQUEST_INBOX_CAP,
+    FolderRec, UploadDeliveryBundle, UploadRequestInbox, UploadRequestInboxCursor,
+    UploadRequestInboxView, UploadRequestRec, UploadRequestSummary, UploadReviewDisposition,
+    UploadReviewDispositionState, UploadSubmission, UPLOAD_REQUEST_INBOX_PAGE_SIZE,
 };
 use crate::store::{
     DEFAULT_REQUEST_ALLOWED_TYPES, DEFAULT_REQUEST_MAX_FILES, DEFAULT_REQUEST_MAX_FILE_BYTES,
@@ -38,6 +41,13 @@ pub struct RequestInboxQuery {
     /// Stable owner-facing URL state: all/open/expiring/closed/expired.
     #[serde(default)]
     pub view: Option<String>,
+    /// Fixed classification instant, required on every continuation URL.
+    #[serde(default)]
+    pub as_of: Option<i64>,
+    /// Opaque-looking but validated v9 keyset boundary. It redundantly binds view + `as_of` so a
+    /// cursor cannot be replayed under another filter.
+    #[serde(default)]
+    pub before: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,6 +78,14 @@ pub struct RequestActionForm {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ReleaseSubmissionForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub confirm_release: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct RequestRotateForm {
     #[serde(default)]
     pub csrf_token: String,
@@ -84,11 +102,10 @@ pub async fn index(
 ) -> Result<Response, AppError> {
     let actor = auth::identity(&headers);
     let csrf = auth::new_csrf_token();
-    let view = parse_inbox_view(query.view.as_deref())?;
-    let as_of = now_secs();
+    let (view, as_of, before) = parse_inbox_query(&query, now_secs())?;
     let inbox = state
         .store
-        .upload_request_inbox(&actor.subject, view, as_of)
+        .upload_request_inbox(&actor.subject, view, as_of, before.as_ref())
         .await?;
     let folders = state.store.list_folders(&actor.subject).await?;
     let html = render_index(&actor.email, &csrf, &inbox, &folders);
@@ -114,6 +131,14 @@ pub async fn detail(
         .store
         .list_upload_submissions(&request.id, &actor.subject)
         .await?;
+    let file_ids = submissions
+        .iter()
+        .map(|submission| submission.file_id.clone())
+        .collect::<Vec<_>>();
+    let review_dispositions = state
+        .store
+        .upload_review_dispositions(&actor.subject, &file_ids)
+        .await?;
     let deliveries = state
         .store
         .list_upload_deliveries(&request.id, &actor.subject)
@@ -128,6 +153,7 @@ pub async fn detail(
             folder: folder.as_ref(),
             deliveries: &deliveries,
             submissions: &submissions,
+            review_dispositions: &review_dispositions,
             public_base: &state.config.public_base,
             as_of,
         },
@@ -338,6 +364,44 @@ pub async fn acknowledge_delivery(
     Ok(redirect_found(&format!("/requests/{id}")))
 }
 
+pub async fn release_submission(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((request_id, submission_id)): Path<(String, String)>,
+    Form(form): Form<ReleaseSubmissionForm>,
+) -> Result<Response, AppError> {
+    verify_csrf(&headers, &form.csrf_token)?;
+    let actor = auth::identity(&headers);
+    if state
+        .store
+        .get_upload_request(&request_id, &actor.subject)
+        .await?
+        .is_none()
+    {
+        return Err(AppError::NotFound("No such held submission.".to_string()));
+    }
+    if form.confirm_release != "release" {
+        return Err(AppError::BadRequest(
+            "Confirm that release can make this file available through existing file or folder shares."
+                .to_string(),
+        ));
+    }
+    if !state
+        .store
+        .release_upload_review_hold(&request_id, &submission_id, &actor.subject, now_secs())
+        .await?
+    {
+        return Err(AppError::NotFound("No such held submission.".to_string()));
+    }
+    state.audit.emit(AuditEvent::notice(
+        "upload_review_hold.release",
+        &actor.subject,
+        &request_id,
+        "manual release for use; not a malware scan or approval",
+    ));
+    Ok(redirect_found(&format!("/requests/{request_id}")))
+}
+
 async fn set_status(
     state: AppState,
     headers: HeaderMap,
@@ -518,6 +582,107 @@ fn parse_inbox_view(raw: Option<&str>) -> Result<UploadRequestInboxView, AppErro
     }
 }
 
+fn parse_inbox_query(
+    query: &RequestInboxQuery,
+    fresh_as_of: i64,
+) -> Result<
+    (
+        UploadRequestInboxView,
+        i64,
+        Option<UploadRequestInboxCursor>,
+    ),
+    AppError,
+> {
+    let Some(raw_cursor) = query.before.as_deref() else {
+        if query.as_of.is_some() {
+            return Err(invalid_inbox_cursor());
+        }
+        return Ok((parse_inbox_view(query.view.as_deref())?, fresh_as_of, None));
+    };
+
+    let explicit_view = query
+        .view
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(invalid_inbox_cursor)?;
+    let view = parse_inbox_view(Some(explicit_view))?;
+    let as_of = query
+        .as_of
+        .filter(|value| *value > 0)
+        .ok_or_else(invalid_inbox_cursor)?;
+    let (cursor_view, cursor_as_of, cursor) = parse_inbox_cursor(raw_cursor)?;
+    if cursor_view != view
+        || cursor_as_of != as_of
+        || as_of > fresh_as_of
+        || cursor.updated_at > as_of
+    {
+        return Err(invalid_inbox_cursor());
+    }
+    Ok((view, as_of, Some(cursor)))
+}
+
+fn parse_inbox_cursor(
+    raw: &str,
+) -> Result<(UploadRequestInboxView, i64, UploadRequestInboxCursor), AppError> {
+    let mut parts = raw.trim().split('.');
+    if parts.next() != Some("v9") {
+        return Err(invalid_inbox_cursor());
+    }
+    let view = parts
+        .next()
+        .and_then(UploadRequestInboxView::from_slug)
+        .ok_or_else(invalid_inbox_cursor)?;
+    let as_of = parts
+        .next()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(invalid_inbox_cursor)?;
+    let updated_at = parts
+        .next()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value >= 0)
+        .ok_or_else(invalid_inbox_cursor)?;
+    let id = parts.next().filter(|id| {
+        !id.is_empty()
+            && id.len() <= 64
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    });
+    if parts.next().is_some() {
+        return Err(invalid_inbox_cursor());
+    }
+    let id = id.ok_or_else(invalid_inbox_cursor)?;
+    Ok((
+        view,
+        as_of,
+        UploadRequestInboxCursor {
+            updated_at,
+            id: id.to_string(),
+        },
+    ))
+}
+
+fn encode_inbox_cursor(
+    view: UploadRequestInboxView,
+    as_of: i64,
+    cursor: &UploadRequestInboxCursor,
+) -> String {
+    format!(
+        "v9.{}.{as_of}.{}.{}",
+        view.slug(),
+        cursor.updated_at,
+        cursor.id
+    )
+}
+
+fn invalid_inbox_cursor() -> AppError {
+    AppError::BadRequest(
+        "This Request Inbox cursor is invalid. Start again from the first page.".to_string(),
+    )
+}
+
 fn render_index(
     email: &str,
     csrf: &str,
@@ -555,7 +720,8 @@ fn render_index(
         } else {
             (
                 format!("No {} requests", inbox.view.label().to_ascii_lowercase()),
-                "This status filter is empty at the Inbox snapshot. Try another view.".to_string(),
+                "This status filter is empty at the Inbox classification boundary. Try another view."
+                    .to_string(),
             )
         };
         let reset = if inbox.view == UploadRequestInboxView::All {
@@ -577,22 +743,23 @@ fn render_index(
             .collect::<Vec<_>>()
             .join("")
     };
-    let scope = if inbox.truncated {
+    let pager = inbox.next.as_ref().map_or_else(String::new, |cursor| {
+        let encoded = encode_inbox_cursor(inbox.view, inbox.as_of, cursor);
         format!(
-            "Showing the newest {} of {} matching requests · Inbox cap {} · as of {}",
-            inbox.items.len(),
-            inbox.matched_total,
-            UPLOAD_REQUEST_INBOX_CAP,
-            fmt_ts(inbox.as_of),
+            "<nav class=\"gallery-pager\" aria-label=\"Upload request results\"><a class=\"btn btn-ghost\" href=\"/requests?view={view}&amp;as_of={as_of}&amp;before={before}\">More requests</a></nav>",
+            view = inbox.view.slug(),
+            as_of = inbox.as_of,
+            before = encoded,
         )
-    } else {
-        format!(
-            "Showing all {} matching requests · Inbox cap {} · as of {}",
-            inbox.matched_total,
-            UPLOAD_REQUEST_INBOX_CAP,
-            fmt_ts(inbox.as_of),
-        )
-    };
+    });
+    let rows = format!("{rows}{pager}");
+    let scope = format!(
+        "Showing {} on this page of {} matching requests · Page size {} · as of {}",
+        inbox.items.len(),
+        inbox.matched_total,
+        UPLOAD_REQUEST_INBOX_PAGE_SIZE,
+        fmt_ts(inbox.as_of),
+    );
     let folder_rows = if folders.is_empty() {
         "<p class=\"muted\">Create a folder in Files before opening an upload request.</p>"
             .to_string()
@@ -649,8 +816,57 @@ struct RequestDetailContext<'a> {
     folder: Option<&'a FolderRec>,
     deliveries: &'a [UploadDeliveryBundle],
     submissions: &'a [UploadSubmission],
+    review_dispositions: &'a [UploadReviewDisposition],
     public_base: &'a str,
     as_of: i64,
+}
+
+fn render_review_submission(
+    request: &UploadRequestRec,
+    submission: &UploadSubmission,
+    disposition: Option<&UploadReviewDisposition>,
+    csrf: &str,
+) -> String {
+    let removed = disposition.is_some_and(|item| !item.file_exists);
+    let review = if removed {
+        "<div class=\"request-review request-review--removed\"><span class=\"ap-badge ap-badge--removed\">Removed</span><p>Permanently removed by the owner. Review Hold is retained only as intake history; release is no longer available.</p></div>".to_string()
+    } else {
+        match disposition.map(|item| item.state) {
+        Some(UploadReviewDispositionState::Held) => format!(
+            "<div class=\"request-review request-review--held\"><span class=\"ap-badge ap-badge--held\">Held</span><p>Held for owner review. Releasing manually allows the file to be used; it is not a malware scan or security approval.</p><form method=\"post\" action=\"/requests/{request_id}/submissions/{submission_id}/release\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\"><label class=\"request-review__confirm\"><input type=\"checkbox\" name=\"confirm_release\" value=\"release\" required><span>I understand release can make this file available through existing file or destination-folder shares.</span></label><button class=\"btn btn-primary btn-sm\" type=\"submit\">Release for use</button></form></div>",
+            request_id = esc(&request.id),
+            submission_id = esc(&submission.id),
+            csrf = esc(csrf),
+        ),
+        Some(UploadReviewDispositionState::Released) => {
+            let released = disposition
+                .and_then(|item| item.released_at)
+                .map(fmt_ts)
+                .unwrap_or_else(|| "Recorded".to_string());
+            format!(
+                "<div class=\"request-review request-review--released\"><span class=\"ap-badge ap-badge--released\">Released</span><p>Manually released for use {released}. This is not a malware scan or security approval.</p></div>",
+                released = esc(&released),
+            )
+        }
+        None => "<div class=\"request-review request-review--legacy\"><span class=\"ap-badge\">Available</span><p>Legacy submission recorded before Review Hold.</p></div>".to_string(),
+        }
+    };
+    let file_label = if removed {
+        format!("<strong>{}</strong>", esc(&submission.name))
+    } else {
+        format!(
+            "<a href=\"/f/{file_id}\">{name}</a>",
+            file_id = esc(&submission.file_id),
+            name = esc(&submission.name),
+        )
+    };
+    format!(
+        "<li class=\"request-receipt\"><div>{file_label}<span>{size} · {kind} · {date}</span></div>{review}</li>",
+        file_label = file_label,
+        size = esc(&human_size(submission.size)),
+        kind = esc(&submission.content_type),
+        date = esc(&fmt_ts(submission.created_at)),
+    )
 }
 
 fn render_detail(email: &str, csrf: &str, detail: RequestDetailContext<'_>) -> String {
@@ -659,10 +875,15 @@ fn render_detail(email: &str, csrf: &str, detail: RequestDetailContext<'_>) -> S
         folder,
         deliveries,
         submissions,
+        review_dispositions,
         public_base,
         as_of,
     } = detail;
     let url = format!("{}/u/{}", public_base, request.token);
+    let review_by_submission = review_dispositions
+        .iter()
+        .map(|disposition| (disposition.submission_id.as_str(), disposition))
+        .collect::<HashMap<_, _>>();
     let mut receipts = deliveries
         .iter()
         .map(|bundle| {
@@ -670,13 +891,11 @@ fn render_detail(email: &str, csrf: &str, detail: RequestDetailContext<'_>) -> S
                 .submissions
                 .iter()
                 .map(|submission| {
-                    format!(
-                        "<li class=\"request-receipt\"><a href=\"/f/{file_id}\">{name}</a><span>{size} · {kind} · {date}</span></li>",
-                        file_id = esc(&submission.file_id),
-                        name = esc(&submission.name),
-                        size = esc(&human_size(submission.size)),
-                        kind = esc(&submission.content_type),
-                        date = esc(&fmt_ts(submission.created_at)),
+                    render_review_submission(
+                        request,
+                        submission,
+                        review_by_submission.get(submission.id.as_str()).copied(),
+                        csrf,
                     )
                 })
                 .collect::<Vec<_>>()
@@ -712,13 +931,11 @@ fn render_detail(email: &str, csrf: &str, detail: RequestDetailContext<'_>) -> S
         let files = legacy
             .iter()
             .map(|submission| {
-                format!(
-                    "<li class=\"request-receipt\"><a href=\"/f/{file_id}\">{name}</a><span>{size} · {kind} · {date}</span></li>",
-                    file_id = esc(&submission.file_id),
-                    name = esc(&submission.name),
-                    size = esc(&human_size(submission.size)),
-                    kind = esc(&submission.content_type),
-                    date = esc(&fmt_ts(submission.created_at)),
+                render_review_submission(
+                    request,
+                    submission,
+                    review_by_submission.get(submission.id.as_str()).copied(),
+                    csrf,
                 )
             })
             .collect::<Vec<_>>()

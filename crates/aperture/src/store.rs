@@ -20,8 +20,9 @@ use crate::model::{
     library_type_for, FileComment, FileRec, FolderRec, LibraryCursor, LibraryItem, LibraryItemKind,
     LibraryPage, LibraryQuery, LibraryType, LibraryView, OwnerUsage, TrashEntry, TrashItem,
     TrashPage, UploadDelivery, UploadDeliveryBundle, UploadRequestInbox, UploadRequestInboxCounts,
-    UploadRequestInboxState, UploadRequestInboxView, UploadRequestRec, UploadRequestSummary,
-    UploadSubmission, VersionRec, UPLOAD_REQUEST_EXPIRING_WINDOW_SECS, UPLOAD_REQUEST_INBOX_CAP,
+    UploadRequestInboxCursor, UploadRequestInboxState, UploadRequestInboxView, UploadRequestRec,
+    UploadRequestSummary, UploadReviewDisposition, UploadReviewDispositionState, UploadSubmission,
+    VersionRec, UPLOAD_REQUEST_EXPIRING_WINDOW_SECS, UPLOAD_REQUEST_INBOX_PAGE_SIZE,
 };
 
 const DEFAULT_TRASH_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
@@ -207,10 +208,14 @@ fn finish_upload_request_inbox(
     requests: impl IntoIterator<Item = UploadRequestRec>,
     view: UploadRequestInboxView,
     as_of: i64,
+    before: Option<&UploadRequestInboxCursor>,
 ) -> UploadRequestInbox {
     let mut counts = UploadRequestInboxCounts::default();
     let mut items = Vec::new();
     for request in requests {
+        if request.updated_at > as_of {
+            continue;
+        }
         let summary = upload_request_summary(&request, as_of);
         counts.all = counts.all.saturating_add(1);
         match summary.state {
@@ -221,7 +226,12 @@ fn finish_upload_request_inbox(
             UploadRequestInboxState::Closed => counts.closed = counts.closed.saturating_add(1),
             UploadRequestInboxState::Expired => counts.expired = counts.expired.saturating_add(1),
         }
-        if summary.state.is_in_view(view) {
+        let before_cursor = before.is_none_or(|cursor| {
+            summary.updated_at < cursor.updated_at
+                || (summary.updated_at == cursor.updated_at
+                    && summary.id.as_str() < cursor.id.as_str())
+        });
+        if summary.state.is_in_view(view) && before_cursor {
             items.push(summary);
         }
     }
@@ -231,15 +241,23 @@ fn finish_upload_request_inbox(
             .cmp(&left.updated_at)
             .then_with(|| right.id.cmp(&left.id))
     });
-    let matched_total = items.len().min(i64::MAX as usize) as i64;
-    items.truncate(UPLOAD_REQUEST_INBOX_CAP as usize);
+    let matched_total = counts.for_view(view);
+    let page_size = UPLOAD_REQUEST_INBOX_PAGE_SIZE as usize;
+    let has_more = items.len() > page_size;
+    items.truncate(page_size);
+    let next = has_more.then(|| {
+        items
+            .last()
+            .expect("a +1 Request Inbox page has a retained boundary")
+            .cursor()
+    });
     UploadRequestInbox {
         as_of,
         view,
         counts,
         matched_total,
-        truncated: matched_total > items.len() as i64,
         items,
+        next,
     }
 }
 
@@ -775,14 +793,16 @@ pub trait Store: Send + Sync {
         owner_sub: &str,
     ) -> Result<Vec<UploadRequestRec>, StoreError>;
 
-    /// Return one exact-count, bounded, token-free owner Inbox snapshot. Every effective state and
-    /// count is classified against the caller's single `as_of`; implementations keep stable
-    /// `updated_at DESC, id DESC` ordering and never project capability or storage material.
+    /// Return one exact-count, token-free owner Inbox keyset page. Every effective state and count
+    /// is classified against the caller's single `as_of`; implementations keep stable
+    /// `updated_at DESC, id DESC` ordering, use a +1 sentinel, and never project capability or
+    /// storage material.
     async fn upload_request_inbox(
         &self,
         owner_sub: &str,
         view: UploadRequestInboxView,
         as_of: i64,
+        before: Option<&UploadRequestInboxCursor>,
     ) -> Result<UploadRequestInbox, StoreError>;
 
     async fn get_upload_request(
@@ -833,6 +853,25 @@ pub trait Store: Send + Sync {
         owner_sub: &str,
     ) -> Result<Vec<UploadSubmission>, StoreError>;
 
+    /// Return v9 Review Hold rows for a bounded set of file ids, scoped through the request owner.
+    /// Missing rows are intentionally meaningful: pre-v9 submissions remain available.
+    async fn upload_review_dispositions(
+        &self,
+        owner_sub: &str,
+        file_ids: &[String],
+    ) -> Result<Vec<UploadReviewDisposition>, StoreError>;
+
+    /// Desired-state transition for one exact submission under its request owner. Release is
+    /// terminal and idempotent; this records manual permission to use the file, not a malware scan
+    /// or security approval.
+    async fn release_upload_review_hold(
+        &self,
+        request_id: &str,
+        submission_id: &str,
+        owner_sub: &str,
+        released_at: i64,
+    ) -> Result<bool, StoreError>;
+
     /// Resolve one unexpired receipt capability by its SHA-256 digest. The returned projection has
     /// no request token, owner identity, destination folder, file id, or storage metadata.
     async fn upload_delivery_by_receipt_hash(
@@ -873,6 +912,7 @@ pub trait Store: Send + Sync {
         file: &FileRec,
         submission: &UploadSubmission,
         new_delivery: Option<&UploadDelivery>,
+        review_disposition: Option<&UploadReviewDisposition>,
     ) -> Result<bool, StoreError>;
 
     /// Release a failed reservation and return its bytes/file slot to the request budget.
@@ -939,6 +979,7 @@ struct MemoryRequestState {
     requests: Vec<UploadRequestRec>,
     deliveries: Vec<UploadDelivery>,
     submissions: Vec<UploadSubmission>,
+    review_dispositions: Vec<UploadReviewDisposition>,
     reservations: Vec<MemoryUploadReservation>,
 }
 
@@ -1119,19 +1160,27 @@ impl Store for InMemoryStore {
                 .expected_object_key
                 .as_deref()
                 .is_some_and(|expected| {
-                    files.iter().any(|file| {
-                        file.id == intent.file_id
-                            && file.owner_sub == intent.owner_sub
-                            && file.object_key == expected
-                            && file.is_effectively_live()
-                    })
+                    !requests
+                        .review_dispositions
+                        .iter()
+                        .any(|row| row.file_id == intent.file_id && row.is_held())
+                        && files.iter().any(|file| {
+                            file.id == intent.file_id
+                                && file.owner_sub == intent.owner_sub
+                                && file.object_key == expected
+                                && file.is_effectively_live()
+                        })
                 }),
             OWNER_WRITE_THUMBNAIL => {
                 intent
                     .expected_object_key
                     .as_deref()
                     .is_some_and(|expected| {
-                        intent.object_key == format!("{expected}.thumb")
+                        !requests
+                            .review_dispositions
+                            .iter()
+                            .any(|row| row.file_id == intent.file_id && row.is_held())
+                            && intent.object_key == format!("{expected}.thumb")
                             && files.iter().any(|file| {
                                 file.id == intent.file_id
                                     && file.owner_sub == intent.owner_sub
@@ -1346,6 +1395,13 @@ impl Store for InMemoryStore {
         }) else {
             return Ok(OwnerBlobCommit::Conflict);
         };
+        if requests
+            .review_dispositions
+            .iter()
+            .any(|row| row.file_id == input.file_id && row.is_held())
+        {
+            return Ok(OwnerBlobCommit::Conflict);
+        }
         if versions
             .iter()
             .any(|version| version.id == input.snapshot_id)
@@ -1909,6 +1965,83 @@ impl Store for InMemoryStore {
         Ok(out)
     }
 
+    async fn upload_review_dispositions(
+        &self,
+        owner_sub: &str,
+        file_ids: &[String],
+    ) -> Result<Vec<UploadReviewDisposition>, StoreError> {
+        if file_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _lifecycle = self
+            .lifecycle_guard
+            .lock()
+            .expect("lifecycle guard poisoned");
+        let state = self
+            .request_state
+            .lock()
+            .expect("request state lock poisoned");
+        let files = self.files.lock().expect("files lock poisoned");
+        let mut out = state
+            .review_dispositions
+            .iter()
+            .filter(|disposition| {
+                file_ids.contains(&disposition.file_id)
+                    && state.requests.iter().any(|request| {
+                        request.id == disposition.request_id && request.owner_sub == owner_sub
+                    })
+            })
+            .map(|disposition| {
+                let mut projected = disposition.clone();
+                projected.file_exists = files.iter().any(|file| file.id == disposition.file_id);
+                projected
+            })
+            .collect::<Vec<_>>();
+        out.sort_by(|left, right| left.file_id.cmp(&right.file_id));
+        Ok(out)
+    }
+
+    async fn release_upload_review_hold(
+        &self,
+        request_id: &str,
+        submission_id: &str,
+        owner_sub: &str,
+        released_at: i64,
+    ) -> Result<bool, StoreError> {
+        let _lifecycle = self
+            .lifecycle_guard
+            .lock()
+            .expect("lifecycle guard poisoned");
+        let mut state = self
+            .request_state
+            .lock()
+            .expect("request state lock poisoned");
+        let files = self.files.lock().expect("files lock poisoned");
+        if !state
+            .requests
+            .iter()
+            .any(|request| request.id == request_id && request.owner_sub == owner_sub)
+            || !state.submissions.iter().any(|submission| {
+                submission.id == submission_id && submission.request_id == request_id
+            })
+        {
+            return Ok(false);
+        }
+        let Some(disposition) = state.review_dispositions.iter_mut().find(|disposition| {
+            disposition.submission_id == submission_id && disposition.request_id == request_id
+        }) else {
+            return Ok(false);
+        };
+        if !files.iter().any(|file| file.id == disposition.file_id) {
+            return Ok(false);
+        }
+        if disposition.state == UploadReviewDispositionState::Held {
+            disposition.state = UploadReviewDispositionState::Released;
+            disposition.released_at = Some(released_at.max(disposition.held_at));
+        }
+        Ok(true)
+    }
+
     async fn upload_delivery_by_receipt_hash(
         &self,
         receipt_token_hash: &str,
@@ -2218,6 +2351,15 @@ impl Store for InMemoryStore {
             .lifecycle_guard
             .lock()
             .expect("lifecycle guard poisoned");
+        let held_file_ids = self
+            .request_state
+            .lock()
+            .expect("request state lock poisoned")
+            .review_dispositions
+            .iter()
+            .filter(|disposition| disposition.is_held())
+            .map(|disposition| disposition.file_id.clone())
+            .collect::<Vec<_>>();
         let mut folders = self.folders.lock().expect("folders lock poisoned");
         let mut files = self.files.lock().expect("files lock poisoned");
         let mut entries = self.trash_entries.lock().expect("trash lock poisoned");
@@ -2256,6 +2398,17 @@ impl Store for InMemoryStore {
                 return Ok(BulkMutation::Conflict);
             }
             entry_ids.push(entry_id);
+        }
+        if items.iter().zip(&entry_ids).any(|(item, entry_id)| {
+            (item.kind == LibraryItemKind::File && held_file_ids.contains(&item.id))
+                || (item.kind == LibraryItemKind::Folder
+                    && files.iter().any(|file| {
+                        file.owner_sub == owner_sub
+                            && file.trash_ancestor_id.as_deref() == Some(entry_id.as_str())
+                            && held_file_ids.contains(&file.id)
+                    }))
+        }) {
+            return Ok(BulkMutation::Conflict);
         }
         for (item, entry_id) in items.iter().zip(&entry_ids) {
             match item.kind {
@@ -3289,6 +3442,7 @@ impl Store for InMemoryStore {
         owner_sub: &str,
         view: UploadRequestInboxView,
         as_of: i64,
+        before: Option<&UploadRequestInboxCursor>,
     ) -> Result<UploadRequestInbox, StoreError> {
         let state = self
             .request_state
@@ -3300,7 +3454,7 @@ impl Store for InMemoryStore {
             .filter(|request| request.owner_sub == owner_sub)
             .cloned()
             .collect::<Vec<_>>();
-        Ok(finish_upload_request_inbox(requests, view, as_of))
+        Ok(finish_upload_request_inbox(requests, view, as_of, before))
     }
 
     async fn get_upload_request(
@@ -3641,6 +3795,7 @@ impl Store for InMemoryStore {
         file: &FileRec,
         submission: &UploadSubmission,
         new_delivery: Option<&UploadDelivery>,
+        review_disposition: Option<&UploadReviewDisposition>,
     ) -> Result<bool, StoreError> {
         let _lifecycle = self
             .lifecycle_guard
@@ -3679,6 +3834,20 @@ impl Store for InMemoryStore {
             .iter()
             .any(|item| item.id == submission.id || item.file_id == submission.file_id)
         {
+            return Ok(false);
+        }
+        if review_disposition.is_some_and(|disposition| {
+            disposition.submission_id != submission.id
+                || disposition.request_id != submission.request_id
+                || disposition.file_id != submission.file_id
+                || disposition.state != UploadReviewDispositionState::Held
+                || disposition.held_at != submission.created_at
+                || disposition.released_at.is_some()
+                || state.review_dispositions.iter().any(|item| {
+                    item.submission_id == disposition.submission_id
+                        || item.file_id == disposition.file_id
+                })
+        }) {
             return Ok(false);
         }
         match (new_delivery, submission.delivery_id.as_deref()) {
@@ -3726,6 +3895,9 @@ impl Store for InMemoryStore {
             state.deliveries.push(delivery.clone());
         }
         state.submissions.push(submission.clone());
+        if let Some(disposition) = review_disposition {
+            state.review_dispositions.push(disposition.clone());
+        }
         state
             .reservations
             .retain(|reservation| reservation.id != reservation_id);
@@ -4510,6 +4682,12 @@ impl PgStore {
         .execute(&self.pool)
         .await?;
         sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_upload_requests_owner_updated_id \
+             ON upload_requests (owner_sub, updated_at DESC, id DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_upload_requests_folder \
              ON upload_requests (owner_sub, folder_id)",
         )
@@ -4570,6 +4748,64 @@ impl PgStore {
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_upload_submissions_delivery \
              ON upload_submissions (delivery_id, created_at)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_upload_submissions_identity_scope \
+             ON upload_submissions (id, request_id, file_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // v9 Request uploads enter an explicit manual Review Hold in the same transaction as the
+        // file, submission, and optional delivery. No row means a pre-v9 submission and therefore
+        // remains available. This is deliberately not a scanner-results table.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS upload_submission_dispositions (\
+                 submission_id TEXT PRIMARY KEY \
+                     REFERENCES upload_submissions(id) ON DELETE CASCADE, \
+                 request_id TEXT NOT NULL REFERENCES upload_requests(id) ON DELETE CASCADE, \
+                 file_id TEXT NOT NULL UNIQUE, \
+                 CONSTRAINT fk_upload_disposition_submission_scope \
+                     FOREIGN KEY (submission_id, request_id, file_id) \
+                     REFERENCES upload_submissions(id, request_id, file_id) ON DELETE CASCADE, \
+                 disposition_state TEXT NOT NULL \
+                     CHECK (disposition_state IN ('held', 'released')), \
+                 held_at BIGINT NOT NULL, \
+                 released_at BIGINT, \
+                 CHECK ((disposition_state = 'held' AND released_at IS NULL) OR \
+                        (disposition_state = 'released' AND released_at IS NOT NULL \
+                         AND released_at >= held_at))\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        let disposition_scope_fk = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (\
+                 SELECT 1 FROM information_schema.table_constraints \
+                 WHERE constraint_schema = CURRENT_SCHEMA \
+                   AND table_name = 'upload_submission_dispositions' \
+                   AND constraint_name = 'fk_upload_disposition_submission_scope' \
+                   AND constraint_type = 'FOREIGN KEY'\
+             )",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if !disposition_scope_fk {
+            sqlx::query(
+                "ALTER TABLE upload_submission_dispositions \
+                 ADD CONSTRAINT fk_upload_disposition_submission_scope \
+                 FOREIGN KEY (submission_id, request_id, file_id) \
+                 REFERENCES upload_submissions(id, request_id, file_id) ON DELETE CASCADE",
+            )
+            .execute(&self.pool)
+            .await?;
+        }
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_upload_submission_dispositions_request_state \
+             ON upload_submission_dispositions \
+                (request_id, disposition_state, held_at DESC)",
         )
         .execute(&self.pool)
         .await?;
@@ -4835,6 +5071,23 @@ impl PgStore {
         })
     }
 
+    fn upload_review_disposition_from_row(
+        row: &sqlx::postgres::PgRow,
+    ) -> Result<UploadReviewDisposition, sqlx::Error> {
+        let raw_state: String = row.try_get("disposition_state")?;
+        let state = UploadReviewDispositionState::from_slug(&raw_state)
+            .ok_or_else(|| sqlx::Error::Decode("unknown upload review disposition".into()))?;
+        Ok(UploadReviewDisposition {
+            submission_id: row.try_get("submission_id")?,
+            request_id: row.try_get("request_id")?,
+            file_id: row.try_get("file_id")?,
+            state,
+            held_at: row.try_get("held_at")?,
+            released_at: row.try_get("released_at")?,
+            file_exists: row.try_get("file_exists")?,
+        })
+    }
+
     fn upload_delivery_from_row(
         row: &sqlx::postgres::PgRow,
     ) -> Result<UploadDelivery, sqlx::Error> {
@@ -4932,7 +5185,12 @@ impl PgStore {
                 let valid = sqlx::query(
                     "SELECT 1 FROM files WHERE id = $1 AND owner_sub = $2 AND object_key = $3 \
                      AND trashed_at = 0 AND trash_entry_id IS NULL \
-                     AND trash_ancestor_id IS NULL FOR UPDATE",
+                     AND trash_ancestor_id IS NULL \
+                     AND NOT EXISTS (\
+                         SELECT 1 FROM upload_submission_dispositions disposition \
+                         WHERE disposition.file_id = $1 \
+                           AND disposition.disposition_state = 'held'\
+                     ) FOR UPDATE",
                 )
                 .bind(&intent.file_id)
                 .bind(&intent.owner_sub)
@@ -5144,6 +5402,18 @@ impl PgStore {
             tx.rollback().await?;
             return Ok(OwnerBlobCommit::Conflict);
         };
+        if sqlx::query(
+            "SELECT 1 FROM upload_submission_dispositions \
+             WHERE file_id = $1 AND disposition_state = 'held' FOR UPDATE",
+        )
+        .bind(input.file_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some()
+        {
+            tx.rollback().await?;
+            return Ok(OwnerBlobCommit::Conflict);
+        }
         let current = Self::file_from_row(&current_row)?;
         if sqlx::query("SELECT 1 FROM file_versions WHERE id = $1 FOR UPDATE")
             .bind(input.snapshot_id)
@@ -6137,6 +6407,37 @@ impl PgStore {
             .fetch_optional(&mut *tx)
             .await?;
             if authority.is_none() {
+                tx.rollback().await?;
+                return Ok(BulkMutation::Conflict);
+            }
+            let held = match item.kind {
+                LibraryItemKind::File => sqlx::query(
+                    "SELECT 1 FROM upload_submission_dispositions d \
+                         JOIN upload_requests r ON r.id = d.request_id \
+                         WHERE d.file_id = $1 AND r.owner_sub = $2 \
+                           AND d.disposition_state = 'held' FOR UPDATE OF d",
+                )
+                .bind(&item.id)
+                .bind(owner_sub)
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_some(),
+                LibraryItemKind::Folder => sqlx::query(
+                    "SELECT 1 FROM upload_submission_dispositions d \
+                         JOIN upload_requests r ON r.id = d.request_id \
+                         JOIN files f ON f.id = d.file_id \
+                         WHERE f.owner_sub = $1 AND r.owner_sub = $1 \
+                           AND f.trash_ancestor_id = $2 \
+                           AND d.disposition_state = 'held' \
+                         LIMIT 1 FOR UPDATE OF d",
+                )
+                .bind(owner_sub)
+                .bind(entry_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_some(),
+            };
+            if held {
                 tx.rollback().await?;
                 return Ok(BulkMutation::Conflict);
             }
@@ -7495,6 +7796,7 @@ impl PgStore {
         owner_sub: &str,
         view: UploadRequestInboxView,
         as_of: i64,
+        before: Option<&UploadRequestInboxCursor>,
     ) -> Result<UploadRequestInbox, sqlx::Error> {
         // One statement gives the bounded page and every tab count the same PostgreSQL snapshot
         // and the same explicit classification instant. The CTE deliberately never selects the
@@ -7510,7 +7812,7 @@ impl PgStore {
                             ELSE 'open'
                           END AS inbox_state
                      FROM upload_requests
-                    WHERE owner_sub = $1
+                    WHERE owner_sub = $1 AND updated_at <= $2
                  ), totals AS (
                    SELECT COUNT(*)::BIGINT AS all_count,
                           COUNT(*) FILTER (WHERE inbox_state = 'open')::BIGINT AS open_count,
@@ -7521,9 +7823,10 @@ impl PgStore {
                  ), page AS (
                    SELECT *
                      FROM classified
-                    WHERE $4 = 'all' OR inbox_state = $4
+                    WHERE ($4 = 'all' OR inbox_state = $4)
+                      AND ($5 = FALSE OR updated_at < $6 OR (updated_at = $6 AND id < $7))
                     ORDER BY updated_at DESC, id DESC
-                    LIMIT $5
+                    LIMIT $8
                  )
                  SELECT page.id, page.title, page.description, page.inbox_state,
                         page.expires_at, page.max_total_bytes, page.max_files,
@@ -7538,7 +7841,10 @@ impl PgStore {
         .bind(as_of)
         .bind(as_of.saturating_add(UPLOAD_REQUEST_EXPIRING_WINDOW_SECS))
         .bind(view.slug())
-        .bind(UPLOAD_REQUEST_INBOX_CAP)
+        .bind(before.is_some())
+        .bind(before.map(|cursor| cursor.updated_at).unwrap_or_default())
+        .bind(before.map(|cursor| cursor.id.as_str()).unwrap_or(""))
+        .bind(UPLOAD_REQUEST_INBOX_PAGE_SIZE.saturating_add(1))
         .fetch_all(&self.pool)
         .await?;
 
@@ -7552,7 +7858,10 @@ impl PgStore {
             closed: totals.try_get("closed_count")?,
             expired: totals.try_get("expired_count")?,
         };
-        let mut items = Vec::with_capacity(rows.len().min(UPLOAD_REQUEST_INBOX_CAP as usize));
+        let mut items = Vec::with_capacity(
+            rows.len()
+                .min(UPLOAD_REQUEST_INBOX_PAGE_SIZE.saturating_add(1) as usize),
+        );
         for row in rows {
             let Some(id) = row.try_get::<Option<String>, _>("id")? else {
                 continue;
@@ -7590,13 +7899,22 @@ impl PgStore {
             });
         }
         let matched_total = counts.for_view(view);
+        let page_size = UPLOAD_REQUEST_INBOX_PAGE_SIZE as usize;
+        let has_more = items.len() > page_size;
+        items.truncate(page_size);
+        let next = has_more.then(|| {
+            items
+                .last()
+                .expect("a +1 Request Inbox page has a retained boundary")
+                .cursor()
+        });
         Ok(UploadRequestInbox {
             as_of,
             view,
             counts,
             matched_total,
-            truncated: matched_total > items.len() as i64,
             items,
+            next,
         })
     }
 
@@ -7768,6 +8086,59 @@ impl PgStore {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(Self::upload_submission_from_row).collect()
+    }
+
+    async fn upload_review_dispositions_async(
+        &self,
+        owner_sub: &str,
+        file_ids: &[String],
+    ) -> Result<Vec<UploadReviewDisposition>, sqlx::Error> {
+        if file_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT d.submission_id, d.request_id, d.file_id, d.disposition_state, \
+                    d.held_at, d.released_at, \
+                    EXISTS (SELECT 1 FROM files f WHERE f.id = d.file_id) AS file_exists \
+             FROM upload_submission_dispositions d \
+             JOIN upload_requests r ON r.id = d.request_id \
+             WHERE r.owner_sub = $1 AND d.file_id = ANY($2) \
+             ORDER BY d.file_id ASC",
+        )
+        .bind(owner_sub)
+        .bind(file_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(Self::upload_review_disposition_from_row)
+            .collect()
+    }
+
+    async fn release_upload_review_hold_async(
+        &self,
+        request_id: &str,
+        submission_id: &str,
+        owner_sub: &str,
+        released_at: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let changed = sqlx::query(
+            "UPDATE upload_submission_dispositions d \
+             SET disposition_state = 'released', \
+                 released_at = CASE WHEN d.disposition_state = 'held' \
+                                    THEN GREATEST($1, d.held_at) ELSE d.released_at END \
+             FROM upload_requests r, upload_submissions s \
+             WHERE d.request_id = r.id AND d.submission_id = s.id \
+               AND d.request_id = $2 AND d.submission_id = $3 \
+               AND s.request_id = $2 AND r.owner_sub = $4 \
+               AND EXISTS (SELECT 1 FROM files f WHERE f.id = d.file_id)",
+        )
+        .bind(released_at)
+        .bind(request_id)
+        .bind(submission_id)
+        .bind(owner_sub)
+        .execute(&self.pool)
+        .await?;
+        Ok(changed.rows_affected() == 1)
     }
 
     async fn upload_delivery_by_receipt_hash_async(
@@ -8042,6 +8413,7 @@ impl PgStore {
         file: &FileRec,
         submission: &UploadSubmission,
         new_delivery: Option<&UploadDelivery>,
+        review_disposition: Option<&UploadReviewDisposition>,
     ) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         // Peek only to discover immutable lock keys, then re-read every value under the canonical
@@ -8071,6 +8443,17 @@ impl PgStore {
             || submission.content_type != file.content_type
             || submission.size != file.size
         {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        if review_disposition.is_some_and(|disposition| {
+            disposition.submission_id != submission.id
+                || disposition.request_id != submission.request_id
+                || disposition.file_id != submission.file_id
+                || disposition.state != UploadReviewDispositionState::Held
+                || disposition.held_at != submission.created_at
+                || disposition.released_at.is_some()
+        }) {
             tx.rollback().await?;
             return Ok(false);
         }
@@ -8233,6 +8616,25 @@ impl PgStore {
         if inserted_receipt.rows_affected() != 1 {
             tx.rollback().await?;
             return Ok(false);
+        }
+        if let Some(disposition) = review_disposition {
+            let inserted_disposition = sqlx::query(
+                "INSERT INTO upload_submission_dispositions \
+                     (submission_id, request_id, file_id, disposition_state, held_at, released_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+            )
+            .bind(&disposition.submission_id)
+            .bind(&disposition.request_id)
+            .bind(&disposition.file_id)
+            .bind(disposition.state.slug())
+            .bind(disposition.held_at)
+            .bind(disposition.released_at)
+            .execute(&mut *tx)
+            .await?;
+            if inserted_disposition.rows_affected() != 1 {
+                tx.rollback().await?;
+                return Ok(false);
+            }
         }
         sqlx::query("DELETE FROM upload_reservations WHERE id = $1")
             .bind(reservation_id)
@@ -8441,6 +8843,28 @@ impl PgStore {
 impl Store for PgStore {
     async fn create(&self, file: &FileRec) -> Result<bool, StoreError> {
         self.create_async(file)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn upload_review_dispositions(
+        &self,
+        owner_sub: &str,
+        file_ids: &[String],
+    ) -> Result<Vec<UploadReviewDisposition>, StoreError> {
+        self.upload_review_dispositions_async(owner_sub, file_ids)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn release_upload_review_hold(
+        &self,
+        request_id: &str,
+        submission_id: &str,
+        owner_sub: &str,
+        released_at: i64,
+    ) -> Result<bool, StoreError> {
+        self.release_upload_review_hold_async(request_id, submission_id, owner_sub, released_at)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
@@ -9022,8 +9446,9 @@ impl Store for PgStore {
         owner_sub: &str,
         view: UploadRequestInboxView,
         as_of: i64,
+        before: Option<&UploadRequestInboxCursor>,
     ) -> Result<UploadRequestInbox, StoreError> {
-        self.upload_request_inbox_async(owner_sub, view, as_of)
+        self.upload_request_inbox_async(owner_sub, view, as_of, before)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
@@ -9147,10 +9572,17 @@ impl Store for PgStore {
         file: &FileRec,
         submission: &UploadSubmission,
         new_delivery: Option<&UploadDelivery>,
+        review_disposition: Option<&UploadReviewDisposition>,
     ) -> Result<bool, StoreError> {
-        self.commit_request_upload_async(reservation_id, file, submission, new_delivery)
-            .await
-            .map_err(|e| StoreError::Backend(e.to_string()))
+        self.commit_request_upload_async(
+            reservation_id,
+            file,
+            submission,
+            new_delivery,
+            review_disposition,
+        )
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
     async fn release_request_upload(&self, reservation_id: &str) -> Result<bool, StoreError> {
@@ -9780,11 +10212,11 @@ mod tests {
         }
 
         let first = store
-            .upload_request_inbox("u", UploadRequestInboxView::All, as_of)
+            .upload_request_inbox("u", UploadRequestInboxView::All, as_of, None)
             .await
             .unwrap();
         let second = store
-            .upload_request_inbox("u", UploadRequestInboxView::All, as_of)
+            .upload_request_inbox("u", UploadRequestInboxView::All, as_of, None)
             .await
             .unwrap();
         assert_eq!(first, second, "the same as_of is classification-stable");
@@ -9822,7 +10254,10 @@ mod tests {
             UploadRequestInboxView::Closed,
             UploadRequestInboxView::Expired,
         ] {
-            let filtered = store.upload_request_inbox("u", view, as_of).await.unwrap();
+            let filtered = store
+                .upload_request_inbox("u", view, as_of, None)
+                .await
+                .unwrap();
             assert_eq!(filtered.counts, first.counts);
             assert_eq!(filtered.matched_total, 1);
             assert_eq!(filtered.items.len(), 1);
@@ -9835,6 +10270,7 @@ mod tests {
                 as_of
                     .saturating_add(UPLOAD_REQUEST_EXPIRING_WINDOW_SECS)
                     .saturating_add(2),
+                None,
             )
             .await
             .unwrap();
@@ -9844,28 +10280,107 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_inbox_has_an_explicit_newest_first_cap() {
+    async fn request_inbox_keysets_past_one_hundred_tied_rows() {
         let store = InMemoryStore::new();
         assert!(store
             .create_folder(&folder("bounded-inbox", "u", "Bounded", 1))
             .await
             .unwrap());
-        for index in 0..=UPLOAD_REQUEST_INBOX_CAP {
+        for index in 0..105 {
             let id = format!("request-{index:03}");
             assert!(store
                 .create_upload_request(&inbox_request(&id, "u", "bounded-inbox", "open", None, 10,))
                 .await
                 .unwrap());
         }
-        let inbox = store
-            .upload_request_inbox("u", UploadRequestInboxView::All, 10)
+
+        let mut before = None;
+        let mut ids = Vec::new();
+        loop {
+            let inbox = store
+                .upload_request_inbox("u", UploadRequestInboxView::All, 10, before.as_ref())
+                .await
+                .unwrap();
+            assert_eq!(inbox.counts.all, 105);
+            assert_eq!(inbox.matched_total, 105);
+            assert!(inbox.items.len() <= UPLOAD_REQUEST_INBOX_PAGE_SIZE as usize);
+            ids.extend(inbox.items.iter().map(|item| item.id.clone()));
+            let Some(next) = inbox.next else {
+                break;
+            };
+            before = Some(next);
+        }
+
+        let expected = (0..105)
+            .rev()
+            .map(|index| format!("request-{index:03}"))
+            .collect::<Vec<_>>();
+        assert_eq!(ids, expected, "tie-safe keysets visit every row once");
+    }
+
+    #[tokio::test]
+    async fn request_inbox_continuation_fences_newer_rows_but_reflects_live_mutations() {
+        let store = InMemoryStore::new();
+        assert!(store
+            .create_folder(&folder("mutable-inbox", "u", "Mutable", 1))
+            .await
+            .unwrap());
+        for index in 0..65 {
+            let id = format!("mutable-{index:03}");
+            assert!(store
+                .create_upload_request(&inbox_request(&id, "u", "mutable-inbox", "open", None, 10,))
+                .await
+                .unwrap());
+        }
+
+        let first = store
+            .upload_request_inbox("u", UploadRequestInboxView::All, 10, None)
             .await
             .unwrap();
-        assert_eq!(inbox.matched_total, UPLOAD_REQUEST_INBOX_CAP + 1);
-        assert_eq!(inbox.items.len(), UPLOAD_REQUEST_INBOX_CAP as usize);
-        assert!(inbox.truncated);
-        assert_eq!(inbox.items.first().unwrap().id, "request-100");
-        assert_eq!(inbox.items.last().unwrap().id, "request-001");
+        let boundary = first.next.clone().expect("65 rows require a continuation");
+        assert_eq!(boundary.id, "mutable-035");
+
+        let mut updated = store
+            .get_upload_request("mutable-033", "u")
+            .await
+            .unwrap()
+            .unwrap();
+        updated.updated_at = 11;
+        assert!(store.update_upload_request(&updated).await.unwrap());
+        let mut same_second = store
+            .get_upload_request("mutable-032", "u")
+            .await
+            .unwrap()
+            .unwrap();
+        same_second.title = "Changed at the classification second".into();
+        same_second.updated_at = 10;
+        assert!(store.update_upload_request(&same_second).await.unwrap());
+        {
+            let mut state = store
+                .request_state
+                .lock()
+                .expect("request state lock poisoned");
+            state.requests.retain(|request| request.id != "mutable-034");
+        }
+
+        let second = store
+            .upload_request_inbox("u", UploadRequestInboxView::All, 10, Some(&boundary))
+            .await
+            .unwrap();
+        assert_eq!(second.counts.all, 63);
+        assert_eq!(second.matched_total, 63);
+        assert_eq!(second.items.first().unwrap().id, "mutable-032");
+        assert_eq!(
+            second.items.first().unwrap().title,
+            "Changed at the classification second",
+            "classification is fixed, but continuation requests are not one cross-request MVCC snapshot"
+        );
+        assert!(second.items.iter().all(|item| item.id != "mutable-034"));
+        assert!(second.items.iter().all(|item| item.id != "mutable-033"));
+        assert!(first
+            .items
+            .iter()
+            .all(|left| second.items.iter().all(|right| left.id != right.id)));
     }
 
     /// A child folder under `parent`.
@@ -10735,6 +11250,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owner_reupload_rejects_review_hold_at_reserve_and_final_commit() {
+        let s = InMemoryStore::new();
+        let current = file("heldatomic", "u", "held-atomic-token", 1);
+        assert!(s.create(&current).await.unwrap());
+        let hold = UploadReviewDisposition {
+            submission_id: "held-submission".into(),
+            request_id: "held-request".into(),
+            file_id: current.id.clone(),
+            state: UploadReviewDispositionState::Held,
+            held_at: 1,
+            released_at: None,
+            file_exists: true,
+        };
+        s.request_state
+            .lock()
+            .expect("request state lock poisoned")
+            .review_dispositions
+            .push(hold.clone());
+        let intent = OwnerBlobWriteIntent {
+            object_key: "heldatomic-new".into(),
+            owner_sub: "u".into(),
+            size: 5,
+            kind: OWNER_WRITE_REUPLOAD.into(),
+            file_id: current.id.clone(),
+            folder_id: None,
+            expected_object_key: Some(current.object_key.clone()),
+            created_at: 2,
+            attempts: 0,
+        };
+        assert_eq!(
+            s.reserve_owner_blob_write(&intent, None).await.unwrap(),
+            OwnerBlobCommit::Conflict
+        );
+
+        s.request_state
+            .lock()
+            .expect("request state lock poisoned")
+            .review_dispositions
+            .clear();
+        assert_eq!(
+            s.reserve_owner_blob_write(&intent, None).await.unwrap(),
+            OwnerBlobCommit::Applied
+        );
+        s.request_state
+            .lock()
+            .expect("request state lock poisoned")
+            .review_dispositions
+            .push(hold);
+        assert_eq!(
+            s.commit_owner_reupload(OwnerReuploadInput {
+                owner_sub: "u",
+                file_id: "heldatomic",
+                expected_object_key: "heldatomic",
+                new_object_key: "heldatomic-new",
+                new_size: 5,
+                new_content_type: "image/webp",
+                snapshot_id: "heldatomic-version",
+                changed_at: 2,
+                owner_quota: None,
+            })
+            .await
+            .unwrap(),
+            OwnerBlobCommit::Conflict
+        );
+        assert_eq!(
+            s.get("heldatomic").await.unwrap().unwrap().object_key,
+            "heldatomic"
+        );
+        assert!(s.list_versions("heldatomic").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn public_commit_requires_exact_blob_and_receipt_without_consuming_on_conflict() {
         let s = InMemoryStore::new();
         s.create_folder(&folder("requestfolder", "u", "Request", 1))
@@ -10805,6 +11392,7 @@ mod tests {
                 &wrong_key,
                 &failed_submission,
                 Some(&failed_delivery),
+                None,
             )
             .await
             .unwrap());
@@ -10821,11 +11409,11 @@ mod tests {
         let mut wrong_receipt = receipt.clone();
         wrong_receipt.size = 2;
         assert!(!s
-            .commit_request_upload("exactblob", &exact, &wrong_receipt, None)
+            .commit_request_upload("exactblob", &exact, &wrong_receipt, None, None)
             .await
             .unwrap());
         assert!(s
-            .commit_request_upload("exactblob", &exact, &receipt, None)
+            .commit_request_upload("exactblob", &exact, &receipt, None, None)
             .await
             .unwrap());
         assert_eq!(
@@ -10901,6 +11489,7 @@ mod tests {
                 &first_file,
                 &first_submission,
                 Some(&delivery),
+                None,
             )
             .await
             .unwrap());
@@ -10942,6 +11531,7 @@ mod tests {
                 &rejected_file.id,
                 &rejected_file,
                 &rejected_submission,
+                None,
                 None,
             )
             .await

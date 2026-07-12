@@ -79,6 +79,7 @@ pub fn app(state: AppState) -> Router {
         .route("/healthz", get(handlers::health::healthz))
         .route("/", get(handlers::forum::home))
         .route("/for-you", get(handlers::forum::for_you))
+        .route("/focus", get(handlers::forum::focus))
         .route("/questions", get(handlers::forum::questions))
         .route("/activity", get(handlers::activity::page))
         .route(
@@ -99,15 +100,10 @@ pub fn app(state: AppState) -> Router {
             "/bookmarks/{pid}/complete",
             post(handlers::bookmarks::complete),
         )
-        .route(
-            "/bookmarks/{pid}/snooze",
-            post(handlers::bookmarks::snooze),
-        )
-        .route(
-            "/bookmarks/{pid}/remove",
-            post(handlers::bookmarks::remove),
-        )
+        .route("/bookmarks/{pid}/snooze", post(handlers::bookmarks::snooze))
+        .route("/bookmarks/{pid}/remove", post(handlers::bookmarks::remove))
         .route("/c/{id}", get(handlers::forum::category))
+        .route("/c/{id}/focus", post(handlers::forum::set_category_focus))
         .route("/t/{id}", get(handlers::forum::thread))
         .route("/t/{id}/read", post(handlers::forum::mark_thread_read))
         .route("/t/{id}/reply", post(handlers::forum::reply))

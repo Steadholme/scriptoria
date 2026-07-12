@@ -597,6 +597,12 @@ body.page-share-landing {
 .ap-badge--exp { background:var(--warn-soft); color:var(--warn-ink); border-color:var(--warn-border); }
 .ap-badge--expired,
 .ap-badge--trash { background:var(--down-soft); color:var(--down-ink); border-color:var(--down-border); }
+.ap-badge--held { background:var(--warn-soft); color:var(--warn-ink); border-color:var(--warn-border); }
+.ap-badge--released { background:var(--up-soft); color:var(--up-ink); border-color:var(--up-border); }
+.ap-review-hold { color:var(--warn-ink); }
+.ap-review-hold-panel { max-width:36rem; padding:var(--sp-5); }
+.ap-review-hold-copy { padding:14px; border:1px solid var(--warn-border); border-radius:var(--radius-md); background:var(--warn-soft); }
+.ap-review-hold-copy p { margin:8px 0 0; }
 
 /* ============================================================================
    S4 rail and upload
@@ -1888,7 +1894,24 @@ body.has-preview { overflow:hidden; }
 .request-delivery--legacy { border-style:dashed; }
 .request-receipts { display:grid; gap:0; margin:0; padding:0; list-style:none; }
 .request-receipt { display:flex; justify-content:space-between; gap:14px; padding:12px 0; border-top:1px solid var(--border); }
+.request-receipt > div:first-child { display:grid; align-content:start; gap:4px; }
 .request-receipt span { color:var(--muted); font-size:.82rem; text-align:right; }
+.request-review { max-width:36rem; display:grid; justify-items:end; gap:6px; text-align:right; }
+.request-review p { margin:0; color:var(--muted); font-size:.78rem; line-height:1.45; }
+.request-review .ap-badge--held { color:var(--warn-ink); }
+.request-review .ap-badge--released { color:var(--up-ink); }
+.request-review .ap-badge--removed { color:var(--danger-ink); }
+.request-review__confirm {
+  display:flex;
+  align-items:flex-start;
+  gap:var(--sp-2);
+  max-width:58ch;
+  color:var(--text);
+  font-size:var(--fs-sm);
+  line-height:1.45;
+  text-align:left;
+}
+.request-review__confirm input { flex:none; margin-top:.2em; }
 .request-head__actions { flex:0 0 auto; }
 .request-head,
 .request-head > div:first-child { min-width:0; }

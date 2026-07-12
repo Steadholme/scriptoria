@@ -10,7 +10,7 @@
 //! HTML in the drive's origin. Owner raw downloads and public share fetches also honor HTTP Range
 //! so browser-native image/video/audio media can stream and seek without buffering the whole blob.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use axum::extract::multipart::MultipartRejection;
 use axum::extract::{Multipart, Path, Query, State};
@@ -34,7 +34,7 @@ use crate::handlers::{
 use crate::model::{
     library_type_for, FileComment, FileRec, FolderRec, LibraryCursor, LibraryItem, LibraryItemKind,
     LibraryQuery, LibraryType, LibraryView, TrashItem, UploadDelivery, UploadRequestRec,
-    UploadSubmission, VersionRec,
+    UploadReviewDisposition, UploadSubmission, VersionRec,
 };
 use crate::store::{
     BulkMutation, DriveItemRef, OwnerBlobCommit, OwnerBlobWriteIntent, OwnerReuploadInput,
@@ -109,6 +109,7 @@ const VIDEO_SVG: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="current
 const AUDIO_SVG: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 13v-2M8 17V7M12 20V4M16 17V7M20 13v-2"/></svg>"##;
 
 const PLAY_SVG: &str = r##"<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M9 7.5v9l7-4.5-7-4.5Z"/></svg>"##;
+const REVIEW_HOLD_SVG: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9.5 8.5v7M14.5 8.5v7"/></svg>"##;
 
 // ---------------------------------------------------------------------------
 // GET / — the signed-in user's drive (gallery grid + upload dropzone)
@@ -203,6 +204,13 @@ pub async fn gallery(
             limit,
         };
         let page = state.store.query_library(&who.subject, &query).await?;
+        let file_ids = page
+            .items
+            .iter()
+            .filter(|item| item.kind == LibraryItemKind::File)
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+        let held = held_file_ids(&state, &who.subject, &file_ids).await?;
         let html = render_library_gallery(LibraryRender {
             config: &state.config,
             who: &who,
@@ -213,6 +221,7 @@ pub async fn gallery(
             query: &query,
             used,
             quota,
+            held: &held,
         });
         return Ok(html_with_csrf(StatusCode::OK, html, &csrf));
     }
@@ -223,6 +232,8 @@ pub async fn gallery(
         .store
         .list_by_owner(&who.subject, folder_filter, before, limit)
         .await?;
+    let file_ids = files.iter().map(|file| file.id.clone()).collect::<Vec<_>>();
+    let held = held_file_ids(&state, &who.subject, &file_ids).await?;
 
     // Legacy folder browsing keeps its existing cursor contract. Library views use an exact
     // look-ahead page returned by Store.
@@ -242,6 +253,7 @@ pub async fn gallery(
         active.as_ref(),
         used,
         quota,
+        &held,
     );
     Ok(html_with_csrf(StatusCode::OK, html, &csrf))
 }
@@ -457,6 +469,9 @@ pub async fn upload(
         .find_file_in_folder(&who.subject, &name, target.as_deref())
         .await?
     {
+        if file_is_held(&state, &existing).await? {
+            return Err(review_hold_conflict());
+        }
         return reupload_as_version(
             &state,
             &who,
@@ -691,15 +706,20 @@ pub async fn detail(
 ) -> Result<Response, AppError> {
     let viewer = auth::identity(&headers);
     let rec = owned_file(&state, &id, &viewer).await?;
+    let held = file_is_held(&state, &rec).await?;
     if inspector_surface_requested(&headers) {
         let folder = match rec.folder_id.as_deref() {
             Some(folder_id) => state.store.get_folder(folder_id, &viewer.subject).await?,
             None => None,
         };
-        let preview = build_inspector_preview(&state, &rec).await;
+        let preview = if held {
+            review_hold_preview(&rec)
+        } else {
+            build_inspector_preview(&state, &rec).await
+        };
         let versions = state.store.list_versions(&rec.id).await?;
         let comments = state.store.list_comments(&rec.id).await?;
-        let view = InspectorView::from_file(&rec, folder.as_ref(), &versions, &comments);
+        let view = InspectorView::from_file(&rec, folder.as_ref(), &versions, &comments, held);
         let mut response =
             (StatusCode::OK, Html(render_inspector(&view, &preview))).into_response();
         response
@@ -713,7 +733,11 @@ pub async fn detail(
         .list_folders(&viewer.subject)
         .await
         .unwrap_or_default();
-    let preview = build_preview(&state, &rec).await;
+    let preview = if held {
+        review_hold_preview(&rec)
+    } else {
+        build_preview(&state, &rec).await
+    };
     let versions = state.store.list_versions(&rec.id).await.unwrap_or_default();
     let comments = state.store.list_comments(&rec.id).await.unwrap_or_default();
     let html = render_detail(DetailRender {
@@ -725,6 +749,7 @@ pub async fn detail(
         preview: &preview,
         versions: &versions,
         comments: &comments,
+        held,
     });
     let mut response = html_with_csrf(StatusCode::OK, html, &csrf);
     response
@@ -752,7 +777,7 @@ pub async fn raw(
     Path(id): Path<String>,
 ) -> Result<Response, AppError> {
     let viewer = auth::identity(&headers);
-    let rec = owned_file(&state, &id, &viewer).await?;
+    let rec = owned_available_file(&state, &id, &viewer).await?;
     serve_file(&state, &rec, &headers).await
 }
 
@@ -771,7 +796,7 @@ pub async fn preview_raw(
     Path(id): Path<String>,
 ) -> Result<Response, AppError> {
     let viewer = auth::identity(&headers);
-    let rec = owned_file(&state, &id, &viewer).await?;
+    let rec = owned_available_file(&state, &id, &viewer).await?;
     let bytes = state.blobs.get(&rec.object_key).await?;
     if rec.content_type == "application/pdf" {
         Ok(serve_pdf_inline(&rec, bytes))
@@ -792,7 +817,7 @@ pub async fn download_version(
     Path((id, vid)): Path<(String, String)>,
 ) -> Result<Response, AppError> {
     let viewer = auth::identity(&headers);
-    let rec = owned_file(&state, &id, &viewer).await?;
+    let rec = owned_available_file(&state, &id, &viewer).await?;
     let version = state
         .store
         .get_version(&vid, &rec.id)
@@ -818,7 +843,7 @@ pub async fn restore_version(
         ));
     }
     let actor = auth::identity(&headers);
-    let rec = owned_file(&state, &id, &actor).await?;
+    let rec = owned_available_file(&state, &id, &actor).await?;
     state
         .store
         .get_version(&vid, &rec.id)
@@ -894,7 +919,7 @@ pub async fn thumb(
     Path(id): Path<String>,
 ) -> Result<Response, AppError> {
     let viewer = auth::identity(&headers);
-    let rec = owned_file(&state, &id, &viewer).await?;
+    let rec = owned_available_file(&state, &id, &viewer).await?;
     // A raster image is undecodable-for-resize without a decoder dep: fall back to the full bytes.
     if rec.is_image() {
         return Ok(redirect_found(&format!("/f/{}/raw", rec.id)));
@@ -1436,6 +1461,11 @@ fn share_room_response(result: Result<Response, AppError>) -> Response {
                     "This request changed while it was being processed. Reload and try again."
                         .to_string(),
                 ),
+                AppError::ReviewHold(_) => (
+                    StatusCode::NOT_FOUND,
+                    "Share not found",
+                    "This share link is invalid or has been removed.".to_string(),
+                ),
                 AppError::NotFound(_) => (
                     StatusCode::NOT_FOUND,
                     "Share not found",
@@ -1598,10 +1628,7 @@ pub async fn share_folder(State(state): State<AppState>, Path(token): Path<Strin
                     "Open shared folder",
                 ));
             }
-            let files = state
-                .store
-                .list_files_in_folder(&folder.id, &folder.owner_sub)
-                .await?;
+            let files = available_shared_folder_files(&state, &folder).await?;
             emit_folder_share_audit(&state, &folder);
             Ok(render_folder_index(&folder, &files, &token, None))
         }
@@ -1634,10 +1661,7 @@ pub async fn share_folder_unlock(
                     "Open shared folder",
                 ));
             }
-            let files = state
-                .store
-                .list_files_in_folder(&folder.id, &folder.owner_sub)
-                .await?;
+            let files = available_shared_folder_files(&state, &folder).await?;
             emit_folder_share_audit(&state, &folder);
             // Non-password folders never reach this branch with a value; carry the password only when set.
             let pw = folder
@@ -2058,9 +2082,16 @@ async fn upload_inbox_submit_inner(
             size: rec.size,
             created_at: now,
         };
+        let review_disposition = UploadReviewDisposition::held(&submission);
         match state
             .store
-            .commit_request_upload(&rec.id, &rec, &submission, new_delivery.as_ref())
+            .commit_request_upload(
+                &rec.id,
+                &rec,
+                &submission,
+                new_delivery.as_ref(),
+                Some(&review_disposition),
+            )
             .await
         {
             Ok(true) => {
@@ -2343,7 +2374,26 @@ async fn shared_folder_file(
                 && f.folder_id.as_deref() == Some(&folder.id)
         })
         .ok_or_else(|| AppError::NotFound("No such file in this shared folder.".to_string()))?;
+    if file_is_held(state, &file).await? {
+        return Err(AppError::NotFound(
+            "No such file in this shared folder.".to_string(),
+        ));
+    }
     Ok(file)
+}
+
+async fn available_shared_folder_files(
+    state: &AppState,
+    folder: &FolderRec,
+) -> Result<Vec<FileRec>, AppError> {
+    let mut files = state
+        .store
+        .list_files_in_folder(&folder.id, &folder.owner_sub)
+        .await?;
+    let ids = files.iter().map(|file| file.id.clone()).collect::<Vec<_>>();
+    let held = held_file_ids(state, &folder.owner_sub, &ids).await?;
+    files.retain(|file| !held.contains(&file.id));
+    Ok(files)
 }
 
 /// Attribute a public folder-share view to the folder's owner (no request identity on this route).
@@ -2472,7 +2522,7 @@ pub async fn configure_share(
         ));
     }
     let actor = auth::identity(&headers);
-    let rec = owned_file(&state, &id, &actor).await?;
+    let rec = owned_available_file(&state, &id, &actor).await?;
 
     let expires_at = parse_expiry(&form.expiry, now_secs());
     let password = form.password.trim();
@@ -3020,6 +3070,11 @@ async fn load_shared(state: &AppState, token: &str) -> Result<FileRec, AppError>
     let rec = state.store.get_by_token(token).await?.ok_or_else(|| {
         AppError::NotFound("This share link is invalid or has been removed.".to_string())
     })?;
+    if file_is_held(state, &rec).await? {
+        return Err(AppError::NotFound(
+            "This share link is invalid or has been removed.".to_string(),
+        ));
+    }
     if rec.share_expired(now_secs()) {
         return Err(AppError::Gone(
             "This share link has expired and is no longer available.".to_string(),
@@ -3151,6 +3206,47 @@ async fn owned_file(state: &AppState, id: &str, who: &Identity) -> Result<FileRe
         return Err(AppError::NotFound(
             "No file exists at that link.".to_string(),
         ));
+    }
+    Ok(rec)
+}
+
+async fn held_file_ids(
+    state: &AppState,
+    owner_sub: &str,
+    file_ids: &[String],
+) -> Result<HashSet<String>, AppError> {
+    Ok(state
+        .store
+        .upload_review_dispositions(owner_sub, file_ids)
+        .await?
+        .into_iter()
+        .filter(UploadReviewDisposition::is_held)
+        .map(|disposition| disposition.file_id)
+        .collect())
+}
+
+async fn file_is_held(state: &AppState, rec: &FileRec) -> Result<bool, AppError> {
+    let ids = [rec.id.clone()];
+    Ok(held_file_ids(state, &rec.owner_sub, &ids)
+        .await?
+        .contains(&rec.id))
+}
+
+fn review_hold_conflict() -> AppError {
+    AppError::ReviewHold(
+        "This file is held for owner review. Release it from the Request detail before using its contents. Manual release is not a malware scan or security approval."
+            .to_string(),
+    )
+}
+
+async fn owned_available_file(
+    state: &AppState,
+    id: &str,
+    who: &Identity,
+) -> Result<FileRec, AppError> {
+    let rec = owned_file(state, id, who).await?;
+    if file_is_held(state, &rec).await? {
+        return Err(review_hold_conflict());
     }
     Ok(rec)
 }
@@ -3770,13 +3866,16 @@ fn render_library_controls(query: &LibraryQuery) -> String {
     )
 }
 
-fn render_library_badges(item: &LibraryItem) -> String {
-    if !item.shared {
-        return "<span class=\"ap-badges\"></span>".to_string();
+fn render_library_badges(item: &LibraryItem, held: bool) -> String {
+    let mut badges = String::from("<span class=\"ap-badges\">");
+    if held {
+        badges.push_str("<span class=\"ap-badge ap-badge--held\">Held</span>");
+        badges.push_str("</span>");
+        return badges;
     }
-    let mut badges = String::from(
-        "<span class=\"ap-badges\"><span class=\"ap-badge ap-badge--link\">Shared by me</span>",
-    );
+    if item.shared {
+        badges.push_str("<span class=\"ap-badge ap-badge--link\">Shared by me</span>");
+    }
     if item.share_expired {
         badges.push_str("<span class=\"ap-badge ap-badge--expired\">Expired</span>");
     }
@@ -3787,7 +3886,11 @@ fn render_library_badges(item: &LibraryItem) -> String {
     badges
 }
 
-fn render_library_cards(items: &[LibraryItem], folders: &[FolderRec]) -> String {
+fn render_library_cards(
+    items: &[LibraryItem],
+    folders: &[FolderRec],
+    held_file_ids: &HashSet<String>,
+) -> String {
     items
         .iter()
         .map(|item| {
@@ -3798,7 +3901,8 @@ fn render_library_cards(items: &[LibraryItem], folders: &[FolderRec]) -> String 
                 .map(|folder| folder.name.as_str())
                 .unwrap_or("My Drive");
             let updated = fmt_ts(item.updated_at);
-            let badges = render_library_badges(item);
+            let held = item.kind == LibraryItemKind::File && held_file_ids.contains(&item.id);
+            let badges = render_library_badges(item, held);
             match item.kind {
                 LibraryItemKind::Folder => format!(
                     "<li class=\"file-card file-card--folder ap-library-item\">\
@@ -3821,7 +3925,12 @@ fn render_library_cards(items: &[LibraryItem], folders: &[FolderRec]) -> String 
                     let content_type = item.content_type.as_deref().unwrap_or_default();
                     let tone = ap_tone_class(content_type);
                     let file_type = library_type_for(content_type).slug();
-                    let thumb = if library_type_for(content_type) == LibraryType::Image {
+                    let thumb = if held {
+                        format!(
+                            "<span class=\"thumb thumb--file ap-review-hold\"><span class=\"thumb__glyph\">{glyph}</span><span class=\"thumb__ext\">HOLD</span></span>",
+                            glyph = REVIEW_HOLD_SVG,
+                        )
+                    } else if library_type_for(content_type) == LibraryType::Image {
                         format!(
                             "<span class=\"thumb thumb--image\"><img src=\"/d/{id}/thumb\" alt=\"{name}\" loading=\"lazy\"></span>",
                             id = esc(&item.id),
@@ -3872,6 +3981,7 @@ struct LibraryRender<'a> {
     query: &'a LibraryQuery,
     used: i64,
     quota: Option<i64>,
+    held: &'a HashSet<String>,
 }
 
 fn render_library_gallery(input: LibraryRender<'_>) -> String {
@@ -3892,7 +4002,7 @@ fn render_library_gallery(input: LibraryRender<'_>) -> String {
     let cards = if input.items.is_empty() {
         "<li class=\"file-card file-card--empty ap-empty\"><div class=\"ap-empty__art\" aria-hidden=\"true\"></div><h3>No matching items.</h3><p>Try another name or clear a filter.</p></li>".to_string()
     } else {
-        render_library_cards(input.items, input.folders)
+        render_library_cards(input.items, input.folders, input.held)
     };
     let pager = input
         .next
@@ -3959,6 +4069,7 @@ fn render_gallery(
     active: Option<&FolderRec>,
     used: i64,
     quota: Option<i64>,
+    held: &HashSet<String>,
 ) -> String {
     let count = match files.len() {
         0 => "No files yet".to_string(),
@@ -3988,7 +4099,7 @@ fn render_gallery(
         None => "/".to_string(),
     });
     let tiles = render_folder_tiles(&children, up_href.as_deref());
-    let file_cards = render_cards(files, csrf);
+    let file_cards = render_cards(files, csrf, held);
     let folder_section = if tiles.is_empty() {
         String::new()
     } else {
@@ -4397,11 +4508,7 @@ fn render_sidebar(
     let all_selected = active.is_none()
         && !trash_active
         && matches!(library_active, None | Some(LibraryView::All));
-    let all_active = if all_selected {
-        " is-active"
-    } else {
-        ""
-    };
+    let all_active = if all_selected { " is-active" } else { "" };
     let all_current = if all_selected {
         " aria-current=\"page\""
     } else {
@@ -4503,11 +4610,7 @@ fn render_folder_tree_level(
         let active = active_id == Some(f.id.as_str());
         let expanded = chain.iter().any(|c| c.id == f.id);
         let class = if active { " is-active" } else { "" };
-        let current = if active {
-            " aria-current=\"page\""
-        } else {
-            ""
-        };
+        let current = if active { " aria-current=\"page\"" } else { "" };
         out.push_str(&format!(
             "<li><a class=\"ap-nav__row{class}\" href=\"/?folder={id}\" title=\"{name}\"{current}>\
                <svg class=\"ap-nav__ico\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M4 5h5l2 2.5h9a1 1 0 0 1 1 1V18a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Z\"/></svg>\
@@ -4620,13 +4723,14 @@ fn render_folder_upload_section(_config: &Config, folder: &FolderRec, csrf: &str
     )
 }
 
-fn render_cards(files: &[FileRec], csrf: &str) -> String {
+fn render_cards(files: &[FileRec], csrf: &str, held_file_ids: &HashSet<String>) -> String {
     files
         .iter()
         .map(|f| {
             let tone = ap_tone_class(&f.content_type);
             let date = fmt_ts(f.updated_at);
-            let badges = render_card_badges(f);
+            let held = held_file_ids.contains(&f.id);
+            let badges = render_card_badges(f, held);
             let kind = if f.is_video() {
                 "video"
             } else if f.is_audio() {
@@ -4636,9 +4740,9 @@ fn render_cards(files: &[FileRec], csrf: &str) -> String {
             } else {
                 "file"
             };
-            let media = f.is_media();
+            let media = !held && f.is_media();
             let media_class = if media { " file-card--media" } else { "" };
-            let play = if f.is_video() || f.is_audio() {
+            let play = if !held && (f.is_video() || f.is_audio()) {
                 format!(
                     "<span class=\"thumb__play\" aria-hidden=\"true\">{PLAY_SVG}</span>",
                     PLAY_SVG = PLAY_SVG,
@@ -4646,7 +4750,12 @@ fn render_cards(files: &[FileRec], csrf: &str) -> String {
             } else {
                 String::new()
             };
-            let thumb = if f.is_image() {
+            let thumb = if held {
+                format!(
+                    "<span class=\"thumb thumb--file ap-review-hold\"><span class=\"thumb__glyph\">{glyph}</span><span class=\"thumb__ext\">HOLD</span></span>",
+                    glyph = REVIEW_HOLD_SVG,
+                )
+            } else if f.is_image() {
                 format!(
                     "<span class=\"thumb thumb--image\"><img src=\"/d/{id}/thumb\" alt=\"{alt}\" loading=\"lazy\"></span>",
                     id = esc(&f.id),
@@ -4724,8 +4833,15 @@ fn render_cards(files: &[FileRec], csrf: &str) -> String {
         .join("")
 }
 
-fn render_card_badges(f: &FileRec) -> String {
+fn render_card_badges(f: &FileRec, held: bool) -> String {
     let mut badges = String::from("<span class=\"ap-badges\">");
+    if held {
+        badges.push_str(
+            "<span class=\"ap-badge ap-badge--held\" title=\"Held for owner review\">Held</span>",
+        );
+        badges.push_str("</span>");
+        return badges;
+    }
     if f.share_token.is_some() {
         badges.push_str(
             "<span class=\"ap-badge ap-badge--link\" title=\"Share link enabled\">\
@@ -4931,6 +5047,19 @@ fn preview_none(rec: &FileRec) -> String {
     )
 }
 
+fn review_hold_preview(rec: &FileRec) -> String {
+    format!(
+        "<div class=\"preview-file ap-stage__none ap-review-hold-panel\">\
+           <span class=\"ap-badge ap-badge--held\">Review Hold</span>\
+           <span class=\"letter-tile ap-type-tile\" aria-hidden=\"true\">{ext}</span>\
+           <strong>Contents held for owner review</strong>\
+           <p class=\"muted\">Metadata remains visible. Raw bytes, previews, versions, restore and sharing stay unavailable until the Request owner manually releases this submission.</p>\
+           <p class=\"muted\">Release allows use; it is not a malware scan or security approval.</p>\
+         </div>",
+        ext = esc(&ext_label(&rec.name)),
+    )
+}
+
 /// Explicit projection for the owner Inspector. Capability material and storage internals cannot be
 /// leaked accidentally because they are not fields of this view model: the renderer never receives
 /// a share token, password hash, object key, bucket, or owner subject.
@@ -4943,6 +5072,7 @@ struct InspectorView {
     location_href: String,
     created_at: i64,
     updated_at: i64,
+    held: bool,
     preview: Preview,
     share_enabled: bool,
     share_expired: bool,
@@ -4965,6 +5095,7 @@ impl InspectorView {
         folder: Option<&FolderRec>,
         versions: &[VersionRec],
         comments: &[FileComment],
+        held: bool,
     ) -> Self {
         let mut activity = Vec::with_capacity(versions.len() + comments.len() + 2);
         if rec.updated_at > rec.created_at {
@@ -5000,7 +5131,7 @@ impl InspectorView {
         let (location_name, location_href) = folder
             .map(|folder| (folder.name.clone(), format!("/?folder={}", folder.id)))
             .unwrap_or_else(|| ("My Drive".to_string(), "/".to_string()));
-        let share_enabled = rec.share_token.is_some();
+        let share_enabled = !held && rec.share_token.is_some();
         Self {
             id: rec.id.clone(),
             name: rec.name.clone(),
@@ -5010,6 +5141,7 @@ impl InspectorView {
             location_href,
             created_at: rec.created_at,
             updated_at: rec.updated_at,
+            held,
             preview: preview_kind(rec),
             share_enabled,
             share_expired: share_enabled && rec.share_expired(now_secs()),
@@ -5025,7 +5157,9 @@ impl InspectorView {
 fn render_inspector(view: &InspectorView, preview: &str) -> String {
     let uploaded = fmt_ts(view.created_at);
     let changed = fmt_ts(view.updated_at);
-    let access_state = if !view.share_enabled {
+    let access_state = if view.held {
+        "Review Hold"
+    } else if !view.share_enabled {
         "Private"
     } else if view.share_expired {
         "Link expired"
@@ -5039,7 +5173,10 @@ fn render_inspector(view: &InspectorView, preview: &str) -> String {
     if let Some(expires_at) = view.share_expires_at {
         access_facts.push(format!("Expires {}", fmt_ts(expires_at)));
     }
-    let access_detail = if access_facts.is_empty() {
+    let access_detail = if view.held {
+        "Contents are unavailable until manually released from the Request detail. Release is not a malware scan or security approval."
+            .to_string()
+    } else if access_facts.is_empty() {
         if view.share_enabled {
             "Manage the capability from the full detail page.".to_string()
         } else {
@@ -5101,7 +5238,11 @@ fn render_inspector(view: &InspectorView, preview: &str) -> String {
          </article>",
         id = esc(&view.id),
         name = esc(&view.name),
-        stage = preview_stage_mod(view.preview),
+        stage = if view.held {
+            "ap-stage--hold"
+        } else {
+            preview_stage_mod(view.preview)
+        },
         preview = preview,
         tone = tone,
         ext = esc(&ext_label(&view.name)),
@@ -5130,6 +5271,7 @@ struct DetailRender<'a> {
     preview: &'a str,
     versions: &'a [VersionRec],
     comments: &'a [FileComment],
+    held: bool,
 }
 
 fn render_detail(ctx: DetailRender<'_>) -> String {
@@ -5142,6 +5284,7 @@ fn render_detail(ctx: DetailRender<'_>) -> String {
         preview,
         versions,
         comments,
+        held,
     } = ctx;
     let uploaded = fmt_ts(rec.created_at);
     let meta_list = format!(
@@ -5158,8 +5301,16 @@ fn render_detail(ctx: DetailRender<'_>) -> String {
         bucket = esc(&rec.bucket),
     );
 
-    let share = render_share_section(config, rec, csrf);
-    let embed_codes = render_embed_codes(config, rec);
+    let share = if held {
+        "<div class=\"ap-review-hold-copy\"><span class=\"ap-badge ap-badge--held\">Held</span><p>Sharing is unavailable while this Request submission is held for owner review.</p></div>".to_string()
+    } else {
+        render_share_section(config, rec, csrf)
+    };
+    let embed_codes = if held {
+        String::new()
+    } else {
+        render_embed_codes(config, rec)
+    };
     let embed = if embed_codes.is_empty() {
         String::new()
     } else {
@@ -5169,7 +5320,11 @@ fn render_detail(ctx: DetailRender<'_>) -> String {
         )
     };
     let move_section = render_move_section(rec, csrf, folders);
-    let versions_section = render_versions(rec, versions, csrf);
+    let versions_section = if held {
+        "<div class=\"field ap-review-hold-copy\"><label>Versions</label><p class=\"muted\">Version download and restore are unavailable during Review Hold.</p></div>".to_string()
+    } else {
+        render_versions(rec, versions, csrf)
+    };
     let comments_section = render_comments(rec, comments, csrf, viewer);
 
     let tone = ap_tone_class(&rec.content_type);
@@ -5189,7 +5344,11 @@ fn render_detail(ctx: DetailRender<'_>) -> String {
         created_ts = rec.created_at,
         date = esc(&uploaded),
     );
-    let stage_mod = preview_stage_mod(preview_kind(rec));
+    let stage_mod = if held {
+        "ap-stage--hold"
+    } else {
+        preview_stage_mod(preview_kind(rec))
+    };
 
     let delete = format!(
         "<form class=\"delete-form\" method=\"post\" action=\"/delete/{id}\" \

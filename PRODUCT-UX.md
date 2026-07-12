@@ -851,14 +851,152 @@ only for its explicit empty favicon, avoiding both a favicon request and a brows
   noise. Final Forum, Drive, Blog, Sluice and CSP reviews report no remaining P0/P1/P2; Sluice's full
   Go suite and capability-path privacy tests pass.
 
+## Iteration 9: focus rules, review hold, and revision evidence
+
+Iteration 9 improves three owner control planes without turning Odyssey into a product ceiling.
+Odyssey still supplies Foundation tokens and primitives; Forum owns attention intent, Drive owns
+intake disposition and byte access, and Blog owns immutable revision evidence. No product state is
+derived from a CSS class, badge, client-side filter, or best-effort audit event.
+
+### Forum: Category Focus Rules
+
+- `/focus` is a private, SSR-first desk for explicit category intent. A signed-in user may keep at
+  most 64 rules with `Priority`, `Follow`, `Mute`, or `None`; the page returns at most 30 current,
+  live threads. Priority categories precede Follow categories, then thread activity ordering is
+  deterministic.
+- Focus never creates Activity and never promises an outbound notification. Thread `Watch` remains
+  the only generic Activity subscription. This avoids turning one broad category preference into
+  unbounded recipient fan-out.
+- Precedence is fixed and visible: thread Watch/Follow can opt one thread back into a muted
+  category, while thread Mute always excludes it. Direct Reply, Mention and accepted Answer
+  Activity remain independent. Every rendered row names the winning category or thread reason.
+- Each category page carries a native CSRF-protected desired-state form and links back to Focus.
+  Save preserves canonical list state, returns to the editor anchor, and renders an accessible SSR
+  confirmation. `/focus` separately lists every active rule, including Mute rules that intentionally
+  yield no thread, so no-JavaScript users can inspect and undo negative intent. Memory and
+  PostgreSQL enforce the same rule cap and projection; the PostgreSQL owner guard serializes
+  concurrent creates and category deletion cascades its rules.
+- Forum still has no authoritative tag taxonomy, thread-tag membership, or tag administration.
+  v9 therefore does not add a cosmetic tag preference table. Tag Focus waits for that complete
+  domain instead of storing intent that cannot match authoritative content.
+- A v6 rollback may recreate legacy Watch beside a newer Mute. Forward migration removes that
+  shadow Watch, Activity reconciliation deletes only its generic Following delivery, and all PG
+  projections defensively make Mute win. Direct delivery paths survive.
+
+This keeps subscriptions separate from inbox projection, as in
+[GitHub notifications](https://docs.github.com/en/subscriptions-and-notifications/concepts/about-notifications),
+while borrowing the visible positive/negative topic intent of
+[Stack Overflow watched and ignored tags](https://stackoverflow.com/help/interesting-topics).
+[Discourse category and tag notification levels](https://meta.discourse.org/t/configuring-default-notification-settings-for-users/285619)
+show why hidden overlap rules become hard to explain; v9 deliberately has one fixed precedence and
+does not copy their five-level delivery model.
+
+Acceptance: GET writes nothing; unknown categories and a 65th rule fail atomically; Memory and PG
+agree on Priority/Follow/Mute and thread overrides; category changes create no Activity event,
+delivery or receipt; legacy Watch + Mute converges to Mute on forward boot; every HTML result is
+subject-scoped `private, no-store` and usable without JavaScript.
+
+### Drive: deep Request Inbox and explicit Review Hold
+
+- Request Inbox replaces the newest-100 dead end with 30-row keyset pages. Continuation cursor
+  `v9` binds the selected view, one fixed classification `as_of`, and `(updated_at, id)`; missing
+  snapshot state, malformed values, future boundaries or replay under another view fail closed.
+  Every response computes exact All/Open/Expiring/Closed/Expired counts and rows in one database
+  snapshot at that classification instant. Continuations are intentionally live across HTTP
+  requests rather than one long-lived MVCC snapshot: mutations at or before `as_of` may appear,
+  while rows touched beyond the boundary wait for refresh.
+- Every new Request upload atomically commits file metadata, immutable Submission, optional first
+  Delivery and one `Held` disposition. A disposition insert failure rolls the whole metadata
+  transaction back and the existing reservation/blob recovery path removes the object. Pre-v9
+  submissions have no disposition and remain available for compatibility.
+- Held content appears in the owner Gallery and Inspector with safe metadata and a distinct badge,
+  but the server never reads its blob for preview. Raw, PDF preview, thumbnail, version download,
+  version restore, Trash restore and share enable fail closed. Direct share and folder share do not
+  enumerate or fetch held content. Trash and purge remain available as the rejection path.
+- The owner releases one exact submission from Request detail through an idempotent, CSRF-protected
+  `Held -> Released` command plus an explicit share-impact confirmation. Release is terminal. It
+  means only “permit this file to be used”; it is not a malware verdict, identity verification,
+  correctness review or security approval, and existing direct/folder shares may become readable.
+  A permanently purged submission remains visible as Removed intake history and cannot be released.
+- Public Delivery Receipt intentionally remains `Received` or `Acknowledged`. It does not disclose
+  the internal Hold state, file id, byte authority or owner workflow, and acknowledgement still
+  does not imply approval.
+
+The access posture follows the separation used by
+[Google Drive malware handling](https://support.google.com/drive/answer/141702?hl=en),
+[Microsoft 365 malicious-file blocking](https://support.microsoft.com/en-au/office/what-to-do-when-a-malicious-file-is-found-in-sharepoint-online-onedrive-or-microsoft-teams-01e902ad-a903-4e0f-b093-1e1ac0c37ad2)
+and [Box Shield malicious content rules](https://support.box.com/hc/en-us/articles/46976541627411-Malicious-Content-Detection-Rule):
+receipt, scanner verdict, access restriction, human review and override are different states. v9
+implements only an intake Hold and manual release; there is no scanner behind its badge.
+
+Acceptance: pages beyond row 100 are reachable without duplicates across timestamp ties; cursor
+scope cannot change silently; same-second mutation semantics are explicit; Memory and PG
+counts/pages agree; new uploads cannot exist without their Hold row; held bytes cannot be replaced
+by same-name owner upload and have no owner or public read bypass; release is owner-scoped,
+idempotent and no-JavaScript; receipt HTML remains unchanged and capability-free; legacy
+submissions remain available.
+
+### Blog: Revision Workbench
+
+- History replaces one-click Restore with `Review changes`. The private Workbench compares any two
+  retained immutable revisions using explicit ids, a no-JavaScript GET selector, Swap, `Changes`
+  and `Rendered preview` modes. A missing pair redirects to a bookmarkable previous/current URL.
+- Source mode renders an escaped unified Markdown diff with added/removed symbols and text, not
+  color alone. Metadata comparison covers title, tags, cover, excerpt, canonical, SEO and social
+  fields; publication, schedule, pin and feature flags are shown separately as historical context
+  because Restore preserves their current values.
+- Preview mode renders each side independently through the existing sanitizer. It is not described
+  as a DOM diff. Source and preview share explicit 200,000-character and 10,000-line limits; source
+  also has a 12,000-edit budget and bounded lookahead. An oversized revision shows a clear bounded
+  fallback instead of silently truncating, exhausting memory or recommending an unbounded path.
+- Memory reads both sides under one revision lock; PostgreSQL reads both in one statement and one
+  MVCC snapshot. Cross-post and missing ids share an unavailable result. All retained
+  `100 + 1 externally pinned` summaries stay selectable while full bodies are fetched only for the
+  chosen pair.
+- Restore remains a CSRF-protected append-only command bound to stable post id and current edit
+  version. It additionally binds the `private` or `public` impact scope the author reviewed; if a
+  Scheduled post becomes public before POST, the command returns conflict and requires another
+  comparison. Public copy warns that article content and restorable metadata, including custom
+  canonical URL, change immediately.
+- External Review Link remains a separate anonymous, version-pinned capability. Restore does not
+  rotate it, and `/review/{token}` gains no History, adjacent revision id, diff or Restore access.
+
+This takes the “compare before restore” interaction from
+[WordPress revisions](https://wordpress.org/documentation/article/revisions/) and the attributable
+history posture of [Ghost post history](https://ghost.org/changelog/post-history/), while keeping
+Inkwell's stronger immutable pair, CAS and external-review boundaries.
+
+Acceptance: owner/admin can compare retained pairs and a foreign user cannot; same-id, cross-post,
+missing and oversized cases fail safely; diff source is escaped and preview is sanitized; Restore
+requires confirmation, stable identity, edit CAS and unchanged visibility scope; published Restore
+preserves publication flags but replaces authoring metadata; an active Review Link stays on its
+original pinned revision.
+
+### Iteration 9 exposure contract
+
+No anonymous gateway route is added. Forum `/focus`, Drive Request/Review Hold controls and Blog
+Revision Workbench all remain behind their existing SSO root routes. Drive `/u/`, `/s/` and
+`/receipts/`, plus Blog `/review/`, retain the v8 capability contracts and generic public errors.
+The candidate therefore changes Scriptoria only; Sluice route count and authentication matrix must
+remain byte-for-byte stable.
+
+Candidate gate: all 583 Rust targets pass across the six public crates, Writer recovery is 5/5,
+strict Clippy and the release build pass, and isolated PostgreSQL 18 is 20/20. Real Chromium passes
+Forum Focus, Drive Review Hold, and Blog Revision Workbench at 320 / 390 / 1440 px, including
+JavaScript disabled at 390 px, with zero horizontal page overflow, console/page errors, or failed
+resources. The Review Hold schema is forward-only after its first disposition write: rollback then
+requires a forward fix or the matching pre-v9 database and Cairn checkpoints.
+
 ## Next iterations
 
-1. Forum: add user-controlled category/tag intent only after defining its precedence against
-   thread Mute and Watch, then evaluate a bounded off-site digest as a separate delivery authority.
-2. Drive: add stable Request Inbox pagination beyond the newest 100, then request-specific rate
-   limits and quarantine state before presenting an Activity or security story.
-3. Blog: add revision detail and visual compare; reviewer notes or editorial states wait for an
-   explicit reviewer identity, authorization, notification and retention model.
+1. Forum: add an admin-owned tag taxonomy and thread-tag membership before Tag Focus, then add
+   stable Focus pagination. A bounded off-site digest remains a separate delivery authority.
+2. Drive: add request-specific rate limits, then integrate a real scanner verdict as a state
+   separate from Review Hold/manual release. Crucible integration needs asynchronous retry,
+   immutable result provenance and false-positive override before any “safe” label.
+3. Blog: link Review management to a private “shared vN versus current” comparison. Reviewer notes
+   or editorial states still wait for explicit reviewer identity, authorization, notification and
+   retention models.
 
 ## Rollout gate
 
@@ -868,7 +1006,10 @@ must retain exact SSO redirects. Drive `/s/` and `/u/` capability flows must rem
 scoped. No production restart happens until an immutable prior image, database checkpoint, Cairn
 object snapshot, and browser checks at 390 px and 1440 px exist. Once Iteration 4 writes a Trash
 entry, purge job, or owner blob intent, an image-only rollback is no longer valid: recover by a
-forward fix, or restore the matching database and Cairn checkpoints together.
+forward fix, or restore the matching database and Cairn checkpoints together. The same rule is
+immediate for v9 Review Hold: after the first disposition row exists, a pre-v9 binary would ignore
+that access authority, so rollback must be a forward fix or a matching pre-v9 database and Cairn
+restore, never an image-only downgrade.
 
 Cross-product review additionally makes these invariants release blockers:
 

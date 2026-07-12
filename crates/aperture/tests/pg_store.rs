@@ -22,8 +22,9 @@ use std::time::Duration;
 use aperture::blobs::{BlobError, Blobs, MemoryBlobs};
 use aperture::model::{
     FileRec, FolderRec, LibraryItemKind, LibraryQuery, LibraryType, LibraryView, UploadDelivery,
-    UploadRequestInboxCounts, UploadRequestInboxView, UploadRequestRec, UploadSubmission,
-    VersionRec, UPLOAD_REQUEST_EXPIRING_WINDOW_SECS,
+    UploadRequestInboxCounts, UploadRequestInboxView, UploadRequestRec, UploadReviewDisposition,
+    UploadReviewDispositionState, UploadSubmission, VersionRec,
+    UPLOAD_REQUEST_EXPIRING_WINDOW_SECS,
 };
 use aperture::store::{
     BlobDeleteClaim, BulkMutation, DriveItemRef, FolderDelete, OwnerBlobCommit,
@@ -122,6 +123,17 @@ async fn pg_store_full_integration() {
     .await
     .unwrap();
     sqlx::query("DROP FUNCTION IF EXISTS aperture_fail_request_receipt()")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query(
+        "DROP TRIGGER IF EXISTS aperture_fail_review_disposition_trigger \
+         ON upload_submission_dispositions",
+    )
+    .execute(&raw)
+    .await
+    .unwrap();
+    sqlx::query("DROP FUNCTION IF EXISTS aperture_fail_review_disposition()")
         .execute(&raw)
         .await
         .unwrap();
@@ -240,6 +252,47 @@ async fn pg_store_full_integration() {
     assert_eq!(
         owner_intent_index, 1,
         "migration installs owner quota index"
+    );
+    let review_hold_index: i64 = sqlx::query(
+        "SELECT CAST(COUNT(*) AS BIGINT) AS count FROM pg_indexes \
+         WHERE schemaname = current_schema() \
+           AND indexname = 'idx_upload_submission_dispositions_request_state'",
+    )
+    .fetch_one(&raw)
+    .await
+    .unwrap()
+    .try_get("count")
+    .unwrap();
+    assert_eq!(review_hold_index, 1, "migration installs Review Hold index");
+    let request_keyset_index: i64 = sqlx::query(
+        "SELECT CAST(COUNT(*) AS BIGINT) AS count FROM pg_indexes \
+         WHERE schemaname = current_schema() \
+           AND indexname = 'idx_upload_requests_owner_updated_id'",
+    )
+    .fetch_one(&raw)
+    .await
+    .unwrap()
+    .try_get("count")
+    .unwrap();
+    assert_eq!(
+        request_keyset_index, 1,
+        "migration installs the full Request Inbox keyset index"
+    );
+    let disposition_scope_fk: bool = sqlx::query_scalar(
+        "SELECT EXISTS (\
+             SELECT 1 FROM information_schema.table_constraints \
+             WHERE constraint_schema = current_schema() \
+               AND table_name = 'upload_submission_dispositions' \
+               AND constraint_name = 'fk_upload_disposition_submission_scope' \
+               AND constraint_type = 'FOREIGN KEY'\
+         )",
+    )
+    .fetch_one(&raw)
+    .await
+    .unwrap();
+    assert!(
+        disposition_scope_fk,
+        "database binds disposition submission/request/file identity"
     );
 
     // --- create + get round-trip -------------------------------------------
@@ -1399,6 +1452,7 @@ async fn pg_store_full_integration() {
             &inbox_folder.owner_sub,
             UploadRequestInboxView::All,
             inbox_as_of,
+            None,
         )
         .await
         .unwrap();
@@ -1427,6 +1481,7 @@ async fn pg_store_full_integration() {
                 &inbox_folder.owner_sub,
                 UploadRequestInboxView::All,
                 inbox_as_of,
+                None,
             )
             .await
             .unwrap(),
@@ -1438,6 +1493,7 @@ async fn pg_store_full_integration() {
             &inbox_folder.owner_sub,
             UploadRequestInboxView::Expiring,
             inbox_as_of,
+            None,
         )
         .await
         .unwrap();
@@ -1445,7 +1501,7 @@ async fn pg_store_full_integration() {
     assert_eq!(pg_expiring.matched_total, 1);
     assert_eq!(pg_expiring.items[0].id, "expiring");
     assert!(store
-        .upload_request_inbox("alice", UploadRequestInboxView::All, inbox_as_of)
+        .upload_request_inbox("alice", UploadRequestInboxView::All, inbox_as_of, None)
         .await
         .unwrap()
         .items
@@ -1456,13 +1512,14 @@ async fn pg_store_full_integration() {
             "pg-request-inbox-missing-owner",
             UploadRequestInboxView::Expired,
             inbox_as_of,
+            None,
         )
         .await
         .unwrap();
     assert_eq!(empty_pg_inbox.counts, UploadRequestInboxCounts::default());
     assert_eq!(empty_pg_inbox.matched_total, 0);
     assert!(empty_pg_inbox.items.is_empty());
-    assert!(!empty_pg_inbox.truncated);
+    assert!(empty_pg_inbox.next.is_none());
 
     let cap_folder = FolderRec {
         id: "pg-request-inbox-cap-folder".to_string(),
@@ -1489,20 +1546,94 @@ async fn pg_store_full_integration() {
         request.updated_at = inbox_as_of;
         assert!(store.create_upload_request(&request).await.unwrap());
     }
-    let capped_pg_inbox = store
+    let first_capped_pg_inbox = store
         .upload_request_inbox(
             &cap_folder.owner_sub,
             UploadRequestInboxView::All,
             inbox_as_of,
+            None,
         )
         .await
         .unwrap();
-    assert_eq!(capped_pg_inbox.counts.all, 101);
-    assert_eq!(capped_pg_inbox.matched_total, 101);
-    assert_eq!(capped_pg_inbox.items.len(), 100);
-    assert!(capped_pg_inbox.truncated);
-    assert_eq!(capped_pg_inbox.items.first().unwrap().id, "pg-inbox-cap-100");
-    assert_eq!(capped_pg_inbox.items.last().unwrap().id, "pg-inbox-cap-001");
+    assert_eq!(first_capped_pg_inbox.counts.all, 101);
+    assert_eq!(first_capped_pg_inbox.matched_total, 101);
+    assert_eq!(first_capped_pg_inbox.items.len(), 30);
+    assert_eq!(
+        first_capped_pg_inbox.items.first().unwrap().id,
+        "pg-inbox-cap-100"
+    );
+    assert_eq!(
+        first_capped_pg_inbox.items.last().unwrap().id,
+        "pg-inbox-cap-071"
+    );
+
+    let mut ids = first_capped_pg_inbox
+        .items
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+    let mut before = first_capped_pg_inbox.next.clone();
+    while let Some(cursor) = before {
+        let page = store
+            .upload_request_inbox(
+                &cap_folder.owner_sub,
+                UploadRequestInboxView::All,
+                inbox_as_of,
+                Some(&cursor),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.counts.all, 101);
+        assert_eq!(page.matched_total, 101);
+        assert!(page.items.len() <= 30);
+        ids.extend(page.items.iter().map(|item| item.id.clone()));
+        before = page.next;
+    }
+    let expected = (0..=100)
+        .rev()
+        .map(|index| format!("pg-inbox-cap-{index:03}"))
+        .collect::<Vec<_>>();
+    assert_eq!(ids, expected, "PostgreSQL keysets visit tied rows once");
+
+    sqlx::query("DELETE FROM upload_requests WHERE id = $1 AND owner_sub = $2")
+        .bind("pg-inbox-cap-070")
+        .bind(&cap_folder.owner_sub)
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE upload_requests SET updated_at = $1 WHERE id = $2 AND owner_sub = $3")
+        .bind(inbox_as_of + 1)
+        .bind("pg-inbox-cap-069")
+        .bind(&cap_folder.owner_sub)
+        .execute(&raw)
+        .await
+        .unwrap();
+    let changed_second_page = store
+        .upload_request_inbox(
+            &cap_folder.owner_sub,
+            UploadRequestInboxView::All,
+            inbox_as_of,
+            first_capped_pg_inbox.next.as_ref(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(changed_second_page.counts.all, 99);
+    assert_eq!(changed_second_page.matched_total, 99);
+    assert_eq!(
+        changed_second_page.items.first().unwrap().id,
+        "pg-inbox-cap-068"
+    );
+    assert!(changed_second_page
+        .items
+        .iter()
+        .all(|item| item.id != "pg-inbox-cap-070" && item.id != "pg-inbox-cap-069"));
+    assert!(first_capped_pg_inbox
+        .items
+        .iter()
+        .all(|left| changed_second_page
+            .items
+            .iter()
+            .all(|right| left.id != right.id)));
 
     let rotate_request = request(
         "request-rotate",
@@ -1947,6 +2078,7 @@ async fn pg_store_full_integration() {
                 &transition_file,
                 &transition_submission,
                 None,
+                None,
             )
             .await
     });
@@ -2022,7 +2154,7 @@ async fn pg_store_full_integration() {
     let mut wrong_blob = received.clone();
     wrong_blob.object_key = "wrong-receipt-object".to_string();
     assert!(!store
-        .commit_request_upload("receiptfile", &wrong_blob, &receipt, Some(&delivery))
+        .commit_request_upload("receiptfile", &wrong_blob, &receipt, Some(&delivery), None,)
         .await
         .unwrap());
     assert!(store
@@ -2050,7 +2182,7 @@ async fn pg_store_full_integration() {
     .unwrap();
     assert_eq!(retained_reservation, 1);
     assert!(store
-        .commit_request_upload("receiptfile", &received, &receipt, Some(&delivery))
+        .commit_request_upload("receiptfile", &received, &receipt, Some(&delivery), None,)
         .await
         .unwrap());
     assert_eq!(
@@ -2072,6 +2204,337 @@ async fn pg_store_full_integration() {
         .await
         .unwrap()
         .is_empty());
+
+    let review_request = request(
+        "request-review-hold",
+        "request-token-review-hold",
+        "legacyfold",
+        4,
+    );
+    assert!(store.create_upload_request(&review_request).await.unwrap());
+    assert_eq!(
+        store
+            .reserve_request_upload(UploadReserveInput {
+                request_id: &review_request.id,
+                expected_token: &review_request.token,
+                reservation_id: "review-held-file",
+                size: 4,
+                content_type: "image/png",
+                content_type_verified: true,
+                owner_quota: None,
+                now: now + 205,
+            })
+            .await
+            .unwrap(),
+        UploadReserve::Reserved
+    );
+    let mut review_file = file(
+        "review-held-file",
+        "alice",
+        "unused-review-share",
+        now + 205,
+    );
+    review_file.share_token = None;
+    review_file.folder_id = Some("legacyfold".to_string());
+    review_file.size = 4;
+    let review_delivery = UploadDelivery {
+        id: "review-held-delivery".to_string(),
+        request_id: review_request.id.clone(),
+        receipt_token_hash: "b".repeat(64),
+        created_at: now + 205,
+        acknowledged_at: None,
+        receipt_expires_at: now + 1000,
+    };
+    let review_submission = UploadSubmission {
+        id: "review-held-submission".to_string(),
+        request_id: review_request.id.clone(),
+        delivery_id: Some(review_delivery.id.clone()),
+        file_id: review_file.id.clone(),
+        name: review_file.name.clone(),
+        content_type: review_file.content_type.clone(),
+        size: review_file.size,
+        created_at: now + 205,
+    };
+    let review_hold = UploadReviewDisposition::held(&review_submission);
+    assert!(store
+        .commit_request_upload(
+            &review_file.id,
+            &review_file,
+            &review_submission,
+            Some(&review_delivery),
+            Some(&review_hold),
+        )
+        .await
+        .unwrap());
+    let pg_holds = store
+        .upload_review_dispositions("alice", std::slice::from_ref(&review_file.id))
+        .await
+        .unwrap();
+    assert_eq!(pg_holds, vec![review_hold.clone()]);
+    assert!(store
+        .upload_review_dispositions("bob", std::slice::from_ref(&review_file.id))
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(
+        store
+            .upload_review_dispositions("alice", std::slice::from_ref(&received.id))
+            .await
+            .unwrap()
+            .is_empty(),
+        "a pre-v9 submission with no disposition stays available"
+    );
+    let held_reupload_intent = OwnerBlobWriteIntent {
+        object_key: "review-held-file-new".into(),
+        owner_sub: "alice".into(),
+        size: 5,
+        kind: OWNER_WRITE_REUPLOAD.into(),
+        file_id: review_file.id.clone(),
+        folder_id: review_file.folder_id.clone(),
+        expected_object_key: Some(review_file.object_key.clone()),
+        created_at: now + 206,
+        attempts: 0,
+    };
+    assert_eq!(
+        store
+            .reserve_owner_blob_write(&held_reupload_intent, None)
+            .await
+            .unwrap(),
+        OwnerBlobCommit::Conflict,
+        "reserve rejects same-name replacement while the submission is held"
+    );
+    sqlx::query(
+        "UPDATE upload_submission_dispositions \
+         SET disposition_state = 'released', released_at = held_at \
+         WHERE submission_id = $1",
+    )
+    .bind(&review_submission.id)
+    .execute(&raw)
+    .await
+    .unwrap();
+    assert_eq!(
+        store
+            .reserve_owner_blob_write(&held_reupload_intent, None)
+            .await
+            .unwrap(),
+        OwnerBlobCommit::Applied
+    );
+    sqlx::query(
+        "UPDATE upload_submission_dispositions \
+         SET disposition_state = 'held', released_at = NULL \
+         WHERE submission_id = $1",
+    )
+    .bind(&review_submission.id)
+    .execute(&raw)
+    .await
+    .unwrap();
+    assert_eq!(
+        store
+            .commit_owner_reupload(OwnerReuploadInput {
+                owner_sub: "alice",
+                file_id: &review_file.id,
+                expected_object_key: &review_file.object_key,
+                new_object_key: &held_reupload_intent.object_key,
+                new_size: held_reupload_intent.size,
+                new_content_type: "image/webp",
+                snapshot_id: "review-held-version",
+                changed_at: now + 206,
+                owner_quota: None,
+            })
+            .await
+            .unwrap(),
+        OwnerBlobCommit::Conflict,
+        "final CAS rechecks Review Hold after reserve"
+    );
+    assert_eq!(
+        store
+            .get(&review_file.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .object_key,
+        review_file.object_key
+    );
+    assert!(store
+        .list_versions(&review_file.id)
+        .await
+        .unwrap()
+        .is_empty());
+    sqlx::query("DELETE FROM owner_blob_write_intents WHERE object_key = $1")
+        .bind(&held_reupload_intent.object_key)
+        .execute(&raw)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .bulk_trash(
+                "alice",
+                &[TrashRootInput {
+                    item: DriveItemRef {
+                        kind: LibraryItemKind::File,
+                        id: review_file.id.clone(),
+                    },
+                    entry_id: "review-held-trash".to_string(),
+                }],
+                now + 206,
+                now + 10_000,
+            )
+            .await
+            .unwrap(),
+        BulkMutation::Applied { changed: 1 }
+    );
+    assert_eq!(
+        store
+            .bulk_restore(
+                "alice",
+                &[DriveItemRef {
+                    kind: LibraryItemKind::File,
+                    id: review_file.id.clone(),
+                }],
+            )
+            .await
+            .unwrap(),
+        BulkMutation::Conflict
+    );
+    assert!(!store
+        .release_upload_review_hold(&review_request.id, &review_submission.id, "bob", now + 206,)
+        .await
+        .unwrap());
+    for released_at in [now + 207, now + 999] {
+        assert!(store
+            .release_upload_review_hold(
+                &review_request.id,
+                &review_submission.id,
+                "alice",
+                released_at,
+            )
+            .await
+            .unwrap());
+    }
+    let released = store
+        .upload_review_dispositions("alice", std::slice::from_ref(&review_file.id))
+        .await
+        .unwrap();
+    assert_eq!(released[0].state, UploadReviewDispositionState::Released);
+    assert_eq!(released[0].released_at, Some(now + 207));
+    assert_eq!(
+        store
+            .bulk_restore(
+                "alice",
+                &[DriveItemRef {
+                    kind: LibraryItemKind::File,
+                    id: review_file.id.clone(),
+                }],
+            )
+            .await
+            .unwrap(),
+        BulkMutation::Applied { changed: 1 }
+    );
+
+    assert_eq!(
+        store
+            .reserve_request_upload(UploadReserveInput {
+                request_id: &review_request.id,
+                expected_token: &review_request.token,
+                reservation_id: "review-rollback-file",
+                size: 5,
+                content_type: "image/png",
+                content_type_verified: true,
+                owner_quota: None,
+                now: now + 207,
+            })
+            .await
+            .unwrap(),
+        UploadReserve::Reserved
+    );
+    let mut rollback_file = review_file.clone();
+    rollback_file.id = "review-rollback-file".to_string();
+    rollback_file.object_key = rollback_file.id.clone();
+    rollback_file.name = "rollback.png".to_string();
+    rollback_file.size = 5;
+    rollback_file.created_at = now + 207;
+    rollback_file.updated_at = now + 207;
+    let rollback_delivery = UploadDelivery {
+        id: "review-rollback-delivery".to_string(),
+        request_id: review_request.id.clone(),
+        receipt_token_hash: "c".repeat(64),
+        created_at: now + 207,
+        acknowledged_at: None,
+        receipt_expires_at: now + 1000,
+    };
+    let rollback_submission = UploadSubmission {
+        id: "review-rollback-submission".to_string(),
+        request_id: review_request.id.clone(),
+        delivery_id: Some(rollback_delivery.id.clone()),
+        file_id: rollback_file.id.clone(),
+        name: rollback_file.name.clone(),
+        content_type: rollback_file.content_type.clone(),
+        size: rollback_file.size,
+        created_at: now + 207,
+    };
+    let rollback_hold = UploadReviewDisposition::held(&rollback_submission);
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION aperture_fail_review_disposition() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected disposition failure'; END $$",
+    )
+    .execute(&raw)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER aperture_fail_review_disposition_trigger \
+         BEFORE INSERT ON upload_submission_dispositions FOR EACH ROW \
+         EXECUTE FUNCTION aperture_fail_review_disposition()",
+    )
+    .execute(&raw)
+    .await
+    .unwrap();
+    assert!(store
+        .commit_request_upload(
+            &rollback_file.id,
+            &rollback_file,
+            &rollback_submission,
+            Some(&rollback_delivery),
+            Some(&rollback_hold),
+        )
+        .await
+        .is_err());
+    sqlx::query(
+        "DROP TRIGGER aperture_fail_review_disposition_trigger \
+         ON upload_submission_dispositions",
+    )
+    .execute(&raw)
+    .await
+    .unwrap();
+    sqlx::query("DROP FUNCTION aperture_fail_review_disposition()")
+        .execute(&raw)
+        .await
+        .unwrap();
+    for (table, column, id) in [
+        ("files", "id", rollback_file.id.as_str()),
+        ("upload_submissions", "id", rollback_submission.id.as_str()),
+        ("upload_deliveries", "id", rollback_delivery.id.as_str()),
+        (
+            "upload_submission_dispositions",
+            "submission_id",
+            rollback_submission.id.as_str(),
+        ),
+    ] {
+        let count: i64 = sqlx::query(&format!(
+            "SELECT CAST(COUNT(*) AS BIGINT) AS count FROM {table} WHERE {column} = $1"
+        ))
+        .bind(id)
+        .fetch_one(&raw)
+        .await
+        .unwrap()
+        .try_get("count")
+        .unwrap();
+        assert_eq!(count, 0, "{table} rolled back with disposition failure");
+    }
+    assert!(store
+        .release_request_upload(&rollback_file.id)
+        .await
+        .unwrap());
+
     assert!(!store
         .acknowledge_upload_delivery("request-room-a", "pg-delivery-one", "bob", now + 205,)
         .await
@@ -2134,6 +2597,7 @@ async fn pg_store_full_integration() {
             &after_ack_file.id,
             &after_ack_file,
             &after_ack_submission,
+            None,
             None,
         )
         .await
@@ -2251,6 +2715,7 @@ async fn pg_store_full_integration() {
             &ack_race_first_file,
             &ack_race_first_submission,
             Some(&ack_race_delivery),
+            None,
         )
         .await
         .unwrap());
@@ -2301,6 +2766,7 @@ async fn pg_store_full_integration() {
                 &commit_file.id,
                 &commit_file,
                 &commit_submission,
+                None,
                 None,
             ),
             acknowledge_store.acknowledge_upload_delivery(
@@ -2588,7 +3054,13 @@ async fn pg_store_full_integration() {
         created_at: now + 205,
     };
     assert!(!store
-        .commit_request_upload("purge-reserve-blob", &losing_file, &losing_receipt, None,)
+        .commit_request_upload(
+            "purge-reserve-blob",
+            &losing_file,
+            &losing_receipt,
+            None,
+            None,
+        )
         .await
         .unwrap());
     race_blobs.delete("purge-reserve-blob").await.unwrap();
@@ -2697,7 +3169,13 @@ async fn pg_store_full_integration() {
     let commit_store = store.clone();
     let committing = tokio::spawn(async move {
         commit_store
-            .commit_request_upload("purge-commit-blob", &winning_file, &winning_receipt, None)
+            .commit_request_upload(
+                "purge-commit-blob",
+                &winning_file,
+                &winning_receipt,
+                None,
+                None,
+            )
             .await
     });
     let mut commit_at_barrier = false;

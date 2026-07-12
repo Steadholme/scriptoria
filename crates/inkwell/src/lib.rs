@@ -86,6 +86,10 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/edit/{slug}/history", get(handlers::posts::history))
         .route(
+            "/edit/{slug}/history/compare",
+            get(handlers::posts::history_compare),
+        )
+        .route(
             "/edit/{slug}/history/{revision_id}/restore",
             post(handlers::posts::restore_revision),
         )

@@ -40,9 +40,9 @@ use thiserror::Error;
 
 use crate::model::{
     ActivityDelivery, ActivityEvent, ActivityItem, ActivityKind, ActivityReason,
-    ActivityRecipientKind, BannedAuthor, Bookmark, BookmarkItem, Category, CategoryFormat, Mention,
-    Post, ReactionCount, Thread, ThreadDigest, ThreadFollowLevel, ThreadReadingState,
-    ThreadSearchHit,
+    ActivityRecipientKind, BannedAuthor, Bookmark, BookmarkItem, Category, CategoryFocusLevel,
+    CategoryFormat, Mention, Post, ReactionCount, Thread, ThreadDigest, ThreadFollowLevel,
+    ThreadReadingState, ThreadSearchHit,
 };
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
@@ -230,6 +230,55 @@ pub struct CatchUpItem {
     pub reply_count: i64,
 }
 
+/// Why one live thread appears on the private Category Focus page. Category Priority/Follow are
+/// read-time projections only; the two override reasons make the narrow thread choice visible when
+/// it intentionally wins over a broad category Mute.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CategoryFocusReason {
+    CategoryPriority,
+    CategoryFollow,
+    ThreadWatchOverride,
+    ThreadFollowOverride,
+}
+
+impl CategoryFocusReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CategoryPriority => "category_priority",
+            Self::CategoryFollow => "category_follow",
+            Self::ThreadWatchOverride => "thread_watch_override",
+            Self::ThreadFollowOverride => "thread_follow_override",
+        }
+    }
+
+    const fn sort_bucket(self) -> u8 {
+        match self {
+            Self::CategoryPriority => 0,
+            Self::CategoryFollow => 1,
+            Self::ThreadWatchOverride | Self::ThreadFollowOverride => 2,
+        }
+    }
+}
+
+/// One bounded, fully-explained row on `/focus`. No capability or notification state is carried:
+/// handlers render only the live Thread plus its current category and winning private intent.
+#[derive(Clone, Debug)]
+pub struct CategoryFocusItem {
+    pub thread: Thread,
+    pub category: Category,
+    pub category_level: CategoryFocusLevel,
+    pub thread_level: ThreadFollowLevel,
+    pub reason: CategoryFocusReason,
+}
+
+/// One owner-scoped desired-state rule shown on `/focus`, including negative Mute intent even when
+/// it intentionally produces no thread rows.
+#[derive(Clone, Debug)]
+pub struct CategoryFocusRuleItem {
+    pub category: Category,
+    pub level: CategoryFocusLevel,
+}
+
 /// Keyset cursor for the personal activity stream.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActivityCursor {
@@ -293,6 +342,11 @@ pub const MAX_FOR_YOU_CANDIDATES: usize = 200;
 /// Catch-up renders 30 task rows and may request one sentinel row to decide whether a keyset link
 /// is needed. Both Store implementations reject a larger request.
 pub const MAX_CATCH_UP_PAGE: i64 = 30;
+/// A subject can keep a small, inspectable set of category rules. The cap is enforced atomically
+/// by Memory and PostgreSQL; `None` removes a rule and never consumes the quota.
+pub const MAX_CATEGORY_FOCUS_RULES: usize = 64;
+/// `/focus` is an intentionally bounded first-page desk in v9. There is no silent unbounded load.
+pub const MAX_CATEGORY_FOCUS_PAGE: i64 = 30;
 /// Parsed aliases are deduplicated before this per-post bound is enforced.
 pub const MAX_MENTIONS_PER_POST: usize = 32;
 /// OP + quoted author + followers + mentions. Klaxon is best-effort and never exceeds this bound.
@@ -559,6 +613,39 @@ fn catch_up_reason(
     }
 }
 
+fn category_focus_reason(
+    category_level: CategoryFocusLevel,
+    thread_level: ThreadFollowLevel,
+) -> Option<CategoryFocusReason> {
+    if thread_level == ThreadFollowLevel::Mute {
+        return None;
+    }
+    match category_level {
+        CategoryFocusLevel::Priority => Some(CategoryFocusReason::CategoryPriority),
+        CategoryFocusLevel::Follow => Some(CategoryFocusReason::CategoryFollow),
+        CategoryFocusLevel::Mute => match thread_level {
+            ThreadFollowLevel::Watch => Some(CategoryFocusReason::ThreadWatchOverride),
+            ThreadFollowLevel::Follow => Some(CategoryFocusReason::ThreadFollowOverride),
+            ThreadFollowLevel::None | ThreadFollowLevel::Mute => None,
+        },
+        CategoryFocusLevel::None => None,
+    }
+}
+
+fn validate_category_focus_page(limit: i64, as_of: i64) -> Result<usize, StoreError> {
+    if as_of < 0 {
+        return Err(StoreError::InvalidOperation(
+            "focus as_of must be non-negative".to_string(),
+        ));
+    }
+    if !(0..=MAX_CATEGORY_FOCUS_PAGE).contains(&limit) {
+        return Err(StoreError::InvalidOperation(format!(
+            "focus page may request at most {MAX_CATEGORY_FOCUS_PAGE} rows"
+        )));
+    }
+    Ok(limit as usize)
+}
+
 fn validate_catch_up_page(
     view: CatchUpView,
     as_of: i64,
@@ -809,6 +896,35 @@ pub trait Store: Send + Sync {
         viewer_sub: &str,
         thread_ids: &[String],
     ) -> Result<HashMap<String, ThreadPersonalSignals>, StoreError>;
+    /// Current desired-state Category Focus rule. Absence is returned as `None`.
+    async fn category_focus_level(
+        &self,
+        viewer_sub: &str,
+        category_id: &str,
+    ) -> Result<CategoryFocusLevel, StoreError>;
+    /// List every current desired-state rule for the owner so no-JavaScript users can inspect and
+    /// navigate back to edit Priority, Follow, and Mute independently of thread projection.
+    async fn category_focus_rules(
+        &self,
+        viewer_sub: &str,
+    ) -> Result<Vec<CategoryFocusRuleItem>, StoreError>;
+    /// Atomically create, replace, or remove one owner-scoped rule. Category rules are private
+    /// Catch-up intent only and must never create an Activity delivery.
+    async fn set_category_focus_level(
+        &self,
+        viewer_sub: &str,
+        category_id: &str,
+        level: CategoryFocusLevel,
+        changed_at: i64,
+    ) -> Result<(), StoreError>;
+    /// One exact, set-based `/focus` projection. Priority precedes Follow, thread Watch/Follow can
+    /// override a category Mute, thread Mute always excludes, and `limit` is hard-capped at 30.
+    async fn category_focus_page(
+        &self,
+        viewer_sub: &str,
+        limit: i64,
+        as_of: i64,
+    ) -> Result<Vec<CategoryFocusItem>, StoreError>;
     /// Read the current commit-ordered post/read boundary without advancing it. PostgreSQL takes a
     /// shared lock on the singleton clock so a writer that already allocated a generation must
     /// commit or roll back before this returns; GET remains write-free.
@@ -1028,6 +1144,7 @@ pub struct InMemoryStore {
     activity_deliveries: Mutex<Vec<StoredActivityDelivery>>,
     activity_receipts: Mutex<Vec<ActivityReceipt>>,
     catch_up_state: Mutex<MemoryCatchUpState>,
+    category_focus_rules: Mutex<Vec<MemoryCategoryFocusRule>>,
     bookmarks: Mutex<Vec<Bookmark>>,
     banned: Mutex<Vec<BannedAuthor>>,
     /// One row per `(post_id, user_sub, kind)` — the in-memory mirror of `post_reactions`.
@@ -1053,6 +1170,15 @@ struct CatchUpPostPoint {
 struct MemoryPostReadReceipt {
     read_at: i64,
     read_seq: i64,
+}
+
+#[derive(Clone, Debug)]
+struct MemoryCategoryFocusRule {
+    viewer_sub: String,
+    category_id: String,
+    level: CategoryFocusLevel,
+    _created_at: i64,
+    _updated_at: i64,
 }
 
 impl MemoryCatchUpState {
@@ -1296,6 +1422,10 @@ impl Store for InMemoryStore {
             ));
         }
         categories.retain(|category| category.id != id);
+        self.category_focus_rules
+            .lock()
+            .expect("category_focus_rules lock poisoned")
+            .retain(|rule| rule.category_id != id);
         Ok(())
     }
 
@@ -2708,6 +2838,207 @@ impl Store for InMemoryStore {
             );
         }
         Ok(signals)
+    }
+
+    async fn category_focus_level(
+        &self,
+        viewer_sub: &str,
+        category_id: &str,
+    ) -> Result<CategoryFocusLevel, StoreError> {
+        Ok(self
+            .category_focus_rules
+            .lock()
+            .expect("category_focus_rules lock poisoned")
+            .iter()
+            .find(|rule| rule.viewer_sub == viewer_sub && rule.category_id == category_id)
+            .map(|rule| rule.level)
+            .unwrap_or_default())
+    }
+
+    async fn category_focus_rules(
+        &self,
+        viewer_sub: &str,
+    ) -> Result<Vec<CategoryFocusRuleItem>, StoreError> {
+        if viewer_sub.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        let categories = self.categories.lock().expect("categories lock poisoned");
+        let rules = self
+            .category_focus_rules
+            .lock()
+            .expect("category_focus_rules lock poisoned");
+        let mut items = rules
+            .iter()
+            .filter(|rule| rule.viewer_sub == viewer_sub)
+            .filter_map(|rule| {
+                categories
+                    .iter()
+                    .find(|category| category.id == rule.category_id)
+                    .cloned()
+                    .map(|category| CategoryFocusRuleItem {
+                        category,
+                        level: rule.level,
+                    })
+            })
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| {
+            left.category
+                .sort_order
+                .cmp(&right.category.sort_order)
+                .then_with(|| left.category.id.cmp(&right.category.id))
+        });
+        Ok(items)
+    }
+
+    async fn set_category_focus_level(
+        &self,
+        viewer_sub: &str,
+        category_id: &str,
+        level: CategoryFocusLevel,
+        changed_at: i64,
+    ) -> Result<(), StoreError> {
+        if viewer_sub.trim().is_empty() || changed_at < 0 {
+            return Err(StoreError::InvalidOperation(
+                "invalid category focus rule".to_string(),
+            ));
+        }
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        if self
+            .categories
+            .lock()
+            .expect("categories lock poisoned")
+            .iter()
+            .all(|category| category.id != category_id)
+        {
+            return Err(StoreError::NotFound("category not found".to_string()));
+        }
+        let mut rules = self
+            .category_focus_rules
+            .lock()
+            .expect("category_focus_rules lock poisoned");
+        let existing = rules
+            .iter()
+            .position(|rule| rule.viewer_sub == viewer_sub && rule.category_id == category_id);
+        match (level, existing) {
+            (CategoryFocusLevel::None, Some(position)) => {
+                rules.remove(position);
+            }
+            (CategoryFocusLevel::None, None) => {}
+            (next, Some(position)) => {
+                if rules[position].level != next {
+                    rules[position].level = next;
+                    rules[position]._updated_at = changed_at;
+                }
+            }
+            (next, None) => {
+                let count = rules
+                    .iter()
+                    .filter(|rule| rule.viewer_sub == viewer_sub)
+                    .count();
+                if count >= MAX_CATEGORY_FOCUS_RULES {
+                    return Err(StoreError::InvalidOperation(format!(
+                        "a user may keep at most {MAX_CATEGORY_FOCUS_RULES} category focus rules"
+                    )));
+                }
+                rules.push(MemoryCategoryFocusRule {
+                    viewer_sub: viewer_sub.to_string(),
+                    category_id: category_id.to_string(),
+                    level: next,
+                    _created_at: changed_at,
+                    _updated_at: changed_at,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    async fn category_focus_page(
+        &self,
+        viewer_sub: &str,
+        limit: i64,
+        as_of: i64,
+    ) -> Result<Vec<CategoryFocusItem>, StoreError> {
+        let limit = validate_category_focus_page(limit, as_of)?;
+        if limit == 0 || viewer_sub.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let (categories, threads, original_posts, posts, subscriptions, rules) = {
+            let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+            (
+                self.categories
+                    .lock()
+                    .expect("categories lock poisoned")
+                    .clone(),
+                self.threads.lock().expect("threads lock poisoned").clone(),
+                self.original_posts
+                    .lock()
+                    .expect("original_posts lock poisoned")
+                    .clone(),
+                self.posts.lock().expect("posts lock poisoned").clone(),
+                self.subscriptions
+                    .lock()
+                    .expect("subscriptions lock poisoned")
+                    .clone(),
+                self.category_focus_rules
+                    .lock()
+                    .expect("category_focus_rules lock poisoned")
+                    .clone(),
+            )
+        };
+        let category_rules: HashMap<&str, CategoryFocusLevel> = rules
+            .iter()
+            .filter(|rule| rule.viewer_sub == viewer_sub)
+            .map(|rule| (rule.category_id.as_str(), rule.level))
+            .collect();
+        let mut items = Vec::new();
+        for mut thread in threads
+            .into_iter()
+            .filter(|thread| thread.created_at <= as_of)
+        {
+            let Some(category_level) = category_rules.get(thread.category_id.as_str()).copied()
+            else {
+                continue;
+            };
+            let Some(category) = categories
+                .iter()
+                .find(|category| category.id == thread.category_id)
+                .cloned()
+            else {
+                continue;
+            };
+            let thread_level = subscriptions
+                .iter()
+                .find(|row| row.thread_id == thread.id && row.subscriber_sub == viewer_sub)
+                .map(|row| row.level)
+                .unwrap_or_default();
+            let Some(reason) = category_focus_reason(category_level, thread_level) else {
+                continue;
+            };
+            if !category.format.is_question()
+                || valid_accepted_post(&thread, &original_posts, &posts).is_none()
+            {
+                thread.accepted_post_id.clear();
+            }
+            items.push(CategoryFocusItem {
+                thread,
+                category,
+                category_level,
+                thread_level,
+                reason,
+            });
+        }
+        items.sort_by(|left, right| {
+            left.reason
+                .sort_bucket()
+                .cmp(&right.reason.sort_bucket())
+                .then_with(|| right.thread.pinned.cmp(&left.thread.pinned))
+                .then_with(|| right.thread.last_at.cmp(&left.thread.last_at))
+                .then_with(|| right.thread.created_at.cmp(&left.thread.created_at))
+                .then_with(|| right.thread.id.cmp(&left.thread.id))
+        });
+        items.truncate(limit);
+        Ok(items)
     }
 
     async fn catch_up_snapshot_generation(&self) -> Result<i64, StoreError> {
@@ -4777,6 +5108,21 @@ impl PgStore {
             .execute(&mut *follow_schema_tx)
             .await?;
         }
+        // An older v6 image can recreate a legacy Watch while a newer Mute row remains. Mute is
+        // the narrow thread authority and must win after the next forward boot; otherwise the
+        // mixed row would revive Activity and personal projections. Follow intentionally does not
+        // delete a legacy Watch because Watch is the stronger positive intent.
+        sqlx::query(
+            "DELETE FROM thread_subscriptions AS watcher \
+             WHERE EXISTS (\
+                 SELECT 1 FROM thread_follow_preferences AS preference \
+                 WHERE preference.thread_id = watcher.thread_id \
+                   AND preference.subscriber_sub = watcher.subscriber_sub \
+                   AND preference.level = 'mute'\
+             )",
+        )
+        .execute(&mut *follow_schema_tx)
+        .await?;
         follow_schema_tx.commit().await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_subscriptions_user ON thread_subscriptions (subscriber_sub)")
             .execute(&self.pool)
@@ -4790,6 +5136,39 @@ impl PgStore {
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_follow_preferences_user \
              ON thread_follow_preferences (subscriber_sub, thread_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Category Focus is owner-scoped read intent only. The owner guard serializes the exact
+        // 64-rule quota, while the Category FK is also the rollback protocol: an older image may
+        // delete an empty category without knowing about v9 and its private rules still cascade.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS forum_category_focus_owner_guards (\
+                 viewer_sub TEXT PRIMARY KEY\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS forum_category_focus_rules (\
+                 viewer_sub TEXT NOT NULL, \
+                 category_id TEXT NOT NULL, \
+                 level TEXT NOT NULL, \
+                 created_at BIGINT NOT NULL, \
+                 updated_at BIGINT NOT NULL, \
+                 PRIMARY KEY (viewer_sub, category_id), \
+                 CONSTRAINT fk_forum_category_focus_category FOREIGN KEY (category_id) \
+                     REFERENCES categories(id) ON DELETE CASCADE, \
+                 CHECK (level IN ('priority', 'follow', 'mute')), \
+                 CHECK (created_at >= 0), \
+                 CHECK (updated_at >= created_at)\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_category_focus_subject_level \
+             ON forum_category_focus_rules (viewer_sub, level, category_id)",
         )
         .execute(&self.pool)
         .await?;
@@ -4898,8 +5277,9 @@ impl PgStore {
             .execute(&mut *activity_schema_tx)
             .await?;
         // A v6 rollback can delete a Watch row without knowing about v7's Activity cleanup. On
-        // the next forward boot, reconcile only generic Following deliveries against the legacy
-        // Watch projection; direct replies, mentions and accepted answers remain authoritative.
+        // the next forward boot, reconcile only generic Following deliveries against the
+        // effective Watch projection. A mixed-version Mute remains defensive authority even if an
+        // unsupported concurrent legacy writer recreates Watch; direct deliveries remain intact.
         sqlx::query(
             "DELETE FROM forum_activity_deliveries AS delivery \
              WHERE delivery.recipient_kind = 'subject' \
@@ -4907,11 +5287,16 @@ impl PgStore {
                AND EXISTS (\
                    SELECT 1 FROM forum_activity_events AS event \
                    WHERE event.id = delivery.activity_id \
-                     AND NOT EXISTS (\
-                         SELECT 1 FROM thread_subscriptions AS watcher \
-                         WHERE watcher.thread_id = event.thread_id \
-                           AND watcher.subscriber_sub = delivery.recipient_key\
-                     )\
+                     AND (NOT EXISTS (\
+                             SELECT 1 FROM thread_subscriptions AS watcher \
+                             WHERE watcher.thread_id = event.thread_id \
+                               AND watcher.subscriber_sub = delivery.recipient_key\
+                         ) OR EXISTS (\
+                             SELECT 1 FROM thread_follow_preferences AS preference \
+                             WHERE preference.thread_id = event.thread_id \
+                               AND preference.subscriber_sub = delivery.recipient_key \
+                               AND preference.level = 'mute'\
+                         ))\
                )",
         )
         .execute(&mut *activity_schema_tx)
@@ -5336,9 +5721,17 @@ impl PgStore {
         if let Some(n) = subscriber_param {
             sql.push_str(
                 " JOIN (\
-                    SELECT thread_id FROM thread_subscriptions WHERE subscriber_sub = $",
+                    SELECT watcher.thread_id FROM thread_subscriptions AS watcher \
+                     WHERE watcher.subscriber_sub = $",
             );
             sql.push_str(&n.to_string());
+            sql.push_str(
+                " AND NOT EXISTS (\
+                    SELECT 1 FROM thread_follow_preferences AS preference \
+                     WHERE preference.thread_id = watcher.thread_id \
+                       AND preference.subscriber_sub = watcher.subscriber_sub \
+                       AND preference.level = 'mute')",
+            );
             sql.push_str(
                 " UNION \
                     SELECT thread_id FROM thread_follow_preferences \
@@ -6020,6 +6413,12 @@ impl PgStore {
             let follower_rows = sqlx::query(
                 "SELECT subscriber_sub FROM thread_subscriptions \
                  WHERE thread_id = $1 \
+                   AND NOT EXISTS (\
+                       SELECT 1 FROM thread_follow_preferences AS preference \
+                       WHERE preference.thread_id = thread_subscriptions.thread_id \
+                         AND preference.subscriber_sub = thread_subscriptions.subscriber_sub \
+                         AND preference.level = 'mute'\
+                   ) \
                  ORDER BY subscriber_sub LIMIT $2",
             )
             .bind(&post.thread_id)
@@ -6872,6 +7271,10 @@ impl PgStore {
         let stored = sqlx::query_scalar::<_, String>(
             "SELECT CASE \
                  WHEN EXISTS (\
+                     SELECT 1 FROM thread_follow_preferences \
+                     WHERE thread_id = $1 AND subscriber_sub = $2 AND level = 'mute'\
+                 ) THEN 'mute' \
+                 WHEN EXISTS (\
                      SELECT 1 FROM thread_subscriptions \
                      WHERE thread_id = $1 AND subscriber_sub = $2\
                  ) THEN 'watch' \
@@ -6908,7 +7311,8 @@ impl PgStore {
             .join(", ");
         let sql = format!(
             "SELECT t.id AS thread_id, \
-                    CASE WHEN watcher.subscriber_sub IS NOT NULL THEN 'watch' \
+                    CASE WHEN preference.level = 'mute' THEN 'mute' \
+                         WHEN watcher.subscriber_sub IS NOT NULL THEN 'watch' \
                          ELSE COALESCE(preference.level, 'none') END AS follow_level, \
                     CASE WHEN t.author_sub = $1 THEN TRUE ELSE FALSE END AS authored, \
                     EXISTS (\
@@ -6970,6 +7374,276 @@ impl PgStore {
         Ok(signals)
     }
 
+    async fn category_focus_level_async(
+        &self,
+        viewer_sub: &str,
+        category_id: &str,
+    ) -> Result<CategoryFocusLevel, StoreError> {
+        let stored = sqlx::query_scalar::<_, String>(
+            "SELECT level FROM forum_category_focus_rules \
+             WHERE viewer_sub = $1 AND category_id = $2",
+        )
+        .bind(viewer_sub)
+        .bind(category_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(backend)?;
+        stored
+            .map(|level| {
+                CategoryFocusLevel::parse(&level).ok_or_else(|| {
+                    StoreError::Backend(format!(
+                        "unknown category focus level for {category_id}: {level}"
+                    ))
+                })
+            })
+            .transpose()
+            .map(|level| level.unwrap_or_default())
+    }
+
+    async fn category_focus_rules_async(
+        &self,
+        viewer_sub: &str,
+    ) -> Result<Vec<CategoryFocusRuleItem>, StoreError> {
+        if viewer_sub.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT c.id, c.name, c.sort_order, c.format, rule.level \
+             FROM forum_category_focus_rules rule \
+             JOIN categories c ON c.id = rule.category_id \
+             WHERE rule.viewer_sub = $1 \
+             ORDER BY c.sort_order ASC, c.id ASC",
+        )
+        .bind(viewer_sub)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        rows.into_iter()
+            .map(|row| {
+                let category_id: String = row.try_get("id").map_err(backend)?;
+                let raw_level: String = row.try_get("level").map_err(backend)?;
+                let level = CategoryFocusLevel::parse(&raw_level).ok_or_else(|| {
+                    StoreError::Backend(format!(
+                        "unknown category focus level for {category_id}: {raw_level}"
+                    ))
+                })?;
+                let raw_format: String = row.try_get("format").map_err(backend)?;
+                Ok(CategoryFocusRuleItem {
+                    category: Category {
+                        id: category_id,
+                        name: row.try_get("name").map_err(backend)?,
+                        sort_order: row.try_get("sort_order").map_err(backend)?,
+                        format: CategoryFormat::parse(&raw_format).unwrap_or_default(),
+                    },
+                    level,
+                })
+            })
+            .collect()
+    }
+
+    async fn set_category_focus_level_async(
+        &self,
+        viewer_sub: &str,
+        category_id: &str,
+        level: CategoryFocusLevel,
+        changed_at: i64,
+    ) -> Result<(), StoreError> {
+        if viewer_sub.trim().is_empty() || changed_at < 0 {
+            return Err(StoreError::InvalidOperation(
+                "invalid category focus rule".to_string(),
+            ));
+        }
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        sqlx::query_scalar::<_, String>("SELECT id FROM categories WHERE id = $1 FOR UPDATE")
+            .bind(category_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(backend)?
+            .ok_or_else(|| StoreError::NotFound("category not found".to_string()))?;
+        sqlx::query(
+            "INSERT INTO forum_category_focus_owner_guards (viewer_sub) VALUES ($1) \
+             ON CONFLICT (viewer_sub) DO NOTHING",
+        )
+        .bind(viewer_sub)
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        sqlx::query_scalar::<_, String>(
+            "SELECT viewer_sub FROM forum_category_focus_owner_guards \
+             WHERE viewer_sub = $1 FOR UPDATE",
+        )
+        .bind(viewer_sub)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(backend)?;
+        let stored = sqlx::query_scalar::<_, String>(
+            "SELECT level FROM forum_category_focus_rules \
+             WHERE viewer_sub = $1 AND category_id = $2 FOR UPDATE",
+        )
+        .bind(viewer_sub)
+        .bind(category_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(backend)?;
+
+        if level == CategoryFocusLevel::None {
+            if stored.is_some() {
+                sqlx::query(
+                    "DELETE FROM forum_category_focus_rules \
+                     WHERE viewer_sub = $1 AND category_id = $2",
+                )
+                .bind(viewer_sub)
+                .bind(category_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(backend)?;
+            }
+            tx.commit().await.map_err(backend)?;
+            return Ok(());
+        }
+
+        if let Some(stored) = stored {
+            let stored = CategoryFocusLevel::parse(&stored).ok_or_else(|| {
+                StoreError::Backend(format!(
+                    "unknown category focus level for {category_id}: {stored}"
+                ))
+            })?;
+            if stored != level {
+                sqlx::query(
+                    "UPDATE forum_category_focus_rules \
+                     SET level = $1, updated_at = GREATEST($2, created_at) \
+                     WHERE viewer_sub = $3 AND category_id = $4",
+                )
+                .bind(level.as_str())
+                .bind(changed_at)
+                .bind(viewer_sub)
+                .bind(category_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(backend)?;
+            }
+            tx.commit().await.map_err(backend)?;
+            return Ok(());
+        }
+
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM forum_category_focus_rules WHERE viewer_sub = $1",
+        )
+        .bind(viewer_sub)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(backend)?;
+        if count >= MAX_CATEGORY_FOCUS_RULES as i64 {
+            return Err(StoreError::InvalidOperation(format!(
+                "a user may keep at most {MAX_CATEGORY_FOCUS_RULES} category focus rules"
+            )));
+        }
+        sqlx::query(
+            "INSERT INTO forum_category_focus_rules \
+                 (viewer_sub, category_id, level, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $4)",
+        )
+        .bind(viewer_sub)
+        .bind(category_id)
+        .bind(level.as_str())
+        .bind(changed_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
+        Ok(())
+    }
+
+    async fn category_focus_page_async(
+        &self,
+        viewer_sub: &str,
+        limit: i64,
+        as_of: i64,
+    ) -> Result<Vec<CategoryFocusItem>, StoreError> {
+        let limit = validate_category_focus_page(limit, as_of)? as i64;
+        if limit == 0 || viewer_sub.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT t.id AS id, t.category_id AS category_id, t.title AS title, \
+                    t.author_sub AS author_sub, t.author_email AS author_email, \
+                    t.created_at AS created_at, t.last_at AS last_at, \
+                    t.locked AS locked, t.pinned AS pinned, \
+                    CASE WHEN c.format = 'question' AND accepted.id IS NOT NULL \
+                         THEN t.accepted_post_id ELSE '' END AS accepted_post_id, \
+                    c.name AS focus_category_name, c.sort_order AS focus_category_sort_order, \
+                    c.format AS focus_category_format, rule.level AS category_focus_level, \
+                    CASE WHEN preference.level = 'mute' THEN 'mute' \
+                         WHEN watcher.subscriber_sub IS NOT NULL THEN 'watch' \
+                         ELSE COALESCE(preference.level, 'none') END AS thread_follow_level \
+             FROM forum_category_focus_rules AS rule \
+             JOIN categories AS c ON c.id = rule.category_id \
+             JOIN threads AS t ON t.category_id = c.id \
+             LEFT JOIN posts AS accepted ON accepted.id = t.accepted_post_id \
+                                        AND accepted.thread_id = t.id \
+                                        AND accepted.id <> t.first_post_id \
+             LEFT JOIN thread_subscriptions AS watcher \
+                    ON watcher.thread_id = t.id AND watcher.subscriber_sub = $1 \
+             LEFT JOIN thread_follow_preferences AS preference \
+                    ON preference.thread_id = t.id AND preference.subscriber_sub = $1 \
+             WHERE rule.viewer_sub = $1 AND t.created_at <= $2 \
+               AND CASE WHEN preference.level = 'mute' THEN 'mute' \
+                        WHEN watcher.subscriber_sub IS NOT NULL THEN 'watch' \
+                        ELSE COALESCE(preference.level, 'none') END <> 'mute' \
+               AND (rule.level IN ('priority', 'follow') \
+                    OR CASE WHEN preference.level = 'mute' THEN 'mute' \
+                            WHEN watcher.subscriber_sub IS NOT NULL THEN 'watch' \
+                            ELSE COALESCE(preference.level, 'none') END IN ('watch', 'follow')) \
+             ORDER BY CASE rule.level WHEN 'priority' THEN 0 WHEN 'follow' THEN 1 ELSE 2 END, \
+                      t.pinned DESC, t.last_at DESC, t.created_at DESC, t.id DESC \
+             LIMIT $3",
+        )
+        .bind(viewer_sub)
+        .bind(as_of)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            let category_id: String = row.try_get("category_id").map_err(backend)?;
+            let stored_category_level: String =
+                row.try_get("category_focus_level").map_err(backend)?;
+            let category_level =
+                CategoryFocusLevel::parse(&stored_category_level).ok_or_else(|| {
+                    StoreError::Backend(format!(
+                        "unknown category focus level for {category_id}: {stored_category_level}"
+                    ))
+                })?;
+            let stored_thread_level: String =
+                row.try_get("thread_follow_level").map_err(backend)?;
+            let thread_level = ThreadFollowLevel::parse(&stored_thread_level).ok_or_else(|| {
+                StoreError::Backend(format!(
+                    "unknown thread follow level in category focus: {stored_thread_level}"
+                ))
+            })?;
+            let reason = category_focus_reason(category_level, thread_level).ok_or_else(|| {
+                StoreError::Backend(format!(
+                    "category focus query returned an excluded thread in {category_id}"
+                ))
+            })?;
+            let category_format: String = row.try_get("focus_category_format").map_err(backend)?;
+            items.push(CategoryFocusItem {
+                thread: Self::thread_from_row(&row).map_err(backend)?,
+                category: Category {
+                    id: category_id,
+                    name: row.try_get("focus_category_name").map_err(backend)?,
+                    sort_order: row.try_get("focus_category_sort_order").map_err(backend)?,
+                    format: CategoryFormat::parse(&category_format).unwrap_or_default(),
+                },
+                category_level,
+                thread_level,
+                reason,
+            });
+        }
+        Ok(items)
+    }
+
     async fn catch_up_page_async(
         &self,
         viewer_sub: &str,
@@ -6999,7 +7673,14 @@ impl PgStore {
         };
         let candidate_sources = match view {
             CatchUpView::Following => {
-                "SELECT thread_id FROM thread_subscriptions WHERE subscriber_sub = $1 \
+                "SELECT watcher.thread_id FROM thread_subscriptions AS watcher \
+                  WHERE watcher.subscriber_sub = $1 \
+                    AND NOT EXISTS (\
+                        SELECT 1 FROM thread_follow_preferences AS preference \
+                         WHERE preference.thread_id = watcher.thread_id \
+                           AND preference.subscriber_sub = watcher.subscriber_sub \
+                           AND preference.level = 'mute'\
+                    ) \
                  UNION \
                  SELECT thread_id FROM thread_follow_preferences \
                   WHERE subscriber_sub = $1 AND level = 'follow'"
@@ -7009,7 +7690,14 @@ impl PgStore {
                   WHERE author_sub = $1 AND created_at <= $2"
             }
             CatchUpView::Updates => {
-                "SELECT thread_id FROM thread_subscriptions WHERE subscriber_sub = $1 \
+                "SELECT watcher.thread_id FROM thread_subscriptions AS watcher \
+                  WHERE watcher.subscriber_sub = $1 \
+                    AND NOT EXISTS (\
+                        SELECT 1 FROM thread_follow_preferences AS preference \
+                         WHERE preference.thread_id = watcher.thread_id \
+                           AND preference.subscriber_sub = watcher.subscriber_sub \
+                           AND preference.level = 'mute'\
+                    ) \
                  UNION \
                  SELECT thread_id FROM thread_follow_preferences \
                   WHERE subscriber_sub = $1 AND level = 'follow' \
@@ -7055,7 +7743,8 @@ impl PgStore {
                              THEN t.accepted_post_id ELSE '' END AS accepted_post_id,
                         t.first_post_id AS first_post_id,
                         c.name AS category_name, c.format AS category_format,
-                        CASE WHEN watcher.subscriber_sub IS NOT NULL THEN 'watch'
+                        CASE WHEN preference.level = 'mute' THEN 'mute'
+                             WHEN watcher.subscriber_sub IS NOT NULL THEN 'watch'
                              ELSE COALESCE(preference.level, 'none') END AS follow_level,
                         CASE WHEN t.author_sub = $1 THEN TRUE ELSE FALSE END AS authored,
                         EXISTS (
@@ -8320,6 +9009,43 @@ impl Store for PgStore {
         thread_ids: &[String],
     ) -> Result<HashMap<String, ThreadPersonalSignals>, StoreError> {
         self.thread_personal_signals_async(viewer_sub, thread_ids)
+            .await
+    }
+
+    async fn category_focus_level(
+        &self,
+        viewer_sub: &str,
+        category_id: &str,
+    ) -> Result<CategoryFocusLevel, StoreError> {
+        self.category_focus_level_async(viewer_sub, category_id)
+            .await
+    }
+
+    async fn category_focus_rules(
+        &self,
+        viewer_sub: &str,
+    ) -> Result<Vec<CategoryFocusRuleItem>, StoreError> {
+        self.category_focus_rules_async(viewer_sub).await
+    }
+
+    async fn set_category_focus_level(
+        &self,
+        viewer_sub: &str,
+        category_id: &str,
+        level: CategoryFocusLevel,
+        changed_at: i64,
+    ) -> Result<(), StoreError> {
+        self.set_category_focus_level_async(viewer_sub, category_id, level, changed_at)
+            .await
+    }
+
+    async fn category_focus_page(
+        &self,
+        viewer_sub: &str,
+        limit: i64,
+        as_of: i64,
+    ) -> Result<Vec<CategoryFocusItem>, StoreError> {
+        self.category_focus_page_async(viewer_sub, limit, as_of)
             .await
     }
 

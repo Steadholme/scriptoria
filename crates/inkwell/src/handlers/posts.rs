@@ -23,8 +23,9 @@ use crate::handlers::{
 use crate::markdown;
 use crate::store::{
     AutosaveOutcome, DeletePostCommand, DeletePostOutcome, DeletePostScope, Post, PostCursor,
-    PostReviewLink, RevokePostReviewLinkCommand, RevokePostReviewLinkOutcome, SavePostCommand,
-    SavePostOutcome, SavePostReviewLinkCommand, SavePostReviewLinkOutcome, WriterAutosave,
+    PostReviewLink, PostRevision, PostRevisionSummary, RevokePostReviewLinkCommand,
+    RevokePostReviewLinkOutcome, SavePostCommand, SavePostOutcome, SavePostReviewLinkCommand,
+    SavePostReviewLinkOutcome, WriterAutosave,
 };
 use crate::{now_nanos, now_secs, unique_slug, AppState};
 
@@ -33,6 +34,10 @@ const POST_HTML: &str = include_str!("../../templates/post.html");
 const EDITOR_HTML: &str = include_str!("../../templates/editor.html");
 const PREFLIGHT_HTML: &str = include_str!("../../templates/preflight.html");
 const PUBLIC_REPRESENTATION_VARY: &str = "Cookie, X-Auth-Subject, X-Auth-Email, X-Auth-Groups";
+const REVISION_DIFF_MAX_CHARS: usize = 200_000;
+const REVISION_DIFF_MAX_LINES: usize = 10_000;
+const REVISION_DIFF_MAX_EDITS: usize = 12_000;
+const REVISION_DIFF_LOOKAHEAD: usize = 32;
 
 pub const CUSTOM_EXCERPT_MAX: usize = 500;
 pub const META_TITLE_MAX: usize = 200;
@@ -212,6 +217,25 @@ pub struct RestoreForm {
     pub expected_version: String,
     #[serde(default)]
     pub expected_post_id: String,
+    #[serde(default)]
+    pub return_to: String,
+    #[serde(default)]
+    pub confirm_restore: String,
+    /// Visibility posture the author reviewed. A scheduled post can become public between the
+    /// compare GET and this POST, so the server must reject that scope change even when the edit
+    /// version is unchanged.
+    #[serde(default)]
+    pub confirmation_scope: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct RevisionCompareQuery {
+    #[serde(default)]
+    pub from: String,
+    #[serde(default)]
+    pub to: String,
+    #[serde(default)]
+    pub mode: String,
     #[serde(default)]
     pub return_to: String,
 }
@@ -1729,30 +1753,33 @@ pub async fn history(
         .store
         .list_post_revisions(&post.id, crate::config::REVISION_PAGE_LIMIT)
         .await?;
-    let (csrf, set_cookie) = auth::ensure_csrf(&headers);
+    let (_csrf, set_cookie) = auth::ensure_csrf(&headers);
     let return_to = validated_return_to(query.return_to.as_deref());
-    let return_field = esc(&return_to);
+    let current_revision_id = revisions
+        .iter()
+        .find(|revision| revision.edit_version == post.edit_version)
+        .map(|revision| revision.id.as_str());
     let rows = revisions
         .iter()
         .map(|revision| {
             let action = if revision.edit_version == post.edit_version {
                 r#"<span class="badge">current</span>"#.to_string()
-            } else {
-                format!(
-                    r#"<form class="inline-form" method="post" action="/edit/{slug}/history/{revision_id}/restore">
-  <input type="hidden" name="csrf_token" value="{csrf}">
-  <input type="hidden" name="expected_version" value="{version}">
-  <input type="hidden" name="expected_post_id" value="{post_id}">
-  <input type="hidden" name="return_to" value="{return_to}">
-  <button class="btn btn-secondary btn-sm" type="submit">Restore content</button>
-</form>"#,
+            } else if let Some(current_revision_id) = current_revision_id {
+                let mut href = format!(
+                    "/edit/{slug}/history/compare?from={from}&amp;to={to}&amp;mode=changes",
                     slug = esc(&slug),
-                    revision_id = esc(&revision.id),
-                    csrf = esc(&csrf),
-                    version = post.edit_version,
-                    post_id = esc(&post.id),
-                    return_to = return_field,
+                    from = crate::handlers::library::percent_encode(&revision.id),
+                    to = crate::handlers::library::percent_encode(current_revision_id),
+                );
+                if !return_to.is_empty() {
+                    href.push_str("&amp;return_to=");
+                    href.push_str(&crate::handlers::library::percent_encode(&return_to));
+                }
+                format!(
+                    r#"<a class="btn btn-secondary btn-sm" href="{href}">Review changes</a>"#
                 )
+            } else {
+                r#"<span class="muted">Unavailable</span>"#.to_string()
             };
             format!(
                 r#"<tr><td>v{version}</td><td>{title}</td><td>{editor}</td><td>{source}</td><td>{chars}</td><td>{action}</td></tr>"#,
@@ -1776,7 +1803,7 @@ pub async fn history(
     let fragment = format!(
         r#"<main class="console console--narrow"><div class="console__head"><h1>Post history</h1><p class="sub">{title}</p></div>
 <p><a class="btn btn-ghost" href="{editor_href}">Back to editor</a></p>
-<section class="card"><div class="card__body"><p class="muted">Restoring recovers content and metadata while preserving the current Draft, Scheduled, or Published state, publication time, pin, and feature flags.</p>
+<section class="card"><div class="card__body"><p class="muted">Review an immutable comparison before restoring. Restore appends a new version while preserving the current Draft, Scheduled, or Published state, publication time, pin, and feature flags.</p>
 <div class="table-wrap"><table class="history"><thead><tr><th>Version</th><th>Title</th><th>Editor</th><th>Source</th><th>Chars</th><th>Action</th></tr></thead><tbody>{rows}</tbody></table></div></div></section></main>"#,
         title = esc(&post.title),
         editor_href = esc(&editor_href),
@@ -1800,6 +1827,612 @@ pub async fn history(
     Ok(private_no_store(html_with_cookie(page, set_cookie)))
 }
 
+/// `GET /edit/{slug}/history/compare` — private, immutable, no-JavaScript comparison of two
+/// revisions. Missing pair parameters canonicalize to the previous/current pair so bookmarks
+/// always bind explicit immutable revision ids.
+pub async fn history_compare(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+    Query(query): Query<RevisionCompareQuery>,
+) -> Result<Response, AppError> {
+    let (sub, email) = auth::require_author(&headers)?;
+    let is_admin = auth::is_admin(&headers);
+    let post = state
+        .store
+        .get_post_authoritative(&slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound("no such post".to_string()))?;
+    if post.author_sub != sub && !is_admin {
+        return Err(AppError::Forbidden(
+            "you can only compare history for your own posts".to_string(),
+        ));
+    }
+
+    let mode = match query.mode.trim() {
+        "" | "changes" => "changes",
+        "preview" => "preview",
+        _ => {
+            return Err(AppError::InvalidRequest(
+                "comparison mode must be changes or preview".to_string(),
+            ));
+        }
+    };
+    let return_to = validated_return_to(Some(&query.return_to));
+    let summaries = state
+        .store
+        .list_post_revisions(&post.id, crate::config::REVISION_PAGE_LIMIT)
+        .await?;
+
+    let from_id = query.from.trim();
+    let to_id = query.to.trim();
+    if from_id.is_empty() && to_id.is_empty() {
+        let current = summaries
+            .iter()
+            .find(|revision| revision.edit_version == post.edit_version)
+            .ok_or_else(|| AppError::NotFound("current revision is unavailable".to_string()))?;
+        let previous = summaries
+            .iter()
+            .find(|revision| revision.edit_version < post.edit_version)
+            .unwrap_or(current);
+        return Ok(private_get_redirect(&revision_compare_url(
+            &slug,
+            &previous.id,
+            &current.id,
+            mode,
+            &return_to,
+            false,
+        )));
+    }
+    if from_id.is_empty() || to_id.is_empty() || from_id.len() > 512 || to_id.len() > 512 {
+        return Err(AppError::InvalidRequest(
+            "choose two valid revisions".to_string(),
+        ));
+    }
+    let pair = state
+        .store
+        .get_post_revision_pair(&post.id, from_id, to_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("one or both revisions are unavailable".to_string()))?;
+
+    let swap_href = revision_compare_url(&slug, &pair.to.id, &pair.from.id, mode, &return_to, true);
+    let changes_href = revision_compare_url(
+        &slug,
+        &pair.from.id,
+        &pair.to.id,
+        "changes",
+        &return_to,
+        true,
+    );
+    let preview_href = revision_compare_url(
+        &slug,
+        &pair.from.id,
+        &pair.to.id,
+        "preview",
+        &return_to,
+        true,
+    );
+    let controls = render_revision_compare_controls(
+        &slug, &summaries, &pair.from, &pair.to, mode, &return_to, &swap_href,
+    );
+    let body = if mode == "preview" {
+        render_revision_preview(&pair.from, &pair.to)
+    } else {
+        render_revision_source_diff(&pair.from.body_md, &pair.to.body_md)
+    };
+    let metadata = render_revision_metadata_diff(&pair.from, &pair.to);
+    let historical = render_revision_historical_context(&pair.from, &pair.to);
+    let now = now_secs();
+    let (csrf, set_cookie) = auth::ensure_csrf(&headers);
+    let restore =
+        render_revision_restore(&slug, &post, &pair.from, &pair.to, &csrf, &return_to, now);
+    let history_href = if return_to.is_empty() {
+        format!("/edit/{slug}/history")
+    } else {
+        format!(
+            "/edit/{slug}/history?return_to={}",
+            crate::handlers::library::percent_encode(&return_to)
+        )
+    };
+    let fragment = format!(
+        r#"<main class="console revision-workbench"><div class="console__head"><span class="eyebrow">Revision Workbench</span><h1>{title}</h1><p class="sub">Compare two immutable saved versions before changing the current post.</p></div>
+<p><a class="btn btn-ghost" href="{history_href}">&larr; Back to history</a></p>
+{controls}
+<nav class="revision-modes" aria-label="Comparison view"><a class="btn {changes_active}" href="{changes_href}">Changes</a><a class="btn {preview_active}" href="{preview_href}">Rendered preview</a></nav>
+{body}{metadata}{historical}{restore}</main>"#,
+        title = esc(&post.title),
+        history_href = esc(&history_href),
+        controls = controls,
+        changes_active = if mode == "changes" {
+            "btn-primary"
+        } else {
+            "btn-secondary"
+        },
+        preview_active = if mode == "preview" {
+            "btn-primary"
+        } else {
+            "btn-secondary"
+        },
+        changes_href = changes_href,
+        preview_href = preview_href,
+        body = body,
+        metadata = metadata,
+        historical = historical,
+        restore = restore,
+    );
+    let theme = odyssey::resolve_theme(
+        headers
+            .get(axum::http::header::COOKIE)
+            .and_then(|value| value.to_str().ok()),
+    );
+    let page = page_shell(PageShell {
+        head_title: "Revision Workbench · Inkwell",
+        body_class: "page-console page-revision-workbench",
+        rss: false,
+        nav_title: "Revision Workbench",
+        email: &email,
+        is_admin,
+        theme,
+        fragment: &fragment,
+        metadata: None,
+    });
+    Ok(private_no_store(html_with_cookie(page, set_cookie)))
+}
+
+fn revision_compare_url(
+    slug: &str,
+    from: &str,
+    to: &str,
+    mode: &str,
+    return_to: &str,
+    html: bool,
+) -> String {
+    let separator = if html { "&amp;" } else { "&" };
+    let mut url = format!(
+        "/edit/{}/history/compare?from={}{}to={}{}mode={}",
+        crate::handlers::library::percent_encode(slug),
+        crate::handlers::library::percent_encode(from),
+        separator,
+        crate::handlers::library::percent_encode(to),
+        separator,
+        mode,
+    );
+    if !return_to.is_empty() {
+        url.push_str(separator);
+        url.push_str("return_to=");
+        url.push_str(&crate::handlers::library::percent_encode(return_to));
+    }
+    url
+}
+
+fn render_revision_compare_controls(
+    slug: &str,
+    summaries: &[PostRevisionSummary],
+    from: &PostRevision,
+    to: &PostRevision,
+    mode: &str,
+    return_to: &str,
+    swap_href: &str,
+) -> String {
+    let mut choices: Vec<(String, i64, String)> = summaries
+        .iter()
+        .map(|revision| {
+            (
+                revision.id.clone(),
+                revision.edit_version,
+                revision.title.clone(),
+            )
+        })
+        .collect();
+    for revision in [from, to] {
+        if !choices.iter().any(|choice| choice.0 == revision.id) {
+            choices.push((
+                revision.id.clone(),
+                revision.edit_version,
+                revision.title.clone(),
+            ));
+        }
+    }
+    choices.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+    let options = |selected: &str| {
+        choices
+            .iter()
+            .map(|(id, version, title)| {
+                let title: String = title.chars().take(80).collect();
+                format!(
+                    r#"<option value="{id}"{selected}>v{version} · {title}</option>"#,
+                    id = esc(id),
+                    selected = if id == selected { " selected" } else { "" },
+                    version = version,
+                    title = esc(&title),
+                )
+            })
+            .collect::<String>()
+    };
+    let return_field = if return_to.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<input type="hidden" name="return_to" value="{}">"#,
+            esc(return_to)
+        )
+    };
+    format!(
+        r#"<section class="card revision-picker"><div class="card__body"><form method="get" action="/edit/{slug}/history/compare"><div class="revision-picker__grid"><label>From<select name="from">{from_options}</select></label><a class="btn btn-ghost revision-swap" href="{swap_href}" aria-label="Swap comparison direction">Swap &harr;</a><label>To<select name="to">{to_options}</select></label><label>View<select name="mode"><option value="changes"{changes}>Changes</option><option value="preview"{preview}>Rendered preview</option></select></label></div>{return_field}<button class="btn btn-primary" type="submit">Compare revisions</button></form></div></section>"#,
+        slug = esc(slug),
+        from_options = options(&from.id),
+        to_options = options(&to.id),
+        swap_href = swap_href,
+        changes = if mode == "changes" { " selected" } else { "" },
+        preview = if mode == "preview" { " selected" } else { "" },
+        return_field = return_field,
+    )
+}
+
+fn render_revision_preview(from: &PostRevision, to: &PostRevision) -> String {
+    format!(
+        r#"<section class="revision-preview" aria-label="Rendered revision previews"><article class="card revision-preview__side"><div class="card__body"><span class="badge">From · v{from_version}</span><h2>{from_title}</h2><div class="article__body">{from_body}</div></div></article><article class="card revision-preview__side"><div class="card__body"><span class="badge">To · v{to_version}</span><h2>{to_title}</h2><div class="article__body">{to_body}</div></div></article></section>"#,
+        from_version = from.edit_version,
+        from_title = esc(&from.title),
+        from_body = render_bounded_revision_body(&from.body_md),
+        to_version = to.edit_version,
+        to_title = esc(&to.title),
+        to_body = render_bounded_revision_body(&to.body_md),
+    )
+}
+
+fn render_bounded_revision_body(body: &str) -> String {
+    let within_char_budget =
+        body.chars().take(REVISION_DIFF_MAX_CHARS + 1).count() <= REVISION_DIFF_MAX_CHARS;
+    let within_line_budget =
+        body.lines().take(REVISION_DIFF_MAX_LINES + 1).count() <= REVISION_DIFF_MAX_LINES;
+    if within_char_budget && within_line_budget {
+        markdown::render_html(body)
+    } else {
+        r#"<div class="revision-diff-fallback" role="status"><strong>Rendered preview unavailable within the safety budget.</strong><span>This immutable revision exceeds the 200,000-character or 10,000-line preview limit. Metadata remains available below.</span></div>"#.to_string()
+    }
+}
+
+fn render_revision_metadata_diff(from: &PostRevision, to: &PostRevision) -> String {
+    let fields = [
+        ("Title", from.title.as_str(), to.title.as_str()),
+        ("Tags", from.tags.as_str(), to.tags.as_str()),
+        ("Cover URL", from.cover_url.as_str(), to.cover_url.as_str()),
+        (
+            "Custom excerpt",
+            from.custom_excerpt.as_str(),
+            to.custom_excerpt.as_str(),
+        ),
+        (
+            "Meta title",
+            from.meta_title.as_str(),
+            to.meta_title.as_str(),
+        ),
+        (
+            "Meta description",
+            from.meta_description.as_str(),
+            to.meta_description.as_str(),
+        ),
+        (
+            "Canonical URL",
+            from.canonical_url.as_str(),
+            to.canonical_url.as_str(),
+        ),
+        (
+            "Social title",
+            from.social_title.as_str(),
+            to.social_title.as_str(),
+        ),
+        (
+            "Social description",
+            from.social_description.as_str(),
+            to.social_description.as_str(),
+        ),
+        (
+            "Social image",
+            from.social_image.as_str(),
+            to.social_image.as_str(),
+        ),
+    ];
+    let rows = fields
+        .iter()
+        .filter(|(_, before, after)| before != after)
+        .map(|(label, before, after)| {
+            format!(
+                r#"<tr><th>{label}</th><td><del>{before}</del></td><td><ins>{after}</ins></td></tr>"#,
+                label = esc(label),
+                before = revision_diff_value(before),
+                after = revision_diff_value(after),
+            )
+        })
+        .collect::<String>();
+    let body = if rows.is_empty() {
+        r#"<p class="muted">No restorable metadata changed.</p>"#.to_string()
+    } else {
+        format!(
+            r#"<div class="table-wrap"><table class="revision-fields"><thead><tr><th>Field</th><th>From</th><th>To</th></tr></thead><tbody>{rows}</tbody></table></div>"#
+        )
+    };
+    format!(
+        r#"<section class="card revision-section"><div class="card__body"><h2>Content and metadata</h2><p class="muted">These fields are copied by Restore.</p>{body}</div></section>"#
+    )
+}
+
+fn render_revision_historical_context(from: &PostRevision, to: &PostRevision) -> String {
+    let visibility = |revision: &PostRevision| {
+        if !revision.published {
+            "Draft".to_string()
+        } else if revision.publish_at > revision.created_at {
+            format!("Scheduled · {}", format_utc_instant(revision.publish_at))
+        } else {
+            "Published".to_string()
+        }
+    };
+    format!(
+        r#"<section class="card revision-section"><div class="card__body"><h2>Historical context</h2><p class="muted">For orientation only. Restore preserves the current publication time, visibility, pin, and feature flags.</p><dl class="revision-context"><div><dt>From · v{from_version}</dt><dd>{from_visibility} · pinned {from_pinned} · featured {from_featured}</dd></div><div><dt>To · v{to_version}</dt><dd>{to_visibility} · pinned {to_pinned} · featured {to_featured}</dd></div></dl></div></section>"#,
+        from_version = from.edit_version,
+        from_visibility = esc(&visibility(from)),
+        from_pinned = yes_no(from.pinned),
+        from_featured = yes_no(from.featured),
+        to_version = to.edit_version,
+        to_visibility = esc(&visibility(to)),
+        to_pinned = yes_no(to.pinned),
+        to_featured = yes_no(to.featured),
+    )
+}
+
+fn render_revision_restore(
+    slug: &str,
+    current: &Post,
+    from: &PostRevision,
+    to: &PostRevision,
+    csrf: &str,
+    return_to: &str,
+    now: i64,
+) -> String {
+    if to.edit_version != current.edit_version || from.edit_version == current.edit_version {
+        return r#"<section class="card revision-section"><div class="card__body"><h2>Restore</h2><p class="muted">Compare a historical revision in From against the current revision in To to restore it.</p></div></section>"#.to_string();
+    }
+    let is_public = current.is_public_at(now);
+    let warning = if is_public {
+        r#"<div class="revision-publish-warning" role="alert"><strong>This post is public.</strong><span>Restoring will immediately replace the public article content and its restorable metadata, including a custom canonical URL. The local slug and publication state remain unchanged.</span></div>"#
+    } else {
+        r#"<p class="muted">Restore appends a new saved version and keeps the current Draft or Scheduled state.</p>"#
+    };
+    let button = if is_public {
+        format!("Restore v{} to published post", from.edit_version)
+    } else {
+        format!("Restore v{} as a new version", from.edit_version)
+    };
+    format!(
+        r#"<section class="card revision-section revision-restore"><div class="card__body"><h2>Restore from comparison</h2>{warning}<form method="post" action="/edit/{slug}/history/{revision_id}/restore"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="expected_post_id" value="{post_id}"><input type="hidden" name="expected_version" value="{version}"><input type="hidden" name="confirmation_scope" value="{confirmation_scope}"><input type="hidden" name="return_to" value="{return_to}"><label class="revision-confirm"><input type="checkbox" name="confirm_restore" value="1" required><span>I understand this copies v{revision_version} into a new current version.</span></label><button class="btn btn-danger" type="submit">{button}</button></form></div></section>"#,
+        warning = warning,
+        slug = esc(slug),
+        revision_id = esc(&from.id),
+        csrf = esc(csrf),
+        post_id = esc(&current.id),
+        version = current.edit_version,
+        confirmation_scope = if is_public { "public" } else { "private" },
+        return_to = esc(return_to),
+        revision_version = from.edit_version,
+        button = esc(&button),
+    )
+}
+
+fn revision_diff_value(value: &str) -> String {
+    if value.trim().is_empty() {
+        r#"<span class="muted">—</span>"#.to_string()
+    } else {
+        format!("<code>{}</code>", esc(value))
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RevisionDiffKind {
+    Context,
+    Delete,
+    Add,
+}
+
+struct RevisionSourceDiff {
+    rows: String,
+    additions: usize,
+    deletions: usize,
+    fallback: Option<&'static str>,
+}
+
+fn render_revision_source_diff(from: &str, to: &str) -> String {
+    let diff = bounded_revision_source_diff(from, to);
+    if let Some(reason) = diff.fallback {
+        return format!(
+            r#"<section class="card revision-section"><div class="card__body"><h2>Markdown changes</h2><div class="revision-diff-fallback" role="status"><strong>Inline diff unavailable within the safety budget.</strong><span>{reason} Metadata remains comparable; Rendered preview applies the same character and line limits.</span></div><dl class="revision-context"><div><dt>From</dt><dd>{from_chars} characters</dd></div><div><dt>To</dt><dd>{to_chars} characters</dd></div></dl></div></section>"#,
+            reason = esc(reason),
+            from_chars = from.chars().count(),
+            to_chars = to.chars().count(),
+        );
+    }
+    format!(
+        r#"<section class="card revision-section"><div class="card__body"><div class="revision-diff-head"><div><h2>Markdown changes</h2><p class="muted">Escaped source diff; rendered HTML is shown separately.</p></div><span class="revision-diff-stats"><ins>+{additions}</ins> <del>−{deletions}</del></span></div><div class="revision-diff" role="table" aria-label="Unified Markdown line diff">{rows}</div></div></section>"#,
+        additions = diff.additions,
+        deletions = diff.deletions,
+        rows = diff.rows,
+    )
+}
+
+fn bounded_revision_source_diff(from: &str, to: &str) -> RevisionSourceDiff {
+    let from_chars = from.chars().count();
+    let to_chars = to.chars().count();
+    if from_chars > REVISION_DIFF_MAX_CHARS || to_chars > REVISION_DIFF_MAX_CHARS {
+        return revision_diff_fallback("A revision exceeds the 200,000-character limit.");
+    }
+    let from_lines: Vec<&str> = from.split('\n').collect();
+    let to_lines: Vec<&str> = to.split('\n').collect();
+    if from_lines.len() > REVISION_DIFF_MAX_LINES || to_lines.len() > REVISION_DIFF_MAX_LINES {
+        return revision_diff_fallback("A revision exceeds the 10,000-line limit.");
+    }
+
+    let mut rows = String::new();
+    let mut from_index = 0usize;
+    let mut to_index = 0usize;
+    let mut additions = 0usize;
+    let mut deletions = 0usize;
+    while from_index < from_lines.len() || to_index < to_lines.len() {
+        if from_index < from_lines.len()
+            && to_index < to_lines.len()
+            && from_lines[from_index] == to_lines[to_index]
+        {
+            push_revision_diff_row(
+                &mut rows,
+                RevisionDiffKind::Context,
+                Some(from_index + 1),
+                Some(to_index + 1),
+                from_lines[from_index],
+            );
+            from_index += 1;
+            to_index += 1;
+            continue;
+        }
+        if from_index >= from_lines.len() {
+            push_revision_diff_row(
+                &mut rows,
+                RevisionDiffKind::Add,
+                None,
+                Some(to_index + 1),
+                to_lines[to_index],
+            );
+            additions += 1;
+            to_index += 1;
+        } else if to_index >= to_lines.len() {
+            push_revision_diff_row(
+                &mut rows,
+                RevisionDiffKind::Delete,
+                Some(from_index + 1),
+                None,
+                from_lines[from_index],
+            );
+            deletions += 1;
+            from_index += 1;
+        } else {
+            let max_add = REVISION_DIFF_LOOKAHEAD.min(to_lines.len() - to_index - 1);
+            let next_add =
+                (1..=max_add).find(|offset| to_lines[to_index + offset] == from_lines[from_index]);
+            let max_delete = REVISION_DIFF_LOOKAHEAD.min(from_lines.len() - from_index - 1);
+            let next_delete = (1..=max_delete)
+                .find(|offset| from_lines[from_index + offset] == to_lines[to_index]);
+            match (next_add, next_delete) {
+                (Some(add), Some(delete)) if add < delete => {
+                    for _ in 0..add {
+                        push_revision_diff_row(
+                            &mut rows,
+                            RevisionDiffKind::Add,
+                            None,
+                            Some(to_index + 1),
+                            to_lines[to_index],
+                        );
+                        additions += 1;
+                        to_index += 1;
+                    }
+                }
+                (_, Some(delete)) => {
+                    for _ in 0..delete {
+                        push_revision_diff_row(
+                            &mut rows,
+                            RevisionDiffKind::Delete,
+                            Some(from_index + 1),
+                            None,
+                            from_lines[from_index],
+                        );
+                        deletions += 1;
+                        from_index += 1;
+                    }
+                }
+                (Some(add), None) => {
+                    for _ in 0..add {
+                        push_revision_diff_row(
+                            &mut rows,
+                            RevisionDiffKind::Add,
+                            None,
+                            Some(to_index + 1),
+                            to_lines[to_index],
+                        );
+                        additions += 1;
+                        to_index += 1;
+                    }
+                }
+                (None, None) => {
+                    push_revision_diff_row(
+                        &mut rows,
+                        RevisionDiffKind::Delete,
+                        Some(from_index + 1),
+                        None,
+                        from_lines[from_index],
+                    );
+                    push_revision_diff_row(
+                        &mut rows,
+                        RevisionDiffKind::Add,
+                        None,
+                        Some(to_index + 1),
+                        to_lines[to_index],
+                    );
+                    deletions += 1;
+                    additions += 1;
+                    from_index += 1;
+                    to_index += 1;
+                }
+            }
+        }
+        if additions + deletions > REVISION_DIFF_MAX_EDITS {
+            return revision_diff_fallback("The comparison exceeds the 12,000-edit limit.");
+        }
+    }
+    RevisionSourceDiff {
+        rows,
+        additions,
+        deletions,
+        fallback: None,
+    }
+}
+
+fn revision_diff_fallback(reason: &'static str) -> RevisionSourceDiff {
+    RevisionSourceDiff {
+        rows: String::new(),
+        additions: 0,
+        deletions: 0,
+        fallback: Some(reason),
+    }
+}
+
+fn push_revision_diff_row(
+    out: &mut String,
+    kind: RevisionDiffKind,
+    from_line: Option<usize>,
+    to_line: Option<usize>,
+    text: &str,
+) {
+    let (class, marker, label) = match kind {
+        RevisionDiffKind::Context => ("context", " ", "Unchanged"),
+        RevisionDiffKind::Delete => ("delete", "−", "Removed"),
+        RevisionDiffKind::Add => ("add", "+", "Added"),
+    };
+    out.push_str(&format!(
+        r#"<div class="revision-diff__row revision-diff__row--{class}" role="row" aria-label="{label}"><span class="revision-diff__line" aria-hidden="true">{from_line}</span><span class="revision-diff__line" aria-hidden="true">{to_line}</span><span class="revision-diff__marker" aria-hidden="true">{marker}</span><code>{text}</code></div>"#,
+        class = class,
+        label = label,
+        from_line = from_line.map(|line| line.to_string()).unwrap_or_default(),
+        to_line = to_line.map(|line| line.to_string()).unwrap_or_default(),
+        marker = marker,
+        text = esc(text),
+    ));
+}
+
 /// Restore one immutable revision as a new authoritative version. Publication and administrative
 /// state remain exactly as they are on the current row; only authoring content/metadata is copied.
 pub async fn restore_revision(
@@ -1820,9 +2453,28 @@ pub async fn restore_revision(
             "you can only restore your own posts".to_string(),
         ));
     }
+    if form.confirm_restore.trim() != "1" {
+        return Err(AppError::InvalidRequest(
+            "confirm the revision restore from the comparison page".to_string(),
+        ));
+    }
     if form.expected_post_id != current.id {
         return Err(AppError::NotFound(
             "the restored post identity no longer exists".to_string(),
+        ));
+    }
+    let now = now_secs();
+    let actual_scope = if current.is_public_at(now) {
+        "public"
+    } else {
+        "private"
+    };
+    if form.confirmation_scope.trim() != actual_scope {
+        return Ok(simple_conflict_response(
+            &slug,
+            current.edit_version,
+            "The post visibility changed after comparison. Review the current revision and its publication impact again before restoring.",
+            &form.return_to,
         ));
     }
     let revision = state
@@ -1843,7 +2495,7 @@ pub async fn restore_revision(
     current.social_title = revision.social_title;
     current.social_description = revision.social_description;
     current.social_image = revision.social_image;
-    current.updated_at = now_secs();
+    current.updated_at = now;
     let outcome = state
         .store
         .save_post(SavePostCommand {
@@ -3467,6 +4119,19 @@ fn redirect(location: &str) -> Response {
     private_no_store((StatusCode::SEE_OTHER, [(header::LOCATION, location)]).into_response())
 }
 
+/// A cache-fenced canonicalization redirect for an idempotent private GET.
+fn private_get_redirect(location: &str) -> Response {
+    let location =
+        HeaderValue::from_str(location).unwrap_or_else(|_| HeaderValue::from_static("/"));
+    private_no_store(
+        (
+            StatusCode::TEMPORARY_REDIRECT,
+            [(header::LOCATION, location)],
+        )
+            .into_response(),
+    )
+}
+
 /// An HTML response, optionally attaching a freshly-minted CSRF `Set-Cookie`.
 fn html_with_cookie(body: String, set_cookie: Option<String>) -> Response {
     let mut resp = Html(body).into_response();
@@ -3512,4 +4177,43 @@ fn request_is_personalized(headers: &HeaderMap, viewer_sub: Option<&str>, is_adm
         || auth::author_email(headers).is_some()
         || is_admin
         || headers.contains_key(header::COOKIE)
+}
+
+#[cfg(test)]
+mod revision_workbench_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_diff_escapes_source_and_tracks_direction() {
+        let diff =
+            bounded_revision_source_diff("safe\n<script>old</script>\nend", "safe\nnew\nend");
+        assert!(diff.fallback.is_none());
+        assert_eq!(diff.additions, 1);
+        assert_eq!(diff.deletions, 1);
+        assert!(diff.rows.contains("revision-diff__row--add"));
+        assert!(diff.rows.contains("revision-diff__row--delete"));
+        assert!(diff.rows.contains("&lt;script&gt;old&lt;/script&gt;"));
+        assert!(!diff.rows.contains("<script>"));
+
+        let reverse =
+            bounded_revision_source_diff("safe\nnew\nend", "safe\n<script>old</script>\nend");
+        assert_eq!(reverse.additions, diff.deletions);
+        assert_eq!(reverse.deletions, diff.additions);
+    }
+
+    #[test]
+    fn bounded_diff_degrades_explicitly_before_unbounded_work() {
+        let oversized = "x".repeat(REVISION_DIFF_MAX_CHARS + 1);
+        let diff = bounded_revision_source_diff(&oversized, "small");
+        assert_eq!(
+            diff.fallback,
+            Some("A revision exceeds the 200,000-character limit.")
+        );
+        let html = render_revision_source_diff(&oversized, "small");
+        assert!(html.contains("Inline diff unavailable within the safety budget"));
+        assert!(html.contains("Rendered preview"));
+        let preview = render_bounded_revision_body(&oversized);
+        assert!(preview.contains("Rendered preview unavailable within the safety budget"));
+        assert!(!preview.contains(&oversized));
+    }
 }

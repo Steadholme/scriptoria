@@ -111,6 +111,15 @@ pub struct PostRevisionSummary {
     pub created_at: i64,
 }
 
+/// One immutable, same-post pair used by the private Revision Workbench. Implementations resolve
+/// both sides under one in-memory lock or one PostgreSQL statement so pruning/deletion cannot
+/// produce a mixed comparison snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PostRevisionPair {
+    pub from: PostRevision,
+    pub to: PostRevision,
+}
+
 /// One active, version-pinned bearer capability for an unpublished post. `token_hash` is the
 /// SHA-256 digest of a 256-bit random token; the raw token never crosses the Store seam.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -691,6 +700,12 @@ pub trait Store: Send + Sync {
         post_id: &str,
         revision_id: &str,
     ) -> Result<Option<PostRevision>, StoreError>;
+    async fn get_post_revision_pair(
+        &self,
+        post_id: &str,
+        from_revision_id: &str,
+        to_revision_id: &str,
+    ) -> Result<Option<PostRevisionPair>, StoreError>;
     /// Current non-expired capability state for one exact owner/post pair. The raw token is never
     /// persisted and therefore cannot be recovered by this read.
     async fn get_post_review_link(
@@ -1201,6 +1216,28 @@ impl Store for InMemoryStore {
             .iter()
             .find(|revision| revision.post_id == post_id && revision.id == revision_id)
             .cloned())
+    }
+
+    async fn get_post_revision_pair(
+        &self,
+        post_id: &str,
+        from_revision_id: &str,
+        to_revision_id: &str,
+    ) -> Result<Option<PostRevisionPair>, StoreError> {
+        let revisions = self.revisions.lock().expect("revisions lock poisoned");
+        let from = revisions
+            .iter()
+            .find(|revision| revision.post_id == post_id && revision.id == from_revision_id)
+            .cloned();
+        let to = if from_revision_id == to_revision_id {
+            from.clone()
+        } else {
+            revisions
+                .iter()
+                .find(|revision| revision.post_id == post_id && revision.id == to_revision_id)
+                .cloned()
+        };
+        Ok(from.zip(to).map(|(from, to)| PostRevisionPair { from, to }))
     }
 
     async fn get_post_review_link(
@@ -3318,6 +3355,40 @@ impl PgStore {
         row.as_ref().map(Self::revision_from_row).transpose()
     }
 
+    async fn get_post_revision_pair_async(
+        &self,
+        post_id: &str,
+        from_revision_id: &str,
+        to_revision_id: &str,
+    ) -> Result<Option<PostRevisionPair>, sqlx::Error> {
+        // One statement gives both immutable sides one MVCC snapshot. `post_id` is part of the
+        // predicate, so a revision id copied from another post is indistinguishable from missing.
+        let rows = sqlx::query(&format!(
+            "{REVISION_COLS} WHERE post_id = $1 AND (id = $2 OR id = $3)"
+        ))
+        .bind(post_id)
+        .bind(from_revision_id)
+        .bind(to_revision_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let revisions: Result<Vec<PostRevision>, sqlx::Error> =
+            rows.iter().map(Self::revision_from_row).collect();
+        let revisions = revisions?;
+        let from = revisions
+            .iter()
+            .find(|revision| revision.id == from_revision_id)
+            .cloned();
+        let to = if from_revision_id == to_revision_id {
+            from.clone()
+        } else {
+            revisions
+                .iter()
+                .find(|revision| revision.id == to_revision_id)
+                .cloned()
+        };
+        Ok(from.zip(to).map(|(from, to)| PostRevisionPair { from, to }))
+    }
+
     async fn get_post_review_link_async(
         &self,
         post_id: &str,
@@ -4043,6 +4114,17 @@ impl Store for PgStore {
         revision_id: &str,
     ) -> Result<Option<PostRevision>, StoreError> {
         self.get_post_revision_async(post_id, revision_id)
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))
+    }
+
+    async fn get_post_revision_pair(
+        &self,
+        post_id: &str,
+        from_revision_id: &str,
+        to_revision_id: &str,
+    ) -> Result<Option<PostRevisionPair>, StoreError> {
+        self.get_post_revision_pair_async(post_id, from_revision_id, to_revision_id)
             .await
             .map_err(|error| StoreError::Backend(error.to_string()))
     }

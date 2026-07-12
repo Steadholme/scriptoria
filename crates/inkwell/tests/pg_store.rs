@@ -969,6 +969,45 @@ async fn pg_store_full_integration() {
         2,
         "conflict appends no revision"
     );
+    let revision_refs = pg.list_post_revisions(&post.id, 50).await.unwrap();
+    let from_revision = revision_refs
+        .iter()
+        .find(|revision| revision.edit_version == 1)
+        .unwrap();
+    let to_revision = revision_refs
+        .iter()
+        .find(|revision| revision.edit_version == 2)
+        .unwrap();
+    let pair = pg
+        .get_post_revision_pair(&post.id, &from_revision.id, &to_revision.id)
+        .await
+        .unwrap()
+        .expect("atomic PG revision pair");
+    assert_eq!(pair.from.edit_version, 1);
+    assert_eq!(pair.to.edit_version, 2);
+    assert_eq!(pair.to.title, "PG Hello (edited)");
+    assert!(pg
+        .get_post_revision_pair(&post.id, &from_revision.id, "rev_foreign_missing")
+        .await
+        .unwrap()
+        .is_none());
+    let foreign_revision_id: String =
+        sqlx::query_scalar("SELECT id FROM post_revisions WHERE post_id <> $1 ORDER BY id LIMIT 1")
+            .bind(&post.id)
+            .fetch_one(&raw)
+            .await
+            .unwrap();
+    assert!(pg
+        .get_post_revision_pair(&post.id, &from_revision.id, &foreign_revision_id)
+        .await
+        .unwrap()
+        .is_none());
+    let same = pg
+        .get_post_revision_pair(&post.id, &to_revision.id, &to_revision.id)
+        .await
+        .unwrap()
+        .expect("same-revision PG pair");
+    assert_eq!(same.from, same.to);
 
     // Opportunistic autosave cleanup is a bounded 256-row batch and never touches valid recovery
     // rows or the independent revision history.
@@ -1692,6 +1731,17 @@ async fn pg_store_full_integration() {
     .await
     .unwrap();
     assert_eq!(outside_versions, vec![1]);
+    let retained_refs = pg
+        .list_post_revisions(&prune_outside.id, inkwell::config::REVISION_PAGE_LIMIT)
+        .await
+        .unwrap();
+    assert_eq!(
+        retained_refs.len(),
+        inkwell::config::REVISION_KEEP_LIMIT + 1
+    );
+    assert!(retained_refs
+        .iter()
+        .any(|revision| revision.edit_version == 1));
     assert_eq!(
         pg.resolve_post_review(&outside_link.token_hash, now)
             .await

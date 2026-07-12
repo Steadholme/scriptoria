@@ -588,6 +588,7 @@ async fn history_restore_is_authorized_append_only_and_preserves_visibility() {
 
     let mut latest = original.clone();
     latest.body_md = "latest body before restore".to_string();
+    latest.meta_title = "Latest metadata title".to_string();
     latest.pinned = true;
     latest.featured = true;
     latest.updated_at = now_secs();
@@ -622,7 +623,8 @@ async fn history_restore_is_authorized_append_only_and_preserves_visibility() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_private_no_store(&history_headers);
-    assert!(history.contains("Restore content"));
+    assert!(history.contains("Review changes"));
+    assert!(!history.contains("/restore\""));
     assert!(history.contains("preserving the current Draft, Scheduled, or Published state"));
     let cookie = history_headers
         .get(header::SET_COOKIE)
@@ -645,12 +647,124 @@ async fn history_restore_is_authorized_append_only_and_preserves_visibility() {
     );
 
     let csrf = cookie.split_once('=').unwrap().1.to_string();
+    let current_revision_id = revisions
+        .iter()
+        .find(|revision| revision.edit_version == 2)
+        .unwrap()
+        .id
+        .clone();
+    let (status, default_headers, _) = call(
+        &state,
+        get_auth("/edit/scheduled-durable/history/compare", "u_writer", None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+    assert_private_no_store(&default_headers);
+    let canonical = default_headers
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(canonical.contains(&format!("from={revision_id}")));
+    assert!(canonical.contains(&format!("to={current_revision_id}")));
+    assert!(canonical.ends_with("mode=changes"));
+
+    let compare_uri = format!(
+        "/edit/scheduled-durable/history/compare?from={revision_id}&to={current_revision_id}&mode=changes"
+    );
+    let (status, compare_headers, compare) =
+        call(&state, get_auth(&compare_uri, "u_writer", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_private_no_store(&compare_headers);
+    for contract in [
+        "Revision Workbench",
+        "Markdown changes",
+        "revision-diff__row--delete",
+        "revision-diff__row--add",
+        "Latest metadata title",
+        r#"name="confirm_restore" value="1" required"#,
+        r#"name="confirmation_scope" value="private""#,
+        r#"name="expected_version" value="2""#,
+        "Compare revisions",
+        "Swap",
+    ] {
+        assert!(
+            compare.contains(contract),
+            "missing compare contract: {contract}"
+        );
+    }
+    assert_eq!(
+        call(&state, get_auth(&compare_uri, "u_reader", None),)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let preview_uri = compare_uri.replace("mode=changes", "mode=preview");
+    let (status, _, preview) = call(&state, get_auth(&preview_uri, "u_writer", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(preview.contains("Rendered revision previews"));
+    assert!(preview.contains("latest body before restore"));
+
     let restore = form(&[
         ("csrf_token", &csrf),
         ("expected_version", "2"),
         ("expected_post_id", &before_restore.id),
+        ("confirm_restore", "1"),
+        ("confirmation_scope", "private"),
     ]);
     let restore_uri = format!("/edit/scheduled-durable/history/{revision_id}/restore");
+    let missing_confirmation = form(&[
+        ("csrf_token", &csrf),
+        ("expected_version", "2"),
+        ("expected_post_id", &before_restore.id),
+    ]);
+    assert_eq!(
+        call(
+            &state,
+            post_with_cookie(
+                &restore_uri,
+                &missing_confirmation,
+                "u_writer",
+                None,
+                &cookie,
+            ),
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    let wrong_visibility_scope = form(&[
+        ("csrf_token", &csrf),
+        ("expected_version", "2"),
+        ("expected_post_id", &before_restore.id),
+        ("confirm_restore", "1"),
+        ("confirmation_scope", "public"),
+    ]);
+    assert_eq!(
+        call(
+            &state,
+            post_with_cookie(
+                &restore_uri,
+                &wrong_visibility_scope,
+                "u_writer",
+                None,
+                &cookie,
+            ),
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT,
+        "restore must be reviewed again when the publication-impact scope changes"
+    );
+    assert_eq!(
+        state
+            .store
+            .get_post("scheduled-durable")
+            .await
+            .unwrap()
+            .edit_version,
+        2
+    );
     let (status, _, _) = call(
         &state,
         post_with_cookie(&restore_uri, &restore, "u_writer", None, &cookie),
@@ -691,6 +805,8 @@ async fn history_restore_is_authorized_append_only_and_preserves_visibility() {
         ("csrf_token", &csrf),
         ("expected_version", "2"),
         ("expected_post_id", &before_restore.id),
+        ("confirm_restore", "1"),
+        ("confirmation_scope", "private"),
     ]);
     assert_eq!(
         call(
@@ -710,6 +826,49 @@ async fn history_restore_is_authorized_append_only_and_preserves_visibility() {
             .edit_version,
         3
     );
+}
+
+#[tokio::test]
+async fn published_revision_compare_requires_an_explicit_public_restore_confirmation() {
+    let state = build_dev_state();
+    create_post(
+        &state,
+        "Published Workbench",
+        "public version one",
+        "publish_now",
+        None,
+    )
+    .await;
+    let original = state.store.get_post("published-workbench").await.unwrap();
+    let mut edited = original.clone();
+    edited.body_md = "public version two".to_string();
+    edited.updated_at = now_secs();
+    state.store.update_post(&edited).await.unwrap();
+    let current = state.store.get_post("published-workbench").await.unwrap();
+    let revisions = state
+        .store
+        .list_post_revisions(&current.id, 50)
+        .await
+        .unwrap();
+    let from = &revisions
+        .iter()
+        .find(|revision| revision.edit_version == 1)
+        .unwrap()
+        .id;
+    let to = &revisions
+        .iter()
+        .find(|revision| revision.edit_version == 2)
+        .unwrap()
+        .id;
+    let uri = format!("/edit/published-workbench/history/compare?from={from}&to={to}&mode=changes");
+    let (status, headers, html) = call(&state, get_auth(&uri, "u_writer", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_private_no_store(&headers);
+    assert!(html.contains("This post is public."));
+    assert!(html.contains("immediately replace the public article content"));
+    assert!(html.contains("Restore v1 to published post"));
+    assert!(html.contains(r#"name="confirm_restore" value="1" required"#));
+    assert!(html.contains(r#"name="confirmation_scope" value="public""#));
 }
 
 #[tokio::test]
