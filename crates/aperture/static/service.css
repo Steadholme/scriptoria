@@ -24,6 +24,64 @@ input[type=url], input[type=datetime-local], input[type=date], textarea, select 
   background:var(--surface); border:1px solid var(--border-2); border-radius:var(--r-sm);
   padding:10px 12px; outline:none; transition:border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
 }
+
+/* Durable current-page selection. The checkbox belongs to the external bulk form via HTML's
+ * `form=` attribute, so these controls remain functional without JavaScript. */
+.file-card,
+.folder-tile { position:relative; }
+.ap-select {
+  position:absolute;
+  z-index:4;
+  inset-block-start:9px;
+  inset-inline-start:9px;
+  width:25px;
+  height:25px;
+  display:grid;
+  place-items:center;
+  border:1px solid var(--hairline-strong, #c8ceda);
+  border-radius:8px;
+  background:rgba(255,255,255,.94);
+  box-shadow:0 2px 8px rgba(24,35,55,.09);
+}
+.ap-select input { width:16px; height:16px; margin:0; accent-color:var(--brand, #315ee7); }
+.file-card.is-selected {
+  border-color:var(--brand, #315ee7);
+  background:color-mix(in srgb, var(--brand, #315ee7) 7%, #fff);
+  box-shadow:0 0 0 2px color-mix(in srgb, var(--brand, #315ee7) 18%, transparent);
+}
+.ap-bulk {
+  position:sticky;
+  z-index:12;
+  top:12px;
+  display:flex;
+  align-items:center;
+  flex-wrap:wrap;
+  gap:9px;
+  margin:10px 0 16px;
+  padding:10px 12px;
+  border:1px solid var(--hairline, #dfe3eb);
+  border-radius:14px;
+  background:rgba(255,255,255,.96);
+  box-shadow:0 10px 30px rgba(24,35,55,.09);
+  backdrop-filter:blur(12px);
+}
+.ap-bulk__count { color:var(--ink-3, #667085); font-size:12px; font-weight:750; }
+.ap-bulk__actions { margin-inline-start:auto; display:flex; align-items:center; flex-wrap:wrap; gap:8px; }
+.ap-bulk__destination { display:flex; align-items:center; gap:7px; color:var(--ink-3, #667085); font-size:12px; font-weight:700; }
+.ap-bulk__destination select { min-width:150px; min-height:34px; border-radius:9px; }
+.ap-bulk button:disabled { opacity:.45; cursor:not-allowed; }
+.gallery-grid.is-list .ap-select { position:static; grid-column:1; align-self:center; }
+.gallery-grid.is-list .file-card { grid-template-columns:28px 40px minmax(0,1fr) 110px 84px 34px; }
+.gallery-grid.is-list .file-card__link { grid-column:2; }
+.gallery-grid.is-list .file-card__body { grid-column:3 / -1; }
+
+@media (max-width:640px) {
+  .ap-bulk { top:6px; align-items:stretch; }
+  .ap-bulk__actions { width:100%; margin-inline-start:0; }
+  .ap-bulk__destination { flex:1 1 100%; }
+  .ap-bulk__destination select { flex:1 1 auto; min-width:0; }
+  .ap-bulk__actions .btn { flex:1 1 auto; }
+}
 textarea { resize:vertical; min-height:88px; line-height:1.6; }
 select { appearance:none; padding-right:36px;
   background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23727a8a' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='m6 9 6 6 6-6'/></svg>");

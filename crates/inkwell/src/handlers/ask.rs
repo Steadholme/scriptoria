@@ -57,7 +57,7 @@ pub async fn ask_page(State(_state): State<AppState>, headers: HeaderMap) -> Res
     );
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
     let page = render_console(&email, is_admin, theme, &csrf, "", &empty_answer());
-    html_with_cookie(page, set_cookie)
+    private_no_store(html_with_cookie(page, set_cookie))
 }
 
 // ---------------------------------------------------------------------------
@@ -115,7 +115,7 @@ pub async fn ask(
         &question,
         &format!("{echo}{answer_html}"),
     );
-    Ok(html_with_cookie(page, set_cookie))
+    Ok(private_no_store(html_with_cookie(page, set_cookie)))
 }
 
 // ---------------------------------------------------------------------------
@@ -246,4 +246,12 @@ fn html_with_cookie(body: String, set_cookie: Option<String>) -> Response {
         }
     }
     resp
+}
+
+fn private_no_store(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response
 }

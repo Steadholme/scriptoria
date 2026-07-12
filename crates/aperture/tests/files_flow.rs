@@ -6,16 +6,20 @@
 //! the public share-token fetch, image vs. download serving, and the size cap. This is the
 //! default `cargo test` suite and stays DB-free.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use aperture::blobs::{BlobError, Blobs, MemoryBlobs};
 use aperture::config::Config;
-use aperture::model::UploadRequestRec;
+use aperture::model::{FileRec, FolderRec, LibraryItemKind, UploadRequestRec};
 use aperture::store::{
-    InMemoryStore, Store, UploadRecoveryClaim, UploadReserve, UploadReserveInput,
+    BulkMutation, DriveItemRef, InMemoryStore, OwnerBlobCommit, OwnerBlobWriteIntent, Store,
+    TrashRootInput, UploadRecoveryClaim, UploadReserve, UploadReserveInput, OWNER_WRITE_FRESH,
 };
-use aperture::{app, build_dev_state, AppState};
+use aperture::{
+    app, build_dev_state, drain_trash_lifecycle_once, now_secs, recover_stale_request_uploads,
+    AppState,
+};
 use axum::body::Body;
 use axum::http::{header, HeaderMap, Request, StatusCode};
 use tower::ServiceExt;
@@ -25,6 +29,45 @@ const BOUNDARY: &str = "----apertureTESTboundary7MA4YWxkTrZu0gW";
 struct FailingPutBlobs {
     deletes: Arc<AtomicUsize>,
     fail_delete: bool,
+}
+
+struct ToggleDeleteBlobs {
+    inner: Arc<MemoryBlobs>,
+    fail_delete: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl Blobs for ToggleDeleteBlobs {
+    fn bucket(&self) -> &str {
+        self.inner.bucket()
+    }
+
+    async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), BlobError> {
+        self.inner.put(key, bytes).await
+    }
+
+    async fn get(&self, key: &str) -> Result<Vec<u8>, BlobError> {
+        self.inner.get(key).await
+    }
+
+    async fn get_range(
+        &self,
+        key: &str,
+        start: u64,
+        end_inclusive: u64,
+    ) -> Result<Vec<u8>, BlobError> {
+        self.inner.get_range(key, start, end_inclusive).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), BlobError> {
+        if self.fail_delete.load(Ordering::SeqCst) {
+            Err(BlobError::Backend(
+                "injected durable queue delete failure".to_string(),
+            ))
+        } else {
+            self.inner.delete(key).await
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -344,9 +387,11 @@ async fn production_owner_routes_fail_closed_but_capabilities_remain_anonymous()
     let locked = app(state);
 
     // No gateway identity can no longer fall through to dev-user on an owner surface.
+    let unauthenticated = send(&locked, get("/", None)).await;
+    assert_eq!(unauthenticated.status, StatusCode::UNAUTHORIZED);
     assert_eq!(
-        send(&locked, get("/", None)).await.status,
-        StatusCode::UNAUTHORIZED
+        unauthenticated.header(header::CACHE_CONTROL),
+        "private, no-store"
     );
     // A claimed identity is not trusted when the production guard has no HMAC verifier. This is
     // deliberately different from the unsigned dev seam.
@@ -363,6 +408,7 @@ async fn production_owner_routes_fail_closed_but_capabilities_remain_anonymous()
     for path in ["/s/not-a-token", "/u/not-a-token"] {
         let response = send(&locked, get(path, None)).await;
         assert_eq!(response.status, StatusCode::NOT_FOUND);
+        assert_eq!(response.header(header::CACHE_CONTROL), "private, no-store");
         let html = response.text();
         assert!(html.contains("data-ap-share-room"));
         assert!(html.contains("Share not found"));
@@ -370,20 +416,120 @@ async fn production_owner_routes_fail_closed_but_capabilities_remain_anonymous()
     }
 
     // Strict-CSP Share Room assets are also anonymous, read-only routes.
-    assert_eq!(
-        send(&locked, get("/s/share-room.css", None)).await.status,
-        StatusCode::OK
-    );
-    assert_eq!(
-        send(&locked, get("/s/share-room.js", None)).await.status,
-        StatusCode::OK
-    );
+    for path in ["/s/share-room.css", "/s/share-room.js"] {
+        let asset = send(&locked, get(path, None)).await;
+        assert_eq!(asset.status, StatusCode::OK);
+        assert_eq!(asset.header(header::CACHE_CONTROL), "public, max-age=300");
+    }
 
     // Explicit dev state preserves the local/test fallback.
     assert_eq!(
         send(&app(build_dev_state()), get("/", None)).await.status,
         StatusCode::OK
     );
+}
+
+#[tokio::test]
+async fn dynamic_owner_and_capability_responses_are_never_storable() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+
+    let home = send(&app, get("/", Some("alice"))).await;
+    assert_eq!(home.status, StatusCode::OK);
+    assert_eq!(home.header(header::CACHE_CONTROL), "private, no-store");
+    let csrf = home.csrf_cookie().unwrap();
+
+    let uploaded = send(
+        &app,
+        upload_req(
+            &csrf,
+            &csrf,
+            "alice",
+            "cache.png",
+            "image/png",
+            &png_bytes(),
+        ),
+    )
+    .await;
+    assert_eq!(uploaded.status, StatusCode::FOUND);
+    assert_eq!(uploaded.header(header::CACHE_CONTROL), "private, no-store");
+    let file_id = uploaded.location().trim_start_matches("/f/").to_string();
+
+    for path in [format!("/f/{file_id}"), format!("/f/{file_id}/raw")] {
+        let response = send(&app, get(&path, Some("alice"))).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.header(header::CACHE_CONTROL), "private, no-store");
+    }
+
+    let mut rename = post_form(
+        &format!("/f/{file_id}/rename"),
+        &csrf,
+        "alice",
+        format!("csrf_token={csrf}&name=renamed.png"),
+    );
+    rename
+        .headers_mut()
+        .insert(header::ACCEPT, "application/json".parse().unwrap());
+    let json = send(&app, rename).await;
+    assert_eq!(json.status, StatusCode::OK);
+    assert_eq!(json.header(header::CONTENT_TYPE), "application/json");
+    assert_eq!(json.header(header::CACHE_CONTROL), "private, no-store");
+
+    let folder = send(
+        &app,
+        post_form(
+            "/folders",
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&name=Cache+inbox"),
+        ),
+    )
+    .await;
+    assert_eq!(folder.status, StatusCode::FOUND);
+    assert_eq!(folder.header(header::CACHE_CONTROL), "private, no-store");
+    let folder_id = folder_from_location(&folder.location());
+    let request = create_upload_request(&app, &store, &folder_id, &csrf, "").await;
+
+    assert!(store
+        .configure_share(
+            &file_id,
+            "alice",
+            Some("cache-share-token".to_string()),
+            None,
+            None,
+        )
+        .await
+        .unwrap());
+    for path in [
+        "/s/cache-share-token".to_string(),
+        "/s/cache-share-token/view".to_string(),
+        format!("/u/{}", request.token),
+        "/s/not-a-token".to_string(),
+    ] {
+        let response = send(&app, get(&path, None)).await;
+        assert!(
+            matches!(response.status, StatusCode::OK | StatusCode::NOT_FOUND),
+            "unexpected status for {path}: {}",
+            response.status
+        );
+        assert_eq!(response.header(header::CACHE_CONTROL), "private, no-store");
+    }
+
+    let health = send(&app, get("/healthz", None)).await;
+    assert_eq!(health.status, StatusCode::OK);
+    assert!(health.header(header::CACHE_CONTROL).is_empty());
+    for path in ["/s/share-room.css", "/s/share-room.js"] {
+        let asset = send(&app, get(path, None)).await;
+        assert_eq!(asset.status, StatusCode::OK);
+        assert_eq!(asset.header(header::CACHE_CONTROL), "public, max-age=300");
+        let method_not_allowed = send(&app, post_public(path, String::new())).await;
+        assert_eq!(method_not_allowed.status, StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            method_not_allowed.header(header::CACHE_CONTROL),
+            "private, no-store"
+        );
+    }
 }
 
 #[tokio::test]
@@ -888,6 +1034,272 @@ async fn upload_detail_raw_share_delete_lifecycle() {
     assert_eq!(purge.status, StatusCode::FOUND);
     assert!(store.get(&id).await.unwrap().is_none());
     assert!(blobs.get(&rec.object_key).await.is_err());
+}
+
+#[tokio::test]
+async fn purge_delete_failure_keeps_a_retryable_durable_blob_anchor() {
+    let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    let inner = Arc::new(MemoryBlobs::new());
+    let controlled = Arc::new(ToggleDeleteBlobs {
+        inner: inner.clone(),
+        fail_delete: AtomicBool::new(false),
+    });
+    let state = AppState {
+        store: store.clone(),
+        blobs: controlled.clone(),
+        ..build_dev_state()
+    };
+    let app = app(state);
+    let (id, csrf) = upload_png(&app, "alice").await;
+    assert_eq!(inner.object_count(), 1);
+
+    let trashed = send(
+        &app,
+        post_form(
+            &format!("/delete/{id}"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(trashed.status, StatusCode::FOUND);
+    controlled.fail_delete.store(true, Ordering::SeqCst);
+    let purged = send(
+        &app,
+        post_form(
+            &format!("/trash/{id}/purge"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(purged.status, StatusCode::FOUND);
+    assert!(store.get(&id).await.unwrap().is_none());
+    assert_eq!(
+        inner.object_count(),
+        1,
+        "a blob backend failure cannot make metadata reappear or lose cleanup authority"
+    );
+
+    controlled.fail_delete.store(false, Ordering::SeqCst);
+    let report = drain_trash_lifecycle_once(
+        store.as_ref(),
+        controlled.as_ref(),
+        now_secs().saturating_add(31),
+    )
+    .await
+    .unwrap();
+    assert!(report.deleted_objects >= 1);
+    assert_eq!(
+        inner.object_count(),
+        0,
+        "the queued retry eventually frees bytes"
+    );
+}
+
+#[tokio::test]
+async fn owner_blob_intents_recover_crashes_on_both_sides_of_put_and_back_off() {
+    let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    let blobs = Arc::new(MemoryBlobs::new());
+    let created_at = now_secs().saturating_sub(1_000);
+    for (key, write_blob) in [("owner-pre-put", false), ("owner-post-put", true)] {
+        let intent = OwnerBlobWriteIntent {
+            object_key: key.to_string(),
+            owner_sub: "alice".to_string(),
+            size: 3,
+            kind: OWNER_WRITE_FRESH.to_string(),
+            file_id: key.to_string(),
+            folder_id: None,
+            expected_object_key: None,
+            created_at,
+            attempts: 0,
+        };
+        assert_eq!(
+            store
+                .reserve_owner_blob_write(&intent, Some(6))
+                .await
+                .unwrap(),
+            OwnerBlobCommit::Applied
+        );
+        if write_blob {
+            blobs.put(key, vec![1, 2, 3]).await.unwrap();
+        }
+    }
+    assert_eq!(blobs.object_count(), 1);
+    recover_stale_request_uploads(store.as_ref(), blobs.as_ref())
+        .await
+        .expect("startup recovery deletes present blobs and acknowledges absent ones");
+    assert_eq!(blobs.object_count(), 0);
+
+    let retry_key = "owner-delete-retry";
+    let retry_intent = OwnerBlobWriteIntent {
+        object_key: retry_key.to_string(),
+        owner_sub: "alice".to_string(),
+        size: 3,
+        kind: OWNER_WRITE_FRESH.to_string(),
+        file_id: retry_key.to_string(),
+        folder_id: None,
+        expected_object_key: None,
+        created_at,
+        attempts: 0,
+    };
+    assert_eq!(
+        store
+            .reserve_owner_blob_write(&retry_intent, None)
+            .await
+            .unwrap(),
+        OwnerBlobCommit::Applied
+    );
+    let retry_blobs = Arc::new(MemoryBlobs::new());
+    retry_blobs.put(retry_key, vec![4, 5, 6]).await.unwrap();
+    let controlled = Arc::new(ToggleDeleteBlobs {
+        inner: retry_blobs.clone(),
+        fail_delete: AtomicBool::new(true),
+    });
+    let drain_at = now_secs();
+    let failed = drain_trash_lifecycle_once(store.as_ref(), controlled.as_ref(), drain_at)
+        .await
+        .unwrap();
+    assert_eq!(failed.deferred_objects, 1);
+    controlled.fail_delete.store(false, Ordering::SeqCst);
+    let too_early = drain_trash_lifecycle_once(store.as_ref(), controlled.as_ref(), drain_at + 29)
+        .await
+        .unwrap();
+    assert_eq!(too_early.deleted_objects, 0);
+    assert_eq!(retry_blobs.object_count(), 1);
+    let retried = drain_trash_lifecycle_once(store.as_ref(), controlled.as_ref(), drain_at + 30)
+        .await
+        .unwrap();
+    assert_eq!(retried.deleted_objects, 1);
+    assert_eq!(retry_blobs.object_count(), 0);
+}
+
+#[tokio::test]
+async fn folder_purge_wins_pending_owner_upload_and_closes_its_request_room() {
+    let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    let blobs = Arc::new(MemoryBlobs::new());
+    let now = now_secs();
+    assert!(store
+        .create_folder(&FolderRec {
+            id: "pending-folder".to_string(),
+            owner_sub: "alice".to_string(),
+            parent_id: None,
+            name: "Pending".to_string(),
+            created_at: now,
+            updated_at: now,
+            share_token: None,
+            expires_at: None,
+            share_password_hash: None,
+            upload_token: None,
+            trashed_at: 0,
+            trash_entry_id: None,
+            trash_ancestor_id: None,
+        })
+        .await
+        .unwrap());
+    assert!(store
+        .create_upload_request(&UploadRequestRec {
+            id: "pending-request".to_string(),
+            owner_sub: "alice".to_string(),
+            folder_id: "pending-folder".to_string(),
+            token: "pending-request-token".to_string(),
+            title: "Pending request".to_string(),
+            description: String::new(),
+            status: "open".to_string(),
+            expires_at: None,
+            max_file_bytes: 10,
+            max_total_bytes: 10,
+            max_files: 1,
+            used_bytes: 0,
+            used_files: 0,
+            allowed_types: "*/*".to_string(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap());
+    let intent = OwnerBlobWriteIntent {
+        object_key: "pending-upload".to_string(),
+        owner_sub: "alice".to_string(),
+        size: 3,
+        kind: OWNER_WRITE_FRESH.to_string(),
+        file_id: "pending-upload".to_string(),
+        folder_id: Some("pending-folder".to_string()),
+        expected_object_key: None,
+        created_at: now,
+        attempts: 0,
+    };
+    assert_eq!(
+        store.reserve_owner_blob_write(&intent, None).await.unwrap(),
+        OwnerBlobCommit::Applied
+    );
+    blobs.put(&intent.object_key, vec![1, 2, 3]).await.unwrap();
+    let item = DriveItemRef {
+        kind: LibraryItemKind::Folder,
+        id: "pending-folder".to_string(),
+    };
+    assert_eq!(
+        store
+            .bulk_trash(
+                "alice",
+                &[TrashRootInput {
+                    item: item.clone(),
+                    entry_id: "pending-folder-trash".to_string(),
+                }],
+                now + 1,
+                now + 2,
+            )
+            .await
+            .unwrap(),
+        BulkMutation::Applied { changed: 1 }
+    );
+    assert_eq!(
+        store.bulk_purge("alice", &[item], now + 3).await.unwrap(),
+        BulkMutation::Applied { changed: 1 }
+    );
+    let file = FileRec {
+        id: intent.file_id.clone(),
+        owner_sub: intent.owner_sub.clone(),
+        name: "pending.png".to_string(),
+        content_type: "image/png".to_string(),
+        size: intent.size,
+        bucket: "memory".to_string(),
+        object_key: intent.object_key.clone(),
+        share_token: None,
+        created_at: now,
+        updated_at: now,
+        expires_at: None,
+        share_password_hash: None,
+        folder_id: intent.folder_id.clone(),
+        trashed_at: 0,
+        trash_entry_id: None,
+        trash_ancestor_id: None,
+        view_count: 0,
+    };
+    assert_eq!(
+        store.commit_owner_upload(&file, None).await.unwrap(),
+        OwnerBlobCommit::Conflict
+    );
+    let request = store
+        .get_upload_request_by_token("pending-request-token")
+        .await
+        .unwrap()
+        .expect("purge keeps the owner-visible request record");
+    assert_eq!(request.status, "closed");
+    assert!(!store
+        .reopen_upload_request("pending-request", "alice", now + 4, now + 100)
+        .await
+        .unwrap());
+    recover_stale_request_uploads(store.as_ref(), blobs.as_ref())
+        .await
+        .expect("the losing intent remains a durable cleanup anchor");
+    assert!(matches!(
+        blobs.get(&intent.object_key).await,
+        Err(BlobError::NotFound)
+    ));
+    assert!(store.get(&intent.file_id).await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -1541,8 +1953,8 @@ async fn folder_create_move_filter_and_delete_lifecycle() {
         "Vacations"
     );
 
-    // Deleting a NON-empty folder (A is inside) is refused (400) — empty-only unless cascading.
-    let refused = send(
+    // Deleting a non-empty folder is recoverable: the whole subtree moves to unified Trash.
+    let trashed = send(
         &app,
         post_form(
             &format!("/folders/{fid}/delete"),
@@ -1552,14 +1964,36 @@ async fn folder_create_move_filter_and_delete_lifecycle() {
         ),
     )
     .await;
-    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert_eq!(trashed.status, StatusCode::FOUND);
+    assert_eq!(trashed.location(), "/");
     assert!(
-        store.get_folder(&fid, "alice").await.unwrap().is_some(),
-        "refused delete kept the folder"
+        store.get_folder(&fid, "alice").await.unwrap().is_none(),
+        "a trashed folder is absent from live owner lookups"
+    );
+    assert!(store.get(&id_a).await.unwrap().is_some());
+    assert!(
+        send(&app, get(&format!("/f/{id_a}"), Some("alice")))
+            .await
+            .status
+            == StatusCode::NOT_FOUND,
+        "a file hidden by a trashed ancestor is inactive"
     );
 
-    // Move A back to the root, then the now-empty folder deletes -> 302 to its parent (root).
-    send(
+    // Restoring the folder revives its descendants, after which the file can be moved normally.
+    let restored = send(
+        &app,
+        post_form(
+            "/trash/restore",
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&item:folder:{fid}=1"),
+        ),
+    )
+    .await;
+    assert_eq!(restored.status, StatusCode::FOUND);
+    assert!(store.get_folder(&fid, "alice").await.unwrap().is_some());
+
+    let moved_to_root = send(
         &app,
         post_form(
             &format!("/f/{id_a}/move"),
@@ -1569,19 +2003,7 @@ async fn folder_create_move_filter_and_delete_lifecycle() {
         ),
     )
     .await;
-    let deleted = send(
-        &app,
-        post_form(
-            &format!("/folders/{fid}/delete"),
-            &csrf,
-            "alice",
-            format!("csrf_token={csrf}"),
-        ),
-    )
-    .await;
-    assert_eq!(deleted.status, StatusCode::FOUND);
-    assert_eq!(deleted.location(), "/");
-    assert!(store.get_folder(&fid, "alice").await.unwrap().is_none());
+    assert_eq!(moved_to_root.status, StatusCode::FOUND);
     assert!(
         store.get(&id_a).await.unwrap().unwrap().folder_id.is_none(),
         "file kept at root"
@@ -1709,6 +2131,168 @@ async fn folder_actions_are_owner_scoped_and_csrf_checked() {
     .await;
     assert_eq!(to_root.status, StatusCode::FOUND);
     assert!(store.get(&id_a).await.unwrap().unwrap().folder_id.is_none());
+}
+
+#[tokio::test]
+async fn bulk_forms_work_without_js_and_reject_csrf_foreign_or_oversized_batches() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let (alice_file, alice_csrf) = upload_png(&app, "alice").await;
+    let (bob_file, _bob_csrf) = upload_png(&app, "bob").await;
+
+    let gallery = send(&app, get("/", Some("alice"))).await;
+    let html = gallery.text();
+    assert!(html.contains("id=\"bulkSelection\""));
+    assert!(html.contains(&format!("name=\"item:file:{alice_file}\"")));
+    assert!(html.contains("form=\"bulkSelection\""));
+    assert!(html.contains("formaction=\"/items/move\""));
+    assert!(html.contains("formaction=\"/items/trash\""));
+
+    let bad_csrf = send(
+        &app,
+        post_form(
+            "/items/trash",
+            &alice_csrf,
+            "alice",
+            format!("csrf_token=wrong&item:file:{alice_file}=1"),
+        ),
+    )
+    .await;
+    assert_eq!(bad_csrf.status, StatusCode::BAD_REQUEST);
+
+    let mixed_owner = send(
+        &app,
+        post_form(
+            "/items/trash",
+            &alice_csrf,
+            "alice",
+            format!("csrf_token={alice_csrf}&item:file:{alice_file}=1&item:file:{bob_file}=1"),
+        ),
+    )
+    .await;
+    assert_eq!(mixed_owner.status, StatusCode::CONFLICT);
+    assert!(store
+        .get(&alice_file)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_effectively_live());
+    assert!(store
+        .get(&bob_file)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_effectively_live());
+
+    for invalid_return_to in [
+        "%2F%3Fq%3Dsafe%0AInjected",
+        "%2F%3Fq%3Dsafe%00Injected",
+        "%2F%3Fq%3Dsafe%7FInjected",
+        "%2F%3Fq%3Dcaf%C3%A9",
+    ] {
+        let invalid = send(
+            &app,
+            post_form(
+                "/items/trash",
+                &alice_csrf,
+                "alice",
+                format!(
+                    "csrf_token={alice_csrf}&item:file:{alice_file}=1&return_to={invalid_return_to}"
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+        assert!(store
+            .get(&alice_file)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_effectively_live());
+    }
+
+    for route in [
+        "/items/move",
+        "/items/trash",
+        "/trash/restore",
+        "/trash/purge",
+    ] {
+        let oversized_body = send(
+            &app,
+            post_form(
+                route,
+                &alice_csrf,
+                "alice",
+                format!(
+                    "csrf_token={alice_csrf}&item:file:{alice_file}=1&padding={}",
+                    "a".repeat(70 * 1024)
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(oversized_body.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            oversized_body.header(header::CACHE_CONTROL),
+            "private, no-store"
+        );
+    }
+    assert!(store
+        .get(&alice_file)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_effectively_live());
+
+    let mut large_png = png_bytes();
+    large_png.resize(70 * 1024, 0);
+    let multipart_is_unaffected = send(
+        &app,
+        upload_req(
+            &alice_csrf,
+            &alice_csrf,
+            "alice",
+            "large-route-check.png",
+            "image/png",
+            &large_png,
+        ),
+    )
+    .await;
+    assert_eq!(multipart_is_unaffected.status, StatusCode::FOUND);
+
+    let oversized = (0..201)
+        .map(|index| format!("&item:file:oversized{index}=1"))
+        .collect::<String>();
+    let too_many = send(
+        &app,
+        post_form(
+            "/items/trash",
+            &alice_csrf,
+            "alice",
+            format!("csrf_token={alice_csrf}{oversized}"),
+        ),
+    )
+    .await;
+    assert_eq!(too_many.status, StatusCode::BAD_REQUEST);
+
+    // A plain form POST with one external checkbox is the complete no-JS lifecycle path.
+    let no_js = send(
+        &app,
+        post_form(
+            "/items/trash",
+            &alice_csrf,
+            "alice",
+            format!("csrf_token={alice_csrf}&item:file:{alice_file}=1"),
+        ),
+    )
+    .await;
+    assert_eq!(no_js.status, StatusCode::FOUND);
+    assert!(!store
+        .get(&alice_file)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_effectively_live());
 }
 
 #[tokio::test]
@@ -2407,7 +2991,7 @@ async fn folder_tree_subfolders_breadcrumb_and_scoped_upload() {
 }
 
 #[tokio::test]
-async fn folder_delete_cascade_removes_subtree_and_blobs() {
+async fn folder_trash_restore_and_purge_preserves_then_frees_subtree_blobs() {
     let state = build_dev_state();
     let store: Arc<dyn Store> = state.store.clone();
     let blobs: Arc<dyn Blobs> = state.blobs.clone();
@@ -2454,8 +3038,9 @@ async fn folder_delete_cascade_removes_subtree_and_blobs() {
     let deep_key = store.get(&deep_id).await.unwrap().unwrap().object_key;
     assert!(blobs.get(&deep_key).await.is_ok());
 
-    // Cascade-delete the parent -> whole subtree + the file (blob) are gone, redirect to root.
-    let del = send(
+    // The compatibility cascade flag cannot bypass recovery: the entire subtree becomes inactive
+    // while its metadata and blobs remain durable.
+    let trashed = send(
         &app,
         post_form(
             &format!("/folders/{pfid}/delete"),
@@ -2465,15 +3050,93 @@ async fn folder_delete_cascade_removes_subtree_and_blobs() {
         ),
     )
     .await;
-    assert_eq!(del.status, StatusCode::FOUND);
-    assert_eq!(del.location(), "/");
+    assert_eq!(trashed.status, StatusCode::FOUND);
+    assert_eq!(trashed.location(), "/");
     assert!(store.get_folder(&pfid, "alice").await.unwrap().is_none());
     assert!(store.get_folder(&cfid, "alice").await.unwrap().is_none());
     assert!(
-        store.get(&deep_id).await.unwrap().is_none(),
-        "the nested file is deleted"
+        store
+            .get_folder_any(&pfid, "alice")
+            .await
+            .unwrap()
+            .is_some(),
+        "the Trash root metadata remains recoverable"
     );
-    assert!(blobs.get(&deep_key).await.is_err(), "its blob is freed");
+    assert!(store.get(&deep_id).await.unwrap().is_some());
+    assert_eq!(
+        send(&app, get(&format!("/f/{deep_id}"), Some("alice")))
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    assert!(blobs.get(&deep_key).await.is_ok(), "Trash retains the blob");
+    let trash = send(&app, get("/?view=trash", Some("alice"))).await;
+    assert!(trash.text().contains("Parent"));
+    assert!(
+        !trash.text().contains("Child</"),
+        "descendants are deduplicated"
+    );
+
+    // Restore revives the original subtree in place.
+    let restored = send(
+        &app,
+        post_form(
+            "/trash/restore",
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&item:folder:{pfid}=1&return_to=/?view=trash"),
+        ),
+    )
+    .await;
+    assert_eq!(restored.status, StatusCode::FOUND);
+    assert!(store.get_folder(&pfid, "alice").await.unwrap().is_some());
+    assert!(store.get_folder(&cfid, "alice").await.unwrap().is_some());
+    assert_eq!(
+        send(&app, get(&format!("/f/{deep_id}"), Some("alice")))
+            .await
+            .status,
+        StatusCode::OK
+    );
+
+    // Permanent deletion is available only from Trash. Metadata disappears only after each blob
+    // key has first been committed to the durable deletion queue; the dev drain then frees bytes.
+    let retrash = send(
+        &app,
+        post_form(
+            &format!("/folders/{pfid}/delete"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(retrash.status, StatusCode::FOUND);
+    let purged = send(
+        &app,
+        post_form(
+            "/trash/purge",
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&item:folder:{pfid}=1&return_to=/?view=trash"),
+        ),
+    )
+    .await;
+    assert_eq!(purged.status, StatusCode::FOUND);
+    assert!(store
+        .get_folder_any(&pfid, "alice")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get_folder_any(&cfid, "alice")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store.get(&deep_id).await.unwrap().is_none());
+    assert!(
+        blobs.get(&deep_key).await.is_err(),
+        "the queued blob is freed"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2737,6 +3400,223 @@ async fn folder_share_public_index_and_gates() {
             .await
             .status,
         StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn capability_tokens_survive_trash_but_stay_inactive_until_restore() {
+    let state = build_dev_state();
+    let store: Arc<dyn Store> = state.store.clone();
+    let app = app(state);
+    let (_root_id, csrf) = upload_png(&app, "alice").await;
+
+    let made = send(
+        &app,
+        post_form(
+            "/folders",
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&name=Capability+vault&parent_id="),
+        ),
+    )
+    .await;
+    let folder_id = folder_from_location(&made.location());
+    let uploaded = send(
+        &app,
+        upload_req_folder(
+            &csrf,
+            &csrf,
+            "alice",
+            &folder_id,
+            "retained.png",
+            "image/png",
+            &png_bytes(),
+        ),
+    )
+    .await;
+    let file_id = uploaded.location().trim_start_matches("/f/").to_string();
+    let file_token = "retained-file-token";
+    let folder_token = "retained-folder-token";
+    assert!(store
+        .configure_share(&file_id, "alice", Some(file_token.to_string()), None, None,)
+        .await
+        .unwrap());
+    assert!(store
+        .configure_folder_share(
+            &folder_id,
+            "alice",
+            Some(folder_token.to_string()),
+            None,
+            None,
+        )
+        .await
+        .unwrap());
+    let request = create_upload_request(&app, &store, &folder_id, &csrf, "").await;
+
+    assert_eq!(
+        send(&app, get(&format!("/s/{file_token}"), None))
+            .await
+            .status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(&app, get(&format!("/s/folder/{folder_token}"), None))
+            .await
+            .status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(
+            &app,
+            get(&format!("/s/folder/{folder_token}/f/{file_id}"), None,),
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(&app, get(&format!("/u/{}", request.token), None))
+            .await
+            .status,
+        StatusCode::OK
+    );
+
+    // An independently trashed file vanishes from both its own capability and a still-live folder
+    // share. Its token remains metadata, so restoration revives the exact same URLs.
+    let file_trashed = send(
+        &app,
+        post_form(
+            &format!("/delete/{file_id}"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(file_trashed.status, StatusCode::FOUND);
+    assert_eq!(
+        store
+            .get(&file_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .share_token
+            .as_deref(),
+        Some(file_token)
+    );
+    assert_eq!(
+        send(&app, get(&format!("/s/{file_token}"), None))
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    let folder_index = send(&app, get(&format!("/s/folder/{folder_token}"), None)).await;
+    assert_eq!(folder_index.status, StatusCode::OK);
+    assert!(!folder_index.text().contains("retained.png"));
+    assert_eq!(
+        send(
+            &app,
+            get(&format!("/s/folder/{folder_token}/f/{file_id}"), None,),
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+    let file_restored = send(
+        &app,
+        post_form(
+            &format!("/trash/{file_id}/restore"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(file_restored.status, StatusCode::FOUND);
+    assert_eq!(
+        send(&app, get(&format!("/s/{file_token}"), None))
+            .await
+            .status,
+        StatusCode::OK
+    );
+
+    // Trashing the ancestor disables every read/upload capability below it without rotating or
+    // erasing any token. Restoring the folder revives all original URLs in place.
+    let folder_trashed = send(
+        &app,
+        post_form(
+            &format!("/folders/{folder_id}/delete"),
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(folder_trashed.status, StatusCode::FOUND);
+    let raw_folder = store
+        .get_folder_any(&folder_id, "alice")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(raw_folder.share_token.as_deref(), Some(folder_token));
+    assert_eq!(
+        store
+            .get(&file_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .share_token
+            .as_deref(),
+        Some(file_token)
+    );
+    assert_eq!(
+        store
+            .get_upload_request(&request.id, "alice")
+            .await
+            .unwrap()
+            .unwrap()
+            .token,
+        request.token
+    );
+    for path in [
+        format!("/s/{file_token}"),
+        format!("/s/folder/{folder_token}"),
+        format!("/u/{}", request.token),
+    ] {
+        assert_eq!(
+            send(&app, get(&path, None)).await.status,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    let folder_restored = send(
+        &app,
+        post_form(
+            "/trash/restore",
+            &csrf,
+            "alice",
+            format!("csrf_token={csrf}&item:folder:{folder_id}=1"),
+        ),
+    )
+    .await;
+    assert_eq!(folder_restored.status, StatusCode::FOUND);
+    assert_eq!(
+        send(&app, get(&format!("/s/{file_token}"), None))
+            .await
+            .status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(&app, get(&format!("/s/folder/{folder_token}"), None))
+            .await
+            .status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(&app, get(&format!("/u/{}", request.token), None))
+            .await
+            .status,
+        StatusCode::OK
     );
 }
 
@@ -3601,6 +4481,24 @@ async fn request_memory_reservation_is_atomic_under_concurrency() {
 #[tokio::test]
 async fn request_memory_recovery_claim_is_all_or_busy() {
     let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    assert!(store
+        .create_folder(&FolderRec {
+            id: "folder".to_string(),
+            owner_sub: "alice".to_string(),
+            parent_id: None,
+            name: "Inbox".to_string(),
+            created_at: 1,
+            updated_at: 1,
+            share_token: None,
+            expires_at: None,
+            share_password_hash: None,
+            upload_token: None,
+            trashed_at: 0,
+            trash_entry_id: None,
+            trash_ancestor_id: None,
+        })
+        .await
+        .unwrap());
     let mut request = store_request("memory-recovery", "memory-recovery-token");
     request.status = "open".to_string();
     request.expires_at = Some(1_000);
@@ -3754,9 +4652,31 @@ fn store_request(id: &str, token: &str) -> UploadRequestRec {
     }
 }
 
+async fn create_store_request_folder(store: &Arc<dyn Store>) {
+    assert!(store
+        .create_folder(&FolderRec {
+            id: "folder".to_string(),
+            owner_sub: "alice".to_string(),
+            parent_id: None,
+            name: "Request destination".to_string(),
+            created_at: 1,
+            updated_at: 1,
+            share_token: None,
+            expires_at: None,
+            share_password_hash: None,
+            upload_token: None,
+            trashed_at: 0,
+            trash_entry_id: None,
+            trash_ancestor_id: None,
+        })
+        .await
+        .unwrap());
+}
+
 #[tokio::test]
 async fn request_rotation_is_expected_token_compare_and_swap() {
     let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    create_store_request_folder(&store).await;
     let request = store_request("rotate-cas", "original-token");
     assert!(store.create_upload_request(&request).await.unwrap());
     let left = store.clone();
@@ -3798,6 +4718,7 @@ async fn request_rotation_is_expected_token_compare_and_swap() {
 #[tokio::test]
 async fn request_reopen_does_not_replace_a_concurrent_policy_update() {
     let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    create_store_request_folder(&store).await;
     let request = store_request("reopen-cas", "reopen-token");
     assert!(store.create_upload_request(&request).await.unwrap());
     let mut policy = request.clone();

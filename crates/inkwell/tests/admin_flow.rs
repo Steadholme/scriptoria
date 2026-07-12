@@ -110,9 +110,15 @@ async fn admin_mutations_feature_unpublish_delete() {
     );
 
     // --- delete ------------------------------------------------------------
+    let alpha = state.store.get_post("alpha").await.unwrap();
     let (status, _) = call(
         &state,
-        post_admin("/admin/posts/alpha/delete", &csrf_body(), "admins", true),
+        post_admin(
+            "/admin/posts/alpha/delete",
+            &delete_body(&alpha),
+            "admins",
+            true,
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
@@ -176,14 +182,20 @@ async fn admin_can_pin_posts_to_top() {
 }
 
 #[tokio::test]
-async fn admin_bulk_action_over_selected_slugs() {
+async fn admin_bulk_action_over_stable_selections() {
     let state = build_dev_state();
     create_post(&state, "One", "u_alice", "alice@hf").await;
     create_post(&state, "Two", "u_bob", "bob@hf").await;
     create_post(&state, "Three", "u_alice", "alice@hf").await;
 
     // Bulk delete "one" and "three"; "two" survives.
-    let body = format!("csrf_token={CSRF}&action=delete&slugs=one&slugs=three");
+    let one = state.store.get_post("one").await.unwrap();
+    let three = state.store.get_post("three").await.unwrap();
+    let body = format!(
+        "csrf_token={CSRF}&action=delete&items={}&items={}",
+        admin_item(&one),
+        admin_item(&three)
+    );
     let (status, _) = call(
         &state,
         post_admin("/admin/posts/bulk", &body, "admins", true),
@@ -197,7 +209,11 @@ async fn admin_bulk_action_over_selected_slugs() {
     assert!(idx.contains("Two"), "two survives the bulk delete");
 
     // Bulk feature "two".
-    let body = format!("csrf_token={CSRF}&action=feature&slugs=two");
+    let two = state.store.get_post("two").await.unwrap();
+    let body = format!(
+        "csrf_token={CSRF}&action=feature&items={}",
+        admin_item(&two)
+    );
     let (status, _) = call(
         &state,
         post_admin("/admin/posts/bulk", &body, "admins", true),
@@ -210,13 +226,79 @@ async fn admin_bulk_action_over_selected_slugs() {
     );
 
     // Non-admin bulk -> 403.
-    let body = format!("csrf_token={CSRF}&action=delete&slugs=two");
+    let body = format!(
+        "csrf_token={CSRF}&action=delete&items={}",
+        admin_item(&state.store.get_post("two").await.unwrap())
+    );
     let (status, _) = call(
         &state,
         post_admin("/admin/posts/bulk", &body, "readers", true),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn admin_bulk_delete_duplicate_or_later_stale_selection_deletes_nothing() {
+    let state = build_dev_state();
+    create_post(&state, "Atomic One", "u_alice", "alice@hf").await;
+    create_post(&state, "Atomic Two", "u_bob", "bob@hf").await;
+    let one = state.store.get_post("atomic-one").await.unwrap();
+    let two = state.store.get_post("atomic-two").await.unwrap();
+
+    let duplicate = format!(
+        "csrf_token={CSRF}&action=delete&items={}&items={}",
+        admin_item(&one),
+        admin_item(&one)
+    );
+    let (status, body) = call(
+        &state,
+        post_admin("/admin/posts/bulk", &duplicate, "admins", true),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body.contains("post identity changed"));
+    assert!(state.store.get_post(&one.slug).await.is_some());
+    assert!(state.store.get_post(&two.slug).await.is_some());
+
+    let mut stale_two = two.clone();
+    stale_two.edit_version += 1;
+    let later_stale = format!(
+        "csrf_token={CSRF}&action=delete&items={}&items={}",
+        admin_item(&one),
+        admin_item(&stale_two)
+    );
+    let (status, body) = call(
+        &state,
+        post_admin("/admin/posts/bulk", &later_stale, "admins", true),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body.contains("post identity changed"));
+    assert!(
+        state.store.get_post(&one.slug).await.is_some(),
+        "a valid earlier checkbox is not partially deleted"
+    );
+    assert!(state.store.get_post(&two.slug).await.is_some());
+}
+
+#[tokio::test]
+async fn successful_admin_redirects_are_private_no_store() {
+    let state = build_dev_state();
+    let body = form(&[
+        ("title", "Private settings"),
+        ("posts_per_page", "8"),
+        ("csrf_token", CSRF),
+    ]);
+    let response = app(state)
+        .oneshot(post_admin("/admin/settings", &body, "admins", true))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "private, no-store"
+    );
 }
 
 #[tokio::test]
@@ -261,7 +343,8 @@ async fn admin_can_edit_and_delete_any_authors_post() {
     );
 
     // And an admin can delete it via the ordinary delete route too.
-    let body = form(&[("csrf_token", CSRF)]);
+    let current = state.store.get_post("alice-post").await.unwrap();
+    let body = delete_body(&current);
     let (status, _) = call(
         &state,
         post_edit(
@@ -274,6 +357,47 @@ async fn admin_can_edit_and_delete_any_authors_post() {
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER, "admin deletes any post");
+}
+
+#[tokio::test]
+async fn admin_delete_requires_current_immutable_identity() {
+    let state = build_dev_state();
+    create_post(&state, "Replace Me", "u_alice", "alice@hf").await;
+    let stale = state.store.get_post("replace-me").await.unwrap();
+
+    let (status, _) = call(
+        &state,
+        post_admin(
+            "/admin/posts/replace-me/delete",
+            &csrf_body(),
+            "admins",
+            true,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "legacy form fails closed");
+
+    state.store.delete_post("replace-me").await.unwrap();
+    create_post(&state, "Replace Me", "u_bob", "bob@hf").await;
+    let replacement = state.store.get_post("replace-me").await.unwrap();
+    assert_ne!(replacement.id, stale.id);
+    let (status, body) = call(
+        &state,
+        post_admin(
+            "/admin/posts/replace-me/delete",
+            &delete_body(&stale),
+            "admins",
+            true,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body.contains("post identity changed"));
+    assert_eq!(
+        state.store.get_post("replace-me").await.unwrap().id,
+        replacement.id,
+        "stale admin authority never deletes the replacement"
+    );
 }
 
 #[tokio::test]
@@ -355,6 +479,23 @@ async fn create_post(state: &AppState, title: &str, sub: &str, email: &str) {
 
 fn csrf_body() -> String {
     format!("csrf_token={CSRF}")
+}
+
+fn delete_body(post: &inkwell::store::Post) -> String {
+    form(&[
+        ("csrf_token", CSRF),
+        ("expected_post_id", &post.id),
+        ("expected_version", &post.edit_version.to_string()),
+    ])
+}
+
+fn admin_item(post: &inkwell::store::Post) -> String {
+    format!(
+        "{}.{}.{}",
+        hex::encode(post.id.as_bytes()),
+        post.edit_version,
+        hex::encode(post.slug.as_bytes())
+    )
 }
 
 fn get(uri: &str, groups: Option<&str>) -> Request<Body> {

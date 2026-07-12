@@ -18,9 +18,13 @@ use thiserror::Error;
 use crate::config::clamp_page;
 use crate::model::{
     library_type_for, FileComment, FileRec, FolderRec, LibraryCursor, LibraryItem, LibraryItemKind,
-    LibraryPage, LibraryQuery, LibraryType, LibraryView, OwnerUsage, UploadRequestRec,
-    UploadSubmission, VersionRec,
+    LibraryPage, LibraryQuery, LibraryType, LibraryView, OwnerUsage, TrashEntry, TrashItem,
+    TrashPage, UploadRequestRec, UploadSubmission, VersionRec,
 };
+
+const DEFAULT_TRASH_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
+/// Domain boundary for every lifecycle mutation, including non-HTTP callers and workers.
+pub const MAX_BULK_ITEMS: usize = 200;
 
 fn mutation_time() -> i64 {
     SystemTime::now()
@@ -198,6 +202,95 @@ pub enum FolderDelete {
     NotFound,
 }
 
+/// A type-tagged owner item submitted by the bulk control plane. Handlers parse the wire value;
+/// Store implementations still re-check every id, owner and state atomically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriveItemRef {
+    pub kind: LibraryItemKind,
+    pub id: String,
+}
+
+/// One selected live root paired with the freshly-random durable Trash entry id allocated by the
+/// handler. The Store rejects the whole batch if any root is stale or the id collides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrashRootInput {
+    pub item: DriveItemRef,
+    pub entry_id: String,
+}
+
+/// Expected bulk conflicts are values rather than backend failures so handlers can return a
+/// uniform 409 without leaking whether a stale id was absent, foreign, or in another lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BulkMutation {
+    Applied { changed: usize },
+    Conflict,
+}
+
+/// One durable object-delete outbox row leased by a bounded cleanup worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobDeleteItem {
+    pub object_key: String,
+    pub attempts: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlobDeleteClaim {
+    Claimed(Vec<BlobDeleteItem>),
+    Empty,
+}
+
+/// Result of an owner blob/metadata commit. Expected races stay domain values so HTTP handlers can
+/// compensate a blob that was already written without turning a stale target into a false 302.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerBlobCommit {
+    Applied,
+    Conflict,
+    Collision,
+    QuotaExceeded,
+}
+
+pub const OWNER_WRITE_FRESH: &str = "fresh";
+pub const OWNER_WRITE_REUPLOAD: &str = "reupload";
+pub const OWNER_WRITE_THUMBNAIL: &str = "thumbnail";
+
+/// Durable authority created before an owner blob write. The object key remains recoverable across
+/// a process crash until metadata finalization consumes this row in the same transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerBlobWriteIntent {
+    pub object_key: String,
+    pub owner_sub: String,
+    pub size: i64,
+    pub kind: String,
+    pub file_id: String,
+    pub folder_id: Option<String>,
+    pub expected_object_key: Option<String>,
+    pub created_at: i64,
+    pub attempts: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct OwnerReuploadInput<'a> {
+    pub owner_sub: &'a str,
+    pub file_id: &'a str,
+    pub expected_object_key: &'a str,
+    pub new_object_key: &'a str,
+    pub new_size: i64,
+    pub new_content_type: &'a str,
+    pub snapshot_id: &'a str,
+    pub changed_at: i64,
+    pub owner_quota: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct OwnerVersionRestoreInput<'a> {
+    pub owner_sub: &'a str,
+    pub file_id: &'a str,
+    pub expected_object_key: &'a str,
+    pub version_id: &'a str,
+    pub snapshot_id: &'a str,
+    pub changed_at: i64,
+}
+
 /// Pluggable metadata store. `create` is collision-aware over BOTH the id and the share token
 /// (returns `false` on any unique conflict so the handler retries with fresh values); `delete`
 /// is ownership-scoped.
@@ -206,6 +299,73 @@ pub trait Store: Send + Sync {
     /// Insert a file row. Returns `Ok(true)` when inserted, `Ok(false)` when a unique value
     /// (id or share token) already existed (the caller retries with fresh values).
     async fn create(&self, file: &FileRec) -> Result<bool, StoreError>;
+
+    /// Commit owner upload metadata only after its blob exists. Implementations serialize on the
+    /// owner guard, revalidate the live destination, and recompute quota in the same transaction.
+    async fn commit_owner_upload(
+        &self,
+        file: &FileRec,
+        owner_quota: Option<i64>,
+    ) -> Result<OwnerBlobCommit, StoreError>;
+
+    /// Reserve quota/cleanup authority before writing an owner blob.
+    async fn reserve_owner_blob_write(
+        &self,
+        intent: &OwnerBlobWriteIntent,
+        owner_quota: Option<i64>,
+    ) -> Result<OwnerBlobCommit, StoreError>;
+
+    /// CAS a live file's current object key, snapshot the actual current row, prune history, and
+    /// durably enqueue stale derived/pruned objects as one metadata transaction.
+    async fn commit_owner_reupload(
+        &self,
+        input: OwnerReuploadInput<'_>,
+    ) -> Result<OwnerBlobCommit, StoreError>;
+
+    /// Atomically restore one retained version while snapshotting the actual current file row.
+    async fn commit_owner_version_restore(
+        &self,
+        input: OwnerVersionRestoreInput<'_>,
+    ) -> Result<OwnerBlobCommit, StoreError>;
+
+    /// Validate that the file still points at the source object and consume the thumbnail intent.
+    async fn finalize_owner_thumbnail(
+        &self,
+        object_key: &str,
+        owner_sub: &str,
+        file_id: &str,
+        expected_object_key: &str,
+    ) -> Result<OwnerBlobCommit, StoreError>;
+
+    async fn claim_owner_blob_writes(
+        &self,
+        lease_id: &str,
+        now: i64,
+        created_before: i64,
+        lease_expired_before: i64,
+        limit: i64,
+    ) -> Result<Vec<OwnerBlobWriteIntent>, StoreError>;
+
+    async fn complete_owner_blob_write(
+        &self,
+        object_key: &str,
+        lease_id: &str,
+    ) -> Result<bool, StoreError>;
+
+    async fn abandon_owner_blob_write(
+        &self,
+        object_key: &str,
+        lease_id: &str,
+        retry_at: i64,
+    ) -> Result<bool, StoreError>;
+
+    /// Create an idempotent durable cleanup anchor for a blob that has no live metadata owner.
+    async fn enqueue_blob_deletion(
+        &self,
+        object_key: &str,
+        enqueued_at: i64,
+        reason: &str,
+    ) -> Result<(), StoreError>;
 
     /// Fetch a file by id.
     async fn get(&self, id: &str) -> Result<Option<FileRec>, StoreError>;
@@ -264,6 +424,86 @@ pub trait Store: Send + Sync {
     /// An owner's trashed files, newest-trash-first.
     async fn list_trashed_by_owner(&self, owner_sub: &str) -> Result<Vec<FileRec>, StoreError>;
 
+    /// Stable, bounded unified Trash roots (files + folders). Descendants hidden by an ancestor
+    /// entry never appear as duplicate cards.
+    async fn query_trash(
+        &self,
+        owner_sub: &str,
+        before: Option<&LibraryCursor>,
+        limit: i64,
+    ) -> Result<TrashPage, StoreError>;
+
+    /// Atomically move all selected effective-live roots to Trash, propagating folder ancestor
+    /// scope without overwriting nested independent Trash scopes.
+    async fn bulk_trash(
+        &self,
+        owner_sub: &str,
+        roots: &[TrashRootInput],
+        trashed_at: i64,
+        purge_after: i64,
+    ) -> Result<BulkMutation, StoreError>;
+
+    /// Atomically restore explicitly-trashed roots and only the descendant scope owned by them.
+    async fn bulk_restore(
+        &self,
+        owner_sub: &str,
+        items: &[DriveItemRef],
+    ) -> Result<BulkMutation, StoreError>;
+
+    /// Atomically move effective-live files/folders. Moving a folder into itself or its descendant
+    /// is rejected with no partial mutation.
+    async fn bulk_move(
+        &self,
+        owner_sub: &str,
+        items: &[DriveItemRef],
+        folder_id: Option<&str>,
+    ) -> Result<BulkMutation, StoreError>;
+
+    /// Logically purge Trash roots in one transaction. Every current/version/thumbnail object key
+    /// is first placed in the durable delete outbox; metadata is never removed without recovery
+    /// authority.
+    async fn bulk_purge(
+        &self,
+        owner_sub: &str,
+        items: &[DriveItemRef],
+        enqueued_at: i64,
+    ) -> Result<BulkMutation, StoreError>;
+
+    /// Claim expired Trash roots for the retention worker. A returned item stays protected by its
+    /// lease until purge succeeds or the lease is abandoned/reclaimed.
+    async fn claim_expired_trash(
+        &self,
+        lease_id: &str,
+        now: i64,
+        lease_expired_before: i64,
+        limit: i64,
+    ) -> Result<Vec<TrashEntry>, StoreError>;
+
+    async fn abandon_trash_claim(&self, entry_id: &str, lease_id: &str)
+        -> Result<bool, StoreError>;
+
+    /// Lease a bounded set of due object deletions.
+    async fn claim_blob_deletions(
+        &self,
+        lease_id: &str,
+        now: i64,
+        lease_expired_before: i64,
+        limit: i64,
+    ) -> Result<BlobDeleteClaim, StoreError>;
+
+    async fn complete_blob_deletion(
+        &self,
+        object_key: &str,
+        lease_id: &str,
+    ) -> Result<bool, StoreError>;
+
+    async fn abandon_blob_deletion(
+        &self,
+        object_key: &str,
+        lease_id: &str,
+        retry_at: i64,
+    ) -> Result<bool, StoreError>;
+
     /// Configure a file's share link, ownership-scoped. Sets all three share columns atomically:
     /// `share_token` (`Some(tok)` to (re)enable, `None` to REVOKE — the file then has no public
     /// surface), `expires_at` (`None` = never), and `share_password_hash` (`None` = no password).
@@ -290,6 +530,14 @@ pub trait Store: Send + Sync {
     /// Fetch one folder, ownership-scoped (used to validate a move target and to render the active
     /// folder's controls). `None` when it does not exist or belongs to someone else.
     async fn get_folder(&self, id: &str, owner_sub: &str) -> Result<Option<FolderRec>, StoreError>;
+
+    /// Fetch a folder regardless of Trash visibility. Reserved for Trash rendering/reconciliation;
+    /// ordinary owner and capability surfaces use [`Store::get_folder`].
+    async fn get_folder_any(
+        &self,
+        id: &str,
+        owner_sub: &str,
+    ) -> Result<Option<FolderRec>, StoreError>;
 
     /// Fetch a folder by its public share token (the unauthenticated `/s/folder/{token}` index). `None`
     /// when the token is unknown / revoked. The row carries `owner_sub`, so the public handler
@@ -571,6 +819,10 @@ pub trait Store: Send + Sync {
 /// held across the guard), so the std `Mutex` is correct here.
 #[derive(Default)]
 pub struct InMemoryStore {
+    /// Serializes cross-domain owner lifecycle commits before any request/file/folder lock. A
+    /// single process-wide guard is intentionally conservative and keeps Memory lock order equal to
+    /// PostgreSQL's owner guard without holding an async mutex across awaits.
+    lifecycle_guard: Mutex<()>,
     files: Mutex<Vec<FileRec>>,
     folders: Mutex<Vec<FolderRec>>,
     /// Retained blob snapshots (mirrors the `file_versions` table).
@@ -579,6 +831,11 @@ pub struct InMemoryStore {
     quotas: Mutex<Vec<(String, i64)>>,
     /// Per-file comments (mirrors the `file_comments` table).
     comments: Mutex<Vec<FileComment>>,
+    /// Unified Trash roots and durable object-delete outbox. New bulk operations acquire the
+    /// locks in folders -> files -> versions -> comments -> trash -> deletes order.
+    trash_entries: Mutex<Vec<TrashEntry>>,
+    blob_deletions: Mutex<Vec<MemoryBlobDelete>>,
+    owner_blob_writes: Mutex<Vec<MemoryOwnerBlobWrite>>,
     /// Upload-request control plane and its short-lived reservations. Keeping these three vectors
     /// behind one lock makes reserve/commit/release atomic in the memory implementation.
     request_state: Mutex<MemoryRequestState>,
@@ -601,10 +858,103 @@ struct MemoryUploadReservation {
     recovery_leased_at: Option<i64>,
 }
 
+#[derive(Clone)]
+struct MemoryBlobDelete {
+    object_key: String,
+    enqueued_at: i64,
+    attempts: i64,
+    next_attempt_at: i64,
+    recovery_lease: Option<String>,
+    recovery_leased_at: Option<i64>,
+}
+
+#[derive(Clone)]
+struct MemoryOwnerBlobWrite {
+    intent: OwnerBlobWriteIntent,
+    next_attempt_at: i64,
+    recovery_lease: Option<String>,
+    recovery_leased_at: Option<i64>,
+}
+
 impl InMemoryStore {
     pub fn new() -> Self {
         Self::default()
     }
+}
+
+fn folder_descends_from(folders: &[FolderRec], child_id: &str, ancestor_id: &str) -> bool {
+    let mut current = Some(child_id);
+    let mut seen: Vec<&str> = Vec::new();
+    while let Some(id) = current {
+        if id == ancestor_id {
+            return true;
+        }
+        if seen.contains(&id) {
+            return false;
+        }
+        seen.push(id);
+        current = folders
+            .iter()
+            .find(|folder| folder.id == id)
+            .and_then(|folder| folder.parent_id.as_deref());
+    }
+    false
+}
+
+fn item_under_selected_folder(
+    item: &DriveItemRef,
+    selected: &[DriveItemRef],
+    files: &[FileRec],
+    folders: &[FolderRec],
+) -> bool {
+    let parent = match item.kind {
+        LibraryItemKind::File => files
+            .iter()
+            .find(|file| file.id == item.id)
+            .and_then(|file| file.folder_id.as_deref()),
+        LibraryItemKind::Folder => folders
+            .iter()
+            .find(|folder| folder.id == item.id)
+            .and_then(|folder| folder.parent_id.as_deref()),
+    };
+    selected.iter().any(|candidate| {
+        candidate.kind == LibraryItemKind::Folder
+            && parent.is_some_and(|parent| folder_descends_from(folders, parent, &candidate.id))
+    })
+}
+
+fn normalized_refs(
+    items: &[DriveItemRef],
+    files: &[FileRec],
+    folders: &[FolderRec],
+) -> Vec<DriveItemRef> {
+    items
+        .iter()
+        .filter(|item| !item_under_selected_folder(item, items, files, folders))
+        .cloned()
+        .collect()
+}
+
+fn trash_before(item: &TrashItem, cursor: &LibraryCursor) -> bool {
+    item.trashed_at < cursor.updated_at
+        || (item.trashed_at == cursor.updated_at
+            && (item.kind.rank() < cursor.kind.rank()
+                || (item.kind == cursor.kind && item.id < cursor.id)))
+}
+
+fn finish_trash_page(mut items: Vec<TrashItem>, limit: i64) -> TrashPage {
+    let limit = clamp_page(limit) as usize;
+    items.sort_by(|left, right| {
+        right
+            .trashed_at
+            .cmp(&left.trashed_at)
+            .then_with(|| right.kind.rank().cmp(&left.kind.rank()))
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    let has_more = items.len() > limit;
+    items.truncate(limit);
+    let next = has_more.then(|| items.last().expect("non-empty bounded page").cursor());
+    TrashPage { items, next }
 }
 
 #[async_trait]
@@ -622,6 +972,675 @@ impl Store for InMemoryStore {
         Ok(true)
     }
 
+    async fn reserve_owner_blob_write(
+        &self,
+        intent: &OwnerBlobWriteIntent,
+        owner_quota: Option<i64>,
+    ) -> Result<OwnerBlobCommit, StoreError> {
+        if intent.object_key.is_empty()
+            || intent.owner_sub.is_empty()
+            || intent.file_id.is_empty()
+            || intent.size < 0
+            || !matches!(
+                intent.kind.as_str(),
+                OWNER_WRITE_FRESH | OWNER_WRITE_REUPLOAD | OWNER_WRITE_THUMBNAIL
+            )
+        {
+            return Ok(OwnerBlobCommit::Conflict);
+        }
+        let _lifecycle = self
+            .lifecycle_guard
+            .lock()
+            .expect("lifecycle guard poisoned");
+        let requests = self
+            .request_state
+            .lock()
+            .expect("request state lock poisoned");
+        let folders = self.folders.lock().expect("folders lock poisoned");
+        let files = self.files.lock().expect("files lock poisoned");
+        let versions = self.versions.lock().expect("versions lock poisoned");
+        let mut intents = self
+            .owner_blob_writes
+            .lock()
+            .expect("owner blob writes lock poisoned");
+        let deletions = self
+            .blob_deletions
+            .lock()
+            .expect("blob deletion lock poisoned");
+
+        let authority_ok = match intent.kind.as_str() {
+            OWNER_WRITE_FRESH => {
+                intent.expected_object_key.is_none()
+                    && intent.object_key == intent.file_id
+                    && intent.folder_id.as_deref().is_none_or(|folder_id| {
+                        folders.iter().any(|folder| {
+                            folder.id == folder_id
+                                && folder.owner_sub == intent.owner_sub
+                                && folder.is_effectively_live()
+                        })
+                    })
+                    && !files.iter().any(|file| file.id == intent.file_id)
+            }
+            OWNER_WRITE_REUPLOAD => intent
+                .expected_object_key
+                .as_deref()
+                .is_some_and(|expected| {
+                    files.iter().any(|file| {
+                        file.id == intent.file_id
+                            && file.owner_sub == intent.owner_sub
+                            && file.object_key == expected
+                            && file.is_effectively_live()
+                    })
+                }),
+            OWNER_WRITE_THUMBNAIL => {
+                intent
+                    .expected_object_key
+                    .as_deref()
+                    .is_some_and(|expected| {
+                        intent.object_key == format!("{expected}.thumb")
+                            && files.iter().any(|file| {
+                                file.id == intent.file_id
+                                    && file.owner_sub == intent.owner_sub
+                                    && file.object_key == expected
+                                    && file.is_effectively_live()
+                            })
+                    })
+            }
+            _ => false,
+        };
+        if !authority_ok {
+            return Ok(OwnerBlobCommit::Conflict);
+        }
+        if intents
+            .iter()
+            .any(|row| row.intent.object_key == intent.object_key)
+            || requests
+                .reservations
+                .iter()
+                .any(|row| row.id == intent.object_key)
+            || files
+                .iter()
+                .any(|file| file.object_key == intent.object_key)
+            || versions
+                .iter()
+                .any(|version| version.object_key == intent.object_key)
+            || deletions
+                .iter()
+                .any(|deletion| deletion.object_key == intent.object_key)
+        {
+            return Ok(OwnerBlobCommit::Collision);
+        }
+        if intent.kind != OWNER_WRITE_THUMBNAIL {
+            let owned_ids: Vec<&str> = files
+                .iter()
+                .filter(|file| file.owner_sub == intent.owner_sub)
+                .map(|file| file.id.as_str())
+                .collect();
+            let committed = files
+                .iter()
+                .filter(|file| file.owner_sub == intent.owner_sub)
+                .map(|file| file.size)
+                .sum::<i64>()
+                .saturating_add(
+                    versions
+                        .iter()
+                        .filter(|version| owned_ids.contains(&version.file_id.as_str()))
+                        .map(|version| version.size)
+                        .sum(),
+                )
+                .saturating_add(
+                    requests
+                        .reservations
+                        .iter()
+                        .filter(|reservation| reservation.owner_sub == intent.owner_sub)
+                        .map(|reservation| reservation.size)
+                        .sum(),
+                )
+                .saturating_add(
+                    intents
+                        .iter()
+                        .filter(|row| {
+                            row.intent.owner_sub == intent.owner_sub
+                                && row.intent.kind != OWNER_WRITE_THUMBNAIL
+                        })
+                        .map(|row| row.intent.size)
+                        .sum(),
+                );
+            if owner_quota.is_some_and(|quota| committed.saturating_add(intent.size) > quota) {
+                return Ok(OwnerBlobCommit::QuotaExceeded);
+            }
+        }
+        intents.push(MemoryOwnerBlobWrite {
+            intent: intent.clone(),
+            next_attempt_at: intent.created_at,
+            recovery_lease: None,
+            recovery_leased_at: None,
+        });
+        Ok(OwnerBlobCommit::Applied)
+    }
+
+    async fn commit_owner_upload(
+        &self,
+        file: &FileRec,
+        owner_quota: Option<i64>,
+    ) -> Result<OwnerBlobCommit, StoreError> {
+        let _lifecycle = self
+            .lifecycle_guard
+            .lock()
+            .expect("lifecycle guard poisoned");
+        let requests = self
+            .request_state
+            .lock()
+            .expect("request state lock poisoned");
+        let folders = self.folders.lock().expect("folders lock poisoned");
+        let mut files = self.files.lock().expect("files lock poisoned");
+        let versions = self.versions.lock().expect("versions lock poisoned");
+        let mut intents = self
+            .owner_blob_writes
+            .lock()
+            .expect("owner blob writes lock poisoned");
+        let Some(intent_index) = intents.iter().position(|row| {
+            row.intent.object_key == file.object_key
+                && row.intent.owner_sub == file.owner_sub
+                && row.intent.file_id == file.id
+                && row.intent.folder_id == file.folder_id
+                && row.intent.size == file.size
+                && row.intent.kind == OWNER_WRITE_FRESH
+                && row.recovery_lease.is_none()
+        }) else {
+            return Ok(OwnerBlobCommit::Conflict);
+        };
+        if file.object_key != file.id
+            || !file.is_effectively_live()
+            || file.folder_id.as_deref().is_some_and(|folder_id| {
+                !folders.iter().any(|folder| {
+                    folder.id == folder_id
+                        && folder.owner_sub == file.owner_sub
+                        && folder.is_effectively_live()
+                })
+            })
+        {
+            return Ok(OwnerBlobCommit::Conflict);
+        }
+        if files.iter().any(|existing| {
+            existing.id == file.id
+                || (file.share_token.is_some() && existing.share_token == file.share_token)
+        }) {
+            return Ok(OwnerBlobCommit::Collision);
+        }
+        let owned_ids: Vec<&str> = files
+            .iter()
+            .filter(|existing| existing.owner_sub == file.owner_sub)
+            .map(|existing| existing.id.as_str())
+            .collect();
+        let total = files
+            .iter()
+            .filter(|existing| existing.owner_sub == file.owner_sub)
+            .map(|existing| existing.size)
+            .sum::<i64>()
+            .saturating_add(
+                versions
+                    .iter()
+                    .filter(|version| owned_ids.contains(&version.file_id.as_str()))
+                    .map(|version| version.size)
+                    .sum(),
+            )
+            .saturating_add(
+                requests
+                    .reservations
+                    .iter()
+                    .filter(|reservation| reservation.owner_sub == file.owner_sub)
+                    .map(|reservation| reservation.size)
+                    .sum(),
+            )
+            .saturating_add(
+                intents
+                    .iter()
+                    .filter(|row| {
+                        row.intent.owner_sub == file.owner_sub
+                            && row.intent.kind != OWNER_WRITE_THUMBNAIL
+                    })
+                    .map(|row| row.intent.size)
+                    .sum(),
+            );
+        if owner_quota.is_some_and(|quota| total > quota) {
+            return Ok(OwnerBlobCommit::QuotaExceeded);
+        }
+        files.push(file.clone());
+        intents.remove(intent_index);
+        Ok(OwnerBlobCommit::Applied)
+    }
+
+    async fn commit_owner_reupload(
+        &self,
+        input: OwnerReuploadInput<'_>,
+    ) -> Result<OwnerBlobCommit, StoreError> {
+        let _lifecycle = self
+            .lifecycle_guard
+            .lock()
+            .expect("lifecycle guard poisoned");
+        let requests = self
+            .request_state
+            .lock()
+            .expect("request state lock poisoned");
+        let mut files = self.files.lock().expect("files lock poisoned");
+        let mut versions = self.versions.lock().expect("versions lock poisoned");
+        let mut intents = self
+            .owner_blob_writes
+            .lock()
+            .expect("owner blob writes lock poisoned");
+        let mut deletions = self
+            .blob_deletions
+            .lock()
+            .expect("blob deletion lock poisoned");
+        let Some(intent_index) = intents.iter().position(|row| {
+            row.intent.object_key == input.new_object_key
+                && row.intent.owner_sub == input.owner_sub
+                && row.intent.file_id == input.file_id
+                && row.intent.expected_object_key.as_deref() == Some(input.expected_object_key)
+                && row.intent.size == input.new_size
+                && row.intent.kind == OWNER_WRITE_REUPLOAD
+                && row.recovery_lease.is_none()
+        }) else {
+            return Ok(OwnerBlobCommit::Conflict);
+        };
+        let Some(file_index) = files.iter().position(|file| {
+            file.id == input.file_id
+                && file.owner_sub == input.owner_sub
+                && file.object_key == input.expected_object_key
+                && file.is_effectively_live()
+        }) else {
+            return Ok(OwnerBlobCommit::Conflict);
+        };
+        if versions
+            .iter()
+            .any(|version| version.id == input.snapshot_id)
+        {
+            return Ok(OwnerBlobCommit::Collision);
+        }
+        let owned_ids: Vec<&str> = files
+            .iter()
+            .filter(|file| file.owner_sub == input.owner_sub)
+            .map(|file| file.id.as_str())
+            .collect();
+        let total = files
+            .iter()
+            .filter(|file| file.owner_sub == input.owner_sub)
+            .map(|file| file.size)
+            .sum::<i64>()
+            .saturating_add(
+                versions
+                    .iter()
+                    .filter(|version| owned_ids.contains(&version.file_id.as_str()))
+                    .map(|version| version.size)
+                    .sum(),
+            )
+            .saturating_add(
+                requests
+                    .reservations
+                    .iter()
+                    .filter(|reservation| reservation.owner_sub == input.owner_sub)
+                    .map(|reservation| reservation.size)
+                    .sum(),
+            )
+            .saturating_add(
+                intents
+                    .iter()
+                    .filter(|row| {
+                        row.intent.owner_sub == input.owner_sub
+                            && row.intent.kind != OWNER_WRITE_THUMBNAIL
+                    })
+                    .map(|row| row.intent.size)
+                    .sum(),
+            );
+        if input.owner_quota.is_some_and(|quota| total > quota) {
+            return Ok(OwnerBlobCommit::QuotaExceeded);
+        }
+        let current = files[file_index].clone();
+        versions.push(VersionRec {
+            id: input.snapshot_id.to_string(),
+            file_id: current.id.clone(),
+            object_key: current.object_key.clone(),
+            size: current.size,
+            content_type: current.content_type.clone(),
+            created_at: input.changed_at,
+        });
+        files[file_index].object_key = input.new_object_key.to_string();
+        files[file_index].size = input.new_size;
+        files[file_index].content_type = input.new_content_type.to_string();
+        files[file_index].updated_at = input
+            .changed_at
+            .max(files[file_index].updated_at.saturating_add(1));
+
+        let mut mine: Vec<VersionRec> = versions
+            .iter()
+            .filter(|version| version.file_id == input.file_id)
+            .cloned()
+            .collect();
+        mine.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        let pruned_ids: Vec<String> = mine
+            .iter()
+            .skip(MAX_VERSIONS_PER_FILE as usize)
+            .map(|version| version.id.clone())
+            .collect();
+        let pruned: Vec<VersionRec> = versions
+            .iter()
+            .filter(|version| pruned_ids.contains(&version.id))
+            .cloned()
+            .collect();
+        versions.retain(|version| !pruned_ids.contains(&version.id));
+        let mut live_keys = vec![files[file_index].object_key.clone()];
+        live_keys.extend(
+            versions
+                .iter()
+                .filter(|version| version.file_id == input.file_id)
+                .map(|version| version.object_key.clone()),
+        );
+        live_keys.push(format!("{}.thumb", files[file_index].object_key));
+        let mut stale_keys = vec![format!("{}.thumb", current.object_key)];
+        for version in pruned {
+            stale_keys.push(version.object_key.clone());
+            stale_keys.push(format!("{}.thumb", version.object_key));
+        }
+        stale_keys.retain(|key| !live_keys.contains(key));
+        stale_keys.sort();
+        stale_keys.dedup();
+        for key in stale_keys {
+            if !deletions.iter().any(|row| row.object_key == key) {
+                deletions.push(MemoryBlobDelete {
+                    object_key: key,
+                    enqueued_at: input.changed_at,
+                    attempts: 0,
+                    next_attempt_at: input.changed_at,
+                    recovery_lease: None,
+                    recovery_leased_at: None,
+                });
+            }
+        }
+        intents.remove(intent_index);
+        Ok(OwnerBlobCommit::Applied)
+    }
+
+    async fn commit_owner_version_restore(
+        &self,
+        input: OwnerVersionRestoreInput<'_>,
+    ) -> Result<OwnerBlobCommit, StoreError> {
+        let _lifecycle = self
+            .lifecycle_guard
+            .lock()
+            .expect("lifecycle guard poisoned");
+        let mut files = self.files.lock().expect("files lock poisoned");
+        let mut versions = self.versions.lock().expect("versions lock poisoned");
+        let mut deletions = self
+            .blob_deletions
+            .lock()
+            .expect("blob deletion lock poisoned");
+        let Some(file_index) = files.iter().position(|file| {
+            file.id == input.file_id
+                && file.owner_sub == input.owner_sub
+                && file.object_key == input.expected_object_key
+                && file.is_effectively_live()
+        }) else {
+            return Ok(OwnerBlobCommit::Conflict);
+        };
+        let Some(version_index) = versions
+            .iter()
+            .position(|version| version.id == input.version_id && version.file_id == input.file_id)
+        else {
+            return Ok(OwnerBlobCommit::Conflict);
+        };
+        if versions
+            .iter()
+            .any(|version| version.id == input.snapshot_id)
+        {
+            return Ok(OwnerBlobCommit::Collision);
+        }
+        let current = files[file_index].clone();
+        let selected = versions[version_index].clone();
+        versions.push(VersionRec {
+            id: input.snapshot_id.to_string(),
+            file_id: current.id.clone(),
+            object_key: current.object_key.clone(),
+            size: current.size,
+            content_type: current.content_type.clone(),
+            created_at: input.changed_at,
+        });
+        versions.retain(|version| version.id != selected.id);
+        files[file_index].object_key = selected.object_key;
+        files[file_index].size = selected.size;
+        files[file_index].content_type = selected.content_type;
+        files[file_index].updated_at = input
+            .changed_at
+            .max(files[file_index].updated_at.saturating_add(1));
+        let mut mine: Vec<VersionRec> = versions
+            .iter()
+            .filter(|version| version.file_id == input.file_id)
+            .cloned()
+            .collect();
+        mine.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        let pruned_ids: Vec<String> = mine
+            .iter()
+            .skip(MAX_VERSIONS_PER_FILE as usize)
+            .map(|version| version.id.clone())
+            .collect();
+        let pruned: Vec<VersionRec> = versions
+            .iter()
+            .filter(|version| pruned_ids.contains(&version.id))
+            .cloned()
+            .collect();
+        versions.retain(|version| !pruned_ids.contains(&version.id));
+        let mut live_keys = vec![files[file_index].object_key.clone()];
+        live_keys.extend(
+            versions
+                .iter()
+                .filter(|version| version.file_id == input.file_id)
+                .map(|version| version.object_key.clone()),
+        );
+        live_keys.push(format!("{}.thumb", files[file_index].object_key));
+        let mut stale_keys = vec![format!("{}.thumb", current.object_key)];
+        for version in pruned {
+            stale_keys.push(version.object_key.clone());
+            stale_keys.push(format!("{}.thumb", version.object_key));
+        }
+        stale_keys.retain(|key| !live_keys.contains(key));
+        stale_keys.sort();
+        stale_keys.dedup();
+        for key in stale_keys {
+            if !deletions.iter().any(|row| row.object_key == key) {
+                deletions.push(MemoryBlobDelete {
+                    object_key: key,
+                    enqueued_at: input.changed_at,
+                    attempts: 0,
+                    next_attempt_at: input.changed_at,
+                    recovery_lease: None,
+                    recovery_leased_at: None,
+                });
+            }
+        }
+        Ok(OwnerBlobCommit::Applied)
+    }
+
+    async fn finalize_owner_thumbnail(
+        &self,
+        object_key: &str,
+        owner_sub: &str,
+        file_id: &str,
+        expected_object_key: &str,
+    ) -> Result<OwnerBlobCommit, StoreError> {
+        let _lifecycle = self
+            .lifecycle_guard
+            .lock()
+            .expect("lifecycle guard poisoned");
+        let files = self.files.lock().expect("files lock poisoned");
+        let mut intents = self
+            .owner_blob_writes
+            .lock()
+            .expect("owner blob writes lock poisoned");
+        let valid_file = files.iter().any(|file| {
+            file.id == file_id
+                && file.owner_sub == owner_sub
+                && file.object_key == expected_object_key
+                && file.is_effectively_live()
+        });
+        let intent_index = intents.iter().position(|row| {
+            row.intent.object_key == object_key
+                && row.intent.owner_sub == owner_sub
+                && row.intent.file_id == file_id
+                && row.intent.expected_object_key.as_deref() == Some(expected_object_key)
+                && row.intent.kind == OWNER_WRITE_THUMBNAIL
+                && row.recovery_lease.is_none()
+        });
+        if !valid_file || intent_index.is_none() {
+            return Ok(OwnerBlobCommit::Conflict);
+        }
+        intents.remove(intent_index.expect("checked intent"));
+        Ok(OwnerBlobCommit::Applied)
+    }
+
+    async fn enqueue_blob_deletion(
+        &self,
+        object_key: &str,
+        enqueued_at: i64,
+        _reason: &str,
+    ) -> Result<(), StoreError> {
+        let _lifecycle = self
+            .lifecycle_guard
+            .lock()
+            .expect("lifecycle guard poisoned");
+        let requests = self
+            .request_state
+            .lock()
+            .expect("request state lock poisoned");
+        let files = self.files.lock().expect("files lock poisoned");
+        let versions = self.versions.lock().expect("versions lock poisoned");
+        let intents = self
+            .owner_blob_writes
+            .lock()
+            .expect("owner blob writes lock poisoned");
+        if requests
+            .reservations
+            .iter()
+            .any(|reservation| reservation.id == object_key)
+            || files.iter().any(|file| file.object_key == object_key)
+            || versions
+                .iter()
+                .any(|version| version.object_key == object_key)
+            || intents
+                .iter()
+                .any(|intent| intent.intent.object_key == object_key)
+        {
+            return Err(StoreError::Backend(format!(
+                "blob deletion key {object_key} still has live authority"
+            )));
+        }
+        let mut rows = self
+            .blob_deletions
+            .lock()
+            .expect("blob deletion lock poisoned");
+        if !rows.iter().any(|row| row.object_key == object_key) {
+            rows.push(MemoryBlobDelete {
+                object_key: object_key.to_string(),
+                enqueued_at,
+                attempts: 0,
+                next_attempt_at: enqueued_at,
+                recovery_lease: None,
+                recovery_leased_at: None,
+            });
+        }
+        Ok(())
+    }
+
+    async fn claim_owner_blob_writes(
+        &self,
+        lease_id: &str,
+        now: i64,
+        created_before: i64,
+        lease_expired_before: i64,
+        limit: i64,
+    ) -> Result<Vec<OwnerBlobWriteIntent>, StoreError> {
+        let mut rows = self
+            .owner_blob_writes
+            .lock()
+            .expect("owner blob writes lock poisoned");
+        let mut candidates: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                row.intent.created_at <= created_before
+                    && row.next_attempt_at <= now
+                    && (row.recovery_lease.is_none()
+                        || row
+                            .recovery_leased_at
+                            .is_some_and(|at| at <= lease_expired_before))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        candidates.sort_by_key(|index| {
+            (
+                rows[*index].next_attempt_at,
+                rows[*index].intent.created_at,
+                rows[*index].intent.object_key.clone(),
+            )
+        });
+        candidates.truncate(clamp_page(limit) as usize);
+        let mut claimed = Vec::with_capacity(candidates.len());
+        for index in candidates {
+            rows[index].recovery_lease = Some(lease_id.to_string());
+            rows[index].recovery_leased_at = Some(now);
+            claimed.push(rows[index].intent.clone());
+        }
+        Ok(claimed)
+    }
+
+    async fn complete_owner_blob_write(
+        &self,
+        object_key: &str,
+        lease_id: &str,
+    ) -> Result<bool, StoreError> {
+        let mut rows = self
+            .owner_blob_writes
+            .lock()
+            .expect("owner blob writes lock poisoned");
+        let before = rows.len();
+        rows.retain(|row| {
+            !(row.intent.object_key == object_key
+                && row.recovery_lease.as_deref() == Some(lease_id))
+        });
+        Ok(rows.len() != before)
+    }
+
+    async fn abandon_owner_blob_write(
+        &self,
+        object_key: &str,
+        lease_id: &str,
+        retry_at: i64,
+    ) -> Result<bool, StoreError> {
+        let mut rows = self
+            .owner_blob_writes
+            .lock()
+            .expect("owner blob writes lock poisoned");
+        let Some(row) = rows.iter_mut().find(|row| {
+            row.intent.object_key == object_key && row.recovery_lease.as_deref() == Some(lease_id)
+        }) else {
+            return Ok(false);
+        };
+        row.intent.attempts = row.intent.attempts.saturating_add(1);
+        row.next_attempt_at = retry_at;
+        row.recovery_lease = None;
+        row.recovery_leased_at = None;
+        Ok(true)
+    }
+
     async fn get(&self, id: &str) -> Result<Option<FileRec>, StoreError> {
         let files = self.files.lock().expect("files lock poisoned");
         Ok(files.iter().find(|f| f.id == id).cloned())
@@ -631,13 +1650,16 @@ impl Store for InMemoryStore {
         let files = self.files.lock().expect("files lock poisoned");
         Ok(files
             .iter()
-            .find(|f| f.trashed_at == 0 && f.share_token.as_deref() == Some(token))
+            .find(|f| f.is_effectively_live() && f.share_token.as_deref() == Some(token))
             .cloned())
     }
 
     async fn bump_view_count(&self, id: &str) -> Result<(), StoreError> {
         let mut files = self.files.lock().expect("files lock poisoned");
-        if let Some(f) = files.iter_mut().find(|f| f.id == id && f.trashed_at == 0) {
+        if let Some(f) = files
+            .iter_mut()
+            .find(|f| f.id == id && f.is_effectively_live())
+        {
             f.view_count += 1;
         }
         Ok(())
@@ -655,7 +1677,7 @@ impl Store for InMemoryStore {
         let mut out: Vec<FileRec> = files
             .iter()
             .filter(|f| f.owner_sub == owner_sub)
-            .filter(|f| f.trashed_at == 0)
+            .filter(|f| f.is_effectively_live())
             // Tree level: `None` = the ROOT (folder_id IS NULL); `Some(id)` = only that folder.
             .filter(|f| match folder {
                 None => f.folder_id.is_none(),
@@ -684,22 +1706,22 @@ impl Store for InMemoryStore {
         query: &LibraryQuery,
     ) -> Result<LibraryPage, StoreError> {
         let now = mutation_time();
-        // Snapshot each collection under its own lock. Folder deletion takes `folders` before
-        // `files`, so holding both here in the opposite order would allow an ABBA deadlock.
-        let files = self.files.lock().expect("files lock poisoned").clone();
-        let folders = self
-            .folders
-            .lock()
-            .expect("folders lock poisoned")
-            .clone();
+        // Use the mutation lock order and clone while both guards are held. A reader can therefore
+        // observe the complete state before or after a subtree lifecycle change, never a hybrid.
+        let folders_guard = self.folders.lock().expect("folders lock poisoned");
+        let files_guard = self.files.lock().expect("files lock poisoned");
+        let folders = folders_guard.clone();
+        let files = files_guard.clone();
+        drop(files_guard);
+        drop(folders_guard);
         let mut items: Vec<LibraryItem> = files
             .iter()
-            .filter(|file| file.owner_sub == owner_sub && file.trashed_at == 0)
+            .filter(|file| file.owner_sub == owner_sub && file.is_effectively_live())
             .map(|file| file_library_item(file, now))
             .chain(
                 folders
                     .iter()
-                    .filter(|folder| folder.owner_sub == owner_sub)
+                    .filter(|folder| folder.owner_sub == owner_sub && folder.is_effectively_live())
                     .map(|folder| folder_library_item(folder, now)),
             )
             .filter(|item| library_item_matches(item, query))
@@ -730,33 +1752,37 @@ impl Store for InMemoryStore {
         owner_sub: &str,
         trashed_at: i64,
     ) -> Result<bool, StoreError> {
-        let mut files = self.files.lock().expect("files lock poisoned");
-        match files
-            .iter_mut()
-            .find(|f| f.id == id && f.owner_sub == owner_sub && f.trashed_at == 0)
-        {
-            Some(f) => {
-                f.trashed_at = trashed_at.max(1);
-                f.updated_at = next_mutation_time(f.updated_at);
-                Ok(true)
-            }
-            None => Ok(false),
-        }
+        let now = trashed_at.max(1);
+        Ok(matches!(
+            self.bulk_trash(
+                owner_sub,
+                &[TrashRootInput {
+                    item: DriveItemRef {
+                        kind: LibraryItemKind::File,
+                        id: id.to_string(),
+                    },
+                    entry_id: format!("compat-file-{id}-{now}"),
+                }],
+                now,
+                now.saturating_add(DEFAULT_TRASH_RETENTION_SECS),
+            )
+            .await?,
+            BulkMutation::Applied { .. }
+        ))
     }
 
     async fn restore_file(&self, id: &str, owner_sub: &str) -> Result<bool, StoreError> {
-        let mut files = self.files.lock().expect("files lock poisoned");
-        match files
-            .iter_mut()
-            .find(|f| f.id == id && f.owner_sub == owner_sub && f.trashed_at > 0)
-        {
-            Some(f) => {
-                f.trashed_at = 0;
-                f.updated_at = next_mutation_time(f.updated_at);
-                Ok(true)
-            }
-            None => Ok(false),
-        }
+        Ok(matches!(
+            self.bulk_restore(
+                owner_sub,
+                &[DriveItemRef {
+                    kind: LibraryItemKind::File,
+                    id: id.to_string(),
+                }],
+            )
+            .await?,
+            BulkMutation::Applied { .. }
+        ))
     }
 
     async fn rename_file(&self, id: &str, owner_sub: &str, name: &str) -> Result<bool, StoreError> {
@@ -789,6 +1815,644 @@ impl Store for InMemoryStore {
         Ok(out)
     }
 
+    async fn query_trash(
+        &self,
+        owner_sub: &str,
+        before: Option<&LibraryCursor>,
+        limit: i64,
+    ) -> Result<TrashPage, StoreError> {
+        // Match lifecycle mutation order and snapshot all three collections under one critical
+        // section so a Trash root and the metadata fields authorizing it cannot diverge.
+        let folders_guard = self.folders.lock().expect("folders lock poisoned");
+        let files_guard = self.files.lock().expect("files lock poisoned");
+        let entries_guard = self.trash_entries.lock().expect("trash lock poisoned");
+        let folders = folders_guard.clone();
+        let files = files_guard.clone();
+        let entries = entries_guard.clone();
+        drop(entries_guard);
+        drop(files_guard);
+        drop(folders_guard);
+        let mut items = Vec::new();
+        for entry in entries.iter().filter(|entry| entry.owner_sub == owner_sub) {
+            let item = match entry.kind {
+                LibraryItemKind::File => files
+                    .iter()
+                    .find(|file| {
+                        file.id == entry.item_id
+                            && file.owner_sub == entry.owner_sub
+                            && file.trash_entry_id.as_deref() == Some(entry.id.as_str())
+                            && file.trash_ancestor_id.is_none()
+                    })
+                    .map(|file| TrashItem {
+                        entry_id: entry.id.clone(),
+                        kind: LibraryItemKind::File,
+                        id: file.id.clone(),
+                        name: file.name.clone(),
+                        content_type: Some(file.content_type.clone()),
+                        size: Some(file.size),
+                        trashed_at: entry.trashed_at,
+                        purge_after: entry.purge_after,
+                    }),
+                LibraryItemKind::Folder => folders
+                    .iter()
+                    .find(|folder| {
+                        folder.id == entry.item_id
+                            && folder.owner_sub == entry.owner_sub
+                            && folder.trash_entry_id.as_deref() == Some(entry.id.as_str())
+                            && folder.trash_ancestor_id.is_none()
+                    })
+                    .map(|folder| TrashItem {
+                        entry_id: entry.id.clone(),
+                        kind: LibraryItemKind::Folder,
+                        id: folder.id.clone(),
+                        name: folder.name.clone(),
+                        content_type: None,
+                        size: None,
+                        trashed_at: entry.trashed_at,
+                        purge_after: entry.purge_after,
+                    }),
+            };
+            if let Some(item) =
+                item.filter(|item| before.is_none_or(|cursor| trash_before(item, cursor)))
+            {
+                items.push(item);
+            }
+        }
+        items.sort_by(|left, right| {
+            right
+                .trashed_at
+                .cmp(&left.trashed_at)
+                .then_with(|| right.kind.rank().cmp(&left.kind.rank()))
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        items.truncate(clamp_page(limit) as usize + 1);
+        Ok(finish_trash_page(items, limit))
+    }
+
+    async fn bulk_trash(
+        &self,
+        owner_sub: &str,
+        roots: &[TrashRootInput],
+        trashed_at: i64,
+        purge_after: i64,
+    ) -> Result<BulkMutation, StoreError> {
+        if roots.is_empty() || roots.len() > MAX_BULK_ITEMS {
+            return Ok(BulkMutation::Conflict);
+        }
+        let mut folders = self.folders.lock().expect("folders lock poisoned");
+        let mut files = self.files.lock().expect("files lock poisoned");
+        let mut entries = self.trash_entries.lock().expect("trash lock poisoned");
+        let mut seen_items: Vec<(LibraryItemKind, &str)> = Vec::new();
+        let mut seen_entries: Vec<&str> = Vec::new();
+        for root in roots {
+            if root.item.id.is_empty()
+                || root.entry_id.is_empty()
+                || seen_items.contains(&(root.item.kind, root.item.id.as_str()))
+                || seen_entries.contains(&root.entry_id.as_str())
+                || entries.iter().any(|entry| entry.id == root.entry_id)
+            {
+                return Ok(BulkMutation::Conflict);
+            }
+            seen_items.push((root.item.kind, &root.item.id));
+            seen_entries.push(&root.entry_id);
+            let valid = match root.item.kind {
+                LibraryItemKind::File => files.iter().any(|file| {
+                    file.id == root.item.id
+                        && file.owner_sub == owner_sub
+                        && file.is_effectively_live()
+                }),
+                LibraryItemKind::Folder => folders.iter().any(|folder| {
+                    folder.id == root.item.id
+                        && folder.owner_sub == owner_sub
+                        && folder.is_effectively_live()
+                }),
+            };
+            if !valid {
+                return Ok(BulkMutation::Conflict);
+            }
+        }
+        let refs: Vec<DriveItemRef> = roots.iter().map(|root| root.item.clone()).collect();
+        let normalized = normalized_refs(&refs, &files, &folders);
+        let folder_snapshot = folders.clone();
+        let now = trashed_at.max(1);
+        for item in &normalized {
+            let root = roots
+                .iter()
+                .find(|root| root.item == *item)
+                .expect("normalized root came from input");
+            entries.push(TrashEntry {
+                id: root.entry_id.clone(),
+                owner_sub: owner_sub.to_string(),
+                kind: item.kind,
+                item_id: item.id.clone(),
+                trashed_at: now,
+                purge_after: purge_after.max(now),
+                recovery_lease: None,
+                recovery_leased_at: None,
+            });
+            match item.kind {
+                LibraryItemKind::File => {
+                    let file = files
+                        .iter_mut()
+                        .find(|file| file.id == item.id)
+                        .expect("validated file");
+                    file.trashed_at = now;
+                    file.trash_entry_id = Some(root.entry_id.clone());
+                    file.updated_at = next_mutation_time(file.updated_at);
+                }
+                LibraryItemKind::Folder => {
+                    let folder = folders
+                        .iter_mut()
+                        .find(|folder| folder.id == item.id)
+                        .expect("validated folder");
+                    folder.trashed_at = now;
+                    folder.trash_entry_id = Some(root.entry_id.clone());
+                    folder.updated_at = next_mutation_time(folder.updated_at);
+                    for descendant in folders.iter_mut().filter(|folder| {
+                        folder.id != item.id
+                            && folder.owner_sub == owner_sub
+                            && folder.trash_ancestor_id.is_none()
+                            && folder_descends_from(&folder_snapshot, &folder.id, &item.id)
+                    }) {
+                        descendant.trash_ancestor_id = Some(root.entry_id.clone());
+                        if descendant.trash_entry_id.is_none() {
+                            descendant.trashed_at = now;
+                        }
+                    }
+                    for file in files.iter_mut().filter(|file| {
+                        file.owner_sub == owner_sub
+                            && file.trash_ancestor_id.is_none()
+                            && file.folder_id.as_deref().is_some_and(|folder_id| {
+                                folder_descends_from(&folder_snapshot, folder_id, &item.id)
+                            })
+                    }) {
+                        file.trash_ancestor_id = Some(root.entry_id.clone());
+                        if file.trash_entry_id.is_none() {
+                            file.trashed_at = now;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(BulkMutation::Applied {
+            changed: normalized.len(),
+        })
+    }
+
+    async fn bulk_restore(
+        &self,
+        owner_sub: &str,
+        items: &[DriveItemRef],
+    ) -> Result<BulkMutation, StoreError> {
+        if items.is_empty() || items.len() > MAX_BULK_ITEMS {
+            return Ok(BulkMutation::Conflict);
+        }
+        let _lifecycle = self
+            .lifecycle_guard
+            .lock()
+            .expect("lifecycle guard poisoned");
+        let mut folders = self.folders.lock().expect("folders lock poisoned");
+        let mut files = self.files.lock().expect("files lock poisoned");
+        let mut entries = self.trash_entries.lock().expect("trash lock poisoned");
+        let mut entry_ids = Vec::new();
+        let mut seen = Vec::new();
+        for item in items {
+            if seen.contains(&(item.kind, item.id.as_str())) {
+                return Ok(BulkMutation::Conflict);
+            }
+            seen.push((item.kind, item.id.as_str()));
+            let entry_id = match item.kind {
+                LibraryItemKind::File => files.iter().find_map(|file| {
+                    (file.id == item.id
+                        && file.owner_sub == owner_sub
+                        && file.trash_ancestor_id.is_none())
+                    .then(|| file.trash_entry_id.clone())
+                    .flatten()
+                }),
+                LibraryItemKind::Folder => folders.iter().find_map(|folder| {
+                    (folder.id == item.id
+                        && folder.owner_sub == owner_sub
+                        && folder.trash_ancestor_id.is_none())
+                    .then(|| folder.trash_entry_id.clone())
+                    .flatten()
+                }),
+            };
+            let Some(entry_id) = entry_id else {
+                return Ok(BulkMutation::Conflict);
+            };
+            if !entries.iter().any(|entry| {
+                entry.id == entry_id
+                    && entry.owner_sub == owner_sub
+                    && entry.kind == item.kind
+                    && entry.item_id == item.id
+            }) {
+                return Ok(BulkMutation::Conflict);
+            }
+            entry_ids.push(entry_id);
+        }
+        for (item, entry_id) in items.iter().zip(&entry_ids) {
+            match item.kind {
+                LibraryItemKind::File => {
+                    let file = files
+                        .iter_mut()
+                        .find(|file| file.id == item.id)
+                        .expect("validated file");
+                    file.trashed_at = 0;
+                    file.trash_entry_id = None;
+                    file.updated_at = next_mutation_time(file.updated_at);
+                }
+                LibraryItemKind::Folder => {
+                    let folder = folders
+                        .iter_mut()
+                        .find(|folder| folder.id == item.id)
+                        .expect("validated folder");
+                    folder.trashed_at = 0;
+                    folder.trash_entry_id = None;
+                    folder.updated_at = next_mutation_time(folder.updated_at);
+                }
+            }
+            for folder in folders
+                .iter_mut()
+                .filter(|folder| folder.trash_ancestor_id.as_deref() == Some(entry_id))
+            {
+                folder.trash_ancestor_id = None;
+                if folder.trash_entry_id.is_none() {
+                    folder.trashed_at = 0;
+                }
+            }
+            for file in files
+                .iter_mut()
+                .filter(|file| file.trash_ancestor_id.as_deref() == Some(entry_id))
+            {
+                file.trash_ancestor_id = None;
+                if file.trash_entry_id.is_none() {
+                    file.trashed_at = 0;
+                }
+            }
+        }
+        entries.retain(|entry| !entry_ids.contains(&entry.id));
+        Ok(BulkMutation::Applied {
+            changed: items.len(),
+        })
+    }
+
+    async fn bulk_move(
+        &self,
+        owner_sub: &str,
+        items: &[DriveItemRef],
+        folder_id: Option<&str>,
+    ) -> Result<BulkMutation, StoreError> {
+        if items.is_empty() || items.len() > MAX_BULK_ITEMS {
+            return Ok(BulkMutation::Conflict);
+        }
+        let mut folders = self.folders.lock().expect("folders lock poisoned");
+        let mut files = self.files.lock().expect("files lock poisoned");
+        if folder_id.is_some_and(|target| {
+            !folders.iter().any(|folder| {
+                folder.id == target && folder.owner_sub == owner_sub && folder.is_effectively_live()
+            })
+        }) {
+            return Ok(BulkMutation::Conflict);
+        }
+        let mut seen = Vec::new();
+        for item in items {
+            if seen.contains(&(item.kind, item.id.as_str())) {
+                return Ok(BulkMutation::Conflict);
+            }
+            seen.push((item.kind, item.id.as_str()));
+            let valid = match item.kind {
+                LibraryItemKind::File => files.iter().any(|file| {
+                    file.id == item.id && file.owner_sub == owner_sub && file.is_effectively_live()
+                }),
+                LibraryItemKind::Folder => folders.iter().any(|folder| {
+                    folder.id == item.id
+                        && folder.owner_sub == owner_sub
+                        && folder.is_effectively_live()
+                }),
+            };
+            if !valid {
+                return Ok(BulkMutation::Conflict);
+            }
+            if item.kind == LibraryItemKind::Folder
+                && folder_id.is_some_and(|target| {
+                    target == item.id || folder_descends_from(&folders, target, &item.id)
+                })
+            {
+                return Ok(BulkMutation::Conflict);
+            }
+        }
+        let normalized = normalized_refs(items, &files, &folders);
+        let target = folder_id.map(str::to_string);
+        for item in &normalized {
+            match item.kind {
+                LibraryItemKind::File => {
+                    let file = files
+                        .iter_mut()
+                        .find(|file| file.id == item.id)
+                        .expect("validated file");
+                    file.folder_id = target.clone();
+                    file.updated_at = next_mutation_time(file.updated_at);
+                }
+                LibraryItemKind::Folder => {
+                    let folder = folders
+                        .iter_mut()
+                        .find(|folder| folder.id == item.id)
+                        .expect("validated folder");
+                    folder.parent_id = target.clone();
+                    folder.updated_at = next_mutation_time(folder.updated_at);
+                }
+            }
+        }
+        Ok(BulkMutation::Applied {
+            changed: normalized.len(),
+        })
+    }
+
+    async fn bulk_purge(
+        &self,
+        owner_sub: &str,
+        items: &[DriveItemRef],
+        enqueued_at: i64,
+    ) -> Result<BulkMutation, StoreError> {
+        if items.is_empty() || items.len() > MAX_BULK_ITEMS {
+            return Ok(BulkMutation::Conflict);
+        }
+        let _lifecycle = self
+            .lifecycle_guard
+            .lock()
+            .expect("lifecycle guard poisoned");
+        let mut requests = self
+            .request_state
+            .lock()
+            .expect("request state lock poisoned");
+        let mut folders = self.folders.lock().expect("folders lock poisoned");
+        let mut files = self.files.lock().expect("files lock poisoned");
+        let mut versions = self.versions.lock().expect("versions lock poisoned");
+        let mut comments = self.comments.lock().expect("comments lock poisoned");
+        let mut entries = self.trash_entries.lock().expect("trash lock poisoned");
+        let mut deletions = self
+            .blob_deletions
+            .lock()
+            .expect("blob deletion lock poisoned");
+        let mut seen = Vec::new();
+        for item in items {
+            if seen.contains(&(item.kind, item.id.as_str())) {
+                return Ok(BulkMutation::Conflict);
+            }
+            seen.push((item.kind, item.id.as_str()));
+            let entry_id = match item.kind {
+                LibraryItemKind::File => files.iter().find_map(|file| {
+                    (file.id == item.id
+                        && file.owner_sub == owner_sub
+                        && file.trash_ancestor_id.is_none())
+                    .then(|| file.trash_entry_id.clone())
+                    .flatten()
+                }),
+                LibraryItemKind::Folder => folders.iter().find_map(|folder| {
+                    (folder.id == item.id
+                        && folder.owner_sub == owner_sub
+                        && folder.trash_ancestor_id.is_none())
+                    .then(|| folder.trash_entry_id.clone())
+                    .flatten()
+                }),
+            };
+            let exact = entry_id.is_some_and(|entry_id| {
+                entries.iter().any(|entry| {
+                    entry.id == entry_id
+                        && entry.owner_sub == owner_sub
+                        && entry.kind == item.kind
+                        && entry.item_id == item.id
+                })
+            });
+            if !exact {
+                return Ok(BulkMutation::Conflict);
+            }
+        }
+        let normalized = normalized_refs(items, &files, &folders);
+        let folder_snapshot = folders.clone();
+        let mut doomed_folders: Vec<String> = Vec::new();
+        let mut doomed_files: Vec<String> = normalized
+            .iter()
+            .filter(|item| item.kind == LibraryItemKind::File)
+            .map(|item| item.id.clone())
+            .collect();
+        for root in normalized
+            .iter()
+            .filter(|item| item.kind == LibraryItemKind::Folder)
+        {
+            doomed_folders.extend(
+                folder_snapshot
+                    .iter()
+                    .filter(|folder| {
+                        folder.owner_sub == owner_sub
+                            && folder_descends_from(&folder_snapshot, &folder.id, &root.id)
+                    })
+                    .map(|folder| folder.id.clone()),
+            );
+        }
+        doomed_folders.sort();
+        doomed_folders.dedup();
+        doomed_files.extend(
+            files
+                .iter()
+                .filter(|file| {
+                    file.owner_sub == owner_sub
+                        && file
+                            .folder_id
+                            .as_ref()
+                            .is_some_and(|folder| doomed_folders.contains(folder))
+                })
+                .map(|file| file.id.clone()),
+        );
+        doomed_files.sort();
+        doomed_files.dedup();
+        let mut keys: Vec<String> = files
+            .iter()
+            .filter(|file| doomed_files.contains(&file.id))
+            .map(|file| file.object_key.clone())
+            .chain(
+                versions
+                    .iter()
+                    .filter(|version| doomed_files.contains(&version.file_id))
+                    .map(|version| version.object_key.clone()),
+            )
+            .collect();
+        let thumbs: Vec<String> = keys.iter().map(|key| format!("{key}.thumb")).collect();
+        keys.extend(thumbs);
+        keys.sort();
+        keys.dedup();
+        for key in keys {
+            if !deletions.iter().any(|entry| entry.object_key == key) {
+                deletions.push(MemoryBlobDelete {
+                    object_key: key,
+                    enqueued_at,
+                    attempts: 0,
+                    next_attempt_at: enqueued_at,
+                    recovery_lease: None,
+                    recovery_leased_at: None,
+                });
+            }
+        }
+        versions.retain(|version| !doomed_files.contains(&version.file_id));
+        comments.retain(|comment| !doomed_files.contains(&comment.file_id));
+        files.retain(|file| !doomed_files.contains(&file.id));
+        for request in requests.requests.iter_mut().filter(|request| {
+            request.owner_sub == owner_sub && doomed_folders.contains(&request.folder_id)
+        }) {
+            request.status = "closed".to_string();
+            request.updated_at = enqueued_at;
+        }
+        folders.retain(|folder| !doomed_folders.contains(&folder.id));
+        entries.retain(|entry| match entry.kind {
+            LibraryItemKind::File => !doomed_files.contains(&entry.item_id),
+            LibraryItemKind::Folder => !doomed_folders.contains(&entry.item_id),
+        });
+        Ok(BulkMutation::Applied {
+            changed: normalized.len(),
+        })
+    }
+
+    async fn claim_expired_trash(
+        &self,
+        lease_id: &str,
+        now: i64,
+        lease_expired_before: i64,
+        limit: i64,
+    ) -> Result<Vec<TrashEntry>, StoreError> {
+        let folders = self.folders.lock().expect("folders lock poisoned");
+        let files = self.files.lock().expect("files lock poisoned");
+        let mut entries = self.trash_entries.lock().expect("trash lock poisoned");
+        let mut candidates: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry.purge_after <= now
+                    && (entry.recovery_lease.is_none()
+                        || entry
+                            .recovery_leased_at
+                            .is_some_and(|leased| leased <= lease_expired_before))
+                    && match entry.kind {
+                        LibraryItemKind::File => files.iter().any(|file| {
+                            file.id == entry.item_id
+                                && file.owner_sub == entry.owner_sub
+                                && file.trash_entry_id.as_deref() == Some(entry.id.as_str())
+                                && file.trash_ancestor_id.is_none()
+                        }),
+                        LibraryItemKind::Folder => folders.iter().any(|folder| {
+                            folder.id == entry.item_id
+                                && folder.owner_sub == entry.owner_sub
+                                && folder.trash_entry_id.as_deref() == Some(entry.id.as_str())
+                                && folder.trash_ancestor_id.is_none()
+                        }),
+                    }
+            })
+            .map(|(index, _)| index)
+            .collect();
+        candidates.sort_by_key(|index| (entries[*index].purge_after, entries[*index].id.clone()));
+        candidates.truncate(clamp_page(limit) as usize);
+        let mut claimed = Vec::new();
+        for index in candidates {
+            entries[index].recovery_lease = Some(lease_id.to_string());
+            entries[index].recovery_leased_at = Some(now);
+            claimed.push(entries[index].clone());
+        }
+        Ok(claimed)
+    }
+
+    async fn abandon_trash_claim(
+        &self,
+        entry_id: &str,
+        lease_id: &str,
+    ) -> Result<bool, StoreError> {
+        let mut entries = self.trash_entries.lock().expect("trash lock poisoned");
+        let Some(entry) = entries.iter_mut().find(|entry| {
+            entry.id == entry_id && entry.recovery_lease.as_deref() == Some(lease_id)
+        }) else {
+            return Ok(false);
+        };
+        entry.recovery_lease = None;
+        entry.recovery_leased_at = None;
+        Ok(true)
+    }
+
+    async fn claim_blob_deletions(
+        &self,
+        lease_id: &str,
+        now: i64,
+        lease_expired_before: i64,
+        limit: i64,
+    ) -> Result<BlobDeleteClaim, StoreError> {
+        let mut rows = self
+            .blob_deletions
+            .lock()
+            .expect("blob deletion lock poisoned");
+        let mut candidates: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                row.next_attempt_at <= now
+                    && (row.recovery_lease.is_none()
+                        || row
+                            .recovery_leased_at
+                            .is_some_and(|leased| leased <= lease_expired_before))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        candidates.sort_by_key(|index| (rows[*index].enqueued_at, rows[*index].object_key.clone()));
+        candidates.truncate(clamp_page(limit) as usize);
+        if candidates.is_empty() {
+            return Ok(BlobDeleteClaim::Empty);
+        }
+        let mut claimed = Vec::new();
+        for index in candidates {
+            rows[index].recovery_lease = Some(lease_id.to_string());
+            rows[index].recovery_leased_at = Some(now);
+            claimed.push(BlobDeleteItem {
+                object_key: rows[index].object_key.clone(),
+                attempts: rows[index].attempts,
+            });
+        }
+        Ok(BlobDeleteClaim::Claimed(claimed))
+    }
+
+    async fn complete_blob_deletion(
+        &self,
+        object_key: &str,
+        lease_id: &str,
+    ) -> Result<bool, StoreError> {
+        let mut rows = self
+            .blob_deletions
+            .lock()
+            .expect("blob deletion lock poisoned");
+        let before = rows.len();
+        rows.retain(|row| {
+            !(row.object_key == object_key && row.recovery_lease.as_deref() == Some(lease_id))
+        });
+        Ok(rows.len() != before)
+    }
+
+    async fn abandon_blob_deletion(
+        &self,
+        object_key: &str,
+        lease_id: &str,
+        retry_at: i64,
+    ) -> Result<bool, StoreError> {
+        let mut rows = self
+            .blob_deletions
+            .lock()
+            .expect("blob deletion lock poisoned");
+        let Some(row) = rows.iter_mut().find(|row| {
+            row.object_key == object_key && row.recovery_lease.as_deref() == Some(lease_id)
+        }) else {
+            return Ok(false);
+        };
+        row.attempts = row.attempts.saturating_add(1);
+        row.next_attempt_at = retry_at;
+        row.recovery_lease = None;
+        row.recovery_leased_at = None;
+        Ok(true)
+    }
+
     async fn configure_share(
         &self,
         id: &str,
@@ -800,7 +2464,7 @@ impl Store for InMemoryStore {
         let mut files = self.files.lock().expect("files lock poisoned");
         match files
             .iter_mut()
-            .find(|f| f.id == id && f.owner_sub == owner_sub)
+            .find(|f| f.id == id && f.owner_sub == owner_sub && f.is_effectively_live())
         {
             Some(f) => {
                 f.share_token = share_token;
@@ -814,8 +2478,21 @@ impl Store for InMemoryStore {
     }
 
     async fn create_folder(&self, folder: &FolderRec) -> Result<bool, StoreError> {
+        let _lifecycle = self
+            .lifecycle_guard
+            .lock()
+            .expect("lifecycle guard poisoned");
         let mut folders = self.folders.lock().expect("folders lock poisoned");
-        if folders.iter().any(|f| f.id == folder.id) {
+        if folder.parent_id.as_deref() == Some(folder.id.as_str())
+            || folders.iter().any(|f| f.id == folder.id)
+            || folder.parent_id.as_deref().is_some_and(|parent_id| {
+                !folders.iter().any(|parent| {
+                    parent.id == parent_id
+                        && parent.owner_sub == folder.owner_sub
+                        && parent.is_effectively_live()
+                })
+            })
+        {
             return Ok(false);
         }
         folders.push(folder.clone());
@@ -826,7 +2503,7 @@ impl Store for InMemoryStore {
         let folders = self.folders.lock().expect("folders lock poisoned");
         let mut out: Vec<FolderRec> = folders
             .iter()
-            .filter(|f| f.owner_sub == owner_sub)
+            .filter(|f| f.owner_sub == owner_sub && f.is_effectively_live())
             .cloned()
             .collect();
         // Name-ordered (case-insensitive), id as a deterministic tiebreak — matches the Pg index.
@@ -843,7 +2520,19 @@ impl Store for InMemoryStore {
         let folders = self.folders.lock().expect("folders lock poisoned");
         Ok(folders
             .iter()
-            .find(|f| f.id == id && f.owner_sub == owner_sub)
+            .find(|f| f.id == id && f.owner_sub == owner_sub && f.is_effectively_live())
+            .cloned())
+    }
+
+    async fn get_folder_any(
+        &self,
+        id: &str,
+        owner_sub: &str,
+    ) -> Result<Option<FolderRec>, StoreError> {
+        let folders = self.folders.lock().expect("folders lock poisoned");
+        Ok(folders
+            .iter()
+            .find(|folder| folder.id == id && folder.owner_sub == owner_sub)
             .cloned())
     }
 
@@ -851,7 +2540,7 @@ impl Store for InMemoryStore {
         let folders = self.folders.lock().expect("folders lock poisoned");
         Ok(folders
             .iter()
-            .find(|f| f.share_token.as_deref() == Some(token))
+            .find(|f| f.is_effectively_live() && f.share_token.as_deref() == Some(token))
             .cloned())
     }
 
@@ -862,7 +2551,7 @@ impl Store for InMemoryStore {
         let folders = self.folders.lock().expect("folders lock poisoned");
         Ok(folders
             .iter()
-            .find(|f| f.upload_token.as_deref() == Some(token))
+            .find(|f| f.is_effectively_live() && f.upload_token.as_deref() == Some(token))
             .cloned())
     }
 
@@ -875,7 +2564,7 @@ impl Store for InMemoryStore {
         let mut folders = self.folders.lock().expect("folders lock poisoned");
         match folders
             .iter_mut()
-            .find(|f| f.id == id && f.owner_sub == owner_sub)
+            .find(|f| f.id == id && f.owner_sub == owner_sub && f.is_effectively_live())
         {
             Some(f) => {
                 f.name = name.to_string();
@@ -897,7 +2586,7 @@ impl Store for InMemoryStore {
         let mut folders = self.folders.lock().expect("folders lock poisoned");
         match folders
             .iter_mut()
-            .find(|f| f.id == id && f.owner_sub == owner_sub)
+            .find(|f| f.id == id && f.owner_sub == owner_sub && f.is_effectively_live())
         {
             Some(f) => {
                 f.share_token = share_token;
@@ -919,7 +2608,7 @@ impl Store for InMemoryStore {
         let mut folders = self.folders.lock().expect("folders lock poisoned");
         match folders
             .iter_mut()
-            .find(|f| f.id == id && f.owner_sub == owner_sub)
+            .find(|f| f.id == id && f.owner_sub == owner_sub && f.is_effectively_live())
         {
             Some(f) => {
                 f.upload_token = upload_token;
@@ -1050,7 +2739,7 @@ impl Store for InMemoryStore {
             .iter()
             .filter(|f| {
                 f.owner_sub == owner_sub
-                    && f.trashed_at == 0
+                    && f.is_effectively_live()
                     && f.folder_id.as_deref() == Some(folder_id)
             })
             .cloned()
@@ -1074,7 +2763,7 @@ impl Store for InMemoryStore {
             .iter()
             .find(|f| {
                 f.owner_sub == owner_sub
-                    && f.trashed_at == 0
+                    && f.is_effectively_live()
                     && f.name == name
                     && f.folder_id.as_deref() == folder_id
             })
@@ -1334,10 +3023,27 @@ impl Store for InMemoryStore {
     }
 
     async fn create_upload_request(&self, request: &UploadRequestRec) -> Result<bool, StoreError> {
+        let _lifecycle = self
+            .lifecycle_guard
+            .lock()
+            .expect("lifecycle guard poisoned");
         let mut state = self
             .request_state
             .lock()
             .expect("request state lock poisoned");
+        if !self
+            .folders
+            .lock()
+            .expect("folders lock poisoned")
+            .iter()
+            .any(|folder| {
+                folder.id == request.folder_id
+                    && folder.owner_sub == request.owner_sub
+                    && folder.is_effectively_live()
+            })
+        {
+            return Ok(false);
+        }
         if state
             .requests
             .iter()
@@ -1439,13 +3145,28 @@ impl Store for InMemoryStore {
             .request_state
             .lock()
             .expect("request state lock poisoned");
-        let Some(request) = state
+        let Some(index) = state
             .requests
-            .iter_mut()
-            .find(|item| item.id == id && item.owner_sub == owner_sub)
+            .iter()
+            .position(|item| item.id == id && item.owner_sub == owner_sub)
         else {
             return Ok(false);
         };
+        let folder_id = state.requests[index].folder_id.clone();
+        if !self
+            .folders
+            .lock()
+            .expect("folders lock poisoned")
+            .iter()
+            .any(|folder| {
+                folder.id == folder_id
+                    && folder.owner_sub == owner_sub
+                    && folder.is_effectively_live()
+            })
+        {
+            return Ok(false);
+        }
+        let request = &mut state.requests[index];
         request.status = status.to_string();
         request.updated_at = updated_at;
         Ok(true)
@@ -1462,13 +3183,28 @@ impl Store for InMemoryStore {
             .request_state
             .lock()
             .expect("request state lock poisoned");
-        let Some(request) = state
+        let Some(index) = state
             .requests
-            .iter_mut()
-            .find(|item| item.id == id && item.owner_sub == owner_sub)
+            .iter()
+            .position(|item| item.id == id && item.owner_sub == owner_sub)
         else {
             return Ok(false);
         };
+        let folder_id = state.requests[index].folder_id.clone();
+        if !self
+            .folders
+            .lock()
+            .expect("folders lock poisoned")
+            .iter()
+            .any(|folder| {
+                folder.id == folder_id
+                    && folder.owner_sub == owner_sub
+                    && folder.is_effectively_live()
+            })
+        {
+            return Ok(false);
+        }
+        let request = &mut state.requests[index];
         if request.is_expired(now) {
             request.expires_at = Some(renewed_expires_at);
         }
@@ -1552,6 +3288,10 @@ impl Store for InMemoryStore {
             owner_quota,
             now,
         } = input;
+        let _lifecycle = self
+            .lifecycle_guard
+            .lock()
+            .expect("lifecycle guard poisoned");
         let mut state = self
             .request_state
             .lock()
@@ -1567,6 +3307,19 @@ impl Store for InMemoryStore {
         if !capability_token_eq(&request.token, expected_token)
             || !request.is_open()
             || request.is_expired(now)
+        {
+            return Ok(UploadReserve::Unavailable);
+        }
+        if !self
+            .folders
+            .lock()
+            .expect("folders lock poisoned")
+            .iter()
+            .any(|folder| {
+                folder.id == request.folder_id
+                    && folder.owner_sub == request.owner_sub
+                    && folder.is_effectively_live()
+            })
         {
             return Ok(UploadReserve::Unavailable);
         }
@@ -1618,10 +3371,22 @@ impl Store for InMemoryStore {
             .filter(|reservation| reservation.owner_sub == request.owner_sub)
             .map(|reservation| reservation.size)
             .sum();
+        let owner_writes: i64 = self
+            .owner_blob_writes
+            .lock()
+            .expect("owner blob writes lock poisoned")
+            .iter()
+            .filter(|row| {
+                row.intent.owner_sub == request.owner_sub
+                    && row.intent.kind != OWNER_WRITE_THUMBNAIL
+            })
+            .map(|row| row.intent.size)
+            .sum();
         if owner_quota.is_some_and(|quota| {
             committed
                 .saturating_add(version_bytes)
                 .saturating_add(reserved)
+                .saturating_add(owner_writes)
                 .saturating_add(size)
                 > quota
         }) {
@@ -1650,6 +3415,10 @@ impl Store for InMemoryStore {
         file: &FileRec,
         submission: &UploadSubmission,
     ) -> Result<bool, StoreError> {
+        let _lifecycle = self
+            .lifecycle_guard
+            .lock()
+            .expect("lifecycle guard poisoned");
         let mut state = self
             .request_state
             .lock()
@@ -1666,10 +3435,15 @@ impl Store for InMemoryStore {
             return Ok(false);
         }
         if file.id != reservation.id
+            || file.object_key != reservation.id
             || file.owner_sub != reservation.owner_sub
             || file.size != reservation.size
+            || !file.is_effectively_live()
             || submission.request_id != reservation.request_id
             || submission.file_id != file.id
+            || submission.name != file.name
+            || submission.content_type != file.content_type
+            || submission.size != file.size
         {
             return Ok(false);
         }
@@ -1677,6 +3451,19 @@ impl Store for InMemoryStore {
             .submissions
             .iter()
             .any(|item| item.id == submission.id || item.file_id == submission.file_id)
+        {
+            return Ok(false);
+        }
+        if !self
+            .folders
+            .lock()
+            .expect("folders lock poisoned")
+            .iter()
+            .any(|folder| {
+                file.folder_id.as_deref() == Some(folder.id.as_str())
+                    && folder.owner_sub == file.owner_sub
+                    && folder.is_effectively_live()
+            })
         {
             return Ok(false);
         }
@@ -1829,7 +3616,7 @@ impl Store for InMemoryStore {
 // `block_in_place` and NO sync-over-async, so a query never blocks a worker thread.
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
-use sqlx::{Postgres, QueryBuilder, Row};
+use sqlx::{Postgres, QueryBuilder, Row, Transaction};
 
 fn push_library_cursor(
     query: &mut QueryBuilder<'_, Postgres>,
@@ -1894,12 +3681,13 @@ fn push_library_file_type(query: &mut QueryBuilder<'_, Postgres>, filter: Librar
 
 /// Column list shared by every SELECT, so the row decoder stays in lock-step with the query.
 const COLS: &str = "id, owner_sub, name, content_type, size, bucket, object_key, share_token, \
-     created_at, updated_at, expires_at, share_password_hash, folder_id, trashed_at, view_count";
+     created_at, updated_at, expires_at, share_password_hash, folder_id, trashed_at, \
+     trash_entry_id, trash_ancestor_id, view_count";
 
 /// Column list shared by every folder SELECT.
 const FOLDER_COLS: &str =
     "id, owner_sub, parent_id, name, created_at, updated_at, share_token, expires_at, share_password_hash, \
-     upload_token";
+     upload_token, trashed_at, trash_entry_id, trash_ancestor_id";
 
 /// Column list shared by every version SELECT.
 const VERSION_COLS: &str = "id, file_id, object_key, size, content_type, created_at";
@@ -1930,6 +3718,97 @@ impl PgStore {
     /// Construct from an existing pool (used by tests that share a pool).
     pub fn from_pool(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    async fn lock_owner_storage_guard_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        owner_sub: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO owner_storage_guards (owner_sub) VALUES ($1) ON CONFLICT DO NOTHING",
+        )
+        .bind(owner_sub)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query("SELECT owner_sub FROM owner_storage_guards WHERE owner_sub = $1 FOR UPDATE")
+            .bind(owner_sub)
+            .fetch_one(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
+    /// Permanent per-key mutex. Rows intentionally survive authority deletion so a key can never
+    /// suffer an ABA window between independent metadata tables. The row is only a lock sentinel;
+    /// the authoritative collision decision still comes from the live tables below the lock.
+    async fn lock_blob_key_guard_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        object_key: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("INSERT INTO blob_key_guards (object_key) VALUES ($1) ON CONFLICT DO NOTHING")
+            .bind(object_key)
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("SELECT object_key FROM blob_key_guards WHERE object_key = $1 FOR UPDATE")
+            .bind(object_key)
+            .fetch_one(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
+    async fn owner_usage_with_pending_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        owner_sub: &str,
+    ) -> Result<i64, sqlx::Error> {
+        sqlx::query(
+            "SELECT CAST(\
+                 COALESCE((SELECT SUM(size) FROM files WHERE owner_sub = $1), 0) + \
+                 COALESCE((SELECT SUM(v.size) FROM file_versions v \
+                           JOIN files f ON f.id = v.file_id WHERE f.owner_sub = $1), 0) + \
+                 COALESCE((SELECT SUM(size) FROM upload_reservations WHERE owner_sub = $1), 0) + \
+                 COALESCE((SELECT SUM(size) FROM owner_blob_write_intents \
+                           WHERE owner_sub = $1 AND write_kind <> 'thumbnail'), 0) \
+                 AS BIGINT) AS bytes",
+        )
+        .bind(owner_sub)
+        .fetch_one(&mut **tx)
+        .await?
+        .try_get("bytes")
+    }
+
+    async fn enqueue_blob_delete_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        object_key: &str,
+        enqueued_at: i64,
+        reason: &str,
+    ) -> Result<(), sqlx::Error> {
+        Self::lock_blob_key_guard_tx(tx, object_key).await?;
+        sqlx::query(
+            "INSERT INTO blob_delete_queue \
+                 (object_key, enqueued_at, next_attempt_at, reason) \
+             VALUES ($1, $2, $2, $3) ON CONFLICT DO NOTHING",
+        )
+        .bind(object_key)
+        .bind(enqueued_at)
+        .bind(reason)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    fn owner_blob_write_from_row(
+        row: &sqlx::postgres::PgRow,
+    ) -> Result<OwnerBlobWriteIntent, sqlx::Error> {
+        Ok(OwnerBlobWriteIntent {
+            object_key: row.try_get("object_key")?,
+            owner_sub: row.try_get("owner_sub")?,
+            size: row.try_get("size")?,
+            kind: row.try_get("write_kind")?,
+            file_id: row.try_get("file_id")?,
+            folder_id: row.try_get("folder_id")?,
+            expected_object_key: row.try_get("expected_object_key")?,
+            created_at: row.try_get("created_at")?,
+            attempts: row.try_get("attempts")?,
+        })
     }
 
     /// Idempotent, portable migration. Standard SQL only — safe to run on every startup. The
@@ -1994,6 +3873,12 @@ impl PgStore {
         sqlx::query("ALTER TABLE files ADD COLUMN IF NOT EXISTS trashed_at BIGINT DEFAULT 0")
             .execute(&self.pool)
             .await?;
+        sqlx::query("ALTER TABLE files ADD COLUMN IF NOT EXISTS trash_entry_id TEXT")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("ALTER TABLE files ADD COLUMN IF NOT EXISTS trash_ancestor_id TEXT")
+            .execute(&self.pool)
+            .await?;
         // Public landing-page opens. Direct `/s/{token}` blob fetches intentionally do not update
         // this counter, preserving hotlink/backward-compatible byte behavior.
         sqlx::query("ALTER TABLE files ADD COLUMN IF NOT EXISTS view_count BIGINT DEFAULT 0")
@@ -2048,6 +3933,197 @@ impl PgStore {
         sqlx::query("ALTER TABLE folders ADD COLUMN IF NOT EXISTS upload_token TEXT")
             .execute(&self.pool)
             .await?;
+        // Unified Trash is a forward-only, single-active migration: an older binary does not know
+        // folder ancestor scope and must never run concurrently after these columns are in use.
+        sqlx::query("ALTER TABLE folders ADD COLUMN IF NOT EXISTS trashed_at BIGINT DEFAULT 0")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("ALTER TABLE folders ADD COLUMN IF NOT EXISTS trash_entry_id TEXT")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("ALTER TABLE folders ADD COLUMN IF NOT EXISTS trash_ancestor_id TEXT")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("UPDATE folders SET trashed_at = 0 WHERE trashed_at IS NULL")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("ALTER TABLE folders ALTER COLUMN trashed_at SET NOT NULL")
+            .execute(&self.pool)
+            .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS trash_entries (\
+                 id TEXT PRIMARY KEY, \
+                 owner_sub TEXT NOT NULL, \
+                 item_kind TEXT NOT NULL, \
+                 item_id TEXT NOT NULL, \
+                 trashed_at BIGINT NOT NULL, \
+                 purge_after BIGINT NOT NULL, \
+                 recovery_lease TEXT, \
+                 recovery_leased_at BIGINT, \
+                 UNIQUE(owner_sub, item_kind, item_id)\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_trash_owner_order \
+             ON trash_entries (owner_sub, trashed_at DESC, item_kind DESC, item_id DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_trash_expiry \
+             ON trash_entries (purge_after, id)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS blob_delete_queue (\
+                 object_key TEXT PRIMARY KEY, \
+                 enqueued_at BIGINT NOT NULL, \
+                 attempts BIGINT NOT NULL DEFAULT 0, \
+                 next_attempt_at BIGINT NOT NULL, \
+                 recovery_lease TEXT, \
+                 recovery_leased_at BIGINT, \
+                 reason TEXT NOT NULL\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_blob_delete_due \
+             ON blob_delete_queue (next_attempt_at, enqueued_at, object_key)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Owner uploads and derived thumbnails persist cleanup authority before touching Cairn.
+        // Finalization consumes this row in the same transaction as the metadata CAS; a crash on
+        // either side of `put` therefore leaves an idempotently recoverable object key.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS owner_blob_write_intents (\
+                 object_key TEXT PRIMARY KEY, \
+                 owner_sub TEXT NOT NULL, \
+                 size BIGINT NOT NULL, \
+                 write_kind TEXT NOT NULL, \
+                 file_id TEXT NOT NULL, \
+                 folder_id TEXT, \
+                 expected_object_key TEXT, \
+                 created_at BIGINT NOT NULL, \
+                 attempts BIGINT NOT NULL DEFAULT 0, \
+                 next_attempt_at BIGINT NOT NULL, \
+                 recovery_lease TEXT, \
+                 recovery_leased_at BIGINT\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_owner_blob_write_due \
+             ON owner_blob_write_intents (next_attempt_at, created_at, object_key)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_owner_blob_write_owner_kind \
+             ON owner_blob_write_intents (owner_sub, write_kind)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Legacy file Trash receives a fresh full retention window from migration time. Lock and
+        // materialize every source before binding it to authority: a deterministic id occupied by a
+        // different row is corruption, while a partial prior migration may already have created the
+        // exact `(owner, file, item)` row under a different id. Both discovery and source update live
+        // in one transaction, so a failed collision never leaves a newly-bound file behind.
+        let migration_now = mutation_time();
+        let legacy_purge_after = migration_now.saturating_add(DEFAULT_TRASH_RETENTION_SECS);
+        let mut trash_tx = self.pool.begin().await?;
+        let legacy_rows = sqlx::query(
+            "SELECT id, owner_sub, trashed_at FROM files \
+             WHERE trashed_at <> 0 AND trash_entry_id IS NULL ORDER BY id ASC FOR UPDATE",
+        )
+        .fetch_all(&mut *trash_tx)
+        .await?;
+        for row in legacy_rows {
+            let file_id: String = row.try_get("id")?;
+            let owner_sub: String = row.try_get("owner_sub")?;
+            let trashed_at: i64 = row.try_get("trashed_at")?;
+            let exact = sqlx::query(
+                "SELECT id FROM trash_entries WHERE owner_sub = $1 AND item_kind = 'file' \
+                 AND item_id = $2 FOR UPDATE",
+            )
+            .bind(&owner_sub)
+            .bind(&file_id)
+            .fetch_optional(&mut *trash_tx)
+            .await?;
+            let entry_id = if let Some(exact) = exact {
+                let entry_id: String = exact.try_get("id")?;
+                sqlx::query(
+                    "UPDATE trash_entries SET purge_after = CASE WHEN purge_after < $1 THEN $1 \
+                     ELSE purge_after END WHERE id = $2 AND owner_sub = $3 \
+                     AND item_kind = 'file' AND item_id = $4",
+                )
+                .bind(legacy_purge_after)
+                .bind(&entry_id)
+                .bind(&owner_sub)
+                .bind(&file_id)
+                .execute(&mut *trash_tx)
+                .await?;
+                entry_id
+            } else {
+                let deterministic_id = format!("legacy-file-{file_id}");
+                if sqlx::query("SELECT 1 FROM trash_entries WHERE id = $1 FOR UPDATE")
+                    .bind(&deterministic_id)
+                    .fetch_optional(&mut *trash_tx)
+                    .await?
+                    .is_some()
+                {
+                    trash_tx.rollback().await?;
+                    return Err(sqlx::Error::Protocol(format!(
+                        "legacy Trash id conflict for file {file_id}"
+                    )));
+                }
+                let inserted = sqlx::query(
+                    "INSERT INTO trash_entries \
+                         (id, owner_sub, item_kind, item_id, trashed_at, purge_after) \
+                     VALUES ($1, $2, 'file', $3, $4, $5) ON CONFLICT DO NOTHING",
+                )
+                .bind(&deterministic_id)
+                .bind(&owner_sub)
+                .bind(&file_id)
+                .bind(trashed_at)
+                .bind(legacy_purge_after)
+                .execute(&mut *trash_tx)
+                .await?;
+                if inserted.rows_affected() != 1 {
+                    trash_tx.rollback().await?;
+                    return Err(sqlx::Error::Protocol(format!(
+                        "legacy Trash authority conflict for file {file_id}"
+                    )));
+                }
+                deterministic_id
+            };
+            let bound = sqlx::query(
+                "UPDATE files SET trash_entry_id = $1 WHERE id = $2 AND owner_sub = $3 \
+                 AND trashed_at = $4 AND trash_entry_id IS NULL",
+            )
+            .bind(&entry_id)
+            .bind(&file_id)
+            .bind(&owner_sub)
+            .bind(trashed_at)
+            .execute(&mut *trash_tx)
+            .await?;
+            if bound.rows_affected() != 1 {
+                trash_tx.rollback().await?;
+                return Err(sqlx::Error::Protocol(format!(
+                    "legacy Trash source changed for file {file_id}"
+                )));
+            }
+        }
+        trash_tx.commit().await?;
         // The folder-share token gets its own unique index for the `/s/folder/{token}` lookup (NULLs are
         // distinct, so many revoked/never-shared folders coexist).
         sqlx::query(
@@ -2249,6 +4325,15 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+        // Cross-table object-key authority uses a permanent row mutex. Random keys make this
+        // append-only table practical, and retaining rows closes delete/reuse ABA windows.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS blob_key_guards (\
+                 object_key TEXT PRIMARY KEY\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
 
         // Preserve every legacy `/u/{folders.upload_token}` URL. Lock and materialize the source
         // rows before inserting anything: without this lock, a concurrent legacy revoke can clear
@@ -2358,6 +4443,8 @@ impl PgStore {
             share_password_hash: row.try_get("share_password_hash")?,
             folder_id: row.try_get("folder_id")?,
             trashed_at: row.try_get("trashed_at")?,
+            trash_entry_id: row.try_get("trash_entry_id")?,
+            trash_ancestor_id: row.try_get("trash_ancestor_id")?,
             view_count: row.try_get("view_count")?,
         })
     }
@@ -2374,6 +4461,32 @@ impl PgStore {
             expires_at: row.try_get("expires_at")?,
             share_password_hash: row.try_get("share_password_hash")?,
             upload_token: row.try_get("upload_token")?,
+            trashed_at: row.try_get("trashed_at")?,
+            trash_entry_id: row.try_get("trash_entry_id")?,
+            trash_ancestor_id: row.try_get("trash_ancestor_id")?,
+        })
+    }
+
+    fn trash_entry_from_row(row: &sqlx::postgres::PgRow) -> Result<TrashEntry, sqlx::Error> {
+        let kind: String = row.try_get("item_kind")?;
+        let kind = match kind.as_str() {
+            "file" => LibraryItemKind::File,
+            "folder" => LibraryItemKind::Folder,
+            other => {
+                return Err(sqlx::Error::Decode(
+                    format!("unknown trash item kind {other}").into(),
+                ))
+            }
+        };
+        Ok(TrashEntry {
+            id: row.try_get("id")?,
+            owner_sub: row.try_get("owner_sub")?,
+            kind,
+            item_id: row.try_get("item_id")?,
+            trashed_at: row.try_get("trashed_at")?,
+            purge_after: row.try_get("purge_after")?,
+            recovery_lease: row.try_get("recovery_lease")?,
+            recovery_leased_at: row.try_get("recovery_leased_at")?,
         })
     }
 
@@ -2441,8 +4554,9 @@ impl PgStore {
         let result = sqlx::query(
             "INSERT INTO files \
                  (id, owner_sub, name, content_type, size, bucket, object_key, share_token, \
-                  created_at, updated_at, expires_at, share_password_hash, folder_id, trashed_at, view_count) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
+                  created_at, updated_at, expires_at, share_password_hash, folder_id, trashed_at, \
+                  trash_entry_id, trash_ancestor_id, view_count) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
              ON CONFLICT DO NOTHING",
         )
         .bind(&file.id)
@@ -2459,10 +4573,669 @@ impl PgStore {
         .bind(&file.share_password_hash)
         .bind(&file.folder_id)
         .bind(file.trashed_at)
+        .bind(&file.trash_entry_id)
+        .bind(&file.trash_ancestor_id)
         .bind(file.view_count)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    async fn reserve_owner_blob_write_async(
+        &self,
+        intent: &OwnerBlobWriteIntent,
+        owner_quota: Option<i64>,
+    ) -> Result<OwnerBlobCommit, sqlx::Error> {
+        if intent.object_key.is_empty()
+            || intent.owner_sub.is_empty()
+            || intent.file_id.is_empty()
+            || intent.size < 0
+            || !matches!(
+                intent.kind.as_str(),
+                OWNER_WRITE_FRESH | OWNER_WRITE_REUPLOAD | OWNER_WRITE_THUMBNAIL
+            )
+        {
+            return Ok(OwnerBlobCommit::Conflict);
+        }
+        let mut tx = self.pool.begin().await?;
+        Self::lock_owner_storage_guard_tx(&mut tx, &intent.owner_sub).await?;
+        let authority_ok = match intent.kind.as_str() {
+            OWNER_WRITE_FRESH => {
+                let folder_ok = if let Some(folder_id) = intent.folder_id.as_deref() {
+                    sqlx::query(
+                        "SELECT 1 FROM folders WHERE id = $1 AND owner_sub = $2 \
+                         AND trashed_at = 0 AND trash_entry_id IS NULL \
+                         AND trash_ancestor_id IS NULL FOR UPDATE",
+                    )
+                    .bind(folder_id)
+                    .bind(&intent.owner_sub)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .is_some()
+                } else {
+                    true
+                };
+                folder_ok
+                    && intent.expected_object_key.is_none()
+                    && intent.object_key == intent.file_id
+                    && sqlx::query("SELECT 1 FROM files WHERE id = $1 FOR UPDATE")
+                        .bind(&intent.file_id)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                        .is_none()
+            }
+            OWNER_WRITE_REUPLOAD | OWNER_WRITE_THUMBNAIL => {
+                let Some(expected) = intent.expected_object_key.as_deref() else {
+                    tx.rollback().await?;
+                    return Ok(OwnerBlobCommit::Conflict);
+                };
+                let valid = sqlx::query(
+                    "SELECT 1 FROM files WHERE id = $1 AND owner_sub = $2 AND object_key = $3 \
+                     AND trashed_at = 0 AND trash_entry_id IS NULL \
+                     AND trash_ancestor_id IS NULL FOR UPDATE",
+                )
+                .bind(&intent.file_id)
+                .bind(&intent.owner_sub)
+                .bind(expected)
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_some();
+                valid
+                    && (intent.kind != OWNER_WRITE_THUMBNAIL
+                        || intent.object_key == format!("{expected}.thumb"))
+            }
+            _ => false,
+        };
+        if !authority_ok {
+            tx.rollback().await?;
+            return Ok(OwnerBlobCommit::Conflict);
+        }
+        // Metadata authority is locked before the global key sentinel. Purge follows the same
+        // metadata -> key order, so a random cross-owner id collision cannot form an ABBA cycle.
+        Self::lock_blob_key_guard_tx(&mut tx, &intent.object_key).await?;
+        let collision = sqlx::query(
+            "SELECT 1 WHERE \
+                 EXISTS (SELECT 1 FROM owner_blob_write_intents WHERE object_key = $1) OR \
+                 EXISTS (SELECT 1 FROM upload_reservations WHERE id = $1) OR \
+                 EXISTS (SELECT 1 FROM files WHERE object_key = $1) OR \
+                 EXISTS (SELECT 1 FROM file_versions WHERE object_key = $1) OR \
+                 EXISTS (SELECT 1 FROM blob_delete_queue WHERE object_key = $1)",
+        )
+        .bind(&intent.object_key)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+        if collision {
+            tx.rollback().await?;
+            return Ok(OwnerBlobCommit::Collision);
+        }
+        if intent.kind != OWNER_WRITE_THUMBNAIL {
+            let used = Self::owner_usage_with_pending_tx(&mut tx, &intent.owner_sub).await?;
+            if owner_quota.is_some_and(|quota| used.saturating_add(intent.size) > quota) {
+                tx.rollback().await?;
+                return Ok(OwnerBlobCommit::QuotaExceeded);
+            }
+        }
+        let inserted = sqlx::query(
+            "INSERT INTO owner_blob_write_intents \
+                 (object_key, owner_sub, size, write_kind, file_id, folder_id, \
+                  expected_object_key, created_at, next_attempt_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING",
+        )
+        .bind(&intent.object_key)
+        .bind(&intent.owner_sub)
+        .bind(intent.size)
+        .bind(&intent.kind)
+        .bind(&intent.file_id)
+        .bind(&intent.folder_id)
+        .bind(&intent.expected_object_key)
+        .bind(intent.created_at)
+        .bind(intent.created_at)
+        .execute(&mut *tx)
+        .await?;
+        if inserted.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(OwnerBlobCommit::Collision);
+        }
+        tx.commit().await?;
+        Ok(OwnerBlobCommit::Applied)
+    }
+
+    async fn commit_owner_upload_async(
+        &self,
+        file: &FileRec,
+        owner_quota: Option<i64>,
+    ) -> Result<OwnerBlobCommit, sqlx::Error> {
+        if file.object_key != file.id || !file.is_effectively_live() {
+            return Ok(OwnerBlobCommit::Conflict);
+        }
+        let mut tx = self.pool.begin().await?;
+        Self::lock_owner_storage_guard_tx(&mut tx, &file.owner_sub).await?;
+        let intent = sqlx::query(
+            "SELECT object_key, owner_sub, size, write_kind, file_id, folder_id, \
+                    expected_object_key, created_at, attempts \
+             FROM owner_blob_write_intents WHERE object_key = $1 AND recovery_lease IS NULL \
+             FOR UPDATE",
+        )
+        .bind(&file.object_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(intent) = intent else {
+            tx.rollback().await?;
+            return Ok(OwnerBlobCommit::Conflict);
+        };
+        let intent = Self::owner_blob_write_from_row(&intent)?;
+        if intent.owner_sub != file.owner_sub
+            || intent.file_id != file.id
+            || intent.folder_id != file.folder_id
+            || intent.size != file.size
+            || intent.kind != OWNER_WRITE_FRESH
+            || intent.expected_object_key.is_some()
+        {
+            tx.rollback().await?;
+            return Ok(OwnerBlobCommit::Conflict);
+        }
+        if let Some(folder_id) = file.folder_id.as_deref() {
+            if sqlx::query(
+                "SELECT 1 FROM folders WHERE id = $1 AND owner_sub = $2 AND trashed_at = 0 \
+                 AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL FOR UPDATE",
+            )
+            .bind(folder_id)
+            .bind(&file.owner_sub)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_none()
+            {
+                tx.rollback().await?;
+                return Ok(OwnerBlobCommit::Conflict);
+            }
+        }
+        let used = Self::owner_usage_with_pending_tx(&mut tx, &file.owner_sub).await?;
+        if owner_quota.is_some_and(|quota| used > quota) {
+            tx.rollback().await?;
+            return Ok(OwnerBlobCommit::QuotaExceeded);
+        }
+        let inserted = sqlx::query(
+            "INSERT INTO files \
+                 (id, owner_sub, name, content_type, size, bucket, object_key, share_token, \
+                  created_at, updated_at, expires_at, share_password_hash, folder_id, trashed_at, \
+                  trash_entry_id, trash_ancestor_id, view_count) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(&file.id)
+        .bind(&file.owner_sub)
+        .bind(&file.name)
+        .bind(&file.content_type)
+        .bind(file.size)
+        .bind(&file.bucket)
+        .bind(&file.object_key)
+        .bind(&file.share_token)
+        .bind(file.created_at)
+        .bind(file.updated_at)
+        .bind(file.expires_at)
+        .bind(&file.share_password_hash)
+        .bind(&file.folder_id)
+        .bind(file.trashed_at)
+        .bind(&file.trash_entry_id)
+        .bind(&file.trash_ancestor_id)
+        .bind(file.view_count)
+        .execute(&mut *tx)
+        .await?;
+        if inserted.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(OwnerBlobCommit::Collision);
+        }
+        let consumed = sqlx::query(
+            "DELETE FROM owner_blob_write_intents WHERE object_key = $1 \
+             AND owner_sub = $2 AND write_kind = 'fresh' AND recovery_lease IS NULL",
+        )
+        .bind(&file.object_key)
+        .bind(&file.owner_sub)
+        .execute(&mut *tx)
+        .await?;
+        if consumed.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(OwnerBlobCommit::Conflict);
+        }
+        tx.commit().await?;
+        Ok(OwnerBlobCommit::Applied)
+    }
+
+    async fn commit_owner_reupload_async(
+        &self,
+        input: OwnerReuploadInput<'_>,
+    ) -> Result<OwnerBlobCommit, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        Self::lock_owner_storage_guard_tx(&mut tx, input.owner_sub).await?;
+        let intent = sqlx::query(
+            "SELECT object_key, owner_sub, size, write_kind, file_id, folder_id, \
+                    expected_object_key, created_at, attempts \
+             FROM owner_blob_write_intents WHERE object_key = $1 AND recovery_lease IS NULL \
+             FOR UPDATE",
+        )
+        .bind(input.new_object_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(intent) = intent else {
+            tx.rollback().await?;
+            return Ok(OwnerBlobCommit::Conflict);
+        };
+        let intent = Self::owner_blob_write_from_row(&intent)?;
+        if intent.owner_sub != input.owner_sub
+            || intent.file_id != input.file_id
+            || intent.size != input.new_size
+            || intent.kind != OWNER_WRITE_REUPLOAD
+            || intent.expected_object_key.as_deref() != Some(input.expected_object_key)
+        {
+            tx.rollback().await?;
+            return Ok(OwnerBlobCommit::Conflict);
+        }
+        let current_row = sqlx::query(&format!(
+            "SELECT {COLS} FROM files WHERE id = $1 AND owner_sub = $2 AND object_key = $3 \
+             AND trashed_at = 0 AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL FOR UPDATE"
+        ))
+        .bind(input.file_id)
+        .bind(input.owner_sub)
+        .bind(input.expected_object_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(current_row) = current_row else {
+            tx.rollback().await?;
+            return Ok(OwnerBlobCommit::Conflict);
+        };
+        let current = Self::file_from_row(&current_row)?;
+        if sqlx::query("SELECT 1 FROM file_versions WHERE id = $1 FOR UPDATE")
+            .bind(input.snapshot_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some()
+        {
+            tx.rollback().await?;
+            return Ok(OwnerBlobCommit::Collision);
+        }
+        let used = Self::owner_usage_with_pending_tx(&mut tx, input.owner_sub).await?;
+        if input.owner_quota.is_some_and(|quota| used > quota) {
+            tx.rollback().await?;
+            return Ok(OwnerBlobCommit::QuotaExceeded);
+        }
+        let inserted = sqlx::query(
+            "INSERT INTO file_versions (id, file_id, object_key, size, content_type, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+        )
+        .bind(input.snapshot_id)
+        .bind(input.file_id)
+        .bind(&current.object_key)
+        .bind(current.size)
+        .bind(&current.content_type)
+        .bind(input.changed_at)
+        .execute(&mut *tx)
+        .await?;
+        if inserted.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(OwnerBlobCommit::Collision);
+        }
+        let updated = sqlx::query(
+            "UPDATE files SET object_key = $1, size = $2, content_type = $3, updated_at = \
+               CASE WHEN updated_at = 9223372036854775807 THEN updated_at \
+                    WHEN updated_at >= $4 THEN updated_at + 1 ELSE $4 END \
+             WHERE id = $5 AND owner_sub = $6 AND object_key = $7 AND trashed_at = 0 \
+               AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL",
+        )
+        .bind(input.new_object_key)
+        .bind(input.new_size)
+        .bind(input.new_content_type)
+        .bind(input.changed_at)
+        .bind(input.file_id)
+        .bind(input.owner_sub)
+        .bind(input.expected_object_key)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(OwnerBlobCommit::Conflict);
+        }
+        let version_rows = sqlx::query(&format!(
+            "SELECT {VERSION_COLS} FROM file_versions WHERE file_id = $1 \
+             ORDER BY created_at DESC, id DESC FOR UPDATE"
+        ))
+        .bind(input.file_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut live_keys = vec![input.new_object_key.to_string()];
+        for row in version_rows.iter().take(MAX_VERSIONS_PER_FILE as usize) {
+            live_keys.push(Self::version_from_row(row)?.object_key);
+        }
+        live_keys.push(format!("{}.thumb", input.new_object_key));
+        let mut pruned_ids = Vec::new();
+        let mut deletions: Vec<(String, &'static str)> = Vec::new();
+        for row in version_rows.iter().skip(MAX_VERSIONS_PER_FILE as usize) {
+            let version = Self::version_from_row(row)?;
+            deletions.push((version.object_key.clone(), "version-prune"));
+            deletions.push((
+                format!("{}.thumb", version.object_key),
+                "version-prune-thumbnail",
+            ));
+            pruned_ids.push(version.id);
+        }
+        deletions.push((format!("{}.thumb", current.object_key), "stale-thumbnail"));
+        deletions.retain(|(key, _)| !live_keys.contains(key));
+        deletions.sort_by(|left, right| left.0.cmp(&right.0));
+        deletions.dedup_by(|left, right| left.0 == right.0);
+        for (key, reason) in deletions {
+            Self::enqueue_blob_delete_tx(&mut tx, &key, input.changed_at, reason).await?;
+        }
+        for version_id in pruned_ids {
+            sqlx::query("DELETE FROM file_versions WHERE id = $1 AND file_id = $2")
+                .bind(version_id)
+                .bind(input.file_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let consumed = sqlx::query(
+            "DELETE FROM owner_blob_write_intents WHERE object_key = $1 AND owner_sub = $2 \
+             AND write_kind = 'reupload' AND recovery_lease IS NULL",
+        )
+        .bind(input.new_object_key)
+        .bind(input.owner_sub)
+        .execute(&mut *tx)
+        .await?;
+        if consumed.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(OwnerBlobCommit::Conflict);
+        }
+        tx.commit().await?;
+        Ok(OwnerBlobCommit::Applied)
+    }
+
+    async fn commit_owner_version_restore_async(
+        &self,
+        input: OwnerVersionRestoreInput<'_>,
+    ) -> Result<OwnerBlobCommit, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        Self::lock_owner_storage_guard_tx(&mut tx, input.owner_sub).await?;
+        let current_row = sqlx::query(&format!(
+            "SELECT {COLS} FROM files WHERE id = $1 AND owner_sub = $2 AND object_key = $3 \
+             AND trashed_at = 0 AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL FOR UPDATE"
+        ))
+        .bind(input.file_id)
+        .bind(input.owner_sub)
+        .bind(input.expected_object_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(current_row) = current_row else {
+            tx.rollback().await?;
+            return Ok(OwnerBlobCommit::Conflict);
+        };
+        let current = Self::file_from_row(&current_row)?;
+        let selected_row = sqlx::query(&format!(
+            "SELECT {VERSION_COLS} FROM file_versions WHERE id = $1 AND file_id = $2 FOR UPDATE"
+        ))
+        .bind(input.version_id)
+        .bind(input.file_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(selected_row) = selected_row else {
+            tx.rollback().await?;
+            return Ok(OwnerBlobCommit::Conflict);
+        };
+        let selected = Self::version_from_row(&selected_row)?;
+        if sqlx::query("SELECT 1 FROM file_versions WHERE id = $1 FOR UPDATE")
+            .bind(input.snapshot_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some()
+        {
+            tx.rollback().await?;
+            return Ok(OwnerBlobCommit::Collision);
+        }
+        let inserted = sqlx::query(
+            "INSERT INTO file_versions (id, file_id, object_key, size, content_type, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+        )
+        .bind(input.snapshot_id)
+        .bind(input.file_id)
+        .bind(&current.object_key)
+        .bind(current.size)
+        .bind(&current.content_type)
+        .bind(input.changed_at)
+        .execute(&mut *tx)
+        .await?;
+        if inserted.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(OwnerBlobCommit::Collision);
+        }
+        let updated = sqlx::query(
+            "UPDATE files SET object_key = $1, size = $2, content_type = $3, updated_at = \
+               CASE WHEN updated_at = 9223372036854775807 THEN updated_at \
+                    WHEN updated_at >= $4 THEN updated_at + 1 ELSE $4 END \
+             WHERE id = $5 AND owner_sub = $6 AND object_key = $7 AND trashed_at = 0 \
+               AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL",
+        )
+        .bind(&selected.object_key)
+        .bind(selected.size)
+        .bind(&selected.content_type)
+        .bind(input.changed_at)
+        .bind(input.file_id)
+        .bind(input.owner_sub)
+        .bind(input.expected_object_key)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(OwnerBlobCommit::Conflict);
+        }
+        let consumed_version =
+            sqlx::query("DELETE FROM file_versions WHERE id = $1 AND file_id = $2")
+                .bind(input.version_id)
+                .bind(input.file_id)
+                .execute(&mut *tx)
+                .await?;
+        if consumed_version.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(OwnerBlobCommit::Conflict);
+        }
+        let version_rows = sqlx::query(&format!(
+            "SELECT {VERSION_COLS} FROM file_versions WHERE file_id = $1 \
+             ORDER BY created_at DESC, id DESC FOR UPDATE"
+        ))
+        .bind(input.file_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut live_keys = vec![selected.object_key.clone()];
+        for row in version_rows.iter().take(MAX_VERSIONS_PER_FILE as usize) {
+            live_keys.push(Self::version_from_row(row)?.object_key);
+        }
+        live_keys.push(format!("{}.thumb", selected.object_key));
+        let mut pruned_ids = Vec::new();
+        let mut deletions: Vec<(String, &'static str)> = Vec::new();
+        for row in version_rows.iter().skip(MAX_VERSIONS_PER_FILE as usize) {
+            let version = Self::version_from_row(row)?;
+            deletions.push((version.object_key.clone(), "version-prune"));
+            deletions.push((
+                format!("{}.thumb", version.object_key),
+                "version-prune-thumbnail",
+            ));
+            pruned_ids.push(version.id);
+        }
+        deletions.push((format!("{}.thumb", current.object_key), "stale-thumbnail"));
+        deletions.retain(|(key, _)| !live_keys.contains(key));
+        deletions.sort_by(|left, right| left.0.cmp(&right.0));
+        deletions.dedup_by(|left, right| left.0 == right.0);
+        for (key, reason) in deletions {
+            Self::enqueue_blob_delete_tx(&mut tx, &key, input.changed_at, reason).await?;
+        }
+        for version_id in pruned_ids {
+            sqlx::query("DELETE FROM file_versions WHERE id = $1 AND file_id = $2")
+                .bind(version_id)
+                .bind(input.file_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(OwnerBlobCommit::Applied)
+    }
+
+    async fn finalize_owner_thumbnail_async(
+        &self,
+        object_key: &str,
+        owner_sub: &str,
+        file_id: &str,
+        expected_object_key: &str,
+    ) -> Result<OwnerBlobCommit, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        Self::lock_owner_storage_guard_tx(&mut tx, owner_sub).await?;
+        if sqlx::query(
+            "SELECT 1 FROM files WHERE id = $1 AND owner_sub = $2 AND object_key = $3 \
+             AND trashed_at = 0 AND trash_entry_id IS NULL \
+             AND trash_ancestor_id IS NULL FOR UPDATE",
+        )
+        .bind(file_id)
+        .bind(owner_sub)
+        .bind(expected_object_key)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_none()
+        {
+            tx.rollback().await?;
+            return Ok(OwnerBlobCommit::Conflict);
+        }
+        let consumed = sqlx::query(
+            "DELETE FROM owner_blob_write_intents WHERE object_key = $1 AND owner_sub = $2 \
+             AND file_id = $3 AND expected_object_key = $4 AND write_kind = 'thumbnail' \
+             AND recovery_lease IS NULL",
+        )
+        .bind(object_key)
+        .bind(owner_sub)
+        .bind(file_id)
+        .bind(expected_object_key)
+        .execute(&mut *tx)
+        .await?;
+        if consumed.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(OwnerBlobCommit::Conflict);
+        }
+        tx.commit().await?;
+        Ok(OwnerBlobCommit::Applied)
+    }
+
+    async fn enqueue_blob_deletion_async(
+        &self,
+        object_key: &str,
+        enqueued_at: i64,
+        reason: &str,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        Self::lock_blob_key_guard_tx(&mut tx, object_key).await?;
+        if sqlx::query(
+            "SELECT 1 WHERE \
+                 EXISTS (SELECT 1 FROM owner_blob_write_intents WHERE object_key = $1) OR \
+                 EXISTS (SELECT 1 FROM upload_reservations WHERE id = $1) OR \
+                 EXISTS (SELECT 1 FROM files WHERE object_key = $1) OR \
+                 EXISTS (SELECT 1 FROM file_versions WHERE object_key = $1)",
+        )
+        .bind(object_key)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some()
+        {
+            tx.rollback().await?;
+            return Err(sqlx::Error::Protocol(format!(
+                "blob deletion key {object_key} still has live authority"
+            )));
+        }
+        sqlx::query(
+            "INSERT INTO blob_delete_queue \
+                 (object_key, enqueued_at, next_attempt_at, reason) \
+             VALUES ($1, $2, $2, $3) ON CONFLICT DO NOTHING",
+        )
+        .bind(object_key)
+        .bind(enqueued_at)
+        .bind(reason)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn claim_owner_blob_writes_async(
+        &self,
+        lease_id: &str,
+        now: i64,
+        created_before: i64,
+        lease_expired_before: i64,
+        limit: i64,
+    ) -> Result<Vec<OwnerBlobWriteIntent>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query(
+            "SELECT object_key, owner_sub, size, write_kind, file_id, folder_id, \
+                    expected_object_key, created_at, attempts \
+             FROM owner_blob_write_intents \
+             WHERE created_at <= $1 AND next_attempt_at <= $2 \
+               AND (recovery_lease IS NULL OR recovery_leased_at <= $3) \
+             ORDER BY next_attempt_at ASC, created_at ASC, object_key ASC LIMIT $4 FOR UPDATE",
+        )
+        .bind(created_before)
+        .bind(now)
+        .bind(lease_expired_before)
+        .bind(clamp_page(limit))
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut claimed = Vec::with_capacity(rows.len());
+        for row in rows {
+            let intent = Self::owner_blob_write_from_row(&row)?;
+            let updated = sqlx::query(
+                "UPDATE owner_blob_write_intents SET recovery_lease = $1, recovery_leased_at = $2 \
+                 WHERE object_key = $3 \
+                   AND (recovery_lease IS NULL OR recovery_leased_at <= $4)",
+            )
+            .bind(lease_id)
+            .bind(now)
+            .bind(&intent.object_key)
+            .bind(lease_expired_before)
+            .execute(&mut *tx)
+            .await?;
+            if updated.rows_affected() == 1 {
+                claimed.push(intent);
+            }
+        }
+        tx.commit().await?;
+        Ok(claimed)
+    }
+
+    async fn complete_owner_blob_write_async(
+        &self,
+        object_key: &str,
+        lease_id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let deleted = sqlx::query(
+            "DELETE FROM owner_blob_write_intents WHERE object_key = $1 AND recovery_lease = $2",
+        )
+        .bind(object_key)
+        .bind(lease_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(deleted.rows_affected() == 1)
+    }
+
+    async fn abandon_owner_blob_write_async(
+        &self,
+        object_key: &str,
+        lease_id: &str,
+        retry_at: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let updated = sqlx::query(
+            "UPDATE owner_blob_write_intents \
+             SET attempts = attempts + 1, next_attempt_at = $1, \
+                 recovery_lease = NULL, recovery_leased_at = NULL \
+             WHERE object_key = $2 AND recovery_lease = $3",
+        )
+        .bind(retry_at)
+        .bind(object_key)
+        .bind(lease_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
     }
 
     async fn configure_share_async(
@@ -2478,7 +5251,8 @@ impl PgStore {
             "UPDATE files SET share_token = $1, expires_at = $2, share_password_hash = $3, \
              updated_at = CASE WHEN updated_at = 9223372036854775807 THEN updated_at \
                                WHEN updated_at >= $4 THEN updated_at + 1 ELSE $4 END \
-             WHERE id = $5 AND owner_sub = $6",
+             WHERE id = $5 AND owner_sub = $6 AND trashed_at = 0 \
+               AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL",
         )
         .bind(&share_token)
         .bind(expires_at)
@@ -2501,7 +5275,8 @@ impl PgStore {
 
     async fn get_by_token_async(&self, token: &str) -> Result<Option<FileRec>, sqlx::Error> {
         let row = sqlx::query(&format!(
-            "SELECT {COLS} FROM files WHERE share_token = $1 AND trashed_at = 0"
+            "SELECT {COLS} FROM files WHERE share_token = $1 AND trashed_at = 0 \
+             AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL"
         ))
         .bind(token)
         .fetch_optional(&self.pool)
@@ -2511,7 +5286,8 @@ impl PgStore {
 
     async fn bump_view_count_async(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "UPDATE files SET view_count = view_count + 1 WHERE id = $1 AND trashed_at = 0",
+            "UPDATE files SET view_count = view_count + 1 WHERE id = $1 AND trashed_at = 0 \
+             AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL",
         )
         .bind(id)
         .execute(&self.pool)
@@ -2535,7 +5311,7 @@ impl PgStore {
             (None, None) => {
                 sqlx::query(&format!(
                     "SELECT {COLS} FROM files WHERE owner_sub = $1 AND folder_id IS NULL \
-                     AND trashed_at = 0 \
+                     AND trashed_at = 0 AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL \
                      ORDER BY created_at DESC, id DESC LIMIT $2"
                 ))
                 .bind(owner_sub)
@@ -2546,7 +5322,7 @@ impl PgStore {
             (None, Some((ts, id))) => {
                 sqlx::query(&format!(
                     "SELECT {COLS} FROM files WHERE owner_sub = $1 AND folder_id IS NULL \
-                     AND trashed_at = 0 \
+                     AND trashed_at = 0 AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL \
                      AND (created_at < $2 OR (created_at = $2 AND id < $3)) \
                      ORDER BY created_at DESC, id DESC LIMIT $4"
                 ))
@@ -2560,7 +5336,7 @@ impl PgStore {
             (Some(fid), None) => {
                 sqlx::query(&format!(
                     "SELECT {COLS} FROM files WHERE owner_sub = $1 AND folder_id = $2 \
-                     AND trashed_at = 0 \
+                     AND trashed_at = 0 AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL \
                      ORDER BY created_at DESC, id DESC LIMIT $3"
                 ))
                 .bind(owner_sub)
@@ -2572,7 +5348,7 @@ impl PgStore {
             (Some(fid), Some((ts, id))) => {
                 sqlx::query(&format!(
                     "SELECT {COLS} FROM files WHERE owner_sub = $1 AND folder_id = $2 \
-                     AND trashed_at = 0 \
+                     AND trashed_at = 0 AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL \
                      AND (created_at < $3 OR (created_at = $3 AND id < $4)) \
                      ORDER BY created_at DESC, id DESC LIMIT $5"
                 ))
@@ -2602,7 +5378,9 @@ impl PgStore {
             let mut files = QueryBuilder::<Postgres>::new(format!(
                 "SELECT {COLS} FROM files WHERE owner_sub = "
             ));
-            files.push_bind(owner_sub).push(" AND trashed_at = 0");
+            files.push_bind(owner_sub).push(
+                " AND trashed_at = 0 AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL",
+            );
             if query.view == LibraryView::Shared {
                 files.push(" AND share_token IS NOT NULL");
             }
@@ -2631,7 +5409,9 @@ impl PgStore {
             let mut folders = QueryBuilder::<Postgres>::new(format!(
                 "SELECT {FOLDER_COLS} FROM folders WHERE owner_sub = "
             ));
-            folders.push_bind(owner_sub);
+            folders.push_bind(owner_sub).push(
+                " AND trashed_at = 0 AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL",
+            );
             if query.view == LibraryView::Shared {
                 folders.push(" AND share_token IS NOT NULL");
             }
@@ -2668,36 +5448,37 @@ impl PgStore {
         owner_sub: &str,
         trashed_at: i64,
     ) -> Result<bool, sqlx::Error> {
-        let updated_at = mutation_time();
-        let result = sqlx::query(
-            "UPDATE files SET trashed_at = $1, \
-             updated_at = CASE WHEN updated_at = 9223372036854775807 THEN updated_at \
-                               WHEN updated_at >= $2 THEN updated_at + 1 ELSE $2 END \
-             WHERE id = $3 AND owner_sub = $4 AND trashed_at = 0",
-        )
-        .bind(trashed_at.max(1))
-        .bind(updated_at)
-        .bind(id)
-        .bind(owner_sub)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
+        let now = trashed_at.max(1);
+        Ok(matches!(
+            self.bulk_trash_async(
+                owner_sub,
+                &[TrashRootInput {
+                    item: DriveItemRef {
+                        kind: LibraryItemKind::File,
+                        id: id.to_string(),
+                    },
+                    entry_id: format!("compat-file-{id}-{now}"),
+                }],
+                now,
+                now.saturating_add(DEFAULT_TRASH_RETENTION_SECS),
+            )
+            .await?,
+            BulkMutation::Applied { .. }
+        ))
     }
 
     async fn restore_file_async(&self, id: &str, owner_sub: &str) -> Result<bool, sqlx::Error> {
-        let updated_at = mutation_time();
-        let result = sqlx::query(
-            "UPDATE files SET trashed_at = 0, \
-             updated_at = CASE WHEN updated_at = 9223372036854775807 THEN updated_at \
-                               WHEN updated_at >= $1 THEN updated_at + 1 ELSE $1 END \
-             WHERE id = $2 AND owner_sub = $3 AND trashed_at <> 0",
-        )
-        .bind(updated_at)
-        .bind(id)
-        .bind(owner_sub)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
+        Ok(matches!(
+            self.bulk_restore_async(
+                owner_sub,
+                &[DriveItemRef {
+                    kind: LibraryItemKind::File,
+                    id: id.to_string(),
+                }],
+            )
+            .await?,
+            BulkMutation::Applied { .. }
+        ))
     }
 
     async fn rename_file_async(
@@ -2736,12 +5517,917 @@ impl PgStore {
         rows.iter().map(Self::file_from_row).collect()
     }
 
+    async fn query_trash_async(
+        &self,
+        owner_sub: &str,
+        before: Option<&LibraryCursor>,
+        limit: i64,
+    ) -> Result<TrashPage, sqlx::Error> {
+        let fetch_limit = clamp_page(limit) + 1;
+        let mut query = QueryBuilder::<Postgres>::new(
+            "SELECT entry_id, item_kind, item_id, trashed_at, purge_after, name, \
+                    content_type, size, kind_rank FROM (\
+               SELECT t.id AS entry_id, t.item_kind, t.item_id, t.trashed_at, t.purge_after, \
+                      f.name, f.content_type, f.size, 1 AS kind_rank \
+               FROM trash_entries t JOIN files f ON f.id = t.item_id \
+               WHERE t.item_kind = 'file' AND f.trash_entry_id = t.id \
+                 AND f.owner_sub = t.owner_sub AND f.trash_ancestor_id IS NULL \
+               UNION ALL \
+               SELECT t.id AS entry_id, t.item_kind, t.item_id, t.trashed_at, t.purge_after, \
+                      d.name, NULL AS content_type, NULL AS size, 0 AS kind_rank \
+               FROM trash_entries t JOIN folders d ON d.id = t.item_id \
+               WHERE t.item_kind = 'folder' AND d.trash_entry_id = t.id \
+                 AND d.owner_sub = t.owner_sub AND d.trash_ancestor_id IS NULL\
+             ) roots WHERE ",
+        );
+        query.push("roots.item_id <> '' AND EXISTS (SELECT 1 FROM trash_entries authority WHERE authority.id = roots.entry_id AND authority.owner_sub = ")
+            .push_bind(owner_sub)
+            .push(")");
+        if let Some(cursor) = before {
+            query
+                .push(" AND (trashed_at < ")
+                .push_bind(cursor.updated_at)
+                .push(" OR (trashed_at = ")
+                .push_bind(cursor.updated_at)
+                .push(" AND (kind_rank < ")
+                .push_bind(cursor.kind.rank())
+                .push(" OR (kind_rank = ")
+                .push_bind(cursor.kind.rank())
+                .push(" AND item_id < ")
+                .push_bind(cursor.id.clone())
+                .push("))))");
+        }
+        query
+            .push(" ORDER BY trashed_at DESC, kind_rank DESC, item_id DESC LIMIT ")
+            .push_bind(fetch_limit);
+        let rows = query.build().fetch_all(&self.pool).await?;
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            let kind: String = row.try_get("item_kind")?;
+            items.push(TrashItem {
+                entry_id: row.try_get("entry_id")?,
+                kind: if kind == "file" {
+                    LibraryItemKind::File
+                } else {
+                    LibraryItemKind::Folder
+                },
+                id: row.try_get("item_id")?,
+                name: row.try_get("name")?,
+                content_type: row.try_get("content_type")?,
+                size: row.try_get("size")?,
+                trashed_at: row.try_get("trashed_at")?,
+                purge_after: row.try_get("purge_after")?,
+            });
+        }
+        Ok(finish_trash_page(items, limit))
+    }
+
+    async fn bulk_trash_async(
+        &self,
+        owner_sub: &str,
+        roots: &[TrashRootInput],
+        trashed_at: i64,
+        purge_after: i64,
+    ) -> Result<BulkMutation, sqlx::Error> {
+        if roots.is_empty() || roots.len() > MAX_BULK_ITEMS {
+            return Ok(BulkMutation::Conflict);
+        }
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO owner_storage_guards (owner_sub) VALUES ($1) ON CONFLICT DO NOTHING",
+        )
+        .bind(owner_sub)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("SELECT owner_sub FROM owner_storage_guards WHERE owner_sub = $1 FOR UPDATE")
+            .bind(owner_sub)
+            .fetch_one(&mut *tx)
+            .await?;
+        let file_rows = sqlx::query(&format!(
+            "SELECT {COLS} FROM files WHERE owner_sub = $1 FOR UPDATE"
+        ))
+        .bind(owner_sub)
+        .fetch_all(&mut *tx)
+        .await?;
+        let files: Vec<FileRec> = file_rows
+            .iter()
+            .map(Self::file_from_row)
+            .collect::<Result<_, _>>()?;
+        let folder_rows = sqlx::query(&format!(
+            "SELECT {FOLDER_COLS} FROM folders WHERE owner_sub = $1 FOR UPDATE"
+        ))
+        .bind(owner_sub)
+        .fetch_all(&mut *tx)
+        .await?;
+        let folders: Vec<FolderRec> = folder_rows
+            .iter()
+            .map(Self::folder_from_row)
+            .collect::<Result<_, _>>()?;
+        let mut seen_items = Vec::new();
+        let mut seen_entries = Vec::new();
+        for root in roots {
+            let valid = !root.item.id.is_empty()
+                && !root.entry_id.is_empty()
+                && !seen_items.contains(&(root.item.kind, root.item.id.as_str()))
+                && !seen_entries.contains(&root.entry_id.as_str())
+                && match root.item.kind {
+                    LibraryItemKind::File => files
+                        .iter()
+                        .any(|file| file.id == root.item.id && file.is_effectively_live()),
+                    LibraryItemKind::Folder => folders
+                        .iter()
+                        .any(|folder| folder.id == root.item.id && folder.is_effectively_live()),
+                };
+            if !valid {
+                tx.rollback().await?;
+                return Ok(BulkMutation::Conflict);
+            }
+            seen_items.push((root.item.kind, root.item.id.as_str()));
+            seen_entries.push(root.entry_id.as_str());
+        }
+        let mut entry_ids: Vec<&str> = roots.iter().map(|root| root.entry_id.as_str()).collect();
+        entry_ids.sort_unstable();
+        for entry_id in entry_ids {
+            if sqlx::query("SELECT 1 FROM trash_entries WHERE id = $1 FOR UPDATE")
+                .bind(entry_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_some()
+            {
+                tx.rollback().await?;
+                return Ok(BulkMutation::Conflict);
+            }
+        }
+        let refs: Vec<DriveItemRef> = roots.iter().map(|root| root.item.clone()).collect();
+        let normalized = normalized_refs(&refs, &files, &folders);
+        let mut normalized_roots: Vec<&TrashRootInput> = normalized
+            .iter()
+            .map(|item| {
+                roots
+                    .iter()
+                    .find(|root| root.item == *item)
+                    .expect("normalized root came from input")
+            })
+            .collect();
+        normalized_roots.sort_by(|left, right| left.entry_id.cmp(&right.entry_id));
+        let now = trashed_at.max(1);
+        for root in normalized_roots {
+            let item = &root.item;
+            let inserted = sqlx::query(
+                "INSERT INTO trash_entries \
+                     (id, owner_sub, item_kind, item_id, trashed_at, purge_after) \
+                 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+            )
+            .bind(&root.entry_id)
+            .bind(owner_sub)
+            .bind(item.kind.slug())
+            .bind(&item.id)
+            .bind(now)
+            .bind(purge_after.max(now))
+            .execute(&mut *tx)
+            .await?;
+            if inserted.rows_affected() != 1 {
+                tx.rollback().await?;
+                return Ok(BulkMutation::Conflict);
+            }
+            match item.kind {
+                LibraryItemKind::File => {
+                    let updated = sqlx::query(
+                        "UPDATE files SET trashed_at = $1, trash_entry_id = $2, updated_at = \
+                           CASE WHEN updated_at = 9223372036854775807 THEN updated_at \
+                                WHEN updated_at >= $1 THEN updated_at + 1 ELSE $1 END \
+                         WHERE id = $3 AND owner_sub = $4 AND trashed_at = 0 \
+                           AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL",
+                    )
+                    .bind(now)
+                    .bind(&root.entry_id)
+                    .bind(&item.id)
+                    .bind(owner_sub)
+                    .execute(&mut *tx)
+                    .await?;
+                    if updated.rows_affected() != 1 {
+                        tx.rollback().await?;
+                        return Ok(BulkMutation::Conflict);
+                    }
+                }
+                LibraryItemKind::Folder => {
+                    let updated = sqlx::query(
+                        "UPDATE folders SET trashed_at = $1, trash_entry_id = $2, updated_at = \
+                           CASE WHEN updated_at = 9223372036854775807 THEN updated_at \
+                                WHEN updated_at >= $1 THEN updated_at + 1 ELSE $1 END \
+                         WHERE id = $3 AND owner_sub = $4 AND trashed_at = 0 \
+                           AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL",
+                    )
+                    .bind(now)
+                    .bind(&root.entry_id)
+                    .bind(&item.id)
+                    .bind(owner_sub)
+                    .execute(&mut *tx)
+                    .await?;
+                    if updated.rows_affected() != 1 {
+                        tx.rollback().await?;
+                        return Ok(BulkMutation::Conflict);
+                    }
+                    let descendants: Vec<&FolderRec> = folders
+                        .iter()
+                        .filter(|folder| {
+                            folder.id != item.id
+                                && folder_descends_from(&folders, &folder.id, &item.id)
+                        })
+                        .collect();
+                    for folder in &descendants {
+                        sqlx::query(
+                            "UPDATE folders SET trash_ancestor_id = $1, \
+                               trashed_at = CASE WHEN trash_entry_id IS NULL THEN $2 ELSE trashed_at END \
+                             WHERE id = $3 AND owner_sub = $4 AND trash_ancestor_id IS NULL",
+                        )
+                        .bind(&root.entry_id)
+                        .bind(now)
+                        .bind(&folder.id)
+                        .bind(owner_sub)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                    let mut scope: Vec<&str> = descendants
+                        .iter()
+                        .map(|folder| folder.id.as_str())
+                        .collect();
+                    scope.push(&item.id);
+                    for folder_id in scope {
+                        sqlx::query(
+                            "UPDATE files SET trash_ancestor_id = $1, \
+                               trashed_at = CASE WHEN trash_entry_id IS NULL THEN $2 ELSE trashed_at END \
+                             WHERE owner_sub = $3 AND folder_id = $4 \
+                               AND trash_ancestor_id IS NULL",
+                        )
+                        .bind(&root.entry_id)
+                        .bind(now)
+                        .bind(owner_sub)
+                        .bind(folder_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
+            }
+        }
+        tx.commit().await?;
+        Ok(BulkMutation::Applied {
+            changed: normalized.len(),
+        })
+    }
+
+    async fn bulk_restore_async(
+        &self,
+        owner_sub: &str,
+        items: &[DriveItemRef],
+    ) -> Result<BulkMutation, sqlx::Error> {
+        if items.is_empty() || items.len() > MAX_BULK_ITEMS {
+            return Ok(BulkMutation::Conflict);
+        }
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO owner_storage_guards (owner_sub) VALUES ($1) ON CONFLICT DO NOTHING",
+        )
+        .bind(owner_sub)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("SELECT owner_sub FROM owner_storage_guards WHERE owner_sub = $1 FOR UPDATE")
+            .bind(owner_sub)
+            .fetch_one(&mut *tx)
+            .await?;
+        let mut seen = Vec::new();
+        let mut roots: Vec<(DriveItemRef, String)> = Vec::new();
+        for item in items {
+            if seen.contains(&(item.kind, item.id.as_str())) {
+                tx.rollback().await?;
+                return Ok(BulkMutation::Conflict);
+            }
+            seen.push((item.kind, item.id.as_str()));
+            let table = match item.kind {
+                LibraryItemKind::File => "files",
+                LibraryItemKind::Folder => "folders",
+            };
+            let sql = format!(
+                "SELECT trash_entry_id FROM {table} WHERE id = $1 AND owner_sub = $2 \
+                 AND trash_entry_id IS NOT NULL AND trash_ancestor_id IS NULL FOR UPDATE"
+            );
+            let row = sqlx::query(&sql)
+                .bind(&item.id)
+                .bind(owner_sub)
+                .fetch_optional(&mut *tx)
+                .await?;
+            let Some(row) = row else {
+                tx.rollback().await?;
+                return Ok(BulkMutation::Conflict);
+            };
+            let entry_id: String = row.try_get("trash_entry_id")?;
+            roots.push((item.clone(), entry_id));
+        }
+        let mut authority_roots = roots.clone();
+        authority_roots.sort_by(|left, right| left.1.cmp(&right.1));
+        for (item, entry_id) in &authority_roots {
+            let authority = sqlx::query(
+                "SELECT 1 FROM trash_entries WHERE id = $1 AND owner_sub = $2 \
+                 AND item_kind = $3 AND item_id = $4 FOR UPDATE",
+            )
+            .bind(entry_id)
+            .bind(owner_sub)
+            .bind(item.kind.slug())
+            .bind(&item.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if authority.is_none() {
+                tx.rollback().await?;
+                return Ok(BulkMutation::Conflict);
+            }
+        }
+        let updated_at = mutation_time();
+        for (item, entry_id) in &roots {
+            let table = match item.kind {
+                LibraryItemKind::File => "files",
+                LibraryItemKind::Folder => "folders",
+            };
+            let sql = format!(
+                "UPDATE {table} SET trashed_at = 0, trash_entry_id = NULL, updated_at = \
+                   CASE WHEN updated_at = 9223372036854775807 THEN updated_at \
+                        WHEN updated_at >= $1 THEN updated_at + 1 ELSE $1 END \
+                 WHERE id = $2 AND owner_sub = $3 AND trash_entry_id = $4 \
+                   AND trash_ancestor_id IS NULL"
+            );
+            let updated = sqlx::query(&sql)
+                .bind(updated_at)
+                .bind(&item.id)
+                .bind(owner_sub)
+                .bind(entry_id)
+                .execute(&mut *tx)
+                .await?;
+            if updated.rows_affected() != 1 {
+                tx.rollback().await?;
+                return Ok(BulkMutation::Conflict);
+            }
+            sqlx::query(
+                "UPDATE files SET trash_ancestor_id = NULL, \
+                   trashed_at = CASE WHEN trash_entry_id IS NULL THEN 0 ELSE trashed_at END \
+                 WHERE trash_ancestor_id = $1 AND owner_sub = $2",
+            )
+            .bind(entry_id)
+            .bind(owner_sub)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE folders SET trash_ancestor_id = NULL, \
+                   trashed_at = CASE WHEN trash_entry_id IS NULL THEN 0 ELSE trashed_at END \
+                 WHERE trash_ancestor_id = $1 AND owner_sub = $2",
+            )
+            .bind(entry_id)
+            .bind(owner_sub)
+            .execute(&mut *tx)
+            .await?;
+            let deleted = sqlx::query(
+                "DELETE FROM trash_entries WHERE id = $1 AND owner_sub = $2 \
+                 AND item_kind = $3 AND item_id = $4",
+            )
+            .bind(entry_id)
+            .bind(owner_sub)
+            .bind(item.kind.slug())
+            .bind(&item.id)
+            .execute(&mut *tx)
+            .await?;
+            if deleted.rows_affected() != 1 {
+                tx.rollback().await?;
+                return Ok(BulkMutation::Conflict);
+            }
+        }
+        tx.commit().await?;
+        Ok(BulkMutation::Applied {
+            changed: roots.len(),
+        })
+    }
+
+    async fn bulk_move_async(
+        &self,
+        owner_sub: &str,
+        items: &[DriveItemRef],
+        folder_id: Option<&str>,
+    ) -> Result<BulkMutation, sqlx::Error> {
+        if items.is_empty() || items.len() > MAX_BULK_ITEMS {
+            return Ok(BulkMutation::Conflict);
+        }
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO owner_storage_guards (owner_sub) VALUES ($1) ON CONFLICT DO NOTHING",
+        )
+        .bind(owner_sub)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("SELECT owner_sub FROM owner_storage_guards WHERE owner_sub = $1 FOR UPDATE")
+            .bind(owner_sub)
+            .fetch_one(&mut *tx)
+            .await?;
+        let file_rows = sqlx::query(&format!(
+            "SELECT {COLS} FROM files WHERE owner_sub = $1 FOR UPDATE"
+        ))
+        .bind(owner_sub)
+        .fetch_all(&mut *tx)
+        .await?;
+        let files: Vec<FileRec> = file_rows
+            .iter()
+            .map(Self::file_from_row)
+            .collect::<Result<_, _>>()?;
+        let folder_rows = sqlx::query(&format!(
+            "SELECT {FOLDER_COLS} FROM folders WHERE owner_sub = $1 FOR UPDATE"
+        ))
+        .bind(owner_sub)
+        .fetch_all(&mut *tx)
+        .await?;
+        let folders: Vec<FolderRec> = folder_rows
+            .iter()
+            .map(Self::folder_from_row)
+            .collect::<Result<_, _>>()?;
+        if folder_id.is_some_and(|target| {
+            !folders
+                .iter()
+                .any(|folder| folder.id == target && folder.is_effectively_live())
+        }) {
+            tx.rollback().await?;
+            return Ok(BulkMutation::Conflict);
+        }
+        let mut seen = Vec::new();
+        for item in items {
+            let valid = !seen.contains(&(item.kind, item.id.as_str()))
+                && match item.kind {
+                    LibraryItemKind::File => files
+                        .iter()
+                        .any(|file| file.id == item.id && file.is_effectively_live()),
+                    LibraryItemKind::Folder => folders
+                        .iter()
+                        .any(|folder| folder.id == item.id && folder.is_effectively_live()),
+                };
+            if !valid
+                || (item.kind == LibraryItemKind::Folder
+                    && folder_id.is_some_and(|target| {
+                        target == item.id || folder_descends_from(&folders, target, &item.id)
+                    }))
+            {
+                tx.rollback().await?;
+                return Ok(BulkMutation::Conflict);
+            }
+            seen.push((item.kind, item.id.as_str()));
+        }
+        let normalized = normalized_refs(items, &files, &folders);
+        let updated_at = mutation_time();
+        for item in &normalized {
+            let (table, parent_column) = match item.kind {
+                LibraryItemKind::File => ("files", "folder_id"),
+                LibraryItemKind::Folder => ("folders", "parent_id"),
+            };
+            let sql = format!(
+                "UPDATE {table} SET {parent_column} = $1, updated_at = \
+                   CASE WHEN updated_at = 9223372036854775807 THEN updated_at \
+                        WHEN updated_at >= $2 THEN updated_at + 1 ELSE $2 END \
+                 WHERE id = $3 AND owner_sub = $4 AND trashed_at = 0 \
+                   AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL"
+            );
+            let updated = sqlx::query(&sql)
+                .bind(folder_id)
+                .bind(updated_at)
+                .bind(&item.id)
+                .bind(owner_sub)
+                .execute(&mut *tx)
+                .await?;
+            if updated.rows_affected() != 1 {
+                tx.rollback().await?;
+                return Ok(BulkMutation::Conflict);
+            }
+        }
+        tx.commit().await?;
+        Ok(BulkMutation::Applied {
+            changed: normalized.len(),
+        })
+    }
+
+    async fn bulk_purge_async(
+        &self,
+        owner_sub: &str,
+        items: &[DriveItemRef],
+        enqueued_at: i64,
+    ) -> Result<BulkMutation, sqlx::Error> {
+        if items.is_empty() || items.len() > MAX_BULK_ITEMS {
+            return Ok(BulkMutation::Conflict);
+        }
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO owner_storage_guards (owner_sub) VALUES ($1) ON CONFLICT DO NOTHING",
+        )
+        .bind(owner_sub)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("SELECT owner_sub FROM owner_storage_guards WHERE owner_sub = $1 FOR UPDATE")
+            .bind(owner_sub)
+            .fetch_one(&mut *tx)
+            .await?;
+        // Folder purge also closes request rooms. Lock them before any reservation/file/folder row,
+        // matching reserve/commit and eliminating request<->guard ABBA cycles.
+        sqlx::query(
+            "SELECT id FROM upload_requests WHERE owner_sub = $1 ORDER BY id ASC FOR UPDATE",
+        )
+        .bind(owner_sub)
+        .fetch_all(&mut *tx)
+        .await?;
+        let file_rows = sqlx::query(&format!(
+            "SELECT {COLS} FROM files WHERE owner_sub = $1 FOR UPDATE"
+        ))
+        .bind(owner_sub)
+        .fetch_all(&mut *tx)
+        .await?;
+        let files: Vec<FileRec> = file_rows
+            .iter()
+            .map(Self::file_from_row)
+            .collect::<Result<_, _>>()?;
+        let folder_rows = sqlx::query(&format!(
+            "SELECT {FOLDER_COLS} FROM folders WHERE owner_sub = $1 FOR UPDATE"
+        ))
+        .bind(owner_sub)
+        .fetch_all(&mut *tx)
+        .await?;
+        let folders: Vec<FolderRec> = folder_rows
+            .iter()
+            .map(Self::folder_from_row)
+            .collect::<Result<_, _>>()?;
+        let mut seen = Vec::new();
+        let mut authorities = Vec::new();
+        for item in items {
+            let entry_id = match item.kind {
+                LibraryItemKind::File => files.iter().find_map(|file| {
+                    (file.id == item.id
+                        && file.trash_entry_id.is_some()
+                        && file.trash_ancestor_id.is_none())
+                    .then(|| file.trash_entry_id.clone())
+                    .flatten()
+                }),
+                LibraryItemKind::Folder => folders.iter().find_map(|folder| {
+                    (folder.id == item.id
+                        && folder.trash_entry_id.is_some()
+                        && folder.trash_ancestor_id.is_none())
+                    .then(|| folder.trash_entry_id.clone())
+                    .flatten()
+                }),
+            };
+            if seen.contains(&(item.kind, item.id.as_str())) || entry_id.is_none() {
+                tx.rollback().await?;
+                return Ok(BulkMutation::Conflict);
+            }
+            seen.push((item.kind, item.id.as_str()));
+            authorities.push((
+                entry_id.expect("checked entry id"),
+                item.kind,
+                item.id.clone(),
+            ));
+        }
+        authorities.sort_by(|left, right| left.0.cmp(&right.0));
+        for (entry_id, kind, item_id) in &authorities {
+            let authority = sqlx::query(
+                "SELECT 1 FROM trash_entries WHERE id = $1 AND owner_sub = $2 \
+                 AND item_kind = $3 AND item_id = $4 FOR UPDATE",
+            )
+            .bind(entry_id)
+            .bind(owner_sub)
+            .bind(kind.slug())
+            .bind(item_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if authority.is_none() {
+                tx.rollback().await?;
+                return Ok(BulkMutation::Conflict);
+            }
+        }
+        let normalized = normalized_refs(items, &files, &folders);
+        let mut doomed_folders = Vec::new();
+        let mut doomed_files: Vec<String> = normalized
+            .iter()
+            .filter(|item| item.kind == LibraryItemKind::File)
+            .map(|item| item.id.clone())
+            .collect();
+        for root in normalized
+            .iter()
+            .filter(|item| item.kind == LibraryItemKind::Folder)
+        {
+            doomed_folders.extend(
+                folders
+                    .iter()
+                    .filter(|folder| folder_descends_from(&folders, &folder.id, &root.id))
+                    .map(|folder| folder.id.clone()),
+            );
+        }
+        doomed_folders.sort();
+        doomed_folders.dedup();
+        doomed_files.extend(
+            files
+                .iter()
+                .filter(|file| {
+                    file.folder_id
+                        .as_ref()
+                        .is_some_and(|folder| doomed_folders.contains(folder))
+                })
+                .map(|file| file.id.clone()),
+        );
+        doomed_files.sort();
+        doomed_files.dedup();
+        let mut keys: Vec<String> = files
+            .iter()
+            .filter(|file| doomed_files.contains(&file.id))
+            .map(|file| file.object_key.clone())
+            .collect();
+        for file_id in &doomed_files {
+            let rows =
+                sqlx::query("SELECT object_key FROM file_versions WHERE file_id = $1 FOR UPDATE")
+                    .bind(file_id)
+                    .fetch_all(&mut *tx)
+                    .await?;
+            for row in rows {
+                keys.push(row.try_get("object_key")?);
+            }
+        }
+        let thumbs: Vec<String> = keys.iter().map(|key| format!("{key}.thumb")).collect();
+        keys.extend(thumbs);
+        keys.sort();
+        keys.dedup();
+        for key in &keys {
+            Self::enqueue_blob_delete_tx(&mut tx, key, enqueued_at, "trash-purge").await?;
+        }
+        for file_id in &doomed_files {
+            sqlx::query("DELETE FROM file_comments WHERE file_id = $1")
+                .bind(file_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM file_versions WHERE file_id = $1")
+                .bind(file_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM files WHERE id = $1 AND owner_sub = $2")
+                .bind(file_id)
+                .bind(owner_sub)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "DELETE FROM trash_entries WHERE owner_sub = $1 \
+                 AND item_kind = 'file' AND item_id = $2",
+            )
+            .bind(owner_sub)
+            .bind(file_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        for folder_id in &doomed_folders {
+            sqlx::query(
+                "UPDATE upload_requests SET status = 'closed', updated_at = $1 \
+                 WHERE owner_sub = $2 AND folder_id = $3",
+            )
+            .bind(enqueued_at)
+            .bind(owner_sub)
+            .bind(folder_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("DELETE FROM folders WHERE id = $1 AND owner_sub = $2")
+                .bind(folder_id)
+                .bind(owner_sub)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "DELETE FROM trash_entries WHERE owner_sub = $1 \
+                 AND item_kind = 'folder' AND item_id = $2",
+            )
+            .bind(owner_sub)
+            .bind(folder_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(BulkMutation::Applied {
+            changed: normalized.len(),
+        })
+    }
+
+    async fn claim_expired_trash_async(
+        &self,
+        lease_id: &str,
+        now: i64,
+        lease_expired_before: i64,
+        limit: i64,
+    ) -> Result<Vec<TrashEntry>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let candidate_rows = sqlx::query(
+            "SELECT t.id FROM trash_entries t \
+             WHERE t.purge_after <= $1 \
+               AND (t.recovery_lease IS NULL OR t.recovery_leased_at <= $2) \
+               AND (\
+                 (t.item_kind = 'file' AND EXISTS (\
+                    SELECT 1 FROM files f WHERE f.id = t.item_id \
+                      AND f.owner_sub = t.owner_sub AND f.trash_entry_id = t.id \
+                      AND f.trash_ancestor_id IS NULL)) OR \
+                 (t.item_kind = 'folder' AND EXISTS (\
+                    SELECT 1 FROM folders d WHERE d.id = t.item_id \
+                      AND d.owner_sub = t.owner_sub AND d.trash_entry_id = t.id \
+                      AND d.trash_ancestor_id IS NULL))\
+               ) \
+             ORDER BY t.purge_after ASC, t.id ASC LIMIT $3",
+        )
+        .bind(now)
+        .bind(lease_expired_before)
+        .bind(clamp_page(limit))
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut candidate_ids: Vec<String> = candidate_rows
+            .iter()
+            .map(|row| row.try_get("id"))
+            .collect::<Result<_, _>>()?;
+        // Every lifecycle mutation locks Trash authority by id. Fairness is decided above before
+        // LIMIT; only the lock acquisition order changes, eliminating claim-vs-bulk ABBA.
+        candidate_ids.sort();
+        let mut claimed = Vec::new();
+        for candidate_id in candidate_ids {
+            let row = sqlx::query(
+                "SELECT t.id, t.owner_sub, t.item_kind, t.item_id, t.trashed_at, t.purge_after, \
+                        t.recovery_lease, t.recovery_leased_at \
+                 FROM trash_entries t WHERE t.id = $1 AND t.purge_after <= $2 \
+                   AND (t.recovery_lease IS NULL OR t.recovery_leased_at <= $3) \
+                   AND (\
+                     (t.item_kind = 'file' AND EXISTS (\
+                        SELECT 1 FROM files f WHERE f.id = t.item_id \
+                          AND f.owner_sub = t.owner_sub AND f.trash_entry_id = t.id \
+                          AND f.trash_ancestor_id IS NULL)) OR \
+                     (t.item_kind = 'folder' AND EXISTS (\
+                        SELECT 1 FROM folders d WHERE d.id = t.item_id \
+                          AND d.owner_sub = t.owner_sub AND d.trash_entry_id = t.id \
+                          AND d.trash_ancestor_id IS NULL))\
+                   ) FOR UPDATE",
+            )
+            .bind(&candidate_id)
+            .bind(now)
+            .bind(lease_expired_before)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(row) = row else {
+                continue;
+            };
+            let entry = Self::trash_entry_from_row(&row)?;
+            let table = match entry.kind {
+                LibraryItemKind::File => "files",
+                LibraryItemKind::Folder => "folders",
+            };
+            let sql = format!(
+                "SELECT 1 FROM {table} WHERE id = $1 AND owner_sub = $2 \
+                 AND trash_entry_id = $3 AND trash_ancestor_id IS NULL"
+            );
+            if sqlx::query(&sql)
+                .bind(&entry.item_id)
+                .bind(&entry.owner_sub)
+                .bind(&entry.id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_none()
+            {
+                continue;
+            }
+            let updated = sqlx::query(
+                "UPDATE trash_entries SET recovery_lease = $1, recovery_leased_at = $2 \
+                 WHERE id = $3 AND (recovery_lease IS NULL OR recovery_leased_at <= $4)",
+            )
+            .bind(lease_id)
+            .bind(now)
+            .bind(&entry.id)
+            .bind(lease_expired_before)
+            .execute(&mut *tx)
+            .await?;
+            if updated.rows_affected() == 1 {
+                let mut leased = entry;
+                leased.recovery_lease = Some(lease_id.to_string());
+                leased.recovery_leased_at = Some(now);
+                claimed.push(leased);
+            }
+        }
+        tx.commit().await?;
+        Ok(claimed)
+    }
+
+    async fn abandon_trash_claim_async(
+        &self,
+        entry_id: &str,
+        lease_id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE trash_entries SET recovery_lease = NULL, recovery_leased_at = NULL \
+             WHERE id = $1 AND recovery_lease = $2",
+        )
+        .bind(entry_id)
+        .bind(lease_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn claim_blob_deletions_async(
+        &self,
+        lease_id: &str,
+        now: i64,
+        lease_expired_before: i64,
+        limit: i64,
+    ) -> Result<BlobDeleteClaim, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query(
+            "SELECT object_key, attempts FROM blob_delete_queue \
+             WHERE next_attempt_at <= $1 \
+               AND (recovery_lease IS NULL OR recovery_leased_at <= $2) \
+             ORDER BY next_attempt_at ASC, enqueued_at ASC, object_key ASC \
+             LIMIT $3 FOR UPDATE",
+        )
+        .bind(now)
+        .bind(lease_expired_before)
+        .bind(clamp_page(limit))
+        .fetch_all(&mut *tx)
+        .await?;
+        if rows.is_empty() {
+            tx.commit().await?;
+            return Ok(BlobDeleteClaim::Empty);
+        }
+        let mut claimed = Vec::with_capacity(rows.len());
+        for row in rows {
+            let object_key: String = row.try_get("object_key")?;
+            let attempts: i64 = row.try_get("attempts")?;
+            let updated = sqlx::query(
+                "UPDATE blob_delete_queue SET recovery_lease = $1, recovery_leased_at = $2 \
+                 WHERE object_key = $3 \
+                   AND (recovery_lease IS NULL OR recovery_leased_at <= $4)",
+            )
+            .bind(lease_id)
+            .bind(now)
+            .bind(&object_key)
+            .bind(lease_expired_before)
+            .execute(&mut *tx)
+            .await?;
+            if updated.rows_affected() == 1 {
+                claimed.push(BlobDeleteItem {
+                    object_key,
+                    attempts,
+                });
+            }
+        }
+        tx.commit().await?;
+        if claimed.is_empty() {
+            Ok(BlobDeleteClaim::Empty)
+        } else {
+            Ok(BlobDeleteClaim::Claimed(claimed))
+        }
+    }
+
+    async fn complete_blob_deletion_async(
+        &self,
+        object_key: &str,
+        lease_id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "DELETE FROM blob_delete_queue WHERE object_key = $1 AND recovery_lease = $2",
+        )
+        .bind(object_key)
+        .bind(lease_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn abandon_blob_deletion_async(
+        &self,
+        object_key: &str,
+        lease_id: &str,
+        retry_at: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE blob_delete_queue \
+             SET attempts = CASE WHEN attempts = 9223372036854775807 THEN attempts \
+                                 ELSE attempts + 1 END, \
+                 next_attempt_at = $1, recovery_lease = NULL, recovery_leased_at = NULL \
+             WHERE object_key = $2 AND recovery_lease = $3",
+        )
+        .bind(retry_at)
+        .bind(object_key)
+        .bind(lease_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn create_folder_async(&self, folder: &FolderRec) -> Result<bool, sqlx::Error> {
+        if folder.parent_id.as_deref() == Some(folder.id.as_str()) {
+            return Ok(false);
+        }
+        let mut tx = self.pool.begin().await?;
+        Self::lock_owner_storage_guard_tx(&mut tx, &folder.owner_sub).await?;
         let result = sqlx::query(
             "INSERT INTO folders \
                  (id, owner_sub, parent_id, name, created_at, updated_at, share_token, expires_at, \
-                  share_password_hash, upload_token) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT DO NOTHING",
+                  share_password_hash, upload_token, trashed_at, trash_entry_id, trash_ancestor_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+             ON CONFLICT DO NOTHING",
         )
         .bind(&folder.id)
         .bind(&folder.owner_sub)
@@ -2753,14 +6439,38 @@ impl PgStore {
         .bind(folder.expires_at)
         .bind(&folder.share_password_hash)
         .bind(&folder.upload_token)
-        .execute(&self.pool)
+        .bind(folder.trashed_at)
+        .bind(&folder.trash_entry_id)
+        .bind(&folder.trash_ancestor_id)
+        .execute(&mut *tx)
         .await?;
-        Ok(result.rows_affected() == 1)
+        if result.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        if let Some(parent_id) = folder.parent_id.as_deref() {
+            if sqlx::query(
+                "SELECT 1 FROM folders WHERE id = $1 AND owner_sub = $2 AND trashed_at = 0 \
+                 AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL FOR UPDATE",
+            )
+            .bind(parent_id)
+            .bind(&folder.owner_sub)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_none()
+            {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+        }
+        tx.commit().await?;
+        Ok(true)
     }
 
     async fn list_folders_async(&self, owner_sub: &str) -> Result<Vec<FolderRec>, sqlx::Error> {
         let rows = sqlx::query(&format!(
             "SELECT {FOLDER_COLS} FROM folders WHERE owner_sub = $1 \
+             AND trashed_at = 0 AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL \
              ORDER BY lower(name) ASC, id ASC"
         ))
         .bind(owner_sub)
@@ -2770,6 +6480,22 @@ impl PgStore {
     }
 
     async fn get_folder_async(
+        &self,
+        id: &str,
+        owner_sub: &str,
+    ) -> Result<Option<FolderRec>, sqlx::Error> {
+        let row = sqlx::query(&format!(
+            "SELECT {FOLDER_COLS} FROM folders WHERE id = $1 AND owner_sub = $2 \
+             AND trashed_at = 0 AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL"
+        ))
+        .bind(id)
+        .bind(owner_sub)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(Self::folder_from_row).transpose()
+    }
+
+    async fn get_folder_any_async(
         &self,
         id: &str,
         owner_sub: &str,
@@ -2789,7 +6515,8 @@ impl PgStore {
         token: &str,
     ) -> Result<Option<FolderRec>, sqlx::Error> {
         let row = sqlx::query(&format!(
-            "SELECT {FOLDER_COLS} FROM folders WHERE share_token = $1"
+            "SELECT {FOLDER_COLS} FROM folders WHERE share_token = $1 \
+             AND trashed_at = 0 AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL"
         ))
         .bind(token)
         .fetch_optional(&self.pool)
@@ -2802,7 +6529,8 @@ impl PgStore {
         token: &str,
     ) -> Result<Option<FolderRec>, sqlx::Error> {
         let row = sqlx::query(&format!(
-            "SELECT {FOLDER_COLS} FROM folders WHERE upload_token = $1"
+            "SELECT {FOLDER_COLS} FROM folders WHERE upload_token = $1 \
+             AND trashed_at = 0 AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL"
         ))
         .bind(token)
         .fetch_optional(&self.pool)
@@ -2821,7 +6549,8 @@ impl PgStore {
             "UPDATE folders SET name = $1, \
              updated_at = CASE WHEN updated_at = 9223372036854775807 THEN updated_at \
                                WHEN updated_at >= $2 THEN updated_at + 1 ELSE $2 END \
-             WHERE id = $3 AND owner_sub = $4",
+             WHERE id = $3 AND owner_sub = $4 AND trashed_at = 0 \
+               AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL",
         )
         .bind(name)
         .bind(updated_at)
@@ -2845,7 +6574,8 @@ impl PgStore {
             "UPDATE folders SET share_token = $1, expires_at = $2, share_password_hash = $3, \
              updated_at = CASE WHEN updated_at = 9223372036854775807 THEN updated_at \
                                WHEN updated_at >= $4 THEN updated_at + 1 ELSE $4 END \
-             WHERE id = $5 AND owner_sub = $6",
+             WHERE id = $5 AND owner_sub = $6 AND trashed_at = 0 \
+               AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL",
         )
         .bind(&share_token)
         .bind(expires_at)
@@ -2869,7 +6599,8 @@ impl PgStore {
             "UPDATE folders SET upload_token = $1, \
              updated_at = CASE WHEN updated_at = 9223372036854775807 THEN updated_at \
                                WHEN updated_at >= $2 THEN updated_at + 1 ELSE $2 END \
-             WHERE id = $3 AND owner_sub = $4",
+             WHERE id = $3 AND owner_sub = $4 AND trashed_at = 0 \
+               AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL",
         )
         .bind(&upload_token)
         .bind(updated_at)
@@ -2993,7 +6724,7 @@ impl PgStore {
     ) -> Result<Vec<FileRec>, sqlx::Error> {
         let rows = sqlx::query(&format!(
             "SELECT {COLS} FROM files WHERE folder_id = $1 AND owner_sub = $2 \
-             AND trashed_at = 0 \
+             AND trashed_at = 0 AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL \
              ORDER BY created_at DESC, id DESC"
         ))
         .bind(folder_id)
@@ -3015,7 +6746,8 @@ impl PgStore {
                 sqlx::query(&format!(
                     "SELECT {COLS} FROM files \
                      WHERE owner_sub = $1 AND name = $2 AND folder_id IS NULL \
-                     AND trashed_at = 0 LIMIT 1"
+                     AND trashed_at = 0 AND trash_entry_id IS NULL \
+                     AND trash_ancestor_id IS NULL LIMIT 1"
                 ))
                 .bind(owner_sub)
                 .bind(name)
@@ -3026,7 +6758,8 @@ impl PgStore {
                 sqlx::query(&format!(
                     "SELECT {COLS} FROM files \
                      WHERE owner_sub = $1 AND name = $2 AND folder_id = $3 \
-                     AND trashed_at = 0 LIMIT 1"
+                     AND trashed_at = 0 AND trash_entry_id IS NULL \
+                     AND trash_ancestor_id IS NULL LIMIT 1"
                 ))
                 .bind(owner_sub)
                 .bind(name)
@@ -3393,6 +7126,8 @@ impl PgStore {
         &self,
         request: &UploadRequestRec,
     ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        Self::lock_owner_storage_guard_tx(&mut tx, &request.owner_sub).await?;
         let result = sqlx::query(
             "INSERT INTO upload_requests \
                  (id, owner_sub, folder_id, token, title, description, status, expires_at, \
@@ -3417,9 +7152,28 @@ impl PgStore {
         .bind(&request.allowed_types)
         .bind(request.created_at)
         .bind(request.updated_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(result.rows_affected() == 1)
+        let inserted = result.rows_affected() == 1;
+        if !inserted {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        if sqlx::query(
+            "SELECT 1 FROM folders WHERE id = $1 AND owner_sub = $2 AND trashed_at = 0 \
+             AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL FOR UPDATE",
+        )
+        .bind(&request.folder_id)
+        .bind(&request.owner_sub)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_none()
+        {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        tx.commit().await?;
+        Ok(true)
     }
 
     async fn list_upload_requests_async(
@@ -3516,6 +7270,32 @@ impl PgStore {
         now: i64,
         renewed_expires_at: i64,
     ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let request = sqlx::query(
+            "SELECT folder_id FROM upload_requests WHERE id = $1 AND owner_sub = $2 FOR UPDATE",
+        )
+        .bind(id)
+        .bind(owner_sub)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(request) = request else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        let folder_id: String = request.try_get("folder_id")?;
+        if sqlx::query(
+            "SELECT 1 FROM folders WHERE id = $1 AND owner_sub = $2 AND trashed_at = 0 \
+             AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL FOR UPDATE",
+        )
+        .bind(&folder_id)
+        .bind(owner_sub)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_none()
+        {
+            tx.rollback().await?;
+            return Ok(false);
+        }
         let result = sqlx::query(
             "UPDATE upload_requests \
              SET status = 'open', \
@@ -3530,9 +7310,11 @@ impl PgStore {
         .bind(renewed_expires_at)
         .bind(id)
         .bind(owner_sub)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(result.rows_affected() == 1)
+        let changed = result.rows_affected() == 1;
+        tx.commit().await?;
+        Ok(changed)
     }
 
     async fn rotate_upload_request_token_async(
@@ -3592,6 +7374,18 @@ impl PgStore {
             now,
         } = input;
         let mut tx = self.pool.begin().await?;
+        // Unlocked hint discovers the immutable owner key. The authoritative request is re-read
+        // after taking the owner guard, establishing guard -> request -> folder/reservation order.
+        let owner_hint = sqlx::query("SELECT owner_sub FROM upload_requests WHERE id = $1")
+            .bind(request_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(owner_hint) = owner_hint else {
+            tx.rollback().await?;
+            return Ok(UploadReserve::Unavailable);
+        };
+        let owner_hint: String = owner_hint.try_get("owner_sub")?;
+        Self::lock_owner_storage_guard_tx(&mut tx, &owner_hint).await?;
         let request_row = sqlx::query(&format!(
             "SELECT {UPLOAD_REQUEST_COLS} FROM upload_requests WHERE id = $1 FOR UPDATE"
         ))
@@ -3603,7 +7397,8 @@ impl PgStore {
             return Ok(UploadReserve::Unavailable);
         };
         let request = Self::upload_request_from_row(&request_row)?;
-        if !capability_token_eq(&request.token, expected_token)
+        if request.owner_sub != owner_hint
+            || !capability_token_eq(&request.token, expected_token)
             || !request.is_open()
             || request.is_expired(now)
         {
@@ -3629,60 +7424,41 @@ impl PgStore {
             return Ok(UploadReserve::FileCountExceeded);
         }
 
-        // Lock one stable row per owner so simultaneous uploads through DIFFERENT request rooms
-        // cannot both pass the global quota decision.
-        sqlx::query(
-            "INSERT INTO owner_storage_guards (owner_sub) VALUES ($1) ON CONFLICT DO NOTHING",
+        if sqlx::query(
+            "SELECT 1 FROM folders WHERE id = $1 AND owner_sub = $2 AND trashed_at = 0 \
+             AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL FOR UPDATE",
         )
+        .bind(&request.folder_id)
         .bind(&request.owner_sub)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("SELECT owner_sub FROM owner_storage_guards WHERE owner_sub = $1 FOR UPDATE")
-            .bind(&request.owner_sub)
-            .fetch_one(&mut *tx)
-            .await?;
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_none()
+        {
+            tx.rollback().await?;
+            return Ok(UploadReserve::Unavailable);
+        }
 
-        if sqlx::query("SELECT 1 FROM files WHERE id = $1")
-            .bind(reservation_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .is_some()
+        Self::lock_blob_key_guard_tx(&mut tx, reservation_id).await?;
+
+        if sqlx::query(
+            "SELECT 1 WHERE \
+                 EXISTS (SELECT 1 FROM files WHERE id = $1 OR object_key = $1) OR \
+                 EXISTS (SELECT 1 FROM file_versions WHERE object_key = $1) OR \
+                 EXISTS (SELECT 1 FROM owner_blob_write_intents WHERE object_key = $1) OR \
+                 EXISTS (SELECT 1 FROM blob_delete_queue WHERE object_key = $1)",
+        )
+        .bind(reservation_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some()
         {
             tx.rollback().await?;
             return Ok(UploadReserve::Collision);
         }
 
         if let Some(quota) = owner_quota {
-            let files = sqlx::query(
-                "SELECT CAST(COALESCE(SUM(size), 0) AS BIGINT) AS bytes \
-                 FROM files WHERE owner_sub = $1",
-            )
-            .bind(&request.owner_sub)
-            .fetch_one(&mut *tx)
-            .await?
-            .try_get::<i64, _>("bytes")?;
-            let versions = sqlx::query(
-                "SELECT CAST(COALESCE(SUM(v.size), 0) AS BIGINT) AS bytes \
-                 FROM file_versions v JOIN files f ON f.id = v.file_id WHERE f.owner_sub = $1",
-            )
-            .bind(&request.owner_sub)
-            .fetch_one(&mut *tx)
-            .await?
-            .try_get::<i64, _>("bytes")?;
-            let reservations = sqlx::query(
-                "SELECT CAST(COALESCE(SUM(size), 0) AS BIGINT) AS bytes \
-                 FROM upload_reservations WHERE owner_sub = $1",
-            )
-            .bind(&request.owner_sub)
-            .fetch_one(&mut *tx)
-            .await?
-            .try_get::<i64, _>("bytes")?;
-            if files
-                .saturating_add(versions)
-                .saturating_add(reservations)
-                .saturating_add(size)
-                > quota
-            {
+            let used = Self::owner_usage_with_pending_tx(&mut tx, &request.owner_sub).await?;
+            if used.saturating_add(size) > quota {
                 tx.rollback().await?;
                 return Ok(UploadReserve::OwnerQuotaExceeded);
             }
@@ -3724,9 +7500,8 @@ impl PgStore {
         submission: &UploadSubmission,
     ) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-        // Peek only to discover the immutable request/owner lock keys. Every writer then takes
-        // locks in request -> owner guard -> reservation order, matching reserve. The reservation
-        // is re-read FOR UPDATE below before any state is committed.
+        // Peek only to discover immutable lock keys, then re-read every value under the canonical
+        // owner guard -> request -> reservation -> folder/file order.
         let reservation_hint = sqlx::query(
             "SELECT request_id, owner_sub, size FROM upload_reservations \
              WHERE id = $1 AND recovery_lease IS NULL",
@@ -3742,38 +7517,41 @@ impl PgStore {
         let owner_sub: String = reservation_hint.try_get("owner_sub")?;
         let reserved_size: i64 = reservation_hint.try_get("size")?;
         if file.id != reservation_id
+            || file.object_key != reservation_id
             || file.owner_sub != owner_sub
             || file.size != reserved_size
+            || !file.is_effectively_live()
             || submission.request_id != request_id
             || submission.file_id != file.id
+            || submission.name != file.name
+            || submission.content_type != file.content_type
+            || submission.size != file.size
         {
             tx.rollback().await?;
             return Ok(false);
         }
 
-        let request_locked = sqlx::query("SELECT id FROM upload_requests WHERE id = $1 FOR UPDATE")
-            .bind(&request_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .is_some();
-        if !request_locked {
+        Self::lock_owner_storage_guard_tx(&mut tx, &owner_sub).await?;
+
+        let request_locked = sqlx::query(
+            "SELECT id, owner_sub, folder_id FROM upload_requests WHERE id = $1 FOR UPDATE",
+        )
+        .bind(&request_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(request_locked) = request_locked else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        if request_locked.try_get::<String, _>("owner_sub")? != owner_sub {
             tx.rollback().await?;
             return Ok(false);
         }
-
-        // Serialize the reservation -> file conversion with every public quota decision for this
-        // owner. Without this lock, a READ COMMITTED reserve could read `files` before this commit
-        // and `upload_reservations` after it, missing the same bytes in both snapshots.
-        sqlx::query(
-            "INSERT INTO owner_storage_guards (owner_sub) VALUES ($1) ON CONFLICT DO NOTHING",
-        )
-        .bind(&owner_sub)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("SELECT owner_sub FROM owner_storage_guards WHERE owner_sub = $1 FOR UPDATE")
-            .bind(&owner_sub)
-            .fetch_one(&mut *tx)
-            .await?;
+        let destination_id: String = request_locked.try_get("folder_id")?;
+        if file.folder_id.as_deref() != Some(destination_id.as_str()) {
+            tx.rollback().await?;
+            return Ok(false);
+        }
 
         let reservation = sqlx::query(
             "SELECT request_id, owner_sub, size FROM upload_reservations \
@@ -3794,11 +7572,26 @@ impl PgStore {
             return Ok(false);
         }
 
+        if sqlx::query(
+            "SELECT 1 FROM folders WHERE id = $1 AND owner_sub = $2 AND trashed_at = 0 \
+             AND trash_entry_id IS NULL AND trash_ancestor_id IS NULL FOR UPDATE",
+        )
+        .bind(&destination_id)
+        .bind(&owner_sub)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_none()
+        {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
         let inserted_file = sqlx::query(
             "INSERT INTO files \
                  (id, owner_sub, name, content_type, size, bucket, object_key, share_token, \
-                  created_at, updated_at, expires_at, share_password_hash, folder_id, trashed_at, view_count) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
+                  created_at, updated_at, expires_at, share_password_hash, folder_id, trashed_at, \
+                  trash_entry_id, trash_ancestor_id, view_count) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
              ON CONFLICT DO NOTHING",
         )
         .bind(&file.id)
@@ -3815,6 +7608,8 @@ impl PgStore {
         .bind(&file.share_password_hash)
         .bind(&file.folder_id)
         .bind(file.trashed_at)
+        .bind(&file.trash_entry_id)
+        .bind(&file.trash_ancestor_id)
         .bind(file.view_count)
         .execute(&mut *tx)
         .await?;
@@ -4051,6 +7846,107 @@ impl Store for PgStore {
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
+    async fn reserve_owner_blob_write(
+        &self,
+        intent: &OwnerBlobWriteIntent,
+        owner_quota: Option<i64>,
+    ) -> Result<OwnerBlobCommit, StoreError> {
+        self.reserve_owner_blob_write_async(intent, owner_quota)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn commit_owner_upload(
+        &self,
+        file: &FileRec,
+        owner_quota: Option<i64>,
+    ) -> Result<OwnerBlobCommit, StoreError> {
+        self.commit_owner_upload_async(file, owner_quota)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn commit_owner_reupload(
+        &self,
+        input: OwnerReuploadInput<'_>,
+    ) -> Result<OwnerBlobCommit, StoreError> {
+        self.commit_owner_reupload_async(input)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn commit_owner_version_restore(
+        &self,
+        input: OwnerVersionRestoreInput<'_>,
+    ) -> Result<OwnerBlobCommit, StoreError> {
+        self.commit_owner_version_restore_async(input)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn finalize_owner_thumbnail(
+        &self,
+        object_key: &str,
+        owner_sub: &str,
+        file_id: &str,
+        expected_object_key: &str,
+    ) -> Result<OwnerBlobCommit, StoreError> {
+        self.finalize_owner_thumbnail_async(object_key, owner_sub, file_id, expected_object_key)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn enqueue_blob_deletion(
+        &self,
+        object_key: &str,
+        enqueued_at: i64,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        self.enqueue_blob_deletion_async(object_key, enqueued_at, reason)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn claim_owner_blob_writes(
+        &self,
+        lease_id: &str,
+        now: i64,
+        created_before: i64,
+        lease_expired_before: i64,
+        limit: i64,
+    ) -> Result<Vec<OwnerBlobWriteIntent>, StoreError> {
+        self.claim_owner_blob_writes_async(
+            lease_id,
+            now,
+            created_before,
+            lease_expired_before,
+            limit,
+        )
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn complete_owner_blob_write(
+        &self,
+        object_key: &str,
+        lease_id: &str,
+    ) -> Result<bool, StoreError> {
+        self.complete_owner_blob_write_async(object_key, lease_id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn abandon_owner_blob_write(
+        &self,
+        object_key: &str,
+        lease_id: &str,
+        retry_at: i64,
+    ) -> Result<bool, StoreError> {
+        self.abandon_owner_blob_write_async(object_key, lease_id, retry_at)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
     async fn query_library(
         &self,
         owner_sub: &str,
@@ -4126,6 +8022,116 @@ impl Store for PgStore {
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
+    async fn query_trash(
+        &self,
+        owner_sub: &str,
+        before: Option<&LibraryCursor>,
+        limit: i64,
+    ) -> Result<TrashPage, StoreError> {
+        self.query_trash_async(owner_sub, before, limit)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn bulk_trash(
+        &self,
+        owner_sub: &str,
+        roots: &[TrashRootInput],
+        trashed_at: i64,
+        purge_after: i64,
+    ) -> Result<BulkMutation, StoreError> {
+        self.bulk_trash_async(owner_sub, roots, trashed_at, purge_after)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn bulk_restore(
+        &self,
+        owner_sub: &str,
+        items: &[DriveItemRef],
+    ) -> Result<BulkMutation, StoreError> {
+        self.bulk_restore_async(owner_sub, items)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn bulk_move(
+        &self,
+        owner_sub: &str,
+        items: &[DriveItemRef],
+        folder_id: Option<&str>,
+    ) -> Result<BulkMutation, StoreError> {
+        self.bulk_move_async(owner_sub, items, folder_id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn bulk_purge(
+        &self,
+        owner_sub: &str,
+        items: &[DriveItemRef],
+        enqueued_at: i64,
+    ) -> Result<BulkMutation, StoreError> {
+        self.bulk_purge_async(owner_sub, items, enqueued_at)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn claim_expired_trash(
+        &self,
+        lease_id: &str,
+        now: i64,
+        lease_expired_before: i64,
+        limit: i64,
+    ) -> Result<Vec<TrashEntry>, StoreError> {
+        self.claim_expired_trash_async(lease_id, now, lease_expired_before, limit)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn abandon_trash_claim(
+        &self,
+        entry_id: &str,
+        lease_id: &str,
+    ) -> Result<bool, StoreError> {
+        self.abandon_trash_claim_async(entry_id, lease_id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn claim_blob_deletions(
+        &self,
+        lease_id: &str,
+        now: i64,
+        lease_expired_before: i64,
+        limit: i64,
+    ) -> Result<BlobDeleteClaim, StoreError> {
+        self.claim_blob_deletions_async(lease_id, now, lease_expired_before, limit)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn complete_blob_deletion(
+        &self,
+        object_key: &str,
+        lease_id: &str,
+    ) -> Result<bool, StoreError> {
+        self.complete_blob_deletion_async(object_key, lease_id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn abandon_blob_deletion(
+        &self,
+        object_key: &str,
+        lease_id: &str,
+        retry_at: i64,
+    ) -> Result<bool, StoreError> {
+        self.abandon_blob_deletion_async(object_key, lease_id, retry_at)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
     async fn configure_share(
         &self,
         id: &str,
@@ -4153,6 +8159,16 @@ impl Store for PgStore {
 
     async fn get_folder(&self, id: &str, owner_sub: &str) -> Result<Option<FolderRec>, StoreError> {
         self.get_folder_async(id, owner_sub)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn get_folder_any(
+        &self,
+        id: &str,
+        owner_sub: &str,
+    ) -> Result<Option<FolderRec>, StoreError> {
+        self.get_folder_any_async(id, owner_sub)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
@@ -4557,6 +8573,8 @@ mod tests {
             share_password_hash: None,
             folder_id: None,
             trashed_at: 0,
+            trash_entry_id: None,
+            trash_ancestor_id: None,
             view_count: 0,
         }
     }
@@ -5036,6 +9054,9 @@ mod tests {
             expires_at: None,
             share_password_hash: None,
             upload_token: None,
+            trashed_at: 0,
+            trash_entry_id: None,
+            trash_ancestor_id: None,
         }
     }
 
@@ -5052,6 +9073,9 @@ mod tests {
             expires_at: None,
             share_password_hash: None,
             upload_token: None,
+            trashed_at: 0,
+            trash_entry_id: None,
+            trash_ancestor_id: None,
         }
     }
 
@@ -5460,5 +9484,678 @@ mod tests {
             .update_file_blob("a", "intruder", "x", 1, "text/plain", 1)
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn unified_trash_preserves_nested_scope_and_capabilities() {
+        let s = InMemoryStore::new();
+        let mut parent = folder("trashparent", "u", "Parent", 1);
+        parent.share_token = Some("parent-share-token".into());
+        s.create_folder(&parent).await.unwrap();
+        let mut child = subfolder("trashchild", "u", "trashparent", "Child");
+        child.share_token = Some("child-share-token".into());
+        s.create_folder(&child).await.unwrap();
+        let mut nested = file("trashfile", "u", "file-share-token", 2);
+        nested.folder_id = Some("trashchild".into());
+        s.create(&nested).await.unwrap();
+
+        assert_eq!(
+            s.bulk_trash(
+                "u",
+                &[TrashRootInput {
+                    item: DriveItemRef {
+                        kind: LibraryItemKind::Folder,
+                        id: "trashchild".into(),
+                    },
+                    entry_id: "child-entry".into(),
+                }],
+                10,
+                100,
+            )
+            .await
+            .unwrap(),
+            BulkMutation::Applied { changed: 1 }
+        );
+        assert!(s
+            .get_folder_by_token("child-share-token")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(s.get_by_token("file-share-token").await.unwrap().is_none());
+
+        assert_eq!(
+            s.bulk_trash(
+                "u",
+                &[TrashRootInput {
+                    item: DriveItemRef {
+                        kind: LibraryItemKind::Folder,
+                        id: "trashparent".into(),
+                    },
+                    entry_id: "parent-entry".into(),
+                }],
+                20,
+                200,
+            )
+            .await
+            .unwrap(),
+            BulkMutation::Applied { changed: 1 }
+        );
+        let hidden_child = s.get_folder_any("trashchild", "u").await.unwrap().unwrap();
+        assert_eq!(hidden_child.trash_entry_id.as_deref(), Some("child-entry"));
+        assert_eq!(
+            hidden_child.trash_ancestor_id.as_deref(),
+            Some("parent-entry")
+        );
+        let roots = s.query_trash("u", None, 20).await.unwrap();
+        assert_eq!(roots.items.len(), 1, "nested roots are deduplicated");
+        assert_eq!(roots.items[0].id, "trashparent");
+
+        assert_eq!(
+            s.bulk_restore(
+                "u",
+                &[DriveItemRef {
+                    kind: LibraryItemKind::Folder,
+                    id: "trashparent".into(),
+                }],
+            )
+            .await
+            .unwrap(),
+            BulkMutation::Applied { changed: 1 }
+        );
+        assert!(s.get_folder("trashparent", "u").await.unwrap().is_some());
+        assert!(s.get_folder("trashchild", "u").await.unwrap().is_none());
+        assert!(s.get_by_token("file-share-token").await.unwrap().is_none());
+        let roots = s.query_trash("u", None, 20).await.unwrap();
+        assert_eq!(roots.items.len(), 1);
+        assert_eq!(roots.items[0].id, "trashchild");
+
+        assert!(matches!(
+            s.bulk_restore(
+                "u",
+                &[DriveItemRef {
+                    kind: LibraryItemKind::Folder,
+                    id: "trashchild".into(),
+                }],
+            )
+            .await
+            .unwrap(),
+            BulkMutation::Applied { .. }
+        ));
+        assert_eq!(
+            s.get_folder_by_token("child-share-token")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "trashchild"
+        );
+        assert_eq!(
+            s.get_by_token("file-share-token")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "trashfile"
+        );
+    }
+
+    #[tokio::test]
+    async fn trash_projection_fails_closed_when_metadata_owner_is_corrupt() {
+        let s = InMemoryStore::new();
+        s.create(&file("ownerdriftfile", "u", "owner-drift-token", 1))
+            .await
+            .unwrap();
+        s.create_folder(&folder("ownerdriftfolder", "u", "Owner drift", 1))
+            .await
+            .unwrap();
+        assert!(matches!(
+            s.bulk_trash(
+                "u",
+                &[
+                    TrashRootInput {
+                        item: DriveItemRef {
+                            kind: LibraryItemKind::File,
+                            id: "ownerdriftfile".into(),
+                        },
+                        entry_id: "owner-drift-file-entry".into(),
+                    },
+                    TrashRootInput {
+                        item: DriveItemRef {
+                            kind: LibraryItemKind::Folder,
+                            id: "ownerdriftfolder".into(),
+                        },
+                        entry_id: "owner-drift-folder-entry".into(),
+                    },
+                ],
+                10,
+                100,
+            )
+            .await
+            .unwrap(),
+            BulkMutation::Applied { changed: 2 }
+        ));
+        assert_eq!(s.query_trash("u", None, 20).await.unwrap().items.len(), 2);
+
+        {
+            let mut folders = s.folders.lock().expect("folders lock poisoned");
+            let mut files = s.files.lock().expect("files lock poisoned");
+            folders
+                .iter_mut()
+                .find(|folder| folder.id == "ownerdriftfolder")
+                .unwrap()
+                .owner_sub = "v".into();
+            files
+                .iter_mut()
+                .find(|file| file.id == "ownerdriftfile")
+                .unwrap()
+                .owner_sub = "v".into();
+        }
+        assert!(
+            s.query_trash("u", None, 20).await.unwrap().items.is_empty(),
+            "entry ownership cannot project metadata owned by another subject"
+        );
+        assert!(s.query_trash("v", None, 20).await.unwrap().items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bulk_mutations_are_atomic_cycle_safe_and_domain_bounded() {
+        let s = InMemoryStore::new();
+        s.create_folder(&folder("cycleparent", "u", "Parent", 1))
+            .await
+            .unwrap();
+        s.create_folder(&subfolder("cyclechild", "u", "cycleparent", "Child"))
+            .await
+            .unwrap();
+        s.create(&file("ownedfile", "u", "owned-token", 1))
+            .await
+            .unwrap();
+        s.create(&file("foreignfile", "v", "foreign-token", 1))
+            .await
+            .unwrap();
+
+        let mixed = [
+            TrashRootInput {
+                item: DriveItemRef {
+                    kind: LibraryItemKind::File,
+                    id: "ownedfile".into(),
+                },
+                entry_id: "owned-entry".into(),
+            },
+            TrashRootInput {
+                item: DriveItemRef {
+                    kind: LibraryItemKind::File,
+                    id: "foreignfile".into(),
+                },
+                entry_id: "foreign-entry".into(),
+            },
+        ];
+        assert_eq!(
+            s.bulk_trash("u", &mixed, 10, 100).await.unwrap(),
+            BulkMutation::Conflict
+        );
+        assert!(s
+            .get("ownedfile")
+            .await
+            .unwrap()
+            .unwrap()
+            .is_effectively_live());
+
+        assert_eq!(
+            s.bulk_move(
+                "u",
+                &[DriveItemRef {
+                    kind: LibraryItemKind::Folder,
+                    id: "cycleparent".into(),
+                }],
+                Some("cyclechild"),
+            )
+            .await
+            .unwrap(),
+            BulkMutation::Conflict
+        );
+        assert!(s
+            .get_folder("cycleparent", "u")
+            .await
+            .unwrap()
+            .unwrap()
+            .parent_id
+            .is_none());
+
+        let too_many_items: Vec<DriveItemRef> = (0..=MAX_BULK_ITEMS)
+            .map(|index| DriveItemRef {
+                kind: LibraryItemKind::File,
+                id: format!("oversized{index}"),
+            })
+            .collect();
+        let too_many_roots: Vec<TrashRootInput> = too_many_items
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, item)| TrashRootInput {
+                item,
+                entry_id: format!("oversizedentry{index}"),
+            })
+            .collect();
+        assert_eq!(
+            s.bulk_trash("u", &too_many_roots, 1, 2).await.unwrap(),
+            BulkMutation::Conflict
+        );
+        assert_eq!(
+            s.bulk_restore("u", &too_many_items).await.unwrap(),
+            BulkMutation::Conflict
+        );
+        assert_eq!(
+            s.bulk_move("u", &too_many_items, None).await.unwrap(),
+            BulkMutation::Conflict
+        );
+        assert_eq!(
+            s.bulk_purge("u", &too_many_items, 1).await.unwrap(),
+            BulkMutation::Conflict
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_requires_exact_trash_authority_and_closes_doomed_request_rooms() {
+        let s = InMemoryStore::new();
+        s.create_folder(&folder("authorityfolder", "u", "Authority", 1))
+            .await
+            .unwrap();
+        assert!(s
+            .create_upload_request(&UploadRequestRec {
+                id: "authorityrequest".into(),
+                owner_sub: "u".into(),
+                folder_id: "authorityfolder".into(),
+                token: "authority-token".into(),
+                title: "Authority".into(),
+                description: String::new(),
+                status: "open".into(),
+                expires_at: None,
+                max_file_bytes: 10,
+                max_total_bytes: 10,
+                max_files: 1,
+                used_bytes: 0,
+                used_files: 0,
+                allowed_types: "*/*".into(),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .await
+            .unwrap());
+        let item = DriveItemRef {
+            kind: LibraryItemKind::Folder,
+            id: "authorityfolder".into(),
+        };
+        assert_eq!(
+            s.bulk_trash(
+                "u",
+                &[TrashRootInput {
+                    item: item.clone(),
+                    entry_id: "authorityentry".into(),
+                }],
+                10,
+                100,
+            )
+            .await
+            .unwrap(),
+            BulkMutation::Applied { changed: 1 }
+        );
+        {
+            let mut entries = s.trash_entries.lock().expect("trash lock poisoned");
+            entries
+                .iter_mut()
+                .find(|entry| entry.id == "authorityentry")
+                .unwrap()
+                .item_id = "dangling-item".into();
+        }
+        assert_eq!(
+            s.bulk_purge("u", std::slice::from_ref(&item), 20)
+                .await
+                .unwrap(),
+            BulkMutation::Conflict
+        );
+        assert!(s
+            .get_folder_any("authorityfolder", "u")
+            .await
+            .unwrap()
+            .is_some());
+        {
+            let mut entries = s.trash_entries.lock().expect("trash lock poisoned");
+            entries
+                .iter_mut()
+                .find(|entry| entry.id == "authorityentry")
+                .unwrap()
+                .item_id = "authorityfolder".into();
+        }
+        assert_eq!(
+            s.bulk_purge("u", &[item], 21).await.unwrap(),
+            BulkMutation::Applied { changed: 1 }
+        );
+        assert_eq!(
+            s.get_upload_request("authorityrequest", "u")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "closed"
+        );
+        assert!(!s
+            .reopen_upload_request("authorityrequest", "u", 22, 100)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn owner_reupload_and_restore_are_atomic_cas_transitions() {
+        let s = InMemoryStore::new();
+        let current = file("atomicfile", "u", "atomic-token", 1);
+        assert!(s.create(&current).await.unwrap());
+        let intent = OwnerBlobWriteIntent {
+            object_key: "atomic-new".into(),
+            owner_sub: "u".into(),
+            size: 5,
+            kind: OWNER_WRITE_REUPLOAD.into(),
+            file_id: current.id.clone(),
+            folder_id: None,
+            expected_object_key: Some(current.object_key.clone()),
+            created_at: 2,
+            attempts: 0,
+        };
+        assert_eq!(
+            s.reserve_owner_blob_write(&intent, Some(8)).await.unwrap(),
+            OwnerBlobCommit::Applied
+        );
+        assert_eq!(
+            s.commit_owner_reupload(OwnerReuploadInput {
+                owner_sub: "u",
+                file_id: "atomicfile",
+                expected_object_key: "atomicfile",
+                new_object_key: "atomic-new",
+                new_size: 5,
+                new_content_type: "image/webp",
+                snapshot_id: "atomic-old-version",
+                changed_at: 2,
+                owner_quota: Some(8),
+            })
+            .await
+            .unwrap(),
+            OwnerBlobCommit::Applied
+        );
+        let replaced = s.get("atomicfile").await.unwrap().unwrap();
+        assert_eq!(replaced.object_key, "atomic-new");
+        assert_eq!(replaced.size, 5);
+        let old = s
+            .get_version("atomic-old-version", "atomicfile")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old.object_key, "atomicfile");
+        assert_eq!(old.size, 3);
+
+        assert_eq!(
+            s.commit_owner_version_restore(OwnerVersionRestoreInput {
+                owner_sub: "u",
+                file_id: "atomicfile",
+                expected_object_key: "atomic-new",
+                version_id: "atomic-old-version",
+                snapshot_id: "atomic-new-version",
+                changed_at: 3,
+            })
+            .await
+            .unwrap(),
+            OwnerBlobCommit::Applied
+        );
+        let restored = s.get("atomicfile").await.unwrap().unwrap();
+        assert_eq!(restored.object_key, "atomicfile");
+        assert_eq!(restored.size, 3);
+        assert!(s
+            .get_version("atomic-old-version", "atomicfile")
+            .await
+            .unwrap()
+            .is_none());
+        let snap = s
+            .get_version("atomic-new-version", "atomicfile")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snap.object_key, "atomic-new");
+        assert_eq!(snap.size, 5);
+        assert!(s
+            .claim_owner_blob_writes("worker", 10, 10, 10, 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn public_commit_requires_exact_blob_and_receipt_without_consuming_on_conflict() {
+        let s = InMemoryStore::new();
+        s.create_folder(&folder("requestfolder", "u", "Request", 1))
+            .await
+            .unwrap();
+        let request = UploadRequestRec {
+            id: "exactrequest".into(),
+            owner_sub: "u".into(),
+            folder_id: "requestfolder".into(),
+            token: "exact-token".into(),
+            title: "Exact".into(),
+            description: String::new(),
+            status: "open".into(),
+            expires_at: None,
+            max_file_bytes: 10,
+            max_total_bytes: 10,
+            max_files: 1,
+            used_bytes: 0,
+            used_files: 0,
+            allowed_types: "image/*".into(),
+            created_at: 1,
+            updated_at: 1,
+        };
+        assert!(s.create_upload_request(&request).await.unwrap());
+        assert_eq!(
+            s.reserve_request_upload(UploadReserveInput {
+                request_id: &request.id,
+                expected_token: &request.token,
+                reservation_id: "exactblob",
+                size: 3,
+                content_type: "image/png",
+                content_type_verified: true,
+                owner_quota: None,
+                now: 2,
+            })
+            .await
+            .unwrap(),
+            UploadReserve::Reserved
+        );
+        let mut exact = file("exactblob", "u", "unused", 2);
+        exact.share_token = None;
+        exact.folder_id = Some("requestfolder".into());
+        let receipt = UploadSubmission {
+            id: "exactreceipt".into(),
+            request_id: request.id.clone(),
+            file_id: exact.id.clone(),
+            name: exact.name.clone(),
+            content_type: exact.content_type.clone(),
+            size: exact.size,
+            created_at: 2,
+        };
+        let mut wrong_key = exact.clone();
+        wrong_key.object_key = "different-blob".into();
+        assert!(!s
+            .commit_request_upload("exactblob", &wrong_key, &receipt)
+            .await
+            .unwrap());
+        let mut wrong_receipt = receipt.clone();
+        wrong_receipt.size = 2;
+        assert!(!s
+            .commit_request_upload("exactblob", &exact, &wrong_receipt)
+            .await
+            .unwrap());
+        assert!(s
+            .commit_request_upload("exactblob", &exact, &receipt)
+            .await
+            .unwrap());
+        assert_eq!(
+            s.get("exactblob").await.unwrap().unwrap().object_key,
+            "exactblob"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_queues_all_blob_keys_and_failed_claims_back_off() {
+        let s = InMemoryStore::new();
+        s.create(&file("queuefile", "u", "queue-token", 1))
+            .await
+            .unwrap();
+        s.add_version(&version("queueversion", "queuefile", 2, 1))
+            .await
+            .unwrap();
+        assert!(s.trash_file("queuefile", "u", 10).await.unwrap());
+        assert_eq!(
+            s.bulk_purge(
+                "u",
+                &[DriveItemRef {
+                    kind: LibraryItemKind::File,
+                    id: "queuefile".into(),
+                }],
+                20,
+            )
+            .await
+            .unwrap(),
+            BulkMutation::Applied { changed: 1 }
+        );
+        assert!(s.get("queuefile").await.unwrap().is_none());
+
+        let BlobDeleteClaim::Claimed(mut claimed) = s
+            .claim_blob_deletions("worker-one", 20, 0, 20)
+            .await
+            .unwrap()
+        else {
+            panic!("purge must enqueue current, version, and thumbnail keys");
+        };
+        claimed.sort_by(|left, right| left.object_key.cmp(&right.object_key));
+        assert_eq!(
+            claimed
+                .iter()
+                .map(|item| item.object_key.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "queuefile",
+                "queuefile.thumb",
+                "queueversion-blob",
+                "queueversion-blob.thumb",
+            ]
+        );
+        let failed = &claimed[0];
+        assert!(s
+            .abandon_blob_deletion(&failed.object_key, "worker-one", 100)
+            .await
+            .unwrap());
+        for item in &claimed[1..] {
+            assert!(s
+                .complete_blob_deletion(&item.object_key, "worker-one")
+                .await
+                .unwrap());
+        }
+        assert_eq!(
+            s.claim_blob_deletions("worker-two", 99, 90, 20)
+                .await
+                .unwrap(),
+            BlobDeleteClaim::Empty
+        );
+        let BlobDeleteClaim::Claimed(retry) = s
+            .claim_blob_deletions("worker-two", 100, 90, 20)
+            .await
+            .unwrap()
+        else {
+            panic!("the failed key must become due after its backoff");
+        };
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].object_key, failed.object_key);
+        assert_eq!(retry[0].attempts, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lifecycle_read_snapshots_never_mix_subtree_generations() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let s = Arc::new(InMemoryStore::new());
+        s.create_folder(&folder("snapshotfolder", "u", "Folder", 1))
+            .await
+            .unwrap();
+        let mut nested = file("snapshotfile", "u", "snapshot-token", 1);
+        nested.folder_id = Some("snapshotfolder".into());
+        s.create(&nested).await.unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+
+        let writer_store = s.clone();
+        let writer_done = done.clone();
+        let writer = tokio::spawn(async move {
+            for index in 0..2_000 {
+                assert!(matches!(
+                    writer_store
+                        .bulk_trash(
+                            "u",
+                            &[TrashRootInput {
+                                item: DriveItemRef {
+                                    kind: LibraryItemKind::Folder,
+                                    id: "snapshotfolder".into(),
+                                },
+                                entry_id: format!("snapshotentry{index}"),
+                            }],
+                            index + 1,
+                            index + 10_000,
+                        )
+                        .await
+                        .unwrap(),
+                    BulkMutation::Applied { .. }
+                ));
+                tokio::task::yield_now().await;
+                assert!(matches!(
+                    writer_store
+                        .bulk_restore(
+                            "u",
+                            &[DriveItemRef {
+                                kind: LibraryItemKind::Folder,
+                                id: "snapshotfolder".into(),
+                            }],
+                        )
+                        .await
+                        .unwrap(),
+                    BulkMutation::Applied { .. }
+                ));
+                tokio::task::yield_now().await;
+            }
+            writer_done.store(true, Ordering::Release);
+        });
+
+        let reader_store = s.clone();
+        let reader_done = done.clone();
+        let reader = tokio::spawn(async move {
+            let query = LibraryQuery {
+                view: LibraryView::All,
+                query: None,
+                type_filter: LibraryType::All,
+                before: None,
+                limit: 20,
+            };
+            let mut checks = 0;
+            while !reader_done.load(Ordering::Acquire) || checks < 2_000 {
+                let live = reader_store.query_library("u", &query).await.unwrap();
+                assert!(
+                    live.items.is_empty() || live.items.len() == 2,
+                    "a snapshot cannot combine a live folder with a hidden descendant"
+                );
+                let trash = reader_store.query_trash("u", None, 20).await.unwrap();
+                assert!(
+                    trash.items.len() <= 1,
+                    "a subtree has one visible Trash root"
+                );
+                checks += 1;
+                tokio::task::yield_now().await;
+            }
+        });
+        writer.await.unwrap();
+        reader.await.unwrap();
     }
 }

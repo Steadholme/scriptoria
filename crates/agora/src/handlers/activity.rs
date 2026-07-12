@@ -11,7 +11,9 @@ use serde::Deserialize;
 
 use crate::auth;
 use crate::error::AppError;
-use crate::handlers::{email_display, esc, fmt_ts, rel_time, render_page_with_activity};
+use crate::handlers::{
+    email_display, esc, fmt_ts, personal_counts, rel_time, render_page_with_personal_counts,
+};
 use crate::model::{ActivityItem, ActivityReason};
 use crate::store::{ActivityCursor, ActivityFilter};
 use crate::{now_secs, AppState};
@@ -57,6 +59,7 @@ pub async fn page(
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let identity = auth::require_author(&headers)?;
+    let now = now_secs();
     let before = parse_cursor(query.before.as_deref());
     let mut items = state
         .store
@@ -70,10 +73,11 @@ pub async fn page(
         .await?;
     let has_more = items.len() as i64 > ACTIVITY_PAGE_SIZE;
     items.truncate(ACTIVITY_PAGE_SIZE as usize);
-    let unread_count = state.store.unread_activity_count(&identity.sub).await?;
+    let counts = personal_counts(&state, &headers, now).await?;
+    let unread_count = counts.unread_activity.unwrap_or(0);
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
     let controls = render_controls(&query, &csrf, &items);
-    let rows = render_rows(&items, &csrf, now_secs());
+    let rows = render_rows(&items, &csrf, now);
     let pagination = if has_more {
         items
             .last()
@@ -107,11 +111,11 @@ pub async fn page(
             format!("{unread_count} unread")
         },
     );
-    let html = render_page_with_activity(
+    let html = render_page_with_personal_counts(
         "Activity",
         &email_display(&headers),
         &content,
-        Some(unread_count),
+        counts,
     );
     Ok(html_response(html, set_cookie))
 }

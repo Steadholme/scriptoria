@@ -53,6 +53,10 @@ impl IntoResponse for AppError {
         let (status, description, www_authenticate) = self.parts();
         let body = crate::handlers::error_page(status, &description);
         let mut response = (status, Html(body)).into_response();
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
         if www_authenticate {
             response
                 .headers_mut()

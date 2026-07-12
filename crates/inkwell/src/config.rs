@@ -35,6 +35,14 @@ pub const REVISION_KEEP_LIMIT: usize = 100;
 pub const REVISION_PAGE_LIMIT: i64 = 50;
 /// Server-side edit autosaves are private recovery data, retained for seven days.
 pub const AUTOSAVE_TTL_SECS: i64 = 7 * 24 * 60 * 60;
+/// Default number of author-owned posts in one Content Library page.
+pub const LIBRARY_DEFAULT_PAGE: i64 = 30;
+/// Hard ceiling for a Content Library read. Keyset navigation keeps older work reachable.
+pub const LIBRARY_MAX_PAGE: i64 = 100;
+/// One author bulk command is deliberately bounded before any row is locked or changed.
+pub const LIBRARY_BULK_MAX: usize = 50;
+/// One destructive post bulk command is bounded before any row is locked or deleted.
+pub const POST_BULK_DELETE_MAX: usize = 50;
 
 /// Clamp a requested page size into `1..=MAX_PAGE`, falling back to [`DEFAULT_PAGE`] when the
 /// request omits `?limit=` or passes a non-positive value.

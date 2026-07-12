@@ -21,11 +21,14 @@ use std::time::Duration;
 
 use aperture::blobs::{BlobError, Blobs, MemoryBlobs};
 use aperture::model::{
-    FileRec, FolderRec, LibraryQuery, LibraryType, LibraryView, UploadRequestRec, UploadSubmission,
-    VersionRec,
+    FileRec, FolderRec, LibraryItemKind, LibraryQuery, LibraryType, LibraryView, UploadRequestRec,
+    UploadSubmission, VersionRec,
 };
 use aperture::store::{
-    FolderDelete, PgStore, Store, UploadRecoveryClaim, UploadReserve, UploadReserveInput,
+    BlobDeleteClaim, BulkMutation, DriveItemRef, FolderDelete, OwnerBlobCommit,
+    OwnerBlobWriteIntent, OwnerReuploadInput, OwnerVersionRestoreInput, PgStore, Store,
+    TrashRootInput, UploadRecoveryClaim, UploadReserve, UploadReserveInput, MAX_BULK_ITEMS,
+    OWNER_WRITE_FRESH, OWNER_WRITE_REUPLOAD,
 };
 use aperture::{app, build_dev_state, now_secs, recover_stale_request_uploads, AppState};
 use sqlx::postgres::PgPoolOptions;
@@ -82,6 +85,8 @@ fn file(id: &str, owner: &str, token: &str, created_at: i64) -> FileRec {
         share_password_hash: None,
         folder_id: None,
         trashed_at: 0,
+        trash_entry_id: None,
+        trash_ancestor_id: None,
         view_count: 0,
     }
 }
@@ -147,7 +152,45 @@ async fn pg_store_full_integration() {
         .execute(&raw)
         .await
         .unwrap();
+    sqlx::query(
+        "DROP TRIGGER IF EXISTS aperture_block_purge_reserve_trigger ON upload_reservations",
+    )
+    .execute(&raw)
+    .await
+    .unwrap();
+    sqlx::query("DROP FUNCTION IF EXISTS aperture_block_purge_reserve()")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DROP TRIGGER IF EXISTS aperture_block_purge_commit_trigger ON files")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DROP FUNCTION IF EXISTS aperture_block_purge_commit()")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DROP TRIGGER IF EXISTS aperture_block_trash_claim_trigger ON trash_entries")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DROP FUNCTION IF EXISTS aperture_block_trash_claim()")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DROP TRIGGER IF EXISTS aperture_block_folder_create_trigger ON folders")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DROP FUNCTION IF EXISTS aperture_block_folder_create()")
+        .execute(&raw)
+        .await
+        .unwrap();
     for table in [
+        "owner_blob_write_intents",
+        "blob_delete_queue",
+        "blob_key_guards",
+        "trash_entries",
         "upload_submissions",
         "upload_reservations",
         "upload_requests",
@@ -167,6 +210,20 @@ async fn pg_store_full_integration() {
     let pg = Arc::new(pg);
     let store: Arc<dyn Store> = pg.clone();
     let now = now_secs();
+    let owner_intent_index: i64 = sqlx::query(
+        "SELECT CAST(COUNT(*) AS BIGINT) AS count FROM pg_indexes \
+         WHERE schemaname = current_schema() \
+           AND indexname = 'idx_owner_blob_write_owner_kind'",
+    )
+    .fetch_one(&raw)
+    .await
+    .unwrap()
+    .try_get("count")
+    .unwrap();
+    assert_eq!(
+        owner_intent_index, 1,
+        "migration installs owner quota index"
+    );
 
     // --- create + get round-trip -------------------------------------------
     assert!(store
@@ -319,6 +376,9 @@ async fn pg_store_full_integration() {
         expires_at: None,
         share_password_hash: None,
         upload_token: None,
+        trashed_at: 0,
+        trash_entry_id: None,
+        trash_ancestor_id: None,
     };
     assert!(store
         .create_folder(&fld("fold000001", "alice", "Zeta"))
@@ -657,6 +717,169 @@ async fn pg_store_full_integration() {
             .is_none(),
         "ccc kept at root"
     );
+
+    // Child creation owns the same lifecycle guard as subtree purge. Hold the child INSERT after
+    // its provisional row exists: purge must wait, then include the committed child in its fresh
+    // subtree snapshot. No dangling parent_id survives either winner ordering.
+    assert!(store
+        .create_folder(&fld("folderraceparent", "folder-race-owner", "Race parent",))
+        .await
+        .unwrap());
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION aperture_block_folder_create() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN \
+           IF NEW.id = 'folderracechild' THEN \
+             PERFORM pg_advisory_xact_lock(7300106); \
+           END IF; \
+           RETURN NEW; \
+         END $$",
+    )
+    .execute(&raw)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER aperture_block_folder_create_trigger BEFORE INSERT ON folders \
+         FOR EACH ROW EXECUTE FUNCTION aperture_block_folder_create()",
+    )
+    .execute(&raw)
+    .await
+    .unwrap();
+    let mut folder_create_barrier = raw.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(7300106)")
+        .execute(&mut *folder_create_barrier)
+        .await
+        .unwrap();
+    let create_store = store.clone();
+    let creating_child = tokio::spawn(async move {
+        create_store
+            .create_folder(&FolderRec {
+                id: "folderracechild".into(),
+                owner_sub: "folder-race-owner".into(),
+                parent_id: Some("folderraceparent".into()),
+                name: "Race child".into(),
+                created_at: now + 100,
+                updated_at: now + 100,
+                share_token: None,
+                expires_at: None,
+                share_password_hash: None,
+                upload_token: None,
+                trashed_at: 0,
+                trash_entry_id: None,
+                trash_ancestor_id: None,
+            })
+            .await
+    });
+    let mut child_at_barrier = false;
+    for _ in 0..200 {
+        let blocked: i64 = sqlx::query(
+            "SELECT CAST(COUNT(*) AS BIGINT) AS count FROM pg_stat_activity \
+             WHERE pid <> pg_backend_pid() AND state = 'active' AND wait_event_type = 'Lock' \
+               AND query LIKE '%INSERT INTO folders%'",
+        )
+        .fetch_one(&raw)
+        .await
+        .unwrap()
+        .try_get("count")
+        .unwrap();
+        if blocked > 0 {
+            child_at_barrier = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(child_at_barrier, "child create did not reach its barrier");
+    let purge_store = store.clone();
+    let purging_parent = tokio::spawn(async move {
+        let item = DriveItemRef {
+            kind: LibraryItemKind::Folder,
+            id: "folderraceparent".into(),
+        };
+        let trashed = purge_store
+            .bulk_trash(
+                "folder-race-owner",
+                &[TrashRootInput {
+                    item: item.clone(),
+                    entry_id: "folder-race-trash".into(),
+                }],
+                now + 101,
+                now + 10_000,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if trashed != (BulkMutation::Applied { changed: 1 }) {
+            return Err(format!("unexpected folder trash result: {trashed:?}"));
+        }
+        purge_store
+            .bulk_purge("folder-race-owner", &[item], now + 102)
+            .await
+            .map_err(|error| error.to_string())
+    });
+    let mut parent_purge_waited = false;
+    for _ in 0..200 {
+        let blocked: i64 = sqlx::query(
+            "SELECT CAST(COUNT(*) AS BIGINT) AS count FROM pg_stat_activity \
+             WHERE pid <> pg_backend_pid() AND state = 'active' AND wait_event_type = 'Lock' \
+               AND query LIKE '%SELECT owner_sub FROM owner_storage_guards%'",
+        )
+        .fetch_one(&raw)
+        .await
+        .unwrap()
+        .try_get("count")
+        .unwrap();
+        if blocked > 0 {
+            parent_purge_waited = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        parent_purge_waited,
+        "subtree purge did not wait behind child create"
+    );
+    folder_create_barrier.rollback().await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_secs(5), creating_child)
+        .await
+        .expect("child create timed out")
+        .unwrap()
+        .unwrap());
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), purging_parent)
+            .await
+            .expect("subtree purge timed out")
+            .unwrap()
+            .unwrap(),
+        BulkMutation::Applied { changed: 1 }
+    );
+    assert!(store
+        .get_folder_any("folderraceparent", "folder-race-owner")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get_folder_any("folderracechild", "folder-race-owner")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        sqlx::query(
+            "SELECT CAST(COUNT(*) AS BIGINT) AS count FROM folders \
+             WHERE parent_id = 'folderraceparent'",
+        )
+        .fetch_one(&raw)
+        .await
+        .unwrap()
+        .try_get::<i64, _>("count")
+        .unwrap(),
+        0
+    );
+    sqlx::query("DROP TRIGGER aperture_block_folder_create_trigger ON folders")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DROP FUNCTION aperture_block_folder_create()")
+        .execute(&raw)
+        .await
+        .unwrap();
     sqlx::query("DELETE FROM folders")
         .execute(&raw)
         .await
@@ -781,6 +1004,10 @@ async fn pg_store_full_integration() {
     // --- Request Rooms v2: migration/backfill, CRUD, receipts and concurrency ---------
     // A cross-table token collision is not idempotence. Migration must fail closed and retain the
     // legacy source instead of silently binding Alice's old capability to Bob's request.
+    assert!(store
+        .create_folder(&fld("bob-folder", "bob", "Bob request destination"))
+        .await
+        .unwrap());
     let conflicting_request = UploadRequestRec {
         id: "preexisting-request".into(),
         owner_sub: "bob".into(),
@@ -814,6 +1041,9 @@ async fn pg_store_full_integration() {
         expires_at: None,
         share_password_hash: None,
         upload_token: Some("legacy-conflict-token".into()),
+        trashed_at: 0,
+        trash_entry_id: None,
+        trash_ancestor_id: None,
     };
     assert!(store.create_folder(&conflicting_folder).await.unwrap());
     let conflict = pg
@@ -838,6 +1068,10 @@ async fn pg_store_full_integration() {
         .execute(&raw)
         .await
         .unwrap();
+    sqlx::query("DELETE FROM folders WHERE id = 'bob-folder'")
+        .execute(&raw)
+        .await
+        .unwrap();
     sqlx::query("DELETE FROM folders WHERE id = 'legacyconflict'")
         .execute(&raw)
         .await
@@ -858,6 +1092,9 @@ async fn pg_store_full_integration() {
         expires_at: None,
         share_password_hash: None,
         upload_token: Some("legacy-race-token".into()),
+        trashed_at: 0,
+        trash_entry_id: None,
+        trash_ancestor_id: None,
     };
     assert!(store.create_folder(&racing_folder).await.unwrap());
     sqlx::query(
@@ -1010,6 +1247,9 @@ async fn pg_store_full_integration() {
         expires_at: None,
         share_password_hash: None,
         upload_token: Some("legacy-upload-token".into()),
+        trashed_at: 0,
+        trash_entry_id: None,
+        trash_ancestor_id: None,
     };
     assert!(store.create_folder(&legacy_folder).await.unwrap());
     assert!(store
@@ -1496,7 +1736,7 @@ async fn pg_store_full_integration() {
         let blocked: i64 = sqlx::query(
             "SELECT CAST(COUNT(*) AS BIGINT) AS count FROM pg_stat_activity \
              WHERE pid <> pg_backend_pid() AND state = 'active' AND wait_event_type = 'Lock' \
-               AND query LIKE '%FROM file_versions v JOIN files f%'",
+               AND query LIKE '%owner_blob_write_intents%'",
         )
         .fetch_one(&raw)
         .await
@@ -1583,6 +1823,21 @@ async fn pg_store_full_integration() {
         size: received.size,
         created_at: now + 204,
     };
+    let mut wrong_blob = received.clone();
+    wrong_blob.object_key = "wrong-receipt-object".to_string();
+    assert!(!store
+        .commit_request_upload("receiptfile", &wrong_blob, &receipt)
+        .await
+        .unwrap());
+    let retained_reservation: i64 = sqlx::query(
+        "SELECT CAST(COUNT(*) AS BIGINT) AS count FROM upload_reservations WHERE id = 'receiptfile'",
+    )
+    .fetch_one(&raw)
+    .await
+    .unwrap()
+    .try_get("count")
+    .unwrap();
+    assert_eq!(retained_reservation, 1);
     assert!(store
         .commit_request_upload("receiptfile", &received, &receipt)
         .await
@@ -1601,6 +1856,377 @@ async fn pg_store_full_integration() {
         .unwrap()
         .share_token
         .is_none());
+
+    // Reserve reaches its durable INSERT while holding owner/request/folder locks. Folder purge
+    // must wait, then win before commit; commit returns a business conflict and compensation can
+    // remove the blob + reservation without a deadlock or stranded budget.
+    assert!(store
+        .create_folder(&fld("purgereserve", "alice", "Purge reserve race"))
+        .await
+        .unwrap());
+    let purge_reserve_request = request(
+        "purge-reserve-request",
+        "purge-reserve-token",
+        "purgereserve",
+        2,
+    );
+    assert!(store
+        .create_upload_request(&purge_reserve_request)
+        .await
+        .unwrap());
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION aperture_block_purge_reserve() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN \
+           IF NEW.id = 'purge-reserve-blob' THEN \
+             PERFORM pg_advisory_xact_lock(7300103); \
+           END IF; \
+           RETURN NEW; \
+         END $$",
+    )
+    .execute(&raw)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER aperture_block_purge_reserve_trigger \
+         BEFORE INSERT ON upload_reservations FOR EACH ROW \
+         EXECUTE FUNCTION aperture_block_purge_reserve()",
+    )
+    .execute(&raw)
+    .await
+    .unwrap();
+    let mut reserve_barrier = raw.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(7300103)")
+        .execute(&mut *reserve_barrier)
+        .await
+        .unwrap();
+    let reserve_store = store.clone();
+    let racing_reserve = tokio::spawn(async move {
+        reserve_store
+            .reserve_request_upload(UploadReserveInput {
+                request_id: "purge-reserve-request",
+                expected_token: "purge-reserve-token",
+                reservation_id: "purge-reserve-blob",
+                size: 4,
+                content_type: "image/png",
+                content_type_verified: true,
+                owner_quota: None,
+                now: now + 205,
+            })
+            .await
+    });
+    let mut reserve_at_barrier = false;
+    for _ in 0..200 {
+        let blocked: i64 = sqlx::query(
+            "SELECT CAST(COUNT(*) AS BIGINT) AS count FROM pg_stat_activity \
+             WHERE pid <> pg_backend_pid() AND state = 'active' AND wait_event_type = 'Lock' \
+               AND query LIKE '%INSERT INTO upload_reservations%'",
+        )
+        .fetch_one(&raw)
+        .await
+        .unwrap()
+        .try_get("count")
+        .unwrap();
+        if blocked > 0 {
+            reserve_at_barrier = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        reserve_at_barrier,
+        "reserve did not reach its controlled barrier"
+    );
+    let purge_store = store.clone();
+    let purge_after_reserve = tokio::spawn(async move {
+        let item = DriveItemRef {
+            kind: LibraryItemKind::Folder,
+            id: "purgereserve".into(),
+        };
+        let trashed = purge_store
+            .bulk_trash(
+                "alice",
+                &[TrashRootInput {
+                    item: item.clone(),
+                    entry_id: "purge-reserve-trash".into(),
+                }],
+                now + 206,
+                now + 10_000,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if trashed != (BulkMutation::Applied { changed: 1 }) {
+            return Err(format!("unexpected trash result: {trashed:?}"));
+        }
+        purge_store
+            .bulk_purge("alice", &[item], now + 207)
+            .await
+            .map_err(|error| error.to_string())
+    });
+    let mut purge_waited_on_guard = false;
+    for _ in 0..200 {
+        let blocked: i64 = sqlx::query(
+            "SELECT CAST(COUNT(*) AS BIGINT) AS count FROM pg_stat_activity \
+             WHERE pid <> pg_backend_pid() AND state = 'active' AND wait_event_type = 'Lock' \
+               AND query LIKE '%SELECT owner_sub FROM owner_storage_guards%'",
+        )
+        .fetch_one(&raw)
+        .await
+        .unwrap()
+        .try_get("count")
+        .unwrap();
+        if blocked > 0 {
+            purge_waited_on_guard = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(purge_waited_on_guard, "purge did not wait behind reserve");
+    reserve_barrier.rollback().await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), racing_reserve)
+            .await
+            .expect("reserve timed out")
+            .unwrap()
+            .unwrap(),
+        UploadReserve::Reserved
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), purge_after_reserve)
+            .await
+            .expect("purge timed out")
+            .unwrap()
+            .unwrap(),
+        BulkMutation::Applied { changed: 1 }
+    );
+    let race_blobs = Arc::new(MemoryBlobs::new());
+    race_blobs
+        .put("purge-reserve-blob", vec![1, 2, 3, 4])
+        .await
+        .unwrap();
+    let mut losing_file = file(
+        "purge-reserve-blob",
+        "alice",
+        "unused-purge-reserve-token",
+        now + 205,
+    );
+    losing_file.share_token = None;
+    losing_file.folder_id = Some("purgereserve".into());
+    losing_file.size = 4;
+    let losing_receipt = UploadSubmission {
+        id: "purge-reserve-receipt".into(),
+        request_id: "purge-reserve-request".into(),
+        file_id: losing_file.id.clone(),
+        name: losing_file.name.clone(),
+        content_type: losing_file.content_type.clone(),
+        size: losing_file.size,
+        created_at: now + 205,
+    };
+    assert!(!store
+        .commit_request_upload("purge-reserve-blob", &losing_file, &losing_receipt)
+        .await
+        .unwrap());
+    race_blobs.delete("purge-reserve-blob").await.unwrap();
+    assert!(store
+        .release_request_upload("purge-reserve-blob")
+        .await
+        .unwrap());
+    let closed = store
+        .get_upload_request("purge-reserve-request", "alice")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (closed.status.as_str(), closed.used_files, closed.used_bytes),
+        ("closed", 0, 0)
+    );
+    assert_eq!(race_blobs.object_count(), 0);
+    sqlx::query("DROP TRIGGER aperture_block_purge_reserve_trigger ON upload_reservations")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DROP FUNCTION aperture_block_purge_reserve()")
+        .execute(&raw)
+        .await
+        .unwrap();
+
+    // The opposite winner is also safe: commit holds the canonical locks through file+receipt
+    // insertion, purge waits, then discovers every committed key and moves it to the outbox.
+    assert!(store
+        .create_folder(&fld("purgecommit", "alice", "Purge commit race"))
+        .await
+        .unwrap());
+    let purge_commit_request = request(
+        "purge-commit-request",
+        "purge-commit-token",
+        "purgecommit",
+        2,
+    );
+    assert!(store
+        .create_upload_request(&purge_commit_request)
+        .await
+        .unwrap());
+    assert_eq!(
+        store
+            .reserve_request_upload(UploadReserveInput {
+                request_id: "purge-commit-request",
+                expected_token: "purge-commit-token",
+                reservation_id: "purge-commit-blob",
+                size: 4,
+                content_type: "image/png",
+                content_type_verified: true,
+                owner_quota: None,
+                now: now + 208,
+            })
+            .await
+            .unwrap(),
+        UploadReserve::Reserved
+    );
+    race_blobs
+        .put("purge-commit-blob", vec![5, 6, 7, 8])
+        .await
+        .unwrap();
+    let mut winning_file = file(
+        "purge-commit-blob",
+        "alice",
+        "unused-purge-commit-token",
+        now + 208,
+    );
+    winning_file.share_token = None;
+    winning_file.folder_id = Some("purgecommit".into());
+    winning_file.size = 4;
+    let winning_receipt = UploadSubmission {
+        id: "purge-commit-receipt".into(),
+        request_id: "purge-commit-request".into(),
+        file_id: winning_file.id.clone(),
+        name: winning_file.name.clone(),
+        content_type: winning_file.content_type.clone(),
+        size: winning_file.size,
+        created_at: now + 208,
+    };
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION aperture_block_purge_commit() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN \
+           IF NEW.id = 'purge-commit-blob' THEN \
+             PERFORM pg_advisory_xact_lock(7300104); \
+           END IF; \
+           RETURN NEW; \
+         END $$",
+    )
+    .execute(&raw)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER aperture_block_purge_commit_trigger BEFORE INSERT ON files \
+         FOR EACH ROW EXECUTE FUNCTION aperture_block_purge_commit()",
+    )
+    .execute(&raw)
+    .await
+    .unwrap();
+    let mut commit_barrier = raw.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(7300104)")
+        .execute(&mut *commit_barrier)
+        .await
+        .unwrap();
+    let commit_store = store.clone();
+    let committing = tokio::spawn(async move {
+        commit_store
+            .commit_request_upload("purge-commit-blob", &winning_file, &winning_receipt)
+            .await
+    });
+    let mut commit_at_barrier = false;
+    for _ in 0..200 {
+        let blocked: i64 = sqlx::query(
+            "SELECT CAST(COUNT(*) AS BIGINT) AS count FROM pg_stat_activity \
+             WHERE pid <> pg_backend_pid() AND state = 'active' AND wait_event_type = 'Lock' \
+               AND query LIKE '%INSERT INTO files%'",
+        )
+        .fetch_one(&raw)
+        .await
+        .unwrap()
+        .try_get("count")
+        .unwrap();
+        if blocked > 0 {
+            commit_at_barrier = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        commit_at_barrier,
+        "commit did not reach its controlled barrier"
+    );
+    let purge_store = store.clone();
+    let purge_after_commit = tokio::spawn(async move {
+        let item = DriveItemRef {
+            kind: LibraryItemKind::Folder,
+            id: "purgecommit".into(),
+        };
+        let trashed = purge_store
+            .bulk_trash(
+                "alice",
+                &[TrashRootInput {
+                    item: item.clone(),
+                    entry_id: "purge-commit-trash".into(),
+                }],
+                now + 209,
+                now + 10_000,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if trashed != (BulkMutation::Applied { changed: 1 }) {
+            return Err(format!("unexpected trash result: {trashed:?}"));
+        }
+        purge_store
+            .bulk_purge("alice", &[item], now + 210)
+            .await
+            .map_err(|error| error.to_string())
+    });
+    let mut purge_waited_on_commit = false;
+    for _ in 0..200 {
+        let blocked: i64 = sqlx::query(
+            "SELECT CAST(COUNT(*) AS BIGINT) AS count FROM pg_stat_activity \
+             WHERE pid <> pg_backend_pid() AND state = 'active' AND wait_event_type = 'Lock' \
+               AND query LIKE '%SELECT owner_sub FROM owner_storage_guards%'",
+        )
+        .fetch_one(&raw)
+        .await
+        .unwrap()
+        .try_get("count")
+        .unwrap();
+        if blocked > 0 {
+            purge_waited_on_commit = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(purge_waited_on_commit, "purge did not wait behind commit");
+    commit_barrier.rollback().await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_secs(5), committing)
+        .await
+        .expect("commit timed out")
+        .unwrap()
+        .unwrap());
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), purge_after_commit)
+            .await
+            .expect("purge timed out")
+            .unwrap()
+            .unwrap(),
+        BulkMutation::Applied { changed: 1 }
+    );
+    assert!(store.get("purge-commit-blob").await.unwrap().is_none());
+    aperture::drain_trash_lifecycle_once(store.as_ref(), race_blobs.as_ref(), now + 211)
+        .await
+        .unwrap();
+    assert_eq!(race_blobs.object_count(), 0);
+    sqlx::query("DROP TRIGGER aperture_block_purge_commit_trigger ON files")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DROP FUNCTION aperture_block_purge_commit()")
+        .execute(&raw)
+        .await
+        .unwrap();
 
     // A real DB failure after the blob write triggers handler compensation: blob deleted,
     // reservation/counters released, no file row and no receipt, with a fixed public 500 shell.
@@ -2009,6 +2635,1356 @@ async fn pg_store_full_integration() {
         .await
         .expect("healthy startup recovers the whole mixed batch after lease repair");
     assert_eq!(mixed_blobs.object_count(), 0);
+
+    // Owner writes persist cleanup authority on both sides of put, and finalization atomically
+    // transitions that authority into current/version metadata.
+    let owner_blobs = Arc::new(MemoryBlobs::new());
+    let fresh_intent = OwnerBlobWriteIntent {
+        object_key: "pg-owner-fresh".into(),
+        owner_sub: "owner-atomic".into(),
+        size: 3,
+        kind: OWNER_WRITE_FRESH.into(),
+        file_id: "pg-owner-fresh".into(),
+        folder_id: None,
+        expected_object_key: None,
+        created_at: now + 2_950,
+        attempts: 0,
+    };
+    assert_eq!(
+        store
+            .reserve_owner_blob_write(&fresh_intent, Some(3))
+            .await
+            .unwrap(),
+        OwnerBlobCommit::Applied
+    );
+    owner_blobs
+        .put(&fresh_intent.object_key, vec![1, 2, 3])
+        .await
+        .unwrap();
+    let mut owner_file = file(
+        "pg-owner-fresh",
+        "owner-atomic",
+        "pg-owner-atomic-token",
+        now + 2_950,
+    );
+    owner_file.size = 3;
+    assert_eq!(
+        store
+            .commit_owner_upload(&owner_file, Some(3))
+            .await
+            .unwrap(),
+        OwnerBlobCommit::Applied
+    );
+    let reupload_intent = OwnerBlobWriteIntent {
+        object_key: "pg-owner-new".into(),
+        owner_sub: "owner-atomic".into(),
+        size: 5,
+        kind: OWNER_WRITE_REUPLOAD.into(),
+        file_id: owner_file.id.clone(),
+        folder_id: None,
+        expected_object_key: Some(owner_file.object_key.clone()),
+        created_at: now + 2_951,
+        attempts: 0,
+    };
+    assert_eq!(
+        store
+            .reserve_owner_blob_write(&reupload_intent, Some(8))
+            .await
+            .unwrap(),
+        OwnerBlobCommit::Applied
+    );
+    owner_blobs
+        .put(&reupload_intent.object_key, vec![4, 5, 6, 7, 8])
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .commit_owner_reupload(OwnerReuploadInput {
+                owner_sub: "owner-atomic",
+                file_id: "pg-owner-fresh",
+                expected_object_key: "pg-owner-fresh",
+                new_object_key: "pg-owner-new",
+                new_size: 5,
+                new_content_type: "image/webp",
+                snapshot_id: "pg-owner-old-version",
+                changed_at: now + 2_951,
+                owner_quota: Some(8),
+            })
+            .await
+            .unwrap(),
+        OwnerBlobCommit::Applied
+    );
+    assert_eq!(
+        store
+            .commit_owner_version_restore(OwnerVersionRestoreInput {
+                owner_sub: "owner-atomic",
+                file_id: "pg-owner-fresh",
+                expected_object_key: "pg-owner-new",
+                version_id: "pg-owner-old-version",
+                snapshot_id: "pg-owner-new-version",
+                changed_at: now + 2_952,
+            })
+            .await
+            .unwrap(),
+        OwnerBlobCommit::Applied
+    );
+    assert_eq!(
+        store
+            .get("pg-owner-fresh")
+            .await
+            .unwrap()
+            .unwrap()
+            .object_key,
+        "pg-owner-fresh"
+    );
+    assert_eq!(
+        store
+            .get_version("pg-owner-new-version", "pg-owner-fresh")
+            .await
+            .unwrap()
+            .unwrap()
+            .object_key,
+        "pg-owner-new"
+    );
+
+    // Missing-row FOR UPDATE is not a gap lock. Two different owner guards can choose the same
+    // snapshot id concurrently; exactly one INSERT wins and the other gets a retryable Collision,
+    // never a backend unique-violation 500.
+    let mut snapshot_a = file(
+        "pgsnapshota",
+        "snapshot-owner-a",
+        "pg-snapshot-a-token",
+        now + 2_953,
+    );
+    snapshot_a.size = 3;
+    let mut snapshot_b = file(
+        "pgsnapshotb",
+        "snapshot-owner-b",
+        "pg-snapshot-b-token",
+        now + 2_953,
+    );
+    snapshot_b.size = 3;
+    assert!(store.create(&snapshot_a).await.unwrap());
+    assert!(store.create(&snapshot_b).await.unwrap());
+    for intent in [
+        OwnerBlobWriteIntent {
+            object_key: "pgsnapshotnewa".into(),
+            owner_sub: snapshot_a.owner_sub.clone(),
+            size: 5,
+            kind: OWNER_WRITE_REUPLOAD.into(),
+            file_id: snapshot_a.id.clone(),
+            folder_id: None,
+            expected_object_key: Some(snapshot_a.object_key.clone()),
+            created_at: now + 2_954,
+            attempts: 0,
+        },
+        OwnerBlobWriteIntent {
+            object_key: "pgsnapshotnewb".into(),
+            owner_sub: snapshot_b.owner_sub.clone(),
+            size: 5,
+            kind: OWNER_WRITE_REUPLOAD.into(),
+            file_id: snapshot_b.id.clone(),
+            folder_id: None,
+            expected_object_key: Some(snapshot_b.object_key.clone()),
+            created_at: now + 2_954,
+            attempts: 0,
+        },
+    ] {
+        assert_eq!(
+            store
+                .reserve_owner_blob_write(&intent, Some(8))
+                .await
+                .unwrap(),
+            OwnerBlobCommit::Applied
+        );
+    }
+    let left_store = store.clone();
+    let right_store = store.clone();
+    let (snapshot_left, snapshot_right) = tokio::join!(
+        left_store.commit_owner_reupload(OwnerReuploadInput {
+            owner_sub: "snapshot-owner-a",
+            file_id: "pgsnapshota",
+            expected_object_key: "pgsnapshota",
+            new_object_key: "pgsnapshotnewa",
+            new_size: 5,
+            new_content_type: "image/webp",
+            snapshot_id: "pg-shared-snapshot-id",
+            changed_at: now + 2_955,
+            owner_quota: Some(8),
+        }),
+        right_store.commit_owner_reupload(OwnerReuploadInput {
+            owner_sub: "snapshot-owner-b",
+            file_id: "pgsnapshotb",
+            expected_object_key: "pgsnapshotb",
+            new_object_key: "pgsnapshotnewb",
+            new_size: 5,
+            new_content_type: "image/webp",
+            snapshot_id: "pg-shared-snapshot-id",
+            changed_at: now + 2_955,
+            owner_quota: Some(8),
+        })
+    );
+    let snapshot_left = snapshot_left.unwrap();
+    let snapshot_right = snapshot_right.unwrap();
+    assert!(matches!(
+        (snapshot_left, snapshot_right),
+        (OwnerBlobCommit::Applied, OwnerBlobCommit::Collision)
+            | (OwnerBlobCommit::Collision, OwnerBlobCommit::Applied)
+    ));
+    if snapshot_left == OwnerBlobCommit::Collision {
+        assert_eq!(
+            store
+                .commit_owner_reupload(OwnerReuploadInput {
+                    owner_sub: "snapshot-owner-a",
+                    file_id: "pgsnapshota",
+                    expected_object_key: "pgsnapshota",
+                    new_object_key: "pgsnapshotnewa",
+                    new_size: 5,
+                    new_content_type: "image/webp",
+                    snapshot_id: "pg-snapshot-retry-a",
+                    changed_at: now + 2_956,
+                    owner_quota: Some(8),
+                })
+                .await
+                .unwrap(),
+            OwnerBlobCommit::Applied
+        );
+    } else {
+        assert_eq!(
+            store
+                .commit_owner_reupload(OwnerReuploadInput {
+                    owner_sub: "snapshot-owner-b",
+                    file_id: "pgsnapshotb",
+                    expected_object_key: "pgsnapshotb",
+                    new_object_key: "pgsnapshotnewb",
+                    new_size: 5,
+                    new_content_type: "image/webp",
+                    snapshot_id: "pg-snapshot-retry-b",
+                    changed_at: now + 2_956,
+                    owner_quota: Some(8),
+                })
+                .await
+                .unwrap(),
+            OwnerBlobCommit::Applied
+        );
+    }
+    assert_eq!(
+        store.get("pgsnapshota").await.unwrap().unwrap().object_key,
+        "pgsnapshotnewa"
+    );
+    assert_eq!(
+        store.get("pgsnapshotb").await.unwrap().unwrap().object_key,
+        "pgsnapshotnewb"
+    );
+    sqlx::query("DELETE FROM file_versions WHERE file_id IN ('pgsnapshota', 'pgsnapshotb')")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM files WHERE id IN ('pgsnapshota', 'pgsnapshotb')")
+        .execute(&raw)
+        .await
+        .unwrap();
+
+    for (key, wrote_blob) in [("pg-owner-pre-put", false), ("pg-owner-post-put", true)] {
+        let intent = OwnerBlobWriteIntent {
+            object_key: key.into(),
+            owner_sub: "owner-recovery".into(),
+            size: 3,
+            kind: OWNER_WRITE_FRESH.into(),
+            file_id: key.into(),
+            folder_id: None,
+            expected_object_key: None,
+            created_at: now.saturating_sub(1_000),
+            attempts: 0,
+        };
+        assert_eq!(
+            store
+                .reserve_owner_blob_write(&intent, Some(6))
+                .await
+                .unwrap(),
+            OwnerBlobCommit::Applied
+        );
+        if wrote_blob {
+            owner_blobs.put(key, vec![9, 9, 9]).await.unwrap();
+        }
+    }
+    recover_stale_request_uploads(store.as_ref(), owner_blobs.as_ref())
+        .await
+        .expect("PG startup recovery owns absent and present owner writes");
+    assert!(owner_blobs.get("pg-owner-post-put").await.is_err());
+    let remaining_owner_intents: i64 = sqlx::query(
+        "SELECT CAST(COUNT(*) AS BIGINT) AS count FROM owner_blob_write_intents \
+         WHERE owner_sub = 'owner-recovery'",
+    )
+    .fetch_one(&raw)
+    .await
+    .unwrap()
+    .try_get("count")
+    .unwrap();
+    assert_eq!(remaining_owner_intents, 0);
+
+    // Different owner guards do not serialize each other, so the permanent object-key mutex must
+    // make cross-table reservation vs owner-intent collision exactly-one-winner.
+    assert!(store
+        .create_folder(&fld("keyguardfolder", "keyguard-public", "Key guard"))
+        .await
+        .unwrap());
+    let keyguard_request = UploadRequestRec {
+        id: "keyguard-request".into(),
+        owner_sub: "keyguard-public".into(),
+        folder_id: "keyguardfolder".into(),
+        token: "keyguard-token".into(),
+        title: "Key guard".into(),
+        description: String::new(),
+        status: "open".into(),
+        expires_at: None,
+        max_file_bytes: 10,
+        max_total_bytes: 10,
+        max_files: 1,
+        used_bytes: 0,
+        used_files: 0,
+        allowed_types: "image/*".into(),
+        created_at: now + 2_953,
+        updated_at: now + 2_953,
+    };
+    assert!(store
+        .create_upload_request(&keyguard_request)
+        .await
+        .unwrap());
+    let cross_table_intent = OwnerBlobWriteIntent {
+        object_key: "shared-cross-table-key".into(),
+        owner_sub: "keyguard-private".into(),
+        size: 1,
+        kind: OWNER_WRITE_FRESH.into(),
+        file_id: "shared-cross-table-key".into(),
+        folder_id: None,
+        expected_object_key: None,
+        created_at: now + 2_954,
+        attempts: 0,
+    };
+    let private_store = store.clone();
+    let public_store = store.clone();
+    let (private_claim, public_claim) = tokio::join!(
+        private_store.reserve_owner_blob_write(&cross_table_intent, None),
+        public_store.reserve_request_upload(UploadReserveInput {
+            request_id: "keyguard-request",
+            expected_token: "keyguard-token",
+            reservation_id: "shared-cross-table-key",
+            size: 1,
+            content_type: "image/png",
+            content_type_verified: true,
+            owner_quota: None,
+            now: now + 2_954,
+        })
+    );
+    let private_claim = private_claim.unwrap();
+    let public_claim = public_claim.unwrap();
+    assert!(matches!(
+        (private_claim, public_claim),
+        (OwnerBlobCommit::Applied, UploadReserve::Collision)
+            | (OwnerBlobCommit::Collision, UploadReserve::Reserved)
+    ));
+    if private_claim == OwnerBlobCommit::Applied {
+        recover_stale_request_uploads(store.as_ref(), owner_blobs.as_ref())
+            .await
+            .unwrap();
+    } else {
+        assert!(store
+            .release_request_upload("shared-cross-table-key")
+            .await
+            .unwrap());
+    }
+    sqlx::query("DELETE FROM upload_requests WHERE id = 'keyguard-request'")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM folders WHERE id = 'keyguardfolder'")
+        .execute(&raw)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .bulk_trash(
+                "owner-atomic",
+                &[TrashRootInput {
+                    item: DriveItemRef {
+                        kind: LibraryItemKind::File,
+                        id: "pg-owner-fresh".into(),
+                    },
+                    entry_id: "pg-owner-atomic-trash".into(),
+                }],
+                now + 2_955,
+                now + 20_000,
+            )
+            .await
+            .unwrap(),
+        BulkMutation::Applied { changed: 1 }
+    );
+    assert_eq!(
+        store
+            .bulk_purge(
+                "owner-atomic",
+                &[DriveItemRef {
+                    kind: LibraryItemKind::File,
+                    id: "pg-owner-fresh".into(),
+                }],
+                now + 2_956,
+            )
+            .await
+            .unwrap(),
+        BulkMutation::Applied { changed: 1 }
+    );
+    aperture::drain_trash_lifecycle_once(store.as_ref(), owner_blobs.as_ref(), now + 2_957)
+        .await
+        .unwrap();
+    assert_eq!(owner_blobs.object_count(), 0);
+
+    // --- Drive v4 lifecycle: migration, nested Trash, atomic batches, durable purge ----------
+    // A legacy soft-deleted row inserted after the initial migration receives a deterministic
+    // root entry and a fresh 30-day grace period when the idempotent migration runs again.
+    let mut legacy = file("legacyv4aa", "alice", "legacy-v4-token", now + 3_000);
+    legacy.trashed_at = now.saturating_sub(100);
+    assert!(store.create(&legacy).await.unwrap());
+    let migration_started = now_secs();
+    pg.migrate()
+        .await
+        .expect("legacy Trash backfill reruns safely");
+    let legacy = store.get("legacyv4aa").await.unwrap().unwrap();
+    assert_eq!(
+        legacy.trash_entry_id.as_deref(),
+        Some("legacy-file-legacyv4aa")
+    );
+    assert!(legacy.trash_ancestor_id.is_none());
+    let legacy_purge_after: i64 =
+        sqlx::query("SELECT purge_after FROM trash_entries WHERE id = 'legacy-file-legacyv4aa'")
+            .fetch_one(&raw)
+            .await
+            .unwrap()
+            .try_get("purge_after")
+            .unwrap();
+    assert!(legacy_purge_after >= migration_started + 30 * 24 * 60 * 60);
+    assert!(store
+        .query_trash("alice", None, 20)
+        .await
+        .unwrap()
+        .items
+        .iter()
+        .any(|item| item.id == "legacyv4aa"));
+    assert_eq!(
+        store
+            .bulk_restore(
+                "alice",
+                &[DriveItemRef {
+                    kind: LibraryItemKind::File,
+                    id: "legacyv4aa".into(),
+                }],
+            )
+            .await
+            .unwrap(),
+        BulkMutation::Applied { changed: 1 }
+    );
+    assert!(store.delete("legacyv4aa", "alice").await.unwrap());
+
+    // A deterministic legacy id already owned by a different authority is corruption. Migration
+    // fails closed and leaves the source unbound rather than silently accepting `ON CONFLICT`.
+    let mut collision = file("legacycol1", "alice", "legacy-collision-token", now + 3_001);
+    collision.trashed_at = now.saturating_sub(200);
+    assert!(store.create(&collision).await.unwrap());
+    sqlx::query(
+        "INSERT INTO trash_entries \
+             (id, owner_sub, item_kind, item_id, trashed_at, purge_after) \
+         VALUES ('legacy-file-legacycol1', 'bob', 'file', 'foreign-item', $1, $2)",
+    )
+    .bind(collision.trashed_at)
+    .bind(now + 10_000)
+    .execute(&raw)
+    .await
+    .unwrap();
+    let migration_error = pg
+        .migrate()
+        .await
+        .expect_err("foreign deterministic authority must fail closed");
+    assert!(migration_error
+        .to_string()
+        .contains("legacy Trash id conflict for file legacycol1"));
+    assert!(store
+        .get("legacycol1")
+        .await
+        .unwrap()
+        .unwrap()
+        .trash_entry_id
+        .is_none());
+    sqlx::query("DELETE FROM trash_entries WHERE id = 'legacy-file-legacycol1'")
+        .execute(&raw)
+        .await
+        .unwrap();
+    assert!(store.delete("legacycol1", "alice").await.unwrap());
+
+    // A partial prior migration may already have created the exact authority under another id.
+    // Re-running migration binds that row and renews the full retention window.
+    let mut partial = file("legacyprt1", "alice", "legacy-partial-token", now + 3_002);
+    partial.trashed_at = now.saturating_sub(300);
+    assert!(store.create(&partial).await.unwrap());
+    sqlx::query(
+        "INSERT INTO trash_entries \
+             (id, owner_sub, item_kind, item_id, trashed_at, purge_after) \
+         VALUES ('partial-legacy-authority', 'alice', 'file', 'legacyprt1', $1, 1)",
+    )
+    .bind(partial.trashed_at)
+    .execute(&raw)
+    .await
+    .unwrap();
+    let partial_migration_started = now_secs();
+    pg.migrate()
+        .await
+        .expect("exact partial authority is adopted atomically");
+    assert_eq!(
+        store
+            .get("legacyprt1")
+            .await
+            .unwrap()
+            .unwrap()
+            .trash_entry_id
+            .as_deref(),
+        Some("partial-legacy-authority")
+    );
+    let partial_purge_after: i64 =
+        sqlx::query("SELECT purge_after FROM trash_entries WHERE id = 'partial-legacy-authority'")
+            .fetch_one(&raw)
+            .await
+            .unwrap()
+            .try_get("purge_after")
+            .unwrap();
+    assert!(partial_purge_after >= partial_migration_started + 30 * 24 * 60 * 60);
+    assert_eq!(
+        store
+            .bulk_restore(
+                "alice",
+                &[DriveItemRef {
+                    kind: LibraryItemKind::File,
+                    id: "legacyprt1".into(),
+                }],
+            )
+            .await
+            .unwrap(),
+        BulkMutation::Applied { changed: 1 }
+    );
+    assert!(store.delete("legacyprt1", "alice").await.unwrap());
+
+    let corrupt_file = file("pgownerbad", "alice", "pg-owner-corrupt-token", now + 3_000);
+    let corrupt_folder = fld("pgownerfld", "alice", "Owner mismatch");
+    assert!(store.create(&corrupt_file).await.unwrap());
+    assert!(store.create_folder(&corrupt_folder).await.unwrap());
+    assert_eq!(
+        store
+            .bulk_trash(
+                "alice",
+                &[
+                    TrashRootInput {
+                        item: DriveItemRef {
+                            kind: LibraryItemKind::File,
+                            id: "pgownerbad".into(),
+                        },
+                        entry_id: "pg-owner-file-entry".into(),
+                    },
+                    TrashRootInput {
+                        item: DriveItemRef {
+                            kind: LibraryItemKind::Folder,
+                            id: "pgownerfld".into(),
+                        },
+                        entry_id: "pg-owner-folder-entry".into(),
+                    },
+                ],
+                now + 3_050,
+                now + 4_000,
+            )
+            .await
+            .unwrap(),
+        BulkMutation::Applied { changed: 2 }
+    );
+    sqlx::query("UPDATE files SET owner_sub = 'mallory' WHERE id = 'pgownerbad'")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE folders SET owner_sub = 'mallory' WHERE id = 'pgownerfld'")
+        .execute(&raw)
+        .await
+        .unwrap();
+    assert!(store
+        .query_trash("alice", None, 20)
+        .await
+        .unwrap()
+        .items
+        .iter()
+        .all(|item| item.id != "pgownerbad" && item.id != "pgownerfld"));
+    assert!(store
+        .query_trash("mallory", None, 20)
+        .await
+        .unwrap()
+        .items
+        .iter()
+        .all(|item| item.id != "pgownerbad" && item.id != "pgownerfld"));
+    sqlx::query("UPDATE files SET owner_sub = 'alice' WHERE id = 'pgownerbad'")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE folders SET owner_sub = 'alice' WHERE id = 'pgownerfld'")
+        .execute(&raw)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .bulk_restore(
+                "alice",
+                &[
+                    DriveItemRef {
+                        kind: LibraryItemKind::File,
+                        id: "pgownerbad".into(),
+                    },
+                    DriveItemRef {
+                        kind: LibraryItemKind::Folder,
+                        id: "pgownerfld".into(),
+                    },
+                ],
+            )
+            .await
+            .unwrap(),
+        BulkMutation::Applied { changed: 2 }
+    );
+    assert!(store.delete("pgownerbad", "alice").await.unwrap());
+    assert_eq!(
+        store
+            .delete_folder_if_empty("pgownerfld", "alice")
+            .await
+            .unwrap(),
+        FolderDelete::Deleted
+    );
+
+    let mut trash_parent = fld("trashpgpar", "alice", "Trash parent");
+    trash_parent.share_token = Some("trash-parent-token".into());
+    assert!(store.create_folder(&trash_parent).await.unwrap());
+    let mut trash_child = fld("trashpgchi", "alice", "Trash child");
+    trash_child.parent_id = Some("trashpgpar".into());
+    trash_child.share_token = Some("trash-child-token".into());
+    assert!(store.create_folder(&trash_child).await.unwrap());
+    let mut trash_file = file("trashpgfil", "alice", "trash-file-token", now + 3_001);
+    trash_file.folder_id = Some("trashpgchi".into());
+    assert!(store.create(&trash_file).await.unwrap());
+    assert!(store
+        .get_folder_by_token("trash-child-token")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(store
+        .get_by_token("trash-file-token")
+        .await
+        .unwrap()
+        .is_some());
+
+    assert_eq!(
+        store
+            .bulk_trash(
+                "alice",
+                &[TrashRootInput {
+                    item: DriveItemRef {
+                        kind: LibraryItemKind::Folder,
+                        id: "trashpgchi".into(),
+                    },
+                    entry_id: "pg-child-entry".into(),
+                }],
+                now + 3_100,
+                now + 30 * 24 * 60 * 60,
+            )
+            .await
+            .unwrap(),
+        BulkMutation::Applied { changed: 1 }
+    );
+    assert!(store
+        .get_folder_by_token("trash-child-token")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get_by_token("trash-file-token")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store
+        .list_files_in_folder("trashpgchi", "alice")
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .find_file_in_folder("alice", "trashpgfil.png", Some("trashpgchi"))
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store
+            .bulk_trash(
+                "alice",
+                &[TrashRootInput {
+                    item: DriveItemRef {
+                        kind: LibraryItemKind::Folder,
+                        id: "trashpgpar".into(),
+                    },
+                    entry_id: "pg-parent-entry".into(),
+                }],
+                now + 3_101,
+                now + 30 * 24 * 60 * 60,
+            )
+            .await
+            .unwrap(),
+        BulkMutation::Applied { changed: 1 }
+    );
+    let trash_roots = store.query_trash("alice", None, 20).await.unwrap();
+    assert_eq!(
+        trash_roots
+            .items
+            .iter()
+            .filter(|item| item.id == "trashpgpar" || item.id == "trashpgchi")
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["trashpgpar"],
+        "an independently trashed child is hidden while its parent scope is active"
+    );
+    assert_eq!(
+        store
+            .bulk_restore(
+                "alice",
+                &[DriveItemRef {
+                    kind: LibraryItemKind::Folder,
+                    id: "trashpgpar".into(),
+                }],
+            )
+            .await
+            .unwrap(),
+        BulkMutation::Applied { changed: 1 }
+    );
+    assert!(store
+        .get_folder_by_token("trash-parent-token")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(store
+        .get_folder_by_token("trash-child-token")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get_by_token("trash-file-token")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store
+            .bulk_restore(
+                "alice",
+                &[DriveItemRef {
+                    kind: LibraryItemKind::Folder,
+                    id: "trashpgchi".into(),
+                }],
+            )
+            .await
+            .unwrap(),
+        BulkMutation::Applied { changed: 1 }
+    );
+    assert!(store
+        .get_folder_by_token("trash-child-token")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(store
+        .get_by_token("trash-file-token")
+        .await
+        .unwrap()
+        .is_some());
+
+    // Foreign or stale members reject the entire batch; cycle checks and the 200-item domain
+    // boundary run inside Store as well as at HTTP parsing.
+    let owned_atomic = file("pgatomic01", "alice", "pg-atomic-token", now + 3_010);
+    let foreign_atomic = file("pgforeign1", "bob", "pg-foreign-token", now + 3_010);
+    assert!(store.create(&owned_atomic).await.unwrap());
+    assert!(store.create(&foreign_atomic).await.unwrap());
+    let mixed_roots = [
+        TrashRootInput {
+            item: DriveItemRef {
+                kind: LibraryItemKind::File,
+                id: "pgatomic01".into(),
+            },
+            entry_id: "pg-atomic-entry".into(),
+        },
+        TrashRootInput {
+            item: DriveItemRef {
+                kind: LibraryItemKind::File,
+                id: "pgforeign1".into(),
+            },
+            entry_id: "pg-foreign-entry".into(),
+        },
+    ];
+    assert_eq!(
+        store
+            .bulk_trash("alice", &mixed_roots, now + 3_200, now + 4_000)
+            .await
+            .unwrap(),
+        BulkMutation::Conflict
+    );
+    assert!(store
+        .get("pgatomic01")
+        .await
+        .unwrap()
+        .unwrap()
+        .is_effectively_live());
+    assert_eq!(
+        store
+            .bulk_trash(
+                "alice",
+                &[TrashRootInput {
+                    item: DriveItemRef {
+                        kind: LibraryItemKind::File,
+                        id: "trashpgfil".into(),
+                    },
+                    entry_id: "pg-stale-entry".into(),
+                }],
+                now + 3_201,
+                now + 4_000,
+            )
+            .await
+            .unwrap(),
+        BulkMutation::Applied { changed: 1 }
+    );
+    assert_eq!(
+        store
+            .bulk_move(
+                "alice",
+                &[
+                    DriveItemRef {
+                        kind: LibraryItemKind::File,
+                        id: "pgatomic01".into(),
+                    },
+                    DriveItemRef {
+                        kind: LibraryItemKind::File,
+                        id: "trashpgfil".into(),
+                    },
+                ],
+                None,
+            )
+            .await
+            .unwrap(),
+        BulkMutation::Conflict
+    );
+    assert!(store
+        .get("pgatomic01")
+        .await
+        .unwrap()
+        .unwrap()
+        .is_effectively_live());
+    assert!(matches!(
+        store
+            .bulk_restore(
+                "alice",
+                &[DriveItemRef {
+                    kind: LibraryItemKind::File,
+                    id: "trashpgfil".into(),
+                }],
+            )
+            .await
+            .unwrap(),
+        BulkMutation::Applied { .. }
+    ));
+    assert_eq!(
+        store
+            .bulk_move(
+                "alice",
+                &[DriveItemRef {
+                    kind: LibraryItemKind::Folder,
+                    id: "trashpgpar".into(),
+                }],
+                Some("trashpgchi"),
+            )
+            .await
+            .unwrap(),
+        BulkMutation::Conflict
+    );
+    let oversized: Vec<DriveItemRef> = (0..=MAX_BULK_ITEMS)
+        .map(|index| DriveItemRef {
+            kind: LibraryItemKind::File,
+            id: format!("pgoversized{index}"),
+        })
+        .collect();
+    assert_eq!(
+        store.bulk_move("alice", &oversized, None).await.unwrap(),
+        BulkMutation::Conflict
+    );
+
+    // Two concurrent lifecycle writers serialize on the owner guard: exactly one commits.
+    let concurrent = file("pgconcur01", "alice", "pg-concurrent-token", now + 3_020);
+    assert!(store.create(&concurrent).await.unwrap());
+    let left_store = store.clone();
+    let right_store = store.clone();
+    let (left, right) = tokio::join!(
+        async move {
+            left_store
+                .bulk_trash(
+                    "alice",
+                    &[TrashRootInput {
+                        item: DriveItemRef {
+                            kind: LibraryItemKind::File,
+                            id: "pgconcur01".into(),
+                        },
+                        entry_id: "pg-concurrent-left".into(),
+                    }],
+                    now + 3_300,
+                    now + 4_000,
+                )
+                .await
+                .unwrap()
+        },
+        async move {
+            right_store
+                .bulk_trash(
+                    "alice",
+                    &[TrashRootInput {
+                        item: DriveItemRef {
+                            kind: LibraryItemKind::File,
+                            id: "pgconcur01".into(),
+                        },
+                        entry_id: "pg-concurrent-right".into(),
+                    }],
+                    now + 3_300,
+                    now + 4_000,
+                )
+                .await
+                .unwrap()
+        }
+    );
+    assert_eq!(
+        [left, right]
+            .into_iter()
+            .filter(|result| matches!(result, BulkMutation::Applied { .. }))
+            .count(),
+        1
+    );
+    assert!(matches!(
+        store
+            .bulk_restore(
+                "alice",
+                &[DriveItemRef {
+                    kind: LibraryItemKind::File,
+                    id: "pgconcur01".into(),
+                }],
+            )
+            .await
+            .unwrap(),
+        BulkMutation::Applied { .. }
+    ));
+
+    // Purge commits every current/version/thumbnail key to the durable outbox in the same
+    // transaction that removes metadata. A failed lease is deferred, then reclaimed and acked.
+    sqlx::query("DELETE FROM blob_delete_queue")
+        .execute(&raw)
+        .await
+        .unwrap();
+    assert!(store
+        .add_version(&VersionRec {
+            id: "pgv4version".into(),
+            file_id: "pgconcur01".into(),
+            object_key: "pgv4versionblob".into(),
+            size: 2,
+            content_type: "image/png".into(),
+            created_at: now + 3_021,
+        })
+        .await
+        .unwrap());
+    assert!(matches!(
+        store
+            .bulk_trash(
+                "alice",
+                &[TrashRootInput {
+                    item: DriveItemRef {
+                        kind: LibraryItemKind::File,
+                        id: "pgconcur01".into(),
+                    },
+                    entry_id: "pg-purge-entry".into(),
+                }],
+                now + 3_400,
+                now + 4_000,
+            )
+            .await
+            .unwrap(),
+        BulkMutation::Applied { .. }
+    ));
+    assert_eq!(
+        store
+            .bulk_purge(
+                "alice",
+                &[DriveItemRef {
+                    kind: LibraryItemKind::File,
+                    id: "pgconcur01".into(),
+                }],
+                now + 3_401,
+            )
+            .await
+            .unwrap(),
+        BulkMutation::Applied { changed: 1 }
+    );
+    assert!(store.get("pgconcur01").await.unwrap().is_none());
+    let queued: i64 = sqlx::query(
+        "SELECT count(*) AS n FROM blob_delete_queue WHERE object_key IN \
+         ('pgconcur01', 'pgconcur01.thumb', 'pgv4versionblob', 'pgv4versionblob.thumb')",
+    )
+    .fetch_one(&raw)
+    .await
+    .unwrap()
+    .try_get("n")
+    .unwrap();
+    assert_eq!(
+        queued, 4,
+        "metadata deletion cannot commit without outbox authority"
+    );
+
+    let BlobDeleteClaim::Claimed(mut claimed) = store
+        .claim_blob_deletions("pg-delete-worker", now + 3_402, now, 20)
+        .await
+        .unwrap()
+    else {
+        panic!("the purge queue must be claimable");
+    };
+    claimed.sort_by(|left, right| left.object_key.cmp(&right.object_key));
+    assert_eq!(claimed.len(), 4);
+    let failed_key = claimed[0].object_key.clone();
+    assert!(store
+        .abandon_blob_deletion(&failed_key, "pg-delete-worker", now + 3_500)
+        .await
+        .unwrap());
+    for item in &claimed[1..] {
+        assert!(store
+            .complete_blob_deletion(&item.object_key, "pg-delete-worker")
+            .await
+            .unwrap());
+    }
+    assert_eq!(
+        store
+            .claim_blob_deletions("pg-delete-worker-two", now + 3_499, now + 3_000, 20)
+            .await
+            .unwrap(),
+        BlobDeleteClaim::Empty
+    );
+    let BlobDeleteClaim::Claimed(retry) = store
+        .claim_blob_deletions("pg-delete-worker-two", now + 3_500, now + 3_000, 20)
+        .await
+        .unwrap()
+    else {
+        panic!("the deferred object must become claimable at retry time");
+    };
+    assert_eq!(retry.len(), 1);
+    assert_eq!(retry[0].object_key, failed_key);
+    assert_eq!(retry[0].attempts, 1);
+    assert!(store
+        .complete_blob_deletion(&failed_key, "pg-delete-worker-two")
+        .await
+        .unwrap());
+
+    // Poison rows must be excluded before SQL LIMIT. More than four historical overfetch windows
+    // of invalid-kind and dangling authorities cannot starve one exact valid Trash root.
+    let poison_valid = file("pgpoisonok", "alice", "pg-poison-valid-token", now + 3_510);
+    assert!(store.create(&poison_valid).await.unwrap());
+    assert_eq!(
+        store
+            .bulk_trash(
+                "alice",
+                &[TrashRootInput {
+                    item: DriveItemRef {
+                        kind: LibraryItemKind::File,
+                        id: "pgpoisonok".into(),
+                    },
+                    entry_id: "zz-valid-poison-entry".into(),
+                }],
+                now + 3_511,
+                now + 3_512,
+            )
+            .await
+            .unwrap(),
+        BulkMutation::Applied { changed: 1 }
+    );
+    sqlx::query(
+        "INSERT INTO trash_entries \
+             (id, owner_sub, item_kind, item_id, trashed_at, purge_after) \
+         SELECT 'aa-invalid-poison-' || LPAD(n::text, 3, '0'), 'alice', 'invalid', \
+                'invalid-item-' || n::text, $1, $2 \
+         FROM generate_series(1, 125) AS poison(n)",
+    )
+    .bind(now + 1)
+    .bind(now + 2)
+    .execute(&raw)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO trash_entries \
+             (id, owner_sub, item_kind, item_id, trashed_at, purge_after) \
+         SELECT 'ab-dangling-poison-' || LPAD(n::text, 3, '0'), 'alice', 'file', \
+                'missing-file-' || n::text, $1, $2 \
+         FROM generate_series(1, 125) AS poison(n)",
+    )
+    .bind(now + 1)
+    .bind(now + 2)
+    .execute(&raw)
+    .await
+    .unwrap();
+    let poison_claim = store
+        .claim_expired_trash("pg-poison-worker", now + 3_513, now + 3_000, 1)
+        .await
+        .unwrap();
+    assert_eq!(poison_claim.len(), 1);
+    assert_eq!(poison_claim[0].id, "zz-valid-poison-entry");
+    assert!(store
+        .abandon_trash_claim("zz-valid-poison-entry", "pg-poison-worker")
+        .await
+        .unwrap());
+    assert_eq!(
+        store
+            .bulk_purge(
+                "alice",
+                &[DriveItemRef {
+                    kind: LibraryItemKind::File,
+                    id: "pgpoisonok".into(),
+                }],
+                now + 3_514,
+            )
+            .await
+            .unwrap(),
+        BulkMutation::Applied { changed: 1 }
+    );
+    sqlx::query("DELETE FROM trash_entries WHERE id LIKE '%-poison-%'")
+        .execute(&raw)
+        .await
+        .unwrap();
+
+    // Claim locks multiple authorities by entry id even though fairness was selected by expiry.
+    // A reversed caller batch therefore waits on the same first row instead of holding the second
+    // one and deadlocking. The trigger makes that interleaving deterministic.
+    for (id, token) in [
+        ("pgclaimlocka", "pg-claim-lock-a-token"),
+        ("pgclaimlockz", "pg-claim-lock-z-token"),
+    ] {
+        assert!(store
+            .create(&file(id, "claim-lock-owner", token, now + 3_520))
+            .await
+            .unwrap());
+    }
+    assert_eq!(
+        store
+            .bulk_trash(
+                "claim-lock-owner",
+                &[
+                    TrashRootInput {
+                        item: DriveItemRef {
+                            kind: LibraryItemKind::File,
+                            id: "pgclaimlocka".into(),
+                        },
+                        entry_id: "aa-claim-lock-entry".into(),
+                    },
+                    TrashRootInput {
+                        item: DriveItemRef {
+                            kind: LibraryItemKind::File,
+                            id: "pgclaimlockz".into(),
+                        },
+                        entry_id: "zz-claim-lock-entry".into(),
+                    },
+                ],
+                now + 3_521,
+                now + 3_522,
+            )
+            .await
+            .unwrap(),
+        BulkMutation::Applied { changed: 2 }
+    );
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION aperture_block_trash_claim() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN \
+           IF NEW.id = 'aa-claim-lock-entry' AND NEW.recovery_lease IS NOT NULL THEN \
+             PERFORM pg_advisory_xact_lock(7300105); \
+           END IF; \
+           RETURN NEW; \
+         END $$",
+    )
+    .execute(&raw)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER aperture_block_trash_claim_trigger BEFORE UPDATE ON trash_entries \
+         FOR EACH ROW EXECUTE FUNCTION aperture_block_trash_claim()",
+    )
+    .execute(&raw)
+    .await
+    .unwrap();
+    let mut claim_barrier = raw.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(7300105)")
+        .execute(&mut *claim_barrier)
+        .await
+        .unwrap();
+    let claim_store = store.clone();
+    let claiming = tokio::spawn(async move {
+        claim_store
+            .claim_expired_trash("ordered-trash-claim", now + 3_523, now + 3_000, 2)
+            .await
+    });
+    let mut claim_at_barrier = false;
+    for _ in 0..200 {
+        let blocked: i64 = sqlx::query(
+            "SELECT CAST(COUNT(*) AS BIGINT) AS count FROM pg_stat_activity \
+             WHERE pid <> pg_backend_pid() AND state = 'active' AND wait_event_type = 'Lock' \
+               AND query LIKE '%UPDATE trash_entries SET recovery_lease%'",
+        )
+        .fetch_one(&raw)
+        .await
+        .unwrap()
+        .try_get("count")
+        .unwrap();
+        if blocked > 0 {
+            claim_at_barrier = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        claim_at_barrier,
+        "claim did not reach its controlled barrier"
+    );
+    let purge_store = store.clone();
+    let reversed_purge = tokio::spawn(async move {
+        purge_store
+            .bulk_purge(
+                "claim-lock-owner",
+                &[
+                    DriveItemRef {
+                        kind: LibraryItemKind::File,
+                        id: "pgclaimlockz".into(),
+                    },
+                    DriveItemRef {
+                        kind: LibraryItemKind::File,
+                        id: "pgclaimlocka".into(),
+                    },
+                ],
+                now + 3_524,
+            )
+            .await
+    });
+    let mut purge_waited_on_first_authority = false;
+    for _ in 0..200 {
+        let blocked: i64 = sqlx::query(
+            "SELECT CAST(COUNT(*) AS BIGINT) AS count FROM pg_stat_activity \
+             WHERE pid <> pg_backend_pid() AND state = 'active' AND wait_event_type = 'Lock' \
+               AND query LIKE '%SELECT 1 FROM trash_entries WHERE id%'",
+        )
+        .fetch_one(&raw)
+        .await
+        .unwrap()
+        .try_get("count")
+        .unwrap();
+        if blocked > 0 {
+            purge_waited_on_first_authority = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        purge_waited_on_first_authority,
+        "reversed purge did not wait on the canonical first authority"
+    );
+    claim_barrier.rollback().await.unwrap();
+    let claimed = tokio::time::timeout(Duration::from_secs(5), claiming)
+        .await
+        .expect("claim timed out")
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.len(), 2);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), reversed_purge)
+            .await
+            .expect("reversed purge timed out")
+            .unwrap()
+            .unwrap(),
+        BulkMutation::Applied { changed: 2 }
+    );
+    sqlx::query("DROP TRIGGER aperture_block_trash_claim_trigger ON trash_entries")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DROP FUNCTION aperture_block_trash_claim()")
+        .execute(&raw)
+        .await
+        .unwrap();
+
+    let expired = file("pgexpired1", "alice", "pg-expired-token", now + 3_030);
+    assert!(store.create(&expired).await.unwrap());
+    assert!(matches!(
+        store
+            .bulk_trash(
+                "alice",
+                &[TrashRootInput {
+                    item: DriveItemRef {
+                        kind: LibraryItemKind::File,
+                        id: "pgexpired1".into(),
+                    },
+                    entry_id: "pg-expired-entry".into(),
+                }],
+                now + 3_600,
+                now + 3_601,
+            )
+            .await
+            .unwrap(),
+        BulkMutation::Applied { .. }
+    ));
+    let claimed_expired = store
+        .claim_expired_trash("pg-trash-worker", now + 3_602, now + 3_000, 20)
+        .await
+        .unwrap();
+    assert_eq!(claimed_expired.len(), 1);
+    assert_eq!(claimed_expired[0].item_id, "pgexpired1");
+    assert!(store
+        .claim_expired_trash("pg-trash-worker-two", now + 3_603, now + 3_000, 20)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .abandon_trash_claim("pg-expired-entry", "pg-trash-worker")
+        .await
+        .unwrap());
+    assert_eq!(
+        store
+            .claim_expired_trash("pg-trash-worker-two", now + 3_604, now + 3_000, 20)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(matches!(
+        store
+            .bulk_purge(
+                "alice",
+                &[DriveItemRef {
+                    kind: LibraryItemKind::File,
+                    id: "pgexpired1".into(),
+                }],
+                now + 3_605,
+            )
+            .await
+            .unwrap(),
+        BulkMutation::Applied { .. }
+    ));
+    if let BlobDeleteClaim::Claimed(items) = store
+        .claim_blob_deletions("pg-final-delete-worker", now + 3_606, now + 3_000, 20)
+        .await
+        .unwrap()
+    {
+        for item in items {
+            assert!(store
+                .complete_blob_deletion(&item.object_key, "pg-final-delete-worker")
+                .await
+                .unwrap());
+        }
+    }
 
     // --- the full HTTP app boots against Postgres (healthz) ----------------
     let state = AppState {

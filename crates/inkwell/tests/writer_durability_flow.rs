@@ -297,6 +297,109 @@ async fn legacy_open_forms_without_post_identity_conflict_into_private_recovery(
 }
 
 #[tokio::test]
+async fn deleted_unreused_editor_forms_return_private_identity_recovery_not_404() {
+    let state = build_dev_state();
+
+    create_post(
+        &state,
+        "Deleted Legacy Editor",
+        "legacy authoritative body",
+        "save_draft",
+        None,
+    )
+    .await;
+    state
+        .store
+        .delete_post("deleted-legacy-editor")
+        .await
+        .unwrap();
+    let legacy = form(&[
+        ("title", "Deleted Legacy Editor"),
+        ("body", "legacy deleted submission recovery"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, headers, conflict) = call(
+        &state,
+        post_auth(
+            "/edit/deleted-legacy-editor",
+            &legacy,
+            "u_writer",
+            None,
+            false,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_private_no_store(&headers);
+    assert!(conflict.contains("legacy deleted submission recovery"));
+    assert!(!conflict.contains("?recover="));
+    assert!(state
+        .store
+        .get_post("deleted-legacy-editor")
+        .await
+        .is_none());
+
+    create_post(
+        &state,
+        "Deleted Modern Editor",
+        "modern authoritative body",
+        "save_draft",
+        None,
+    )
+    .await;
+    let deleted = state.store.get_post("deleted-modern-editor").await.unwrap();
+    state
+        .store
+        .delete_post("deleted-modern-editor")
+        .await
+        .unwrap();
+    let modern = form(&[
+        ("title", "Deleted Modern Editor"),
+        ("body", "modern deleted submission recovery"),
+        ("expected_post_id", &deleted.id),
+        ("expected_version", &deleted.edit_version.to_string()),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, headers, conflict) = call(
+        &state,
+        post_auth(
+            "/edit/deleted-modern-editor",
+            &modern,
+            "u_writer",
+            None,
+            false,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_private_no_store(&headers);
+    assert!(conflict.contains("modern deleted submission recovery"));
+
+    let (status, headers, json) = call(
+        &state,
+        post_auth(
+            "/edit/deleted-modern-editor",
+            &modern,
+            "u_writer",
+            None,
+            true,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_private_no_store(&headers);
+    let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(json["conflict"], true);
+    assert_eq!(json["submitted_body"], "modern deleted submission recovery");
+    assert!(json.get("recover").is_none());
+    assert!(state
+        .store
+        .get_post("deleted-modern-editor")
+        .await
+        .is_none());
+}
+
+#[tokio::test]
 async fn modern_identity_mismatch_reflects_only_submission_without_replacement_recovery() {
     let state = build_dev_state();
     create_post(
@@ -372,6 +475,8 @@ async fn modern_identity_mismatch_reflects_only_submission_without_replacement_r
     assert_private_no_store(&headers);
     let json: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(json["conflict"], true);
+    assert_eq!(json["submitted_body"], "old caller submitted body");
+    assert!(!json.to_string().contains("replacement private body"));
     assert!(json.get("recover").is_none());
     assert!(json.get("current_version").is_none());
 

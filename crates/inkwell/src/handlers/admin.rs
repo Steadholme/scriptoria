@@ -21,7 +21,10 @@ use crate::auth;
 use crate::config::MAX_PAGE;
 use crate::error::AppError;
 use crate::handlers::{esc, page_shell, PageShell};
-use crate::store::{Post, SavePostCommand, SavePostOutcome, Settings};
+use crate::store::{
+    DeletePostCommand, DeletePostOutcome, DeletePostScope, DeletePostSelection, DeletePostsCommand,
+    DeletePostsOutcome, Post, SavePostCommand, SavePostOutcome, Settings,
+};
 use crate::{now_secs, AppState};
 
 const ADMIN_HTML: &str = include_str!("../../templates/admin.html");
@@ -31,6 +34,23 @@ const ADMIN_HTML: &str = include_str!("../../templates/admin.html");
 pub struct CsrfForm {
     #[serde(default)]
     pub csrf_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeleteForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub expected_post_id: String,
+    #[serde(default)]
+    pub expected_version: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AdminSelection {
+    slug: String,
+    post_id: String,
+    expected_version: i64,
 }
 
 /// Site-settings form body. `posts_per_page` arrives as a string and is parsed + clamped.
@@ -95,7 +115,7 @@ pub async fn index(
         metadata: None,
     });
 
-    Ok(html_with_cookie(page, set_cookie))
+    Ok(private_no_store(html_with_cookie(page, set_cookie)))
 }
 
 /// One admin table row: selection checkbox (bound to the external bulk form via `form=`),
@@ -116,7 +136,7 @@ fn render_row(p: &Post, csrf: &str, now: i64) -> String {
     let csrf = esc(csrf);
     format!(
         r#"          <tr>
-            <td class="admin-table__check"><input type="checkbox" name="slugs" form="bulk-form" value="{slug}"></td>
+            <td class="admin-table__check"><input type="checkbox" name="items" form="bulk-form" value="{selection}"></td>
             <td><a href="/p/{slug}">{title}</a></td>
             <td>{author}</td>
             <td>{status}</td>
@@ -138,12 +158,17 @@ fn render_row(p: &Post, csrf: &str, now: i64) -> String {
               <a class="btn btn-secondary btn-sm" href="/edit/{slug}">Edit</a>
               <form class="inline-form" method="post" action="/admin/posts/{slug}/delete" onsubmit="return confirm('Delete this post? This cannot be undone.');">
                 <input type="hidden" name="csrf_token" value="{csrf}">
+                <input type="hidden" name="expected_post_id" value="{post_id}">
+                <input type="hidden" name="expected_version" value="{version}">
                 <button class="btn btn-danger btn-sm" type="submit">Delete</button>
               </form>
             </td>
           </tr>
 "#,
         slug = slug,
+        selection = encode_selection(p),
+        post_id = esc(&p.id),
+        version = p.edit_version,
         title = esc(&p.title),
         author = esc(&p.author_email),
         status = status,
@@ -295,14 +320,35 @@ pub async fn delete(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(slug): Path<String>,
-    Form(form): Form<CsrfForm>,
+    Form(form): Form<DeleteForm>,
 ) -> Result<Response, AppError> {
     auth::require_admin(&headers)?;
     auth::verify_csrf(&headers, &form.csrf_token)?;
-
-    // Confirm existence (404 otherwise) before deleting.
-    load(&state, &slug).await?;
-    state.store.delete_post(&slug).await?;
+    let Some(expected_version) = form
+        .expected_version
+        .trim()
+        .parse::<i64>()
+        .ok()
+        .filter(|version| *version > 0)
+    else {
+        return Err(delete_conflict());
+    };
+    if form.expected_post_id.trim().is_empty() {
+        return Err(delete_conflict());
+    }
+    match state
+        .store
+        .delete_post_cas(DeletePostCommand {
+            slug: slug.clone(),
+            post_id: form.expected_post_id.trim().to_string(),
+            expected_version,
+            scope: DeletePostScope::Admin,
+        })
+        .await?
+    {
+        DeletePostOutcome::Deleted(_) => {}
+        DeletePostOutcome::Conflict => return Err(delete_conflict()),
+    }
     tracing::info!(slug = %slug, "admin deleted post");
 
     crate::deindex_post(state.store.as_ref(), &slug).await;
@@ -322,7 +368,7 @@ pub async fn delete(
 // ---------------------------------------------------------------------------
 
 /// `POST /admin/posts/bulk` — apply `action` (pin|unpin|feature|unfeature|unpublish|delete) to every
-/// checked `slugs` value. Parsed from the raw body: repeated `slugs=` keys don't round-trip
+/// checked stable selection. Parsed from the raw body: repeated `items=` keys don't round-trip
 /// through `serde_urlencoded` into a `Vec`, so the body is decoded by hand here.
 pub async fn bulk(
     State(state): State<AppState>,
@@ -336,71 +382,93 @@ pub async fn bulk(
     auth::verify_csrf(&headers, &csrf)?;
 
     let action = field(&pairs, "action");
-    let slugs: Vec<String> = pairs
+    let selections: Vec<AdminSelection> = pairs
         .iter()
-        .filter(|(k, _)| k == "slugs")
-        .map(|(_, v)| v.clone())
-        .collect();
+        .filter(|(key, _)| key == "items")
+        .map(|(_, value)| parse_selection(value))
+        .collect::<Result<_, _>>()?;
+    if selections.is_empty() {
+        return Err(delete_conflict());
+    }
 
     let actor = actor(&headers);
-    for slug in &slugs {
+    if action == "delete" {
+        let deleted = match state
+            .store
+            .delete_posts_cas(DeletePostsCommand {
+                selections: selections
+                    .iter()
+                    .map(|selection| DeletePostSelection {
+                        slug: selection.slug.clone(),
+                        post_id: selection.post_id.clone(),
+                        expected_version: selection.expected_version,
+                    })
+                    .collect(),
+                scope: DeletePostScope::Admin,
+            })
+            .await?
+        {
+            DeletePostsOutcome::Deleted(posts) => posts,
+            DeletePostsOutcome::Conflict => return Err(delete_conflict()),
+        };
+        // The store transaction has committed the complete set before derived-index cleanup and
+        // audit side effects begin, so a stale later selection can never leave a partial delete.
+        for post in &deleted {
+            crate::deindex_post(state.store.as_ref(), &post.slug).await;
+            state.audit.emit(AuditEvent::notice(
+                "admin.post.delete",
+                &actor,
+                &post.slug,
+                "delete",
+            ));
+        }
+        tracing::info!(action = %action, count = deleted.len(), "admin bulk action");
+        return Ok(redirect("/admin"));
+    }
+
+    for selection in &selections {
+        let slug = &selection.slug;
         match action.as_str() {
             "pin" | "unpin" => {
-                if let Some(mut post) = state.store.get_post_authoritative(slug).await? {
-                    post.pinned = action == "pin";
-                    post.bump_updated_at(now_secs());
-                    let post = save_admin_post(&state, &headers, post, "admin.pin").await?;
-                    state.audit.emit(AuditEvent::info(
-                        "admin.post.pin",
-                        &actor,
-                        slug,
-                        if post.pinned { "pinned" } else { "unpinned" },
-                    ));
-                }
+                let mut post = load_selection(&state, selection).await?;
+                post.pinned = action == "pin";
+                post.bump_updated_at(now_secs());
+                let post = save_admin_post(&state, &headers, post, "admin.pin").await?;
+                state.audit.emit(AuditEvent::info(
+                    "admin.post.pin",
+                    &actor,
+                    slug,
+                    if post.pinned { "pinned" } else { "unpinned" },
+                ));
             }
             "feature" | "unfeature" => {
-                if let Some(mut post) = state.store.get_post_authoritative(slug).await? {
-                    post.featured = action == "feature";
-                    post.bump_updated_at(now_secs());
-                    let post = save_admin_post(&state, &headers, post, "admin.feature").await?;
-                    state.audit.emit(AuditEvent::info(
-                        "admin.post.feature",
-                        &actor,
-                        slug,
-                        if post.featured {
-                            "featured"
-                        } else {
-                            "unfeatured"
-                        },
-                    ));
-                }
+                let mut post = load_selection(&state, selection).await?;
+                post.featured = action == "feature";
+                post.bump_updated_at(now_secs());
+                let post = save_admin_post(&state, &headers, post, "admin.feature").await?;
+                state.audit.emit(AuditEvent::info(
+                    "admin.post.feature",
+                    &actor,
+                    slug,
+                    if post.featured {
+                        "featured"
+                    } else {
+                        "unfeatured"
+                    },
+                ));
             }
             "unpublish" => {
-                if let Some(mut post) = state.store.get_post_authoritative(slug).await? {
-                    post.published = false;
-                    post.bump_updated_at(now_secs());
-                    let post =
-                        save_admin_post(&state, &headers, post, "admin.unpublish").await?;
-                    crate::reindex_post(state.store.as_ref(), &post).await;
-                    state.audit.emit(AuditEvent::notice(
-                        "admin.post.unpublish",
-                        &actor,
-                        slug,
-                        "unpublish",
-                    ));
-                }
-            }
-            "delete" => {
-                if state.store.get_post_authoritative(slug).await?.is_some() {
-                    state.store.delete_post(slug).await?;
-                    crate::deindex_post(state.store.as_ref(), slug).await;
-                    state.audit.emit(AuditEvent::notice(
-                        "admin.post.delete",
-                        &actor,
-                        slug,
-                        "delete",
-                    ));
-                }
+                let mut post = load_selection(&state, selection).await?;
+                post.published = false;
+                post.bump_updated_at(now_secs());
+                let post = save_admin_post(&state, &headers, post, "admin.unpublish").await?;
+                crate::reindex_post(state.store.as_ref(), &post).await;
+                state.audit.emit(AuditEvent::notice(
+                    "admin.post.unpublish",
+                    &actor,
+                    slug,
+                    "unpublish",
+                ));
             }
             other => {
                 return Err(AppError::InvalidRequest(format!(
@@ -409,7 +477,7 @@ pub async fn bulk(
             }
         }
     }
-    tracing::info!(action = %action, count = slugs.len(), "admin bulk action");
+    tracing::info!(action = %action, count = selections.len(), "admin bulk action");
 
     Ok(redirect("/admin"))
 }
@@ -425,6 +493,63 @@ async fn load(state: &AppState, slug: &str) -> Result<Post, AppError> {
         .get_post_authoritative(slug)
         .await?
         .ok_or_else(|| AppError::NotFound("no such post".to_string()))
+}
+
+async fn load_selection(state: &AppState, selection: &AdminSelection) -> Result<Post, AppError> {
+    let post = state
+        .store
+        .get_post_authoritative(&selection.slug)
+        .await?
+        .ok_or_else(delete_conflict)?;
+    if post.id != selection.post_id || post.edit_version != selection.expected_version {
+        return Err(delete_conflict());
+    }
+    Ok(post)
+}
+
+fn delete_conflict() -> AppError {
+    AppError::Conflict(
+        "the post identity changed; reload the admin page before applying this action".to_string(),
+    )
+}
+
+fn encode_selection(post: &Post) -> String {
+    format!(
+        "{}.{}.{}",
+        hex::encode(post.id.as_bytes()),
+        post.edit_version,
+        hex::encode(post.slug.as_bytes())
+    )
+}
+
+fn parse_selection(raw: &str) -> Result<AdminSelection, AppError> {
+    let mut parts = raw.split('.');
+    let encoded_id = parts.next().unwrap_or_default();
+    let version = parts.next().unwrap_or_default();
+    let encoded_slug = parts.next().unwrap_or_default();
+    if parts.next().is_some() || encoded_id.len() > 512 || encoded_slug.len() > 512 {
+        return Err(delete_conflict());
+    }
+    let decode = |value: &str| {
+        hex::decode(value)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .filter(|value| !value.is_empty())
+    };
+    let Some(post_id) = decode(encoded_id) else {
+        return Err(delete_conflict());
+    };
+    let Some(slug) = decode(encoded_slug) else {
+        return Err(delete_conflict());
+    };
+    let Some(expected_version) = version.parse::<i64>().ok().filter(|version| *version > 0) else {
+        return Err(delete_conflict());
+    };
+    Ok(AdminSelection {
+        slug,
+        post_id,
+        expected_version,
+    })
 }
 
 async fn save_admin_post(
@@ -465,7 +590,7 @@ fn actor(headers: &HeaderMap) -> String {
 }
 
 /// Parse an `application/x-www-form-urlencoded` body into ordered `(key, value)` pairs,
-/// preserving duplicate keys (so multiple `slugs=` selections all survive).
+/// preserving duplicate keys (so multiple `items=` selections all survive).
 fn parse_pairs(body: &str) -> Vec<(String, String)> {
     body.split('&')
         .filter(|s| !s.is_empty())
@@ -527,14 +652,9 @@ fn hex_val(b: u8) -> Option<u8> {
 
 /// A 303 redirect (post/redirect/get).
 fn redirect(location: &str) -> Response {
-    (
-        StatusCode::SEE_OTHER,
-        [(
-            header::LOCATION,
-            HeaderValue::from_str(location).expect("valid location"),
-        )],
-    )
-        .into_response()
+    let location =
+        HeaderValue::from_str(location).unwrap_or_else(|_| HeaderValue::from_static("/admin"));
+    private_no_store((StatusCode::SEE_OTHER, [(header::LOCATION, location)]).into_response())
 }
 
 /// An HTML response, optionally attaching a freshly-minted CSRF `Set-Cookie`.
@@ -548,21 +668,29 @@ fn html_with_cookie(body: String, set_cookie: Option<String>) -> Response {
     resp
 }
 
+fn private_no_store(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parse_pairs_keeps_duplicate_slugs() {
-        let pairs = parse_pairs("csrf_token=tok&action=delete&slugs=a&slugs=b-2&slugs=c");
+    fn parse_pairs_keeps_duplicate_items() {
+        let pairs = parse_pairs("csrf_token=tok&action=delete&items=a&items=b-2&items=c");
         assert_eq!(field(&pairs, "csrf_token"), "tok");
         assert_eq!(field(&pairs, "action"), "delete");
-        let slugs: Vec<&str> = pairs
+        let items: Vec<&str> = pairs
             .iter()
-            .filter(|(k, _)| k == "slugs")
+            .filter(|(k, _)| k == "items")
             .map(|(_, v)| v.as_str())
             .collect();
-        assert_eq!(slugs, vec!["a", "b-2", "c"]);
+        assert_eq!(items, vec!["a", "b-2", "c"]);
     }
 
     #[test]

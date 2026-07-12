@@ -19,10 +19,10 @@ use crate::auth;
 use crate::error::AppError;
 use crate::handlers::insight::thread_summary;
 use crate::handlers::{
-    ag_initial, ag_tone, email_display, esc, fmt_ts, rel_time, render_page_with_activity,
-    replies_label, unread_activity_count,
+    ag_initial, ag_tone, email_display, esc, fmt_ts, personal_counts, rel_time,
+    render_page_with_personal_counts, replies_label,
 };
-use crate::model::{Post, ReactionCount, Thread};
+use crate::model::{Bookmark, Post, ReactionCount, Thread};
 use crate::store::{
     AcceptedAnswerAction, ReplyAnchor, ThreadSort, ThreadStatusFilter,
     MAX_KLAXON_RECIPIENTS_PER_REPLY,
@@ -255,12 +255,12 @@ pub async fn home(
         recent = recent_html,
     );
 
-    let unread = unread_activity_count(&state, &headers).await?;
-    Ok(Html(render_page_with_activity(
+    let counts = personal_counts(&state, &headers, now).await?;
+    Ok(Html(render_page_with_personal_counts(
         "Forum",
         &email_display(&headers),
         &content,
-        unread,
+        counts,
     )))
 }
 
@@ -338,12 +338,12 @@ pub async fn questions(
         controls = controls,
         list = list,
     );
-    let unread = unread_activity_count(&state, &headers).await?;
-    Ok(Html(render_page_with_activity(
+    let counts = personal_counts(&state, &headers, now).await?;
+    Ok(Html(render_page_with_personal_counts(
         "Questions",
         &email_display(&headers),
         &content,
-        unread,
+        counts,
     )))
 }
 
@@ -447,12 +447,12 @@ pub async fn category(
         list = list,
     );
 
-    let unread = unread_activity_count(&state, &headers).await?;
-    Ok(Html(render_page_with_activity(
+    let counts = personal_counts(&state, &headers, now).await?;
+    Ok(Html(render_page_with_personal_counts(
         &category.name,
         &email_display(&headers),
         &content,
-        unread,
+        counts,
     )))
 }
 
@@ -675,6 +675,20 @@ pub async fn thread(
             .await?;
         reactions.insert(p.id.clone(), counts);
     }
+    // One bounded owner-scoped lookup for the whole visible post page. Bookmark state must never
+    // add another per-post query beside the legacy reaction aggregation.
+    let bookmarks: HashMap<String, Bookmark> = if let Some(subject) = viewer.as_deref() {
+        let post_ids: Vec<String> = ordered.iter().map(|post| post.id.clone()).collect();
+        state
+            .store
+            .bookmarks_for_posts(subject, &post_ids)
+            .await?
+            .into_iter()
+            .map(|bookmark| (bookmark.post_id.clone(), bookmark))
+            .collect()
+    } else {
+        HashMap::new()
+    };
 
     let posts_html = render_posts(
         &ordered,
@@ -687,6 +701,7 @@ pub async fn thread(
         can_manage_answer,
         is_question,
         &reactions,
+        &bookmarks,
         &quoted_posts,
     );
 
@@ -809,8 +824,13 @@ pub async fn thread(
         reply = reply_form,
     );
 
-    let unread = unread_activity_count(&state, &headers).await?;
-    let html = render_page_with_activity(&thread.title, &email_display(&headers), &content, unread);
+    let counts = personal_counts(&state, &headers, now).await?;
+    let html = render_page_with_personal_counts(
+        &thread.title,
+        &email_display(&headers),
+        &content,
+        counts,
+    );
     Ok(html_response(html, set_cookie))
 }
 
@@ -829,6 +849,7 @@ pub async fn new_form(
     Query(q): Query<NewQuery>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
+    let now = now_secs();
     let categories = state.store.list_categories().await?;
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
     let requested = q.cat.unwrap_or_default();
@@ -919,8 +940,8 @@ pub async fn new_form(
         script = SIMILAR_SCRIPT,
     );
 
-    let unread = unread_activity_count(&state, &headers).await?;
-    let html = render_page_with_activity(
+    let counts = personal_counts(&state, &headers, now).await?;
+    let html = render_page_with_personal_counts(
         if is_question {
             "Ask a question"
         } else {
@@ -928,7 +949,7 @@ pub async fn new_form(
         },
         &email_display(&headers),
         &content,
-        unread,
+        counts,
     );
     Ok(html_response(html, set_cookie))
 }
@@ -1163,6 +1184,7 @@ pub async fn edit_thread_form(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
+    let now = now_secs();
     let author = auth::require_author(&headers)?;
     let thread = state
         .store
@@ -1187,8 +1209,13 @@ pub async fn edit_thread_form(
         &format!("/t/{}", esc(&thread.id)),
         &headers,
     );
-    let unread = unread_activity_count(&state, &headers).await?;
-    let html = render_page_with_activity("Edit thread", &email_display(&headers), &content, unread);
+    let counts = personal_counts(&state, &headers, now).await?;
+    let html = render_page_with_personal_counts(
+        "Edit thread",
+        &email_display(&headers),
+        &content,
+        counts,
+    );
     Ok(html_response(html, set_cookie))
 }
 
@@ -1344,6 +1371,7 @@ pub async fn edit_reply_form(
     Path((tid, pid)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
+    let now = now_secs();
     let author = auth::require_author(&headers)?;
     let posts = state.store.posts_in_thread(&tid).await?;
     let post = locate_own_reply(&posts, &pid, &author.sub)?;
@@ -1358,8 +1386,13 @@ pub async fn edit_reply_form(
         &format!("/t/{}", esc(&tid)),
         &headers,
     );
-    let unread = unread_activity_count(&state, &headers).await?;
-    let html = render_page_with_activity("Edit reply", &email_display(&headers), &content, unread);
+    let counts = personal_counts(&state, &headers, now).await?;
+    let html = render_page_with_personal_counts(
+        "Edit reply",
+        &email_display(&headers),
+        &content,
+        counts,
+    );
     Ok(html_response(html, set_cookie))
 }
 
@@ -2404,6 +2437,7 @@ fn render_posts(
     can_manage_answer: bool,
     is_question: bool,
     reactions: &HashMap<String, Vec<ReactionCount>>,
+    bookmarks: &HashMap<String, Bookmark>,
     quoted_posts: &HashMap<String, Post>,
 ) -> String {
     if posts.is_empty() {
@@ -2474,6 +2508,29 @@ fn render_posts(
             tid = esc(thread_id),
             pid = esc(&p.id),
         );
+        let bookmark_control = if viewer.is_none() {
+            String::new()
+        } else if let Some(bookmark) = bookmarks.get(&p.id) {
+            let state = if bookmark.remind_at.is_some_and(|at| at <= now) {
+                " · Due"
+            } else if bookmark.remind_at.is_some() {
+                " · Scheduled"
+            } else {
+                ""
+            };
+            format!(
+                r#"<a class="btn btn-ghost btn-sm ag-post-bookmark is-saved" href="/bookmarks/{pid}/edit" aria-label="Edit saved bookmark{state}">Saved{state}</a>"#,
+                pid = esc(&p.id),
+                state = state,
+            )
+        } else {
+            format!(
+                r#"<form class="inline-form" method="post" action="/t/{tid}/p/{pid}/bookmark"><input type="hidden" name="csrf" value="{csrf}"><button class="btn btn-ghost btn-sm ag-post-bookmark" type="submit" aria-label="Bookmark this post">Bookmark</button></form>"#,
+                tid = esc(thread_id),
+                pid = esc(&p.id),
+                csrf = esc(csrf),
+            )
+        };
         // Admins can remove any reply. The OP owns the thread identity and must be removed through
         // Delete thread, so a reply by another author is never silently promoted into editable OP.
         let admin_controls = if is_admin && i > 0 {
@@ -2496,7 +2553,7 @@ fn render_posts(
             String::new()
         } else {
             format!(
-                r#"<div class="owner-actions post__actions">{quote_control}{owner_controls}{accept_control}{admin_controls}</div>"#,
+                r#"<div class="owner-actions post__actions">{quote_control}{bookmark_control}{owner_controls}{accept_control}{admin_controls}</div>"#,
             )
         };
         let counts = reactions.get(&p.id).unwrap_or(&empty_counts);

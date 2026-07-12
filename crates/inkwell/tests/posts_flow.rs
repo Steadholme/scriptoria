@@ -10,6 +10,7 @@ use inkwell::{app, build_dev_state, now_secs};
 use tower::ServiceExt;
 
 const CSRF: &str = "tok_csrf_for_tests";
+const PUBLIC_VARY: &str = "Cookie, X-Auth-Subject, X-Auth-Email, X-Auth-Groups";
 
 #[tokio::test]
 async fn full_blog_flow_in_memory() {
@@ -64,6 +65,11 @@ async fn full_blog_flow_in_memory() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "private, no-store",
+        "successful authoring redirects are never cacheable"
+    );
     let location = resp
         .headers()
         .get(header::LOCATION)
@@ -120,25 +126,220 @@ async fn full_blog_flow_in_memory() {
     assert!(body.contains("Hello World (edited)"), "title updated");
     assert!(body.contains("Updated body."), "body updated");
 
-    // --- delete: wrong owner -> 403 ----------------------------------------
-    let body = form(&[("csrf_token", CSRF)]);
+    // --- delete: wrong owner is the same generic stable-identity conflict ---
+    let current = state.store.get_post("hello-world").await.unwrap();
+    let body = delete_form(&current);
     let (status, _) = call(
         &state,
         post_csrf("/delete/hello-world", &body, Some(("u_mallory", "m@hf"))),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "non-owner cannot delete");
+    assert_eq!(status, StatusCode::CONFLICT, "non-owner cannot delete");
 
     // --- delete: owner succeeds --------------------------------------------
-    let body = form(&[("csrf_token", CSRF)]);
-    let (status, _) = call(
-        &state,
-        post_csrf("/delete/hello-world", &body, Some(("u_alice", "alice@hf"))),
-    )
-    .await;
-    assert_eq!(status, StatusCode::SEE_OTHER);
+    let response = app(state.clone())
+        .oneshot(post_csrf(
+            "/delete/hello-world",
+            &body,
+            Some(("u_alice", "alice@hf")),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "private, no-store"
+    );
     let (status, _) = call(&state, get("/p/hello-world")).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "deleted post is gone");
+}
+
+#[tokio::test]
+async fn public_reads_cache_only_anonymous_authoritative_representations() {
+    let state = build_dev_state();
+    let body = form(&[
+        ("title", "Cache Boundary"),
+        ("body", "public body"),
+        ("tags", "Rust"),
+        ("intent", "publish_now"),
+        ("csrf_token", CSRF),
+    ]);
+    let response = app(state.clone())
+        .oneshot(post_csrf("/new", &body, Some(("u_alice", "alice@hf"))))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    for uri in ["/", "/tag/rust", "/p/cache-boundary"] {
+        let anonymous = app(state.clone()).oneshot(get(uri)).await.unwrap();
+        assert_eq!(anonymous.status(), StatusCode::OK, "{uri}");
+        assert!(
+            anonymous.headers().get(header::CACHE_CONTROL).is_none(),
+            "anonymous public {uri} keeps public cache semantics"
+        );
+        assert_eq!(
+            anonymous.headers().get(header::VARY).unwrap(),
+            PUBLIC_VARY,
+            "anonymous {uri} declares every representation input to shared caches"
+        );
+        if uri.starts_with("/p/") {
+            assert!(
+                anonymous.headers().get(header::SET_COOKIE).is_none(),
+                "anonymous public article does not mint a CSRF cookie"
+            );
+        }
+
+        let themed_anonymous = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::COOKIE, "odyssey-theme=dark")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            themed_anonymous
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .unwrap(),
+            "private, no-store",
+            "cookie-personalized {uri} is private"
+        );
+        assert_eq!(
+            themed_anonymous.headers().get(header::VARY).unwrap(),
+            PUBLIC_VARY
+        );
+
+        let personalized = app(state.clone())
+            .oneshot(get_auth(uri, "u_alice", "alice@hf"))
+            .await
+            .unwrap();
+        assert_eq!(personalized.status(), StatusCode::OK, "{uri}");
+        assert_eq!(
+            personalized.headers().get(header::CACHE_CONTROL).unwrap(),
+            "private, no-store",
+            "identity-bearing {uri} is private"
+        );
+        assert_eq!(
+            personalized.headers().get(header::VARY).unwrap(),
+            PUBLIC_VARY
+        );
+    }
+
+    let draft = form(&[
+        ("title", "Private Cache Draft"),
+        ("body", "draft body"),
+        ("intent", "save_draft"),
+        ("csrf_token", CSRF),
+    ]);
+    app(state.clone())
+        .oneshot(post_csrf("/new", &draft, Some(("u_alice", "alice@hf"))))
+        .await
+        .unwrap();
+    let private_draft = app(state.clone())
+        .oneshot(get_auth("/p/private-cache-draft", "u_alice", "alice@hf"))
+        .await
+        .unwrap();
+    assert_eq!(private_draft.status(), StatusCode::OK);
+    assert_eq!(
+        private_draft.headers().get(header::CACHE_CONTROL).unwrap(),
+        "private, no-store"
+    );
+    assert_eq!(
+        private_draft.headers().get(header::VARY).unwrap(),
+        PUBLIC_VARY
+    );
+}
+
+#[tokio::test]
+async fn router_and_extractor_errors_are_private_no_store() {
+    let state = build_dev_state();
+    let missing = app(state.clone())
+        .oneshot(get("/route-that-does-not-exist"))
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        missing.headers().get(header::CACHE_CONTROL).unwrap(),
+        "private, no-store"
+    );
+
+    let unsupported = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/new")
+                .header(header::CONTENT_TYPE, "text/plain")
+                .header("x-auth-subject", "u_alice")
+                .header("x-auth-email", "alice@hf")
+                .body(Body::from("not a form"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unsupported.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(
+        unsupported.headers().get(header::CACHE_CONTROL).unwrap(),
+        "private, no-store"
+    );
+}
+
+#[tokio::test]
+async fn delete_legacy_foreign_stale_and_replacement_forms_fail_closed() {
+    let state = build_dev_state();
+    let create = |sub: &'static str, email: &'static str| {
+        post_csrf(
+            "/new",
+            "title=Delete+ABA&body=body&intent=save_draft&csrf_token=tok_csrf_for_tests",
+            Some((sub, email)),
+        )
+    };
+    app(state.clone())
+        .oneshot(create("u_alice", "alice@hf"))
+        .await
+        .unwrap();
+    let stale = state.store.get_post("delete-aba").await.unwrap();
+
+    let legacy = form(&[("csrf_token", CSRF)]);
+    let (status, _) = call(
+        &state,
+        post_csrf("/delete/delete-aba", &legacy, Some(("u_alice", "alice@hf"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "old form has no authority");
+
+    let foreign = delete_form(&stale);
+    let (status, _) = call(
+        &state,
+        post_csrf("/delete/delete-aba", &foreign, Some(("u_bob", "bob@hf"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "foreign identity is generic");
+
+    state.store.delete_post("delete-aba").await.unwrap();
+    app(state.clone())
+        .oneshot(create("u_bob", "bob@hf"))
+        .await
+        .unwrap();
+    let replacement = state.store.get_post("delete-aba").await.unwrap();
+    assert_ne!(replacement.id, stale.id);
+    let (status, _) = call(
+        &state,
+        post_csrf(
+            "/delete/delete-aba",
+            &delete_form(&stale),
+            Some(("u_alice", "alice@hf")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        state.store.get_post("delete-aba").await.unwrap().id,
+        replacement.id,
+        "replacement survives stale form"
+    );
 }
 
 #[tokio::test]
@@ -477,6 +678,14 @@ fn form(pairs: &[(&str, &str)]) -> String {
         fields.push(format!("intent={intent}"));
     }
     fields.join("&")
+}
+
+fn delete_form(post: &inkwell::store::Post) -> String {
+    form(&[
+        ("csrf_token", CSRF),
+        ("expected_post_id", &post.id),
+        ("expected_version", &post.edit_version.to_string()),
+    ])
 }
 
 /// Minimal application/x-www-form-urlencoded value encoder.

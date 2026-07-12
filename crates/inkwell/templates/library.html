@@ -1,0 +1,68 @@
+<main class="console ink-library">
+  <header class="console__head ink-library__head">
+    <div>
+      <p class="ink-library__eyebrow">Writer workspace</p>
+      <h1>Content library</h1>
+      <p class="sub">Find, organize, and return to your own posts without mixing them into the public reader.</p>
+    </div>
+    <a class="btn btn-primary" href="{{NEW_HREF}}">New post</a>
+  </header>
+
+  {{NOTICE}}
+
+  <section class="card ink-library__filters">
+    <div class="card__body">
+      <form method="get" action="/library" class="ink-library__filterform" role="search">
+        <div class="field ink-library__query">
+          <label for="library-q">Search your content</label>
+          <input id="library-q" name="q" type="search" maxlength="200" value="{{QUERY}}" placeholder="Title, slug, body, or tag">
+        </div>
+        <div class="field">
+          <label for="library-status">Status</label>
+          <select id="library-status" name="status">{{STATUS_OPTIONS}}</select>
+        </div>
+        <div class="field">
+          <label for="library-tag">Exact tag</label>
+          <input id="library-tag" name="tag" type="text" maxlength="40" value="{{TAG}}" placeholder="e.g. rust">
+        </div>
+        <input type="hidden" name="limit" value="{{LIMIT}}">
+        <div class="ink-library__filteractions">
+          <button class="btn btn-secondary" type="submit">Apply filters</button>
+          <a class="btn btn-ghost" href="/library">Reset</a>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="card ink-library__content" aria-labelledby="library-results-title">
+    <div class="card__body">
+      <div class="ink-library__resultshead">
+        <div>
+          <h2 id="library-results-title">Your posts</h2>
+          <p class="muted">{{RESULT_SUMMARY}}</p>
+        </div>
+        <form id="library-bulk" class="ink-library__bulk" method="post" action="/library/posts/bulk">
+          <input type="hidden" name="csrf_token" value="{{CSRF}}">
+          <input type="hidden" name="return_to" value="{{RETURN_TO}}">
+          <label for="library-action">Selected posts</label>
+          <select id="library-action" name="action">
+            <option value="publish_now">Publish now</option>
+            <option value="draft">Move to draft</option>
+            <option value="pin">Pin</option>
+            <option value="unpin">Unpin</option>
+            <option value="add_tag">Add tag</option>
+            <option value="remove_tag">Remove tag</option>
+          </select>
+          <label class="sr-only" for="library-bulk-tag">Tag for add or remove</label>
+          <input id="library-bulk-tag" name="tag" type="text" maxlength="40" placeholder="Tag for add/remove">
+          <button class="btn btn-secondary btn-sm" type="submit">Apply</button>
+        </form>
+      </div>
+      <p class="muted ink-library__bulkhelp">Select up to 50 posts. Every selected version is checked before any change is committed.</p>
+      <div class="ink-library__rows" role="list">
+{{ROWS}}
+      </div>
+      {{PAGER}}
+    </div>
+  </section>
+</main>

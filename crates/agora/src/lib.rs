@@ -27,6 +27,7 @@
 //! - `POST /t/{tid}/p/{pid}/react`      toggle a reaction (up/heart) on a post
 //! - `POST /t/{id}/accept`   thread author/admin explicitly accept or clear an accepted answer
 //! - `POST /t/{id}/subscribe` toggle the current user's thread subscription
+//! - `GET  /bookmarks`       personal All/Due/Scheduled bookmark queue
 //! - `GET  /search`           shareable thread + accepted-answer search (`?q=&category=&status=`)
 //! - `GET  /api/search/suggest` bounded same-origin quick-search suggestions
 //! - `POST /api/similar`     (sso+CSRF) top-3 existing threads similar to a draft {title,body}
@@ -86,6 +87,23 @@ pub fn app(state: AppState) -> Router {
             "/activity/{id}/state",
             post(handlers::activity::set_read_state),
         )
+        .route("/bookmarks", get(handlers::bookmarks::page))
+        .route(
+            "/bookmarks/{pid}/edit",
+            get(handlers::bookmarks::edit_form).post(handlers::bookmarks::update),
+        )
+        .route(
+            "/bookmarks/{pid}/complete",
+            post(handlers::bookmarks::complete),
+        )
+        .route(
+            "/bookmarks/{pid}/snooze",
+            post(handlers::bookmarks::snooze),
+        )
+        .route(
+            "/bookmarks/{pid}/remove",
+            post(handlers::bookmarks::remove),
+        )
         .route("/c/{id}", get(handlers::forum::category))
         .route("/t/{id}", get(handlers::forum::thread))
         .route("/t/{id}/reply", post(handlers::forum::reply))
@@ -103,6 +121,10 @@ pub fn app(state: AppState) -> Router {
             post(handlers::forum::delete_reply),
         )
         .route("/t/{tid}/p/{pid}/react", post(handlers::forum::react))
+        .route(
+            "/t/{tid}/p/{pid}/bookmark",
+            post(handlers::bookmarks::ensure),
+        )
         .route("/t/{id}/accept", post(handlers::forum::accept_answer))
         .route(
             "/t/{id}/subscribe",
@@ -118,11 +140,33 @@ pub fn app(state: AppState) -> Router {
         .route("/api/thread/{id}/summary", get(handlers::insight::summary))
         .merge(admin_router())
         .fallback(get(handlers::forum::home))
+        // Every HTML surface contains subject-owned navigation state (Activity + Due counts and,
+        // on thread pages, bookmark controls). Never let a shared cache replay one user's view.
+        .layer(axum::middleware::from_fn(private_html_no_store))
         // Reject a forged gateway identity (spoofed X-Auth-* from a rogue in-network peer):
         // when GATEWAY_HMAC_KEY is set, an injected identity MUST carry a valid X-Auth-Sig.
         // No-op when the key is unset or no identity is present (health/public/dev).
         .layer(axum::middleware::from_fn(require_gateway_sig))
         .with_state(state)
+}
+
+async fn private_html_no_store(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(req).await;
+    let is_html = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/html"));
+    if is_html {
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("private, no-store"),
+        );
+    }
+    response
 }
 
 /// The `/admin` subtree, gated as one unit by [`require_admin_mw`]: category CRUD, thread

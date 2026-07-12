@@ -154,12 +154,278 @@ pub enum SavePostOutcome {
     NotFound,
 }
 
+/// Authorization scope for an atomic post delete. Owner commands bind the authoritative row to
+/// the gateway subject; admin commands deliberately omit that predicate after the handler has
+/// already enforced the admin gate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeletePostScope {
+    Owner(String),
+    Admin,
+}
+
+/// Stable delete compare-and-swap. The URL slug is retained as an additional identity component,
+/// but neither it nor a freshly loaded row can substitute for the immutable id and edit version
+/// rendered into the form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeletePostCommand {
+    pub slug: String,
+    pub post_id: String,
+    pub expected_version: i64,
+    pub scope: DeletePostScope,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeletePostOutcome {
+    Deleted(Box<Post>),
+    /// Missing, foreign, stale, and replaced identities intentionally share one outcome.
+    Conflict,
+}
+
+/// One immutable identity in a bounded destructive bulk command. Both the URL slug and stable row
+/// id are compared so a delete/recreate of the same slug cannot grant a stale checkbox authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeletePostSelection {
+    pub slug: String,
+    pub post_id: String,
+    pub expected_version: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeletePostsCommand {
+    pub selections: Vec<DeletePostSelection>,
+    pub scope: DeletePostScope,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeletePostsOutcome {
+    /// Returned only after every selected post and its private children have been committed away.
+    Deleted(Vec<Post>),
+    /// Empty, oversized, duplicate, missing, foreign, stale, and replaced batches are identical.
+    Conflict,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AutosaveOutcome {
     Saved(Box<WriterAutosave>),
     Stale { stored_client_seq: i64 },
     Conflict { current_version: i64 },
     NotFound,
+}
+
+/// Author Content Library status. It is derived from the authoritative publication fields at one
+/// fixed `as_of` instant; no second persisted status can drift from `published` / `publish_at`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LibraryStatus {
+    #[default]
+    All,
+    Draft,
+    Scheduled,
+    Published,
+}
+
+/// Exclusive keyset for `updated_at DESC, id DESC` author-library traversal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LibraryCursor {
+    pub updated_at: i64,
+    pub post_id: String,
+}
+
+/// Fully-authorized Content Library query. `owner_sub` is supplied by the gateway identity, never
+/// by a form field. Search and tag filtering run against authoritative post rows, including drafts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LibraryQuery {
+    pub owner_sub: String,
+    pub q: String,
+    pub status: LibraryStatus,
+    pub tag: String,
+    pub as_of: i64,
+    pub cursor: Option<LibraryCursor>,
+    pub limit: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LibraryPage {
+    pub posts: Vec<Post>,
+    pub next: Option<LibraryCursor>,
+}
+
+/// Stable selection identity carried by a Library checkbox. Slugs are intentionally absent: a
+/// delete/recreate of the same URL can never turn a stale selection into authority over a new row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LibrarySelection {
+    pub post_id: String,
+    pub expected_version: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LibraryBulkAction {
+    PublishNow,
+    Draft,
+    Pin,
+    Unpin,
+    AddTag(String),
+    RemoveTag(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct LibraryBulkCommand {
+    pub owner_sub: String,
+    pub editor_email: String,
+    pub selections: Vec<LibrarySelection>,
+    pub action: LibraryBulkAction,
+    pub now: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LibraryBulkOutcome {
+    /// Only posts whose authoritative state actually changed are returned. No-op selections still
+    /// participate in the all-row CAS but do not create revisions or advance versions.
+    Applied(Vec<Post>),
+    /// Deliberately carries no row/version detail, so cross-owner ids and stale rows look identical.
+    Conflict,
+}
+
+impl LibraryBulkAction {
+    pub fn audit_detail(&self) -> &'static str {
+        match self {
+            Self::PublishNow => "publish_now",
+            Self::Draft => "draft",
+            Self::Pin => "pin",
+            Self::Unpin => "unpin",
+            Self::AddTag(_) => "add_tag",
+            Self::RemoveTag(_) => "remove_tag",
+        }
+    }
+
+    fn revision_source(&self) -> &'static str {
+        match self {
+            Self::PublishNow => "library.publish",
+            Self::Draft => "library.draft",
+            Self::Pin => "library.pin",
+            Self::Unpin => "library.unpin",
+            Self::AddTag(_) => "library.tag.add",
+            Self::RemoveTag(_) => "library.tag.remove",
+        }
+    }
+}
+
+fn library_status_matches(post: &Post, status: LibraryStatus, as_of: i64) -> bool {
+    match status {
+        LibraryStatus::All => true,
+        LibraryStatus::Draft => !post.published,
+        LibraryStatus::Scheduled => post.published && post.publish_at > as_of,
+        LibraryStatus::Published => post.is_public_at(as_of),
+    }
+}
+
+fn library_text_matches(post: &Post, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let query = query.to_lowercase();
+    [&post.title, &post.slug, &post.body_md, &post.tags]
+        .iter()
+        .any(|value| value.to_lowercase().contains(&query))
+}
+
+fn library_tag_matches(post: &Post, tag: &str) -> bool {
+    tag.is_empty()
+        || crate::tags::parse_tags(&post.tags)
+            .iter()
+            .any(|candidate| candidate.to_lowercase() == tag.to_lowercase())
+}
+
+fn after_library_cursor(post: &Post, cursor: &LibraryCursor) -> bool {
+    post.updated_at < cursor.updated_at
+        || (post.updated_at == cursor.updated_at && post.id < cursor.post_id)
+}
+
+fn finish_library_page(mut posts: Vec<Post>, limit: i64) -> LibraryPage {
+    let limit = limit.clamp(1, crate::config::LIBRARY_MAX_PAGE) as usize;
+    let has_more = posts.len() > limit;
+    posts.truncate(limit);
+    let next = has_more.then(|| {
+        let post = posts.last().expect("a page with look-ahead has one item");
+        LibraryCursor {
+            updated_at: post.updated_at,
+            post_id: post.id.clone(),
+        }
+    });
+    LibraryPage { posts, next }
+}
+
+/// Mutate author-owned fields only. `featured` and every body/metadata field remain untouched.
+/// Invalid tag commands and version exhaustion fail before the caller persists any selected row.
+fn apply_library_action(post: &mut Post, action: &LibraryBulkAction, now: i64) -> Result<bool, ()> {
+    let changed = match action {
+        LibraryBulkAction::PublishNow => {
+            if post.is_public_at(now) {
+                false
+            } else {
+                post.published = true;
+                post.publish_at = now;
+                true
+            }
+        }
+        LibraryBulkAction::Draft => {
+            let changed = post.published || post.publish_at != 0;
+            post.published = false;
+            post.publish_at = 0;
+            changed
+        }
+        LibraryBulkAction::Pin => {
+            let changed = !post.pinned;
+            post.pinned = true;
+            changed
+        }
+        LibraryBulkAction::Unpin => {
+            let changed = post.pinned;
+            post.pinned = false;
+            changed
+        }
+        LibraryBulkAction::AddTag(raw) => {
+            let additions = crate::tags::parse_tags(raw);
+            if additions.len() != 1 {
+                return Err(());
+            }
+            let addition = &additions[0];
+            let key = crate::tags::tag_slug(addition);
+            let mut tags = crate::tags::parse_tags(&post.tags);
+            if tags
+                .iter()
+                .any(|candidate| crate::tags::tag_slug(candidate) == key)
+            {
+                false
+            } else {
+                if tags.len() >= crate::tags::MAX_TAGS {
+                    return Err(());
+                }
+                tags.push(addition.clone());
+                post.tags = crate::tags::join_tags(&tags);
+                true
+            }
+        }
+        LibraryBulkAction::RemoveTag(raw) => {
+            let removals = crate::tags::parse_tags(raw);
+            if removals.len() != 1 {
+                return Err(());
+            }
+            let key = crate::tags::tag_slug(&removals[0]);
+            let mut tags = crate::tags::parse_tags(&post.tags);
+            let original_len = tags.len();
+            tags.retain(|candidate| crate::tags::tag_slug(candidate) != key);
+            let changed = tags.len() != original_len;
+            if changed {
+                post.tags = crate::tags::join_tags(&tags);
+            }
+            changed
+        }
+    };
+    if changed {
+        post.edit_version = post.edit_version.checked_add(1).ok_or(())?;
+        post.updated_at = now.max(post.updated_at.checked_add(1).ok_or(())?);
+    }
+    Ok(changed)
 }
 
 impl Post {
@@ -275,6 +541,15 @@ pub trait Store: Send + Sync {
     async fn get_post(&self, slug: &str) -> Option<Post>;
     /// Fail-closed post read for authoring commands; database errors must never look like a 404.
     async fn get_post_authoritative(&self, slug: &str) -> Result<Option<Post>, StoreError>;
+    /// One fail-closed, owner-scoped Content Library page. Every implementation applies all filters
+    /// before the stable `updated_at DESC, id DESC` keyset and returns backend failures as errors.
+    async fn list_library(&self, query: LibraryQuery) -> Result<LibraryPage, StoreError>;
+    /// Apply one bounded author action to stable id/version selections atomically. All selections
+    /// are authorized and compared before any write; autosaves are neither read nor consumed.
+    async fn bulk_update_library(
+        &self,
+        command: LibraryBulkCommand,
+    ) -> Result<LibraryBulkOutcome, StoreError>;
     /// Public/reader-visible keyset page (`pinned DESC, created_at DESC, id DESC`). Anonymous
     /// readers see only posts whose publish time has arrived; an author also sees their own drafts
     /// and scheduled posts.
@@ -339,7 +614,19 @@ pub trait Store: Send + Sync {
         session_id: &str,
         owner_sub: &str,
     ) -> Result<(), StoreError>;
-    /// Delete a post by slug.
+    /// Atomically delete exactly one stable post identity under an owner/admin authorization scope.
+    async fn delete_post_cas(
+        &self,
+        command: DeletePostCommand,
+    ) -> Result<DeletePostOutcome, StoreError>;
+    /// Atomically delete one bounded set of immutable post identities. Implementations compare and
+    /// authorize every selection before the first delete, and return no per-row conflict detail.
+    async fn delete_posts_cas(
+        &self,
+        command: DeletePostsCommand,
+    ) -> Result<DeletePostsOutcome, StoreError>;
+    /// Unconditional delete retained for maintenance and test fixture setup. HTTP commands must use
+    /// [`Store::delete_post_cas`] so a slug delete/recreate cannot become authority over a new row.
     async fn delete_post(&self, slug: &str) -> Result<(), StoreError>;
 
     // -- site settings (single-row; edited from /admin, applied to the index) --------------
@@ -443,6 +730,104 @@ impl Store for InMemoryStore {
             .iter()
             .find(|post| post.slug == slug)
             .cloned())
+    }
+
+    async fn list_library(&self, query: LibraryQuery) -> Result<LibraryPage, StoreError> {
+        let limit = query.limit.clamp(1, crate::config::LIBRARY_MAX_PAGE);
+        let search: String = query.q.trim().chars().take(200).collect();
+        let tag: String = query
+            .tag
+            .trim()
+            .chars()
+            .take(crate::tags::MAX_TAG_CHARS)
+            .collect();
+        let posts = self.posts.lock().expect("posts lock poisoned");
+        let mut rows: Vec<Post> = posts
+            .iter()
+            .filter(|post| post.author_sub == query.owner_sub)
+            .filter(|post| library_status_matches(post, query.status, query.as_of))
+            .filter(|post| library_text_matches(post, &search))
+            .filter(|post| library_tag_matches(post, &tag))
+            .filter(|post| {
+                query
+                    .cursor
+                    .as_ref()
+                    .is_none_or(|cursor| after_library_cursor(post, cursor))
+            })
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        rows.truncate(limit as usize + 1);
+        Ok(finish_library_page(rows, limit))
+    }
+
+    async fn bulk_update_library(
+        &self,
+        mut command: LibraryBulkCommand,
+    ) -> Result<LibraryBulkOutcome, StoreError> {
+        if command.selections.is_empty()
+            || command.selections.len() > crate::config::LIBRARY_BULK_MAX
+        {
+            return Ok(LibraryBulkOutcome::Conflict);
+        }
+        command.selections.sort_by(|a, b| a.post_id.cmp(&b.post_id));
+        if command
+            .selections
+            .windows(2)
+            .any(|pair| pair[0].post_id == pair[1].post_id)
+        {
+            return Ok(LibraryBulkOutcome::Conflict);
+        }
+
+        let _mutation = self.mutation_lock.lock().expect("mutation lock poisoned");
+        let mut posts = self.posts.lock().expect("posts lock poisoned");
+        let mut updates = Vec::with_capacity(command.selections.len());
+        for selection in &command.selections {
+            let Some(index) = posts.iter().position(|post| {
+                post.id == selection.post_id && post.author_sub == command.owner_sub
+            }) else {
+                return Ok(LibraryBulkOutcome::Conflict);
+            };
+            let current = posts[index].clone();
+            if current.edit_version != selection.expected_version {
+                return Ok(LibraryBulkOutcome::Conflict);
+            }
+            let mut saved = current.clone();
+            let changed = match apply_library_action(&mut saved, &command.action, command.now) {
+                Ok(changed) => changed,
+                Err(()) => return Ok(LibraryBulkOutcome::Conflict),
+            };
+            updates.push((index, current, saved, changed));
+        }
+
+        let mut revisions = self.revisions.lock().expect("revisions lock poisoned");
+        let mut changed_posts = Vec::new();
+        for (index, current, saved, changed) in updates {
+            if !changed {
+                continue;
+            }
+            ensure_current_revision(
+                &mut revisions,
+                &current,
+                &command.owner_sub,
+                &command.editor_email,
+            );
+            revisions.push(revision_from_post(
+                &saved,
+                &command.owner_sub,
+                &command.editor_email,
+                command.action.revision_source(),
+                None,
+            ));
+            prune_mem_revisions(&mut revisions, &saved.id);
+            posts[index] = saved.clone();
+            changed_posts.push(saved);
+        }
+        Ok(LibraryBulkOutcome::Applied(changed_posts))
     }
 
     async fn list_visible_posts(
@@ -588,6 +973,17 @@ impl Store for InMemoryStore {
             });
         }
 
+        let Some(next_version) = current.edit_version.checked_add(1) else {
+            return Ok(SavePostOutcome::Conflict {
+                current_version: current.edit_version,
+            });
+        };
+        let Some(next_updated_at) = current.updated_at.checked_add(1) else {
+            return Ok(SavePostOutcome::Conflict {
+                current_version: current.edit_version,
+            });
+        };
+
         let mut revisions = self.revisions.lock().expect("revisions lock poisoned");
         ensure_current_revision(
             &mut revisions,
@@ -601,8 +997,8 @@ impl Store for InMemoryStore {
         saved.author_sub = current.author_sub.clone();
         saved.author_email = current.author_email.clone();
         saved.created_at = current.created_at;
-        saved.edit_version = current.edit_version.saturating_add(1);
-        saved.updated_at = saved.updated_at.max(current.updated_at.saturating_add(1));
+        saved.edit_version = next_version;
+        saved.updated_at = saved.updated_at.max(next_updated_at);
         revisions.push(revision_from_post(
             &saved,
             &command.editor_sub,
@@ -677,9 +1073,7 @@ impl Store for InMemoryStore {
         let mut rows = self.autosaves.lock().expect("autosaves lock poisoned");
         // The target session is resolved before opportunistic cleanup. An expired high sequence
         // must never reject a fresh session write with the same random id.
-        rows.retain(|row| {
-            !(row.session_id == autosave.session_id && row.expires_at <= now)
-        });
+        rows.retain(|row| !(row.session_id == autosave.session_id && row.expires_at <= now));
         cleanup_expired_mem_autosaves(&mut rows, now);
         if let Some(existing) = rows
             .iter_mut()
@@ -711,9 +1105,7 @@ impl Store for InMemoryStore {
         Ok(rows
             .iter()
             .find(|row| {
-                row.session_id == session_id
-                    && row.owner_sub == owner_sub
-                    && row.expires_at > now
+                row.session_id == session_id && row.owner_sub == owner_sub && row.expires_at > now
             })
             .cloned())
     }
@@ -728,6 +1120,83 @@ impl Store for InMemoryStore {
             .expect("autosaves lock poisoned")
             .retain(|row| !(row.session_id == session_id && row.owner_sub == owner_sub));
         Ok(())
+    }
+
+    async fn delete_post_cas(
+        &self,
+        command: DeletePostCommand,
+    ) -> Result<DeletePostOutcome, StoreError> {
+        let _mutation = self.mutation_lock.lock().expect("mutation lock poisoned");
+        let mut posts = self.posts.lock().expect("posts lock poisoned");
+        let Some(index) = posts.iter().position(|post| {
+            post.slug == command.slug
+                && post.id == command.post_id
+                && post.edit_version == command.expected_version
+                && match &command.scope {
+                    DeletePostScope::Owner(owner_sub) => post.author_sub == *owner_sub,
+                    DeletePostScope::Admin => true,
+                }
+        }) else {
+            return Ok(DeletePostOutcome::Conflict);
+        };
+        let deleted = posts.remove(index);
+        self.revisions
+            .lock()
+            .expect("revisions lock poisoned")
+            .retain(|revision| revision.post_id != deleted.id);
+        self.autosaves
+            .lock()
+            .expect("autosaves lock poisoned")
+            .retain(|autosave| autosave.post_id != deleted.id);
+        Ok(DeletePostOutcome::Deleted(Box::new(deleted)))
+    }
+
+    async fn delete_posts_cas(
+        &self,
+        mut command: DeletePostsCommand,
+    ) -> Result<DeletePostsOutcome, StoreError> {
+        if command.selections.is_empty()
+            || command.selections.len() > crate::config::POST_BULK_DELETE_MAX
+        {
+            return Ok(DeletePostsOutcome::Conflict);
+        }
+        command
+            .selections
+            .sort_by(|left, right| left.post_id.cmp(&right.post_id));
+        if command
+            .selections
+            .windows(2)
+            .any(|pair| pair[0].post_id == pair[1].post_id)
+        {
+            return Ok(DeletePostsOutcome::Conflict);
+        }
+
+        let _mutation = self.mutation_lock.lock().expect("mutation lock poisoned");
+        let mut posts = self.posts.lock().expect("posts lock poisoned");
+        let mut revisions = self.revisions.lock().expect("revisions lock poisoned");
+        let mut autosaves = self.autosaves.lock().expect("autosaves lock poisoned");
+
+        let mut deleted = Vec::with_capacity(command.selections.len());
+        for selection in &command.selections {
+            let Some(post) = posts.iter().find(|post| {
+                post.slug == selection.slug
+                    && post.id == selection.post_id
+                    && post.edit_version == selection.expected_version
+                    && match &command.scope {
+                        DeletePostScope::Owner(owner_sub) => post.author_sub == *owner_sub,
+                        DeletePostScope::Admin => true,
+                    }
+            }) else {
+                return Ok(DeletePostsOutcome::Conflict);
+            };
+            deleted.push(post.clone());
+        }
+
+        let deleted_ids: HashSet<&str> = deleted.iter().map(|post| post.id.as_str()).collect();
+        posts.retain(|post| !deleted_ids.contains(post.id.as_str()));
+        revisions.retain(|revision| !deleted_ids.contains(revision.post_id.as_str()));
+        autosaves.retain(|autosave| !deleted_ids.contains(autosave.post_id.as_str()));
+        Ok(DeletePostsOutcome::Deleted(deleted))
     }
 
     async fn delete_post(&self, slug: &str) -> Result<(), StoreError> {
@@ -1053,7 +1522,7 @@ fn cleanup_expired_mem_autosaves(autosaves: &mut Vec<WriterAutosave>, now: i64) 
 // DB enforces the slug UNIQUE constraint, so no in-process serializer is needed.
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
-use sqlx::Row;
+use sqlx::{Postgres, QueryBuilder, Row};
 
 const POST_COLS: &str = "SELECT id, slug, title, body_md, author_sub, author_email, \
                          created_at, updated_at, edit_version, published, publish_at, featured, pinned, \
@@ -1232,8 +1701,13 @@ impl PgStore {
         )
         .execute(&mut *repair)
         .await?;
+        // Deliberately use PostgreSQL's checked BIGINT arithmetic here. If a legacy/operator row
+        // is already at either numeric maximum, the repair transaction and startup migration must
+        // fail closed; silently skipping it would preserve two different authoring states under
+        // one cache/CAS version and allow stale public chunks to remain authoritative.
         sqlx::query(
-            "UPDATE posts SET edit_version = posts.edit_version + 1 \
+            "UPDATE posts SET edit_version = posts.edit_version + 1, \
+                              updated_at = posts.updated_at + 1 \
              WHERE EXISTS (\
                  SELECT 1 FROM post_revisions r \
                  WHERE r.post_id = posts.id AND r.edit_version = posts.edit_version AND (\
@@ -1280,6 +1754,13 @@ impl PgStore {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts (created_at)")
             .execute(&self.pool)
             .await?;
+        // Backs owner-first Content Library traversal and its updated-work keyset.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_posts_author_updated \
+             ON posts (author_sub, updated_at, id)",
+        )
+        .execute(&self.pool)
+        .await?;
         // Backs the public index order (`pinned DESC, created_at DESC, id DESC`).
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_posts_public_order ON posts (pinned, created_at)",
@@ -1644,6 +2125,168 @@ impl PgStore {
         rows.iter().map(Self::post_from_row).collect()
     }
 
+    async fn list_library_async(&self, query: LibraryQuery) -> Result<LibraryPage, sqlx::Error> {
+        let limit = query.limit.clamp(1, crate::config::LIBRARY_MAX_PAGE);
+        let mut sql = QueryBuilder::<Postgres>::new(POST_COLS);
+        sql.push(" WHERE author_sub = ")
+            .push_bind(query.owner_sub.clone());
+        match query.status {
+            LibraryStatus::All => {}
+            LibraryStatus::Draft => {
+                sql.push(" AND published = FALSE");
+            }
+            LibraryStatus::Scheduled => {
+                sql.push(" AND published = TRUE AND publish_at > ")
+                    .push_bind(query.as_of);
+            }
+            LibraryStatus::Published => {
+                sql.push(" AND published = TRUE AND (publish_at = 0 OR publish_at <= ")
+                    .push_bind(query.as_of)
+                    .push(")");
+            }
+        }
+        let search: String = query.q.trim().chars().take(200).collect();
+        if !search.is_empty() {
+            sql.push(" AND (POSITION(LOWER(")
+                .push_bind(search.clone())
+                .push(") IN LOWER(title)) > 0 OR POSITION(LOWER(")
+                .push_bind(search.clone())
+                .push(") IN LOWER(slug)) > 0 OR POSITION(LOWER(")
+                .push_bind(search.clone())
+                .push(") IN LOWER(body_md)) > 0 OR POSITION(LOWER(")
+                .push_bind(search)
+                .push(") IN LOWER(COALESCE(tags, ''))) > 0)");
+        }
+        let tag: String = query
+            .tag
+            .trim()
+            .chars()
+            .take(crate::tags::MAX_TAG_CHARS)
+            .collect();
+        if !tag.is_empty() {
+            // Tags are stored in canonical `", "` form. Delimiter wrapping makes this an exact
+            // membership test without LIKE wildcards or a PostgreSQL-only array operator.
+            sql.push(" AND POSITION(LOWER(', ' || ")
+                .push_bind(tag)
+                .push(" || ', ') IN LOWER(', ' || COALESCE(tags, '') || ', ')) > 0");
+        }
+        if let Some(cursor) = query.cursor {
+            sql.push(" AND (updated_at < ")
+                .push_bind(cursor.updated_at)
+                .push(" OR (updated_at = ")
+                .push_bind(cursor.updated_at)
+                .push(" AND id < ")
+                .push_bind(cursor.post_id)
+                .push("))");
+        }
+        sql.push(" ORDER BY updated_at DESC, id DESC LIMIT ")
+            .push_bind(limit + 1);
+        let rows = sql.build().fetch_all(&self.pool).await?;
+        let posts: Result<Vec<Post>, sqlx::Error> = rows.iter().map(Self::post_from_row).collect();
+        Ok(finish_library_page(posts?, limit))
+    }
+
+    async fn bulk_update_library_async(
+        &self,
+        mut command: LibraryBulkCommand,
+    ) -> Result<LibraryBulkOutcome, sqlx::Error> {
+        if command.selections.is_empty()
+            || command.selections.len() > crate::config::LIBRARY_BULK_MAX
+        {
+            return Ok(LibraryBulkOutcome::Conflict);
+        }
+        command.selections.sort_by(|a, b| a.post_id.cmp(&b.post_id));
+        if command
+            .selections
+            .windows(2)
+            .any(|pair| pair[0].post_id == pair[1].post_id)
+        {
+            return Ok(LibraryBulkOutcome::Conflict);
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let mut updates = Vec::with_capacity(command.selections.len());
+        // Every bulk command locks rows in stable id order. The owner predicate is part of the
+        // authoritative lookup, so a foreign id and a deleted id produce the same generic outcome.
+        for selection in &command.selections {
+            let row = sqlx::query(&format!(
+                "{POST_COLS} WHERE author_sub = $1 AND id = $2 FOR UPDATE"
+            ))
+            .bind(&command.owner_sub)
+            .bind(&selection.post_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(row) = row else {
+                return Ok(LibraryBulkOutcome::Conflict);
+            };
+            let current = Self::post_from_row(&row)?;
+            if current.edit_version != selection.expected_version {
+                return Ok(LibraryBulkOutcome::Conflict);
+            }
+            let mut saved = current.clone();
+            let changed = match apply_library_action(&mut saved, &command.action, command.now) {
+                Ok(changed) => changed,
+                Err(()) => return Ok(LibraryBulkOutcome::Conflict),
+            };
+            updates.push((current, saved, changed));
+        }
+
+        let mut changed_posts = Vec::new();
+        for (current, saved, changed) in updates {
+            if !changed {
+                continue;
+            }
+            let snapshot = revision_from_post(
+                &current,
+                &command.owner_sub,
+                &command.editor_email,
+                "snapshot",
+                None,
+            );
+            Self::insert_revision_tx(&mut tx, &snapshot).await?;
+            let updated = sqlx::query(
+                "UPDATE posts SET published = $1, publish_at = $2, pinned = $3, tags = $4, \
+                        updated_at = $5, edit_version = $6 \
+                 WHERE author_sub = $7 AND id = $8 AND edit_version = $9",
+            )
+            .bind(saved.published)
+            .bind(saved.publish_at)
+            .bind(saved.pinned)
+            .bind(&saved.tags)
+            .bind(saved.updated_at)
+            .bind(saved.edit_version)
+            .bind(&command.owner_sub)
+            .bind(&saved.id)
+            .bind(current.edit_version)
+            .execute(&mut *tx)
+            .await?;
+            if updated.rows_affected() != 1 {
+                return Ok(LibraryBulkOutcome::Conflict);
+            }
+            let revision = revision_from_post(
+                &saved,
+                &command.owner_sub,
+                &command.editor_email,
+                command.action.revision_source(),
+                None,
+            );
+            Self::insert_revision_tx(&mut tx, &revision).await?;
+            sqlx::query(
+                "DELETE FROM post_revisions WHERE post_id = $1 AND id IN (\
+                     SELECT id FROM post_revisions WHERE post_id = $1 \
+                     ORDER BY edit_version DESC, id DESC OFFSET $2\
+                 )",
+            )
+            .bind(&saved.id)
+            .bind(crate::config::REVISION_KEEP_LIMIT as i64)
+            .execute(&mut *tx)
+            .await?;
+            changed_posts.push(saved);
+        }
+        tx.commit().await?;
+        Ok(LibraryBulkOutcome::Applied(changed_posts))
+    }
+
     async fn get_post_async(&self, slug: &str) -> Result<Option<Post>, sqlx::Error> {
         let row = sqlx::query(&format!("{POST_COLS} WHERE slug = $1"))
             .bind(slug)
@@ -1913,10 +2556,10 @@ impl PgStore {
         let row = sqlx::query(&format!(
             "{POST_COLS} WHERE slug = $1 AND id = $2 FOR UPDATE"
         ))
-            .bind(&command.post.slug)
-            .bind(&command.post.id)
-            .fetch_optional(&mut *tx)
-            .await?;
+        .bind(&command.post.slug)
+        .bind(&command.post.id)
+        .fetch_optional(&mut *tx)
+        .await?;
         let Some(row) = row else {
             return Ok(SavePostOutcome::NotFound);
         };
@@ -1926,6 +2569,17 @@ impl PgStore {
                 current_version: current.edit_version,
             });
         }
+
+        let Some(next_version) = current.edit_version.checked_add(1) else {
+            return Ok(SavePostOutcome::Conflict {
+                current_version: current.edit_version,
+            });
+        };
+        let Some(next_updated_at) = current.updated_at.checked_add(1) else {
+            return Ok(SavePostOutcome::Conflict {
+                current_version: current.edit_version,
+            });
+        };
 
         let current_revision = revision_from_post(
             &current,
@@ -1942,8 +2596,8 @@ impl PgStore {
         saved.author_sub = current.author_sub.clone();
         saved.author_email = current.author_email.clone();
         saved.created_at = current.created_at;
-        saved.edit_version = current.edit_version.saturating_add(1);
-        saved.updated_at = saved.updated_at.max(current.updated_at.saturating_add(1));
+        saved.edit_version = next_version;
+        saved.updated_at = saved.updated_at.max(next_updated_at);
         let result = sqlx::query(
             "UPDATE posts SET title = $1, body_md = $2, published = $3, updated_at = $4, \
                     edit_version = $5, publish_at = $6, featured = $7, pinned = $8, tags = $9, \
@@ -2074,13 +2728,11 @@ impl PgStore {
         }
         // Keep the global lock order `post -> autosave`. The exact target is removed first so an
         // expired high client_seq cannot participate in the following CAS.
-        sqlx::query(
-            "DELETE FROM writer_autosaves WHERE session_id = $1 AND expires_at <= $2",
-        )
-        .bind(&autosave.session_id)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query("DELETE FROM writer_autosaves WHERE session_id = $1 AND expires_at <= $2")
+            .bind(&autosave.session_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
         if let Some(row) = sqlx::query(
             "SELECT owner_sub, post_id, client_seq FROM writer_autosaves \
              WHERE session_id = $1 FOR UPDATE",
@@ -2177,6 +2829,137 @@ impl PgStore {
         row.as_ref().map(Self::autosave_from_row).transpose()
     }
 
+    async fn delete_post_cas_async(
+        &self,
+        command: &DeletePostCommand,
+    ) -> Result<DeletePostOutcome, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let row = match &command.scope {
+            DeletePostScope::Owner(owner_sub) => {
+                sqlx::query(&format!(
+                    "{POST_COLS} WHERE slug = $1 AND id = $2 AND edit_version = $3 \
+                     AND author_sub = $4 FOR UPDATE"
+                ))
+                .bind(&command.slug)
+                .bind(&command.post_id)
+                .bind(command.expected_version)
+                .bind(owner_sub)
+                .fetch_optional(&mut *tx)
+                .await?
+            }
+            DeletePostScope::Admin => {
+                sqlx::query(&format!(
+                    "{POST_COLS} WHERE slug = $1 AND id = $2 AND edit_version = $3 FOR UPDATE"
+                ))
+                .bind(&command.slug)
+                .bind(&command.post_id)
+                .bind(command.expected_version)
+                .fetch_optional(&mut *tx)
+                .await?
+            }
+        };
+        let Some(row) = row else {
+            return Ok(DeletePostOutcome::Conflict);
+        };
+        let deleted = Self::post_from_row(&row)?;
+        sqlx::query("DELETE FROM writer_autosaves WHERE post_id = $1")
+            .bind(&deleted.id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM post_revisions WHERE post_id = $1")
+            .bind(&deleted.id)
+            .execute(&mut *tx)
+            .await?;
+        let result = sqlx::query("DELETE FROM posts WHERE id = $1 AND edit_version = $2")
+            .bind(&deleted.id)
+            .bind(command.expected_version)
+            .execute(&mut *tx)
+            .await?;
+        if result.rows_affected() != 1 {
+            return Ok(DeletePostOutcome::Conflict);
+        }
+        tx.commit().await?;
+        Ok(DeletePostOutcome::Deleted(Box::new(deleted)))
+    }
+
+    async fn delete_posts_cas_async(
+        &self,
+        mut command: DeletePostsCommand,
+    ) -> Result<DeletePostsOutcome, sqlx::Error> {
+        if command.selections.is_empty()
+            || command.selections.len() > crate::config::POST_BULK_DELETE_MAX
+        {
+            return Ok(DeletePostsOutcome::Conflict);
+        }
+        // A deterministic immutable-id order prevents two overlapping admin batches from taking
+        // row locks in opposite orders. Duplicate ids are rejected before a transaction starts.
+        command
+            .selections
+            .sort_by(|left, right| left.post_id.cmp(&right.post_id));
+        if command
+            .selections
+            .windows(2)
+            .any(|pair| pair[0].post_id == pair[1].post_id)
+        {
+            return Ok(DeletePostsOutcome::Conflict);
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let mut deleted = Vec::with_capacity(command.selections.len());
+        // Lock and authorize the complete stable set before deleting any parent or child row.
+        // Returning Conflict drops this transaction, so every category remains all-or-nothing.
+        for selection in &command.selections {
+            let row = match &command.scope {
+                DeletePostScope::Owner(owner_sub) => {
+                    sqlx::query(&format!(
+                        "{POST_COLS} WHERE author_sub = $1 AND id = $2 FOR UPDATE"
+                    ))
+                    .bind(owner_sub)
+                    .bind(&selection.post_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                }
+                DeletePostScope::Admin => {
+                    sqlx::query(&format!("{POST_COLS} WHERE id = $1 FOR UPDATE"))
+                        .bind(&selection.post_id)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                }
+            };
+            let Some(row) = row else {
+                return Ok(DeletePostsOutcome::Conflict);
+            };
+            let post = Self::post_from_row(&row)?;
+            if post.slug != selection.slug || post.edit_version != selection.expected_version {
+                return Ok(DeletePostsOutcome::Conflict);
+            }
+            deleted.push(post);
+        }
+
+        for post in &deleted {
+            sqlx::query("DELETE FROM writer_autosaves WHERE post_id = $1")
+                .bind(&post.id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM post_revisions WHERE post_id = $1")
+                .bind(&post.id)
+                .execute(&mut *tx)
+                .await?;
+            let result =
+                sqlx::query("DELETE FROM posts WHERE id = $1 AND slug = $2 AND edit_version = $3")
+                    .bind(&post.id)
+                    .bind(&post.slug)
+                    .bind(post.edit_version)
+                    .execute(&mut *tx)
+                    .await?;
+            if result.rows_affected() != 1 {
+                return Ok(DeletePostsOutcome::Conflict);
+            }
+        }
+        tx.commit().await?;
+        Ok(DeletePostsOutcome::Deleted(deleted))
+    }
+
     async fn delete_post_async(&self, slug: &str) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         if let Some(row) = sqlx::query("SELECT id FROM posts WHERE slug = $1 FOR UPDATE")
@@ -2228,6 +3011,21 @@ impl Store for PgStore {
 
     async fn get_post_authoritative(&self, slug: &str) -> Result<Option<Post>, StoreError> {
         self.get_post_async(slug)
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))
+    }
+
+    async fn list_library(&self, query: LibraryQuery) -> Result<LibraryPage, StoreError> {
+        self.list_library_async(query)
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))
+    }
+
+    async fn bulk_update_library(
+        &self,
+        command: LibraryBulkCommand,
+    ) -> Result<LibraryBulkOutcome, StoreError> {
+        self.bulk_update_library_async(command)
             .await
             .map_err(|error| StoreError::Backend(error.to_string()))
     }
@@ -2379,6 +3177,24 @@ impl Store for PgStore {
             .execute(&self.pool)
             .await
             .map(|_| ())
+            .map_err(|error| StoreError::Backend(error.to_string()))
+    }
+
+    async fn delete_post_cas(
+        &self,
+        command: DeletePostCommand,
+    ) -> Result<DeletePostOutcome, StoreError> {
+        self.delete_post_cas_async(&command)
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))
+    }
+
+    async fn delete_posts_cas(
+        &self,
+        command: DeletePostsCommand,
+    ) -> Result<DeletePostsOutcome, StoreError> {
+        self.delete_posts_cas_async(command)
+            .await
             .map_err(|error| StoreError::Backend(error.to_string()))
     }
 
@@ -2851,11 +3667,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(store
-            .get_writer_autosave(target, &post.author_sub, 2)
-            .await
-            .unwrap()
-            .is_none(), "expired row beyond cleanup batch stays unreadable");
+        assert!(
+            store
+                .get_writer_autosave(target, &post.author_sub, 2)
+                .await
+                .unwrap()
+                .is_none(),
+            "expired row beyond cleanup batch stays unreadable"
+        );
         let fresh = make(target.to_string(), 1, 100);
         assert!(matches!(
             store.put_writer_autosave(fresh, 2).await.unwrap(),
@@ -2870,6 +3689,629 @@ mod tests {
                 .client_seq,
             1,
             "expired high sequence never rejects the fresh write"
+        );
+    }
+
+    #[tokio::test]
+    async fn library_is_owner_scoped_composable_and_keyset_stable() {
+        let store = InMemoryStore::new();
+        let now = 1_000;
+        let mut published = post("alice-published", 10);
+        published.author_sub = "alice".to_string();
+        published.title = "Needle field note".to_string();
+        published.tags = "Rust, Notes".to_string();
+        published.updated_at = 30;
+        store.create_post(&published).await.unwrap();
+
+        let mut draft = post("alice-draft", 20);
+        draft.author_sub = "alice".to_string();
+        draft.title = "Needle draft".to_string();
+        draft.tags = "Rust".to_string();
+        draft.published = false;
+        draft.updated_at = 40;
+        store.create_post(&draft).await.unwrap();
+
+        let mut scheduled = post("alice-scheduled", 30);
+        scheduled.author_sub = "alice".to_string();
+        scheduled.title = "Needle scheduled".to_string();
+        scheduled.tags = "Rust".to_string();
+        scheduled.publish_at = now + 60;
+        scheduled.updated_at = 40;
+        store.create_post(&scheduled).await.unwrap();
+
+        let mut foreign = post("bob-private-needle", 40);
+        foreign.author_sub = "bob".to_string();
+        foreign.published = false;
+        foreign.tags = "Rust".to_string();
+        foreign.updated_at = 50;
+        store.create_post(&foreign).await.unwrap();
+
+        let query = |status, cursor, limit| LibraryQuery {
+            owner_sub: "alice".to_string(),
+            q: "needle".to_string(),
+            status,
+            tag: "rust".to_string(),
+            as_of: now,
+            cursor,
+            limit,
+        };
+        let first = store
+            .list_library(query(LibraryStatus::All, None, 1))
+            .await
+            .unwrap();
+        assert_eq!(
+            first.posts[0].id, "alice-scheduled",
+            "id breaks updated_at tie"
+        );
+        let second = store
+            .list_library(query(LibraryStatus::All, first.next, 2))
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .posts
+                .iter()
+                .map(|post| post.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alice-draft", "alice-published"]
+        );
+        assert!(second.posts.iter().all(|post| post.author_sub == "alice"));
+        assert_eq!(
+            store
+                .list_library(query(LibraryStatus::Draft, None, 10))
+                .await
+                .unwrap()
+                .posts
+                .iter()
+                .map(|post| post.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alice-draft"]
+        );
+        assert_eq!(
+            store
+                .list_library(query(LibraryStatus::Scheduled, None, 10))
+                .await
+                .unwrap()
+                .posts[0]
+                .id,
+            "alice-scheduled"
+        );
+        assert_eq!(
+            store
+                .list_library(query(LibraryStatus::Published, None, 10))
+                .await
+                .unwrap()
+                .posts[0]
+                .id,
+            "alice-published"
+        );
+    }
+
+    #[tokio::test]
+    async fn library_bulk_is_atomic_versioned_and_leaves_autosaves_private() {
+        let store = InMemoryStore::new();
+        let mut one = post("bulk-one", 10);
+        one.author_sub = "alice".to_string();
+        one.author_email = "alice@hf".to_string();
+        one.published = false;
+        one.featured = true;
+        store.create_post(&one).await.unwrap();
+        let mut two = post("bulk-two", 20);
+        two.author_sub = "alice".to_string();
+        two.author_email = "alice@hf".to_string();
+        two.published = false;
+        store.create_post(&two).await.unwrap();
+        let mut foreign = post("bulk-foreign", 30);
+        foreign.author_sub = "bob".to_string();
+        store.create_post(&foreign).await.unwrap();
+
+        let autosave = WriterAutosave {
+            session_id: "library-autosave".to_string(),
+            post_id: one.id.clone(),
+            owner_sub: "alice".to_string(),
+            base_version: 1,
+            client_seq: 1,
+            title: one.title.clone(),
+            body_md: "private recovery".to_string(),
+            tags: String::new(),
+            cover_url: String::new(),
+            custom_excerpt: String::new(),
+            meta_title: String::new(),
+            meta_description: String::new(),
+            canonical_url: String::new(),
+            social_title: String::new(),
+            social_description: String::new(),
+            social_image: String::new(),
+            publish_at: String::new(),
+            pinned: false,
+            updated_at: 30,
+            expires_at: 1_000,
+        };
+        store.put_writer_autosave(autosave, 30).await.unwrap();
+
+        let command = |selections, action| LibraryBulkCommand {
+            owner_sub: "alice".to_string(),
+            editor_email: "alice@hf".to_string(),
+            selections,
+            action,
+            now: 30,
+        };
+        let stale = store
+            .bulk_update_library(command(
+                vec![
+                    LibrarySelection {
+                        post_id: one.id.clone(),
+                        expected_version: 1,
+                    },
+                    LibrarySelection {
+                        post_id: two.id.clone(),
+                        expected_version: 99,
+                    },
+                ],
+                LibraryBulkAction::PublishNow,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stale, LibraryBulkOutcome::Conflict);
+        assert!(!store.get_post("bulk-one").await.unwrap().published);
+
+        let applied = store
+            .bulk_update_library(command(
+                vec![
+                    LibrarySelection {
+                        post_id: two.id.clone(),
+                        expected_version: 1,
+                    },
+                    LibrarySelection {
+                        post_id: one.id.clone(),
+                        expected_version: 1,
+                    },
+                ],
+                LibraryBulkAction::AddTag("Roadmap".to_string()),
+            ))
+            .await
+            .unwrap();
+        let LibraryBulkOutcome::Applied(changed) = applied else {
+            panic!("valid author bulk command must apply");
+        };
+        assert_eq!(changed.len(), 2);
+        let saved_one = store.get_post("bulk-one").await.unwrap();
+        assert_eq!(saved_one.edit_version, 2);
+        assert!(saved_one.updated_at > one.updated_at);
+        assert!(crate::tags::has_tag(&saved_one.tags, "roadmap"));
+        assert!(
+            saved_one.featured,
+            "author bulk never changes admin feature state"
+        );
+        assert!(
+            store
+                .get_writer_autosave("library-autosave", "alice", 31)
+                .await
+                .unwrap()
+                .is_some(),
+            "bulk never consumes private Writer recovery"
+        );
+        assert_eq!(
+            store.list_post_revisions(&one.id, 10).await.unwrap()[0].source,
+            "library.tag.add"
+        );
+
+        let no_op = store
+            .bulk_update_library(command(
+                vec![LibrarySelection {
+                    post_id: one.id.clone(),
+                    expected_version: 2,
+                }],
+                LibraryBulkAction::AddTag("roadmap".to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(no_op, LibraryBulkOutcome::Applied(Vec::new()));
+        assert_eq!(store.get_post("bulk-one").await.unwrap().edit_version, 2);
+
+        let oversized = store
+            .bulk_update_library(command(
+                vec![
+                    LibrarySelection {
+                        post_id: one.id.clone(),
+                        expected_version: 2,
+                    };
+                    crate::config::LIBRARY_BULK_MAX + 1
+                ],
+                LibraryBulkAction::Pin,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(oversized, LibraryBulkOutcome::Conflict);
+        assert!(!store.get_post("bulk-one").await.unwrap().pinned);
+
+        let foreign = store
+            .bulk_update_library(command(
+                vec![LibrarySelection {
+                    post_id: foreign.id,
+                    expected_version: 1,
+                }],
+                LibraryBulkAction::Pin,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(foreign, LibraryBulkOutcome::Conflict);
+    }
+
+    #[tokio::test]
+    async fn library_bulk_accepts_exactly_fifty_and_rolls_back_all_on_one_stale_row() {
+        let store = InMemoryStore::new();
+        let mut selections = Vec::new();
+        for index in 0..crate::config::LIBRARY_BULK_MAX {
+            let mut item = post(&format!("bounded-{index:02}"), index as i64);
+            item.author_sub = "alice".to_string();
+            item.published = false;
+            store.create_post(&item).await.unwrap();
+            selections.push(LibrarySelection {
+                post_id: item.id,
+                expected_version: 1,
+            });
+        }
+        let applied = store
+            .bulk_update_library(LibraryBulkCommand {
+                owner_sub: "alice".to_string(),
+                editor_email: "alice@hf".to_string(),
+                selections: selections.clone(),
+                action: LibraryBulkAction::Pin,
+                now: 100,
+            })
+            .await
+            .unwrap();
+        let LibraryBulkOutcome::Applied(changed) = applied else {
+            panic!("the exact 50-row boundary must be accepted");
+        };
+        assert_eq!(changed.len(), crate::config::LIBRARY_BULK_MAX);
+        assert!(changed
+            .iter()
+            .all(|item| item.pinned && item.edit_version == 2));
+
+        let mut stale = selections
+            .into_iter()
+            .map(|mut selection| {
+                selection.expected_version = 2;
+                selection
+            })
+            .collect::<Vec<_>>();
+        stale[37].expected_version = 1;
+        assert_eq!(
+            store
+                .bulk_update_library(LibraryBulkCommand {
+                    owner_sub: "alice".to_string(),
+                    editor_email: "alice@hf".to_string(),
+                    selections: stale,
+                    action: LibraryBulkAction::Unpin,
+                    now: 101,
+                })
+                .await
+                .unwrap(),
+            LibraryBulkOutcome::Conflict
+        );
+        for index in 0..crate::config::LIBRARY_BULK_MAX {
+            let saved = store
+                .get_post(&format!("bounded-{index:02}"))
+                .await
+                .unwrap();
+            assert!(saved.pinned);
+            assert_eq!(saved.edit_version, 2, "no row partially advanced");
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_cas_is_owner_scoped_and_rejects_slug_replacement_aba() {
+        let store = InMemoryStore::new();
+        let mut original = post("delete-original", 10);
+        original.slug = "stable-slug".to_string();
+        original.author_sub = "alice".to_string();
+        store.create_post(&original).await.unwrap();
+
+        let command = |post_id: &str, version: i64, scope| DeletePostCommand {
+            slug: "stable-slug".to_string(),
+            post_id: post_id.to_string(),
+            expected_version: version,
+            scope,
+        };
+        assert_eq!(
+            store
+                .delete_post_cas(command(
+                    &original.id,
+                    original.edit_version,
+                    DeletePostScope::Owner("bob".to_string()),
+                ))
+                .await
+                .unwrap(),
+            DeletePostOutcome::Conflict
+        );
+        assert_eq!(
+            store
+                .delete_post_cas(command(
+                    &original.id,
+                    original.edit_version + 1,
+                    DeletePostScope::Owner("alice".to_string()),
+                ))
+                .await
+                .unwrap(),
+            DeletePostOutcome::Conflict
+        );
+
+        store.delete_post("stable-slug").await.unwrap();
+        let mut replacement = post("delete-replacement", 20);
+        replacement.slug = "stable-slug".to_string();
+        replacement.author_sub = "alice".to_string();
+        store.create_post(&replacement).await.unwrap();
+        assert_eq!(
+            store
+                .delete_post_cas(command(
+                    &original.id,
+                    original.edit_version,
+                    DeletePostScope::Admin,
+                ))
+                .await
+                .unwrap(),
+            DeletePostOutcome::Conflict,
+            "even admin authority is bound to the rendered immutable identity"
+        );
+        assert_eq!(
+            store.get_post("stable-slug").await.unwrap().id,
+            replacement.id
+        );
+
+        let deleted = store
+            .delete_post_cas(command(
+                &replacement.id,
+                replacement.edit_version,
+                DeletePostScope::Admin,
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(deleted, DeletePostOutcome::Deleted(post) if post.id == replacement.id));
+        assert!(store.get_post("stable-slug").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_cas_is_bounded_generic_and_all_or_nothing() {
+        let store = InMemoryStore::new();
+        let mut one = post("bulk-delete-one", 10);
+        one.author_sub = "alice".to_string();
+        let mut two = post("bulk-delete-two", 20);
+        two.author_sub = "alice".to_string();
+        let mut foreign = post("bulk-delete-foreign", 30);
+        foreign.author_sub = "bob".to_string();
+        for item in [&one, &two, &foreign] {
+            store.create_post(item).await.unwrap();
+        }
+        let selection = |item: &Post, version: i64| DeletePostSelection {
+            slug: item.slug.clone(),
+            post_id: item.id.clone(),
+            expected_version: version,
+        };
+        let command = |selections, scope| DeletePostsCommand { selections, scope };
+
+        assert_eq!(
+            store
+                .delete_posts_cas(command(
+                    vec![
+                        selection(&one, one.edit_version),
+                        selection(&one, one.edit_version),
+                    ],
+                    DeletePostScope::Admin,
+                ))
+                .await
+                .unwrap(),
+            DeletePostsOutcome::Conflict,
+            "duplicate immutable ids fail as one generic conflict"
+        );
+        assert!(store.get_post(&one.slug).await.is_some());
+        assert!(store.get_post(&two.slug).await.is_some());
+
+        assert_eq!(
+            store
+                .delete_posts_cas(command(
+                    vec![
+                        selection(&one, one.edit_version),
+                        selection(&two, two.edit_version + 1),
+                    ],
+                    DeletePostScope::Admin,
+                ))
+                .await
+                .unwrap(),
+            DeletePostsOutcome::Conflict,
+            "a stale later checkbox deletes no earlier valid row"
+        );
+        assert!(store.get_post(&one.slug).await.is_some());
+        assert!(store.get_post(&two.slug).await.is_some());
+
+        assert_eq!(
+            store
+                .delete_posts_cas(command(
+                    vec![
+                        selection(&one, one.edit_version),
+                        selection(&foreign, foreign.edit_version),
+                    ],
+                    DeletePostScope::Owner("alice".to_string()),
+                ))
+                .await
+                .unwrap(),
+            DeletePostsOutcome::Conflict,
+            "foreign and missing identities share the generic conflict"
+        );
+        assert!(store.get_post(&one.slug).await.is_some());
+        assert!(store.get_post(&foreign.slug).await.is_some());
+
+        let missing = DeletePostSelection {
+            slug: "bulk-delete-missing".to_string(),
+            post_id: "bulk-delete-missing".to_string(),
+            expected_version: 1,
+        };
+        assert_eq!(
+            store
+                .delete_posts_cas(command(
+                    vec![selection(&one, one.edit_version), missing],
+                    DeletePostScope::Admin,
+                ))
+                .await
+                .unwrap(),
+            DeletePostsOutcome::Conflict
+        );
+        assert!(store.get_post(&one.slug).await.is_some());
+
+        let mut old = post("bulk-delete-old", 40);
+        old.slug = "bulk-delete-reused".to_string();
+        store.create_post(&old).await.unwrap();
+        store.delete_post(&old.slug).await.unwrap();
+        let mut replacement = post("bulk-delete-replacement", 41);
+        replacement.slug = old.slug.clone();
+        store.create_post(&replacement).await.unwrap();
+        assert_eq!(
+            store
+                .delete_posts_cas(command(
+                    vec![
+                        selection(&one, one.edit_version),
+                        selection(&old, old.edit_version),
+                    ],
+                    DeletePostScope::Admin,
+                ))
+                .await
+                .unwrap(),
+            DeletePostsOutcome::Conflict,
+            "slug replacement never inherits a stale bulk selection"
+        );
+        assert!(store.get_post(&one.slug).await.is_some());
+        assert_eq!(
+            store.get_post(&replacement.slug).await.unwrap().id,
+            replacement.id
+        );
+
+        let oversized = (0..=crate::config::POST_BULK_DELETE_MAX)
+            .map(|index| DeletePostSelection {
+                slug: format!("oversized-{index}"),
+                post_id: format!("oversized-{index}"),
+                expected_version: 1,
+            })
+            .collect();
+        assert_eq!(
+            store
+                .delete_posts_cas(command(oversized, DeletePostScope::Admin))
+                .await
+                .unwrap(),
+            DeletePostsOutcome::Conflict
+        );
+        assert!(store.get_post(&one.slug).await.is_some());
+
+        let deleted = store
+            .delete_posts_cas(command(
+                vec![
+                    selection(&two, two.edit_version),
+                    selection(&one, one.edit_version),
+                ],
+                DeletePostScope::Admin,
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(deleted, DeletePostsOutcome::Deleted(posts) if posts.len() == 2));
+        assert!(store.get_post(&one.slug).await.is_none());
+        assert!(store.get_post(&two.slug).await.is_none());
+        assert!(store.get_post(&foreign.slug).await.is_some());
+        assert!(store.get_post(&replacement.slug).await.is_some());
+
+        let mut boundary = Vec::with_capacity(crate::config::POST_BULK_DELETE_MAX);
+        for index in 0..crate::config::POST_BULK_DELETE_MAX {
+            let item = post(
+                &format!("bulk-delete-boundary-{index:02}"),
+                100 + index as i64,
+            );
+            store.create_post(&item).await.unwrap();
+            boundary.push(selection(&item, item.edit_version));
+        }
+        let deleted = store
+            .delete_posts_cas(command(boundary, DeletePostScope::Admin))
+            .await
+            .unwrap();
+        assert!(
+            matches!(deleted, DeletePostsOutcome::Deleted(posts) if posts.len() == crate::config::POST_BULK_DELETE_MAX)
+        );
+        for index in 0..crate::config::POST_BULK_DELETE_MAX {
+            assert!(
+                store
+                    .get_post(&format!("bulk-delete-boundary-{index:02}"))
+                    .await
+                    .is_none(),
+                "the exact 50-row boundary is accepted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn save_post_fails_closed_when_version_or_updated_at_is_exhausted() {
+        let store = InMemoryStore::new();
+        let mut version_exhausted = post("version-exhausted", 10);
+        version_exhausted.edit_version = i64::MAX;
+        store.create_post(&version_exhausted).await.unwrap();
+        let revisions_before = store
+            .list_post_revisions(&version_exhausted.id, 10)
+            .await
+            .unwrap()
+            .len();
+        let mut changed = version_exhausted.clone();
+        changed.title = "must not save".to_string();
+        assert_eq!(
+            store
+                .save_post(SavePostCommand {
+                    post: changed,
+                    expected_version: i64::MAX,
+                    editor_sub: "u".to_string(),
+                    editor_email: "u@hf".to_string(),
+                    source: "test".to_string(),
+                    restored_from: None,
+                    consume_autosave_session: None,
+                })
+                .await
+                .unwrap(),
+            SavePostOutcome::Conflict {
+                current_version: i64::MAX
+            }
+        );
+        assert_eq!(
+            store.get_post("version-exhausted").await.unwrap().title,
+            version_exhausted.title
+        );
+        assert_eq!(
+            store
+                .list_post_revisions(&version_exhausted.id, 10)
+                .await
+                .unwrap()
+                .len(),
+            revisions_before,
+            "failed save appends no revision"
+        );
+
+        let mut timestamp_exhausted = post("timestamp-exhausted", 20);
+        timestamp_exhausted.updated_at = i64::MAX;
+        store.create_post(&timestamp_exhausted).await.unwrap();
+        let mut changed = timestamp_exhausted.clone();
+        changed.body_md = "must not save".to_string();
+        assert_eq!(
+            store
+                .save_post(SavePostCommand {
+                    post: changed,
+                    expected_version: 1,
+                    editor_sub: "u".to_string(),
+                    editor_email: "u@hf".to_string(),
+                    source: "test".to_string(),
+                    restored_from: None,
+                    consume_autosave_session: None,
+                })
+                .await
+                .unwrap(),
+            SavePostOutcome::Conflict { current_version: 1 }
+        );
+        assert_eq!(
+            store.get_post("timestamp-exhausted").await.unwrap().body_md,
+            timestamp_exhausted.body_md
         );
     }
 }

@@ -63,6 +63,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::DefaultBodyLimit;
+use axum::http::{header, HeaderValue, Method};
 use axum::routing::{get, post};
 use axum::Router;
 use rand::rngs::OsRng;
@@ -71,7 +72,10 @@ use rand::RngCore;
 use crate::audit::AuditSink;
 use crate::blobs::{Blobs, MemoryBlobs, S3Blobs};
 use crate::config::Config;
-use crate::store::{InMemoryStore, PgStore, Store, UploadRecoveryClaim};
+use crate::model::LibraryItemKind;
+use crate::store::{
+    BlobDeleteClaim, BulkMutation, DriveItemRef, InMemoryStore, PgStore, Store, UploadRecoveryClaim,
+};
 
 /// Shared application state. Cheap to clone (everything behind `Arc` / a cloneable sink).
 #[derive(Clone)]
@@ -82,10 +86,15 @@ pub struct AppState {
     pub audit: AuditSink,
 }
 
+const BULK_FORM_BODY_LIMIT: usize = 64 * 1024;
+
 /// Build the router wiring all endpoints onto `state`. Routes are explicit (no fallback): the
 /// service owns its subdomain, so Sluice forwards these exact paths. The body limit is sized to
 /// the configured `MAX_UPLOAD` plus a small multipart-envelope headroom.
 pub fn app(state: AppState) -> Router {
+    if state.config.trash_worker_enabled {
+        spawn_trash_worker(state.store.clone(), state.blobs.clone());
+    }
     // 1 MiB of headroom for multipart boundaries/headers above the file cap.
     let body_limit = state.config.max_upload.saturating_add(1024 * 1024);
     Router::new()
@@ -123,6 +132,22 @@ pub fn app(state: AppState) -> Router {
         .route("/f/{id}/share", post(handlers::files::configure_share))
         .route("/f/{id}/revoke", post(handlers::files::revoke_share))
         .route("/f/{id}/move", post(handlers::files::move_file))
+        .route(
+            "/items/move",
+            post(handlers::files::bulk_move).layer(DefaultBodyLimit::max(BULK_FORM_BODY_LIMIT)),
+        )
+        .route(
+            "/items/trash",
+            post(handlers::files::bulk_trash).layer(DefaultBodyLimit::max(BULK_FORM_BODY_LIMIT)),
+        )
+        .route(
+            "/trash/restore",
+            post(handlers::files::bulk_restore).layer(DefaultBodyLimit::max(BULK_FORM_BODY_LIMIT)),
+        )
+        .route(
+            "/trash/purge",
+            post(handlers::files::bulk_purge).layer(DefaultBodyLimit::max(BULK_FORM_BODY_LIMIT)),
+        )
         .route("/folders", post(handlers::files::create_folder))
         .route("/folders/{id}/rename", post(handlers::files::rename_folder))
         .route("/folders/{id}/delete", post(handlers::files::delete_folder))
@@ -174,7 +199,174 @@ pub fn app(state: AppState) -> Router {
             state.clone(),
             require_gateway_sig,
         ))
+        // Outermost response policy: every dynamic owner/capability/error response is private and
+        // non-storable. Only health and the two immutable Share Room assets are exceptions.
+        .layer(axum::middleware::from_fn(response_cache_policy))
         .with_state(state)
+}
+
+const TRASH_WORKER_INITIAL_GRACE_SECS: u64 = 30;
+const TRASH_WORKER_INTERVAL_SECS: u64 = 60;
+const TRASH_RETENTION_BATCH: i64 = 50;
+const BLOB_DELETE_BATCH: i64 = 100;
+const OWNER_BLOB_WRITE_BATCH: i64 = 100;
+const RECOVERY_LEASE_TTL_SECS: i64 = 5 * 60;
+
+/// Observable outcome of one explicit bounded Trash lifecycle drain. Tests and operators can call
+/// this directly; the production router runs the same primitive after a startup grace period.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrashDrainReport {
+    pub purged_roots: usize,
+    pub deleted_objects: usize,
+    pub deferred_objects: usize,
+}
+
+/// Run one bounded retention + object-outbox pass. Expired metadata is purged only through
+/// `Store::bulk_purge`, which commits every object key to the durable queue before deleting rows.
+/// Object deletion is idempotent; a failure releases the lease with bounded exponential backoff.
+pub async fn drain_trash_lifecycle_once(
+    store: &dyn Store,
+    blobs: &dyn Blobs,
+    now: i64,
+) -> Result<TrashDrainReport, String> {
+    let lease_id = random_alnum(32);
+    let stale_before = now.saturating_sub(RECOVERY_LEASE_TTL_SECS);
+    let expired = store
+        .claim_expired_trash(&lease_id, now, stale_before, TRASH_RETENTION_BATCH)
+        .await
+        .map_err(|error| format!("claim expired Trash: {error}"))?;
+    let mut report = TrashDrainReport::default();
+    for entry in expired {
+        let item = DriveItemRef {
+            kind: match entry.kind {
+                LibraryItemKind::File => LibraryItemKind::File,
+                LibraryItemKind::Folder => LibraryItemKind::Folder,
+            },
+            id: entry.item_id.clone(),
+        };
+        match store
+            .bulk_purge(&entry.owner_sub, &[item], now)
+            .await
+            .map_err(|error| format!("purge expired Trash entry {}: {error}", entry.id))?
+        {
+            BulkMutation::Applied { changed } => report.purged_roots += changed,
+            BulkMutation::Conflict => {
+                let _ = store.abandon_trash_claim(&entry.id, &lease_id).await;
+            }
+        }
+    }
+
+    // Only intents older than one lease window are eligible while serving, so an ordinary slow
+    // request cannot have its in-flight blob reclaimed. Startup recovery uses a separate all-age
+    // pass before the router becomes reachable.
+    let write_lease = random_alnum(32);
+    let writes = store
+        .claim_owner_blob_writes(
+            &write_lease,
+            now,
+            stale_before,
+            stale_before,
+            OWNER_BLOB_WRITE_BATCH,
+        )
+        .await
+        .map_err(|error| format!("claim owner blob writes: {error}"))?;
+    for intent in writes {
+        match blobs.delete(&intent.object_key).await {
+            Ok(()) => {
+                if store
+                    .complete_owner_blob_write(&intent.object_key, &write_lease)
+                    .await
+                    .map_err(|error| {
+                        format!("ack owner blob write {}: {error}", intent.object_key)
+                    })?
+                {
+                    report.deleted_objects += 1;
+                }
+            }
+            Err(error) => {
+                let shift = intent.attempts.clamp(0, 7) as u32;
+                let delay = 30_i64.saturating_mul(1_i64 << shift).min(60 * 60);
+                store
+                    .abandon_owner_blob_write(
+                        &intent.object_key,
+                        &write_lease,
+                        now.saturating_add(delay),
+                    )
+                    .await
+                    .map_err(|store_error| {
+                        format!(
+                            "defer owner blob write {} after {error}: {store_error}",
+                            intent.object_key
+                        )
+                    })?;
+                report.deferred_objects += 1;
+            }
+        }
+    }
+
+    let deletion_lease = random_alnum(32);
+    match store
+        .claim_blob_deletions(&deletion_lease, now, stale_before, BLOB_DELETE_BATCH)
+        .await
+        .map_err(|error| format!("claim blob deletions: {error}"))?
+    {
+        BlobDeleteClaim::Empty => {}
+        BlobDeleteClaim::Claimed(items) => {
+            for item in items {
+                match blobs.delete(&item.object_key).await {
+                    Ok(()) => {
+                        if store
+                            .complete_blob_deletion(&item.object_key, &deletion_lease)
+                            .await
+                            .map_err(|error| {
+                                format!("ack blob deletion {}: {error}", item.object_key)
+                            })?
+                        {
+                            report.deleted_objects += 1;
+                        }
+                    }
+                    Err(error) => {
+                        let shift = item.attempts.clamp(0, 7) as u32;
+                        let delay = 30_i64.saturating_mul(1_i64 << shift).min(60 * 60);
+                        store
+                            .abandon_blob_deletion(
+                                &item.object_key,
+                                &deletion_lease,
+                                now.saturating_add(delay),
+                            )
+                            .await
+                            .map_err(|store_error| {
+                                format!(
+                                    "defer blob deletion {} after {error}: {store_error}",
+                                    item.object_key
+                                )
+                            })?;
+                        report.deferred_objects += 1;
+                    }
+                }
+            }
+        }
+    }
+    Ok(report)
+}
+
+fn spawn_trash_worker(store: Arc<dyn Store>, blobs: Arc<dyn Blobs>) {
+    tokio::spawn(async move {
+        // The first production pass is intentionally delayed. Legacy Trash migration grants a new
+        // 30-day deadline as a second guard; startup can never immediately delete historical data.
+        tokio::time::sleep(std::time::Duration::from_secs(
+            TRASH_WORKER_INITIAL_GRACE_SECS,
+        ))
+        .await;
+        loop {
+            if let Err(error) =
+                drain_trash_lifecycle_once(store.as_ref(), blobs.as_ref(), now_secs()).await
+            {
+                tracing::error!(%error, "bounded Trash lifecycle drain failed");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(TRASH_WORKER_INTERVAL_SECS)).await;
+        }
+    });
 }
 
 /// The `/admin` subtree, gated as one unit by [`require_admin_mw`]: the per-owner storage usage
@@ -237,6 +429,30 @@ async fn require_gateway_sig(
     }
 
     next.run(req).await
+}
+
+/// Prevent browsers, CDNs, and shared proxies from replaying a capability or owner response after
+/// revoke, Trash, password, or policy changes. This layer intentionally wraps the gateway guard as
+/// well, so early 401/403/404 responses receive the same non-storage policy.
+async fn response_cache_policy(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let read_only = matches!(*req.method(), Method::GET | Method::HEAD);
+    let is_health = read_only && req.uri().path() == "/healthz";
+    let is_public_asset =
+        read_only && matches!(req.uri().path(), "/s/share-room.css" | "/s/share-room.js");
+    let mut response = next.run(req).await;
+    if is_health {
+        return response;
+    }
+    let policy = if is_public_asset {
+        HeaderValue::from_static("public, max-age=300")
+    } else {
+        HeaderValue::from_static("private, no-store")
+    };
+    response.headers_mut().insert(header::CACHE_CONTROL, policy);
+    response
 }
 
 /// Construct dev state: dev [`Config`] + empty in-memory metadata + in-memory blobs. Used by
@@ -344,7 +560,7 @@ pub async fn recover_stale_request_uploads(
         .await
         .map_err(|error| format!("claim stale upload reservations: {error}"))?;
     let items = match claim {
-        UploadRecoveryClaim::Empty => return Ok(()),
+        UploadRecoveryClaim::Empty => Vec::new(),
         UploadRecoveryClaim::Busy => {
             return Err(
                 "stale upload reservation recovery is already leased by another startup"
@@ -396,8 +612,69 @@ pub async fn recover_stale_request_uploads(
         }
     }
 
-    tracing::info!(count = items.len(), "stale public uploads recovered");
+    let owner_writes = recover_owner_blob_writes_startup(store, blobs).await?;
+    tracing::info!(
+        public_count = items.len(),
+        owner_count = owner_writes,
+        "stale uploads recovered"
+    );
     Ok(())
+}
+
+async fn recover_owner_blob_writes_startup(
+    store: &dyn Store,
+    blobs: &dyn Blobs,
+) -> Result<usize, String> {
+    let now = now_secs();
+    let lease_id = random_alnum(32);
+    let mut recovered = 0usize;
+    loop {
+        let items = store
+            .claim_owner_blob_writes(&lease_id, now, now, now, OWNER_BLOB_WRITE_BATCH)
+            .await
+            .map_err(|error| format!("claim stale owner blob writes: {error}"))?;
+        if items.is_empty() {
+            return Ok(recovered);
+        }
+        for (index, item) in items.iter().enumerate() {
+            if let Err(error) = blobs.delete(&item.object_key).await {
+                for pending in &items[index..] {
+                    let retry_at = if pending.object_key == item.object_key {
+                        now.saturating_add(
+                            30_i64.saturating_mul(1_i64 << pending.attempts.clamp(0, 7) as u32),
+                        )
+                    } else {
+                        now
+                    };
+                    let _ = store
+                        .abandon_owner_blob_write(&pending.object_key, &lease_id, retry_at)
+                        .await;
+                }
+                return Err(format!(
+                    "delete stale owner blob {}: {error}",
+                    item.object_key
+                ));
+            }
+            match store
+                .complete_owner_blob_write(&item.object_key, &lease_id)
+                .await
+            {
+                Ok(true) => recovered += 1,
+                Ok(false) => {
+                    return Err(format!(
+                        "stale owner blob {} lost its recovery lease",
+                        item.object_key
+                    ))
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "complete stale owner blob {}: {error}",
+                        item.object_key
+                    ))
+                }
+            }
+        }
+    }
 }
 
 /// Interpret a boolean-ish env var (`on` / `true` / `1` / `yes`, case-insensitive).
@@ -431,4 +708,30 @@ pub fn random_alnum(len: usize) -> String {
         .iter()
         .map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char)
         .collect()
+}
+
+#[cfg(test)]
+mod shell_contract_tests {
+    #[test]
+    fn every_html_shell_suppresses_the_implicit_favicon_request() {
+        let templates = [
+            include_str!("../templates/admin.html"),
+            include_str!("../templates/detail.html"),
+            include_str!("../templates/error.html"),
+            include_str!("../templates/gallery.html"),
+            include_str!("../templates/request_detail.html"),
+            include_str!("../templates/requests.html"),
+            include_str!("../templates/share_error.html"),
+            include_str!("../templates/share_folder.html"),
+            include_str!("../templates/share_landing.html"),
+            include_str!("../templates/share_password.html"),
+            include_str!("../templates/upload_inbox.html"),
+        ];
+        for template in templates {
+            assert!(
+                template.contains(r#"<link rel="icon" href="data:,">"#),
+                "every Aperture HTML shell must prevent a browser-generated /favicon.ico request"
+            );
+        }
+    }
 }

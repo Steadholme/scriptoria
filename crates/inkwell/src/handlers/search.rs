@@ -85,7 +85,12 @@ pub async fn search_page(
         fragment: &fragment,
         metadata: None,
     });
-    Ok(Html(page).into_response())
+    Ok(crate::handlers::posts::public_read_response(
+        Html(page).into_response(),
+        &headers,
+        None,
+        is_admin,
+    ))
 }
 
 // ---------------------------------------------------------------------------

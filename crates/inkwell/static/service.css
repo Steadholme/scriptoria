@@ -2033,7 +2033,119 @@ body.page {
 
 .draftbar__spacer { margin-left:auto; }
 
-/* S15 RESPONSIVE ---------------------------------------------------------- */
+/* S15 AUTHOR CONTENT LIBRARY ---------------------------------------------- */
+.ink-library { max-width:1180px; }
+
+.ink-library__head {
+  display:flex;
+  align-items:flex-start;
+  justify-content:space-between;
+  gap:var(--sp-5);
+}
+
+.ink-library__eyebrow {
+  margin:0 0 6px;
+  color:var(--brand-ink);
+  font-size:12px;
+  font-weight:700;
+  letter-spacing:.1em;
+  text-transform:uppercase;
+}
+
+.ink-library__filters { margin-bottom:var(--sp-5); }
+
+.ink-library__filterform {
+  display:grid;
+  grid-template-columns:minmax(260px,2fr) minmax(150px,.7fr) minmax(180px,1fr) auto;
+  align-items:end;
+  gap:var(--sp-4);
+}
+
+.ink-library__filterform .field { margin:0; }
+
+.ink-library__filteractions {
+  display:flex;
+  align-items:center;
+  gap:8px;
+  min-height:42px;
+}
+
+.ink-library__resultshead {
+  display:flex;
+  align-items:flex-start;
+  justify-content:space-between;
+  gap:var(--sp-5);
+}
+
+.ink-library__resultshead h2,
+.ink-library__resultshead p { margin:0; }
+
+.ink-library__bulk {
+  display:flex;
+  align-items:end;
+  justify-content:flex-end;
+  gap:8px;
+  flex-wrap:wrap;
+}
+
+.ink-library__bulk > label:not(.sr-only) {
+  align-self:center;
+  color:var(--ink-2);
+  font-size:13px;
+  font-weight:600;
+}
+
+.ink-library__bulk select,
+.ink-library__bulk input { width:auto; min-width:150px; }
+.ink-library__bulkhelp { margin:10px 0 0; font-size:12.5px; }
+
+.ink-library__rows {
+  margin-top:var(--sp-4);
+  border-top:1px solid var(--hairline);
+}
+
+.ink-library__row {
+  display:grid;
+  grid-template-columns:28px minmax(0,1fr) auto;
+  align-items:center;
+  gap:var(--sp-4);
+  padding:16px 0;
+  border-bottom:1px solid var(--hairline);
+}
+
+.ink-library__select { align-self:start; padding-top:4px; }
+.ink-library__select input { width:auto; }
+.ink-library__main { min-width:0; }
+
+.ink-library__titleline {
+  display:flex;
+  align-items:center;
+  gap:10px;
+  min-width:0;
+}
+
+.ink-library__titleline > a {
+  min-width:0;
+  overflow-wrap:anywhere;
+  color:var(--ink);
+  font-size:15px;
+  font-weight:700;
+  text-decoration:none;
+}
+
+.ink-library__titleline > a:hover { color:var(--brand-ink); }
+.ink-library__badges { display:flex; gap:6px; flex-wrap:wrap; }
+.ink-library__main p { margin:5px 0; font-size:12.5px; }
+.ink-library__main .tags { margin-top:7px; }
+.ink-library__rowactions { display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end; }
+
+.ink-library__status--published { color:var(--ok-ink); background:var(--ok-soft); }
+.ink-library__status--scheduled { color:var(--warn-ink); background:var(--warn-soft); }
+.ink-library__status--draft { color:var(--ink-2); background:var(--surface-2); }
+.ink-library__pager { display:flex; justify-content:center; padding-top:var(--sp-5); }
+.ink-library__empty { border-bottom:1px solid var(--hairline); }
+
+/* S16 RESPONSIVE ---------------------------------------------------------- */
 @media (max-width:960px) {
   .ink-editor { grid-template-columns:1fr; }
   .ink-editor__rail { position:static; }
@@ -2044,6 +2156,10 @@ body.page {
     border-right:0;
     border-bottom:1px solid var(--hairline);
   }
+  .ink-library__filterform { grid-template-columns:1fr 1fr; }
+  .ink-library__query { grid-column:1 / -1; }
+  .ink-library__resultshead { flex-direction:column; }
+  .ink-library__bulk { justify-content:flex-start; }
 }
 
 @media (max-width:720px) {
@@ -2071,9 +2187,20 @@ body.page {
   .ink-editor__actionbar .spacer { display:none; }
   .writer-state { width:100%; }
   .ink-editor__actionbar .btn { flex:1 1 auto; }
+  .ink-library__head { flex-direction:column; }
+  .ink-library__filterform { grid-template-columns:1fr; }
+  .ink-library__query { grid-column:auto; }
+  .ink-library__filteractions { flex-wrap:wrap; }
+  .ink-library__bulk { display:grid; grid-template-columns:1fr; width:100%; }
+  .ink-library__bulk select,
+  .ink-library__bulk input,
+  .ink-library__bulk .btn { width:100%; }
+  .ink-library__row { grid-template-columns:28px minmax(0,1fr); }
+  .ink-library__rowactions { grid-column:2; justify-content:flex-start; }
+  .ink-library__titleline { align-items:flex-start; flex-direction:column; }
 }
 
-/* S16 DARK RAMP ----------------------------------------------------------- */
+/* S17 DARK RAMP ----------------------------------------------------------- */
 /* Odyssey's canonical dark ramp (tokens.css :root[data-theme="dark"]) already remaps every
    --accent/--ink/--surface/--border token this service leans on, so no --accent* remap is needed
    here. The one gap is Inkwell's own brand family: it is a teal defined at the BODY scope

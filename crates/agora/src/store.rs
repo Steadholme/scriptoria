@@ -25,6 +25,8 @@
 //! - `forum_activity_deliveries(activity_id TEXT, recipient_kind TEXT, recipient_key TEXT,
 //!    reason TEXT)`
 //! - `forum_activity_receipts(activity_id TEXT, viewer_sub TEXT, read_at BIGINT)`
+//! - `forum_bookmarks(bookmark_id TEXT, owner_sub TEXT, post_id TEXT, note TEXT, remind_at BIGINT,
+//!    created_at BIGINT, updated_at BIGINT, version BIGINT)`
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
@@ -34,8 +36,8 @@ use thiserror::Error;
 
 use crate::model::{
     ActivityDelivery, ActivityEvent, ActivityItem, ActivityKind, ActivityReason,
-    ActivityRecipientKind, BannedAuthor, Category, CategoryFormat, Mention, Post, ReactionCount,
-    Thread, ThreadDigest, ThreadSearchHit,
+    ActivityRecipientKind, BannedAuthor, Bookmark, BookmarkItem, Category, CategoryFormat, Mention,
+    Post, ReactionCount, Thread, ThreadDigest, ThreadSearchHit,
 };
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
@@ -47,6 +49,8 @@ pub enum StoreError {
     InvalidOperation(String),
     #[error("store record not found: {0}")]
     NotFound(String),
+    #[error("store conflict: {0}")]
+    Conflict(String),
 }
 
 /// Which keyset page of a thread's replies to fetch, over the shared `(created_at, id)` cursor.
@@ -133,6 +137,39 @@ pub enum ActivityFilter {
     Reason(ActivityReason),
 }
 
+/// Personal bookmark list scope.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BookmarkState {
+    #[default]
+    All,
+    Due,
+    Scheduled,
+}
+
+/// State-specific keyset cursor. `sort_at` is `created_at` for All and `remind_at` otherwise.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BookmarkCursor {
+    pub sort_at: i64,
+    pub post_id: String,
+}
+
+/// Immutable row identity plus monotonic edit version. Both values are required for every
+/// mutation so deleting and recreating the same `(owner_sub, post_id)` can never create an ABA.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BookmarkCas<'a> {
+    pub bookmark_id: &'a str,
+    pub version: i64,
+}
+
+/// Atomic reminder edit. `Keep` is required so editing a note on an already-due bookmark does not
+/// silently clear or reject its existing reminder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BookmarkReminderUpdate {
+    Keep,
+    Clear,
+    Set(i64),
+}
+
 /// Hard mutation bound shared by the UI and both Store implementations.
 pub const MAX_ACTIVITY_BATCH: usize = 30;
 /// A thread cannot accumulate an unbounded reply fan-out.
@@ -141,6 +178,11 @@ pub const MAX_THREAD_FOLLOWERS: usize = 256;
 pub const MAX_MENTIONS_PER_POST: usize = 32;
 /// OP + quoted author + followers + mentions. Klaxon is best-effort and never exceeds this bound.
 pub const MAX_KLAXON_RECIPIENTS_PER_REPLY: usize = MAX_THREAD_FOLLOWERS + MAX_MENTIONS_PER_POST + 2;
+pub const MAX_BOOKMARKS_PER_USER: usize = 1_000;
+pub const MAX_BOOKMARK_NOTE_CHARS: usize = 200;
+pub const MAX_BOOKMARK_PAGE: i64 = 30;
+pub const MAX_BOOKMARK_POST_BATCH: usize = 32;
+pub const MAX_REMINDER_HORIZON_SECS: i64 = 10 * 366 * 24 * 60 * 60;
 
 fn subject_delivery(
     recipient: &str,
@@ -242,6 +284,53 @@ fn activity_filter_matches(filter: ActivityFilter, reason: ActivityReason) -> bo
     match filter {
         ActivityFilter::All => true,
         ActivityFilter::Reason(expected) => expected == reason,
+    }
+}
+
+fn validate_bookmark_note(note: &str) -> Result<(), StoreError> {
+    if note.chars().count() > MAX_BOOKMARK_NOTE_CHARS {
+        return Err(StoreError::InvalidOperation(format!(
+            "bookmark note may contain at most {MAX_BOOKMARK_NOTE_CHARS} characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_future_reminder(remind_at: i64, now: i64) -> Result<(), StoreError> {
+    let latest = now.saturating_add(MAX_REMINDER_HORIZON_SECS);
+    if remind_at <= now {
+        return Err(StoreError::InvalidOperation(
+            "bookmark reminder must be in the future".to_string(),
+        ));
+    }
+    if remind_at > latest {
+        return Err(StoreError::InvalidOperation(
+            "bookmark reminder may be at most 10 years in the future".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn next_bookmark_version(version: i64) -> Result<i64, StoreError> {
+    version.checked_add(1).ok_or_else(|| {
+        StoreError::Conflict("bookmark version is exhausted; reload and retry".to_string())
+    })
+}
+
+fn validate_bookmark_cas(bookmark: &Bookmark, expected: BookmarkCas<'_>) -> Result<(), StoreError> {
+    if bookmark.bookmark_id != expected.bookmark_id || bookmark.version != expected.version {
+        return Err(StoreError::Conflict(
+            "bookmark changed in another tab; reload and retry".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn bookmark_state_matches(bookmark: &Bookmark, state: BookmarkState, now: i64) -> bool {
+    match state {
+        BookmarkState::All => true,
+        BookmarkState::Due => bookmark.remind_at.is_some_and(|at| at <= now),
+        BookmarkState::Scheduled => bookmark.remind_at.is_some_and(|at| at > now),
     }
 }
 
@@ -478,6 +567,69 @@ pub trait Store: Send + Sync {
         changed_at: i64,
     ) -> Result<i64, StoreError>;
 
+    /// Idempotently create a plain personal bookmark after rechecking the live post and enforcing
+    /// the per-owner quota atomically. Existing rows are returned unchanged.
+    async fn ensure_bookmark(
+        &self,
+        owner_sub: &str,
+        post_id: &str,
+        created_at: i64,
+    ) -> Result<Bookmark, StoreError>;
+    /// Fetch the bookmark state for one bounded visible post page in one Store call.
+    async fn bookmarks_for_posts(
+        &self,
+        owner_sub: &str,
+        post_ids: &[String],
+    ) -> Result<Vec<Bookmark>, StoreError>;
+    /// Stable owner-only All/Due/Scheduled keyset page joined to live post/thread content.
+    async fn bookmark_page(
+        &self,
+        owner_sub: &str,
+        state: BookmarkState,
+        cursor: Option<&BookmarkCursor>,
+        limit: i64,
+        now: i64,
+    ) -> Result<Vec<BookmarkItem>, StoreError>;
+    async fn due_bookmark_count(&self, owner_sub: &str, now: i64) -> Result<i64, StoreError>;
+    async fn get_bookmark(
+        &self,
+        owner_sub: &str,
+        post_id: &str,
+    ) -> Result<Option<BookmarkItem>, StoreError>;
+    /// CAS update of private note/reminder state. The post identity is immutable.
+    async fn update_bookmark(
+        &self,
+        owner_sub: &str,
+        post_id: &str,
+        expected: BookmarkCas<'_>,
+        note: &str,
+        reminder: BookmarkReminderUpdate,
+        changed_at: i64,
+    ) -> Result<Bookmark, StoreError>;
+    /// Clear a currently-due reminder while retaining the bookmark itself.
+    async fn complete_due_bookmark(
+        &self,
+        owner_sub: &str,
+        post_id: &str,
+        expected: BookmarkCas<'_>,
+        changed_at: i64,
+    ) -> Result<Bookmark, StoreError>;
+    /// Move a reminder to an explicit future UTC epoch, guarded by the same version CAS.
+    async fn snooze_bookmark(
+        &self,
+        owner_sub: &str,
+        post_id: &str,
+        expected: BookmarkCas<'_>,
+        remind_at: i64,
+        changed_at: i64,
+    ) -> Result<Bookmark, StoreError>;
+    async fn remove_bookmark(
+        &self,
+        owner_sub: &str,
+        post_id: &str,
+        expected: BookmarkCas<'_>,
+    ) -> Result<(), StoreError>;
+
     /// Toggle one user's reaction of `kind` on a post. Idempotent per `(post_id, user_sub, kind)`:
     /// if the reaction already exists it is removed and `false` returned; otherwise it is inserted
     /// and `true` returned. `created_at` stamps a newly-inserted row.
@@ -529,6 +681,7 @@ pub struct InMemoryStore {
     activity_events: Mutex<Vec<ActivityEvent>>,
     activity_deliveries: Mutex<Vec<StoredActivityDelivery>>,
     activity_receipts: Mutex<Vec<ActivityReceipt>>,
+    bookmarks: Mutex<Vec<Bookmark>>,
     banned: Mutex<Vec<BannedAuthor>>,
     /// One row per `(post_id, user_sub, kind)` — the in-memory mirror of `post_reactions`.
     reactions: Mutex<Vec<Reaction>>,
@@ -1520,6 +1673,10 @@ impl Store for InMemoryStore {
         drop(original_posts);
         drop(threads);
         drop(categories);
+        self.bookmarks
+            .lock()
+            .expect("bookmarks lock poisoned")
+            .retain(|bookmark| !removed_ids.contains(&bookmark.post_id));
         let mut reactions = self.reactions.lock().expect("reactions lock poisoned");
         reactions.retain(|reaction| !removed_ids.contains(&reaction.post_id));
         let mut mentions = self.mentions.lock().expect("mentions lock poisoned");
@@ -1625,6 +1782,10 @@ impl Store for InMemoryStore {
         drop(threads);
         drop(categories);
 
+        self.bookmarks
+            .lock()
+            .expect("bookmarks lock poisoned")
+            .retain(|bookmark| bookmark.post_id != post_id);
         self.reactions
             .lock()
             .expect("reactions lock poisoned")
@@ -2202,6 +2363,335 @@ impl Store for InMemoryStore {
         Ok(changed)
     }
 
+    async fn ensure_bookmark(
+        &self,
+        owner_sub: &str,
+        post_id: &str,
+        created_at: i64,
+    ) -> Result<Bookmark, StoreError> {
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        if !self
+            .posts
+            .lock()
+            .expect("posts lock poisoned")
+            .iter()
+            .any(|post| post.id == post_id)
+        {
+            return Err(StoreError::NotFound("post not found".to_string()));
+        }
+        let mut bookmarks = self.bookmarks.lock().expect("bookmarks lock poisoned");
+        if let Some(existing) = bookmarks
+            .iter()
+            .find(|row| row.owner_sub == owner_sub && row.post_id == post_id)
+        {
+            return Ok(existing.clone());
+        }
+        if bookmarks
+            .iter()
+            .filter(|row| row.owner_sub == owner_sub)
+            .count()
+            >= MAX_BOOKMARKS_PER_USER
+        {
+            return Err(StoreError::InvalidOperation(format!(
+                "a user may save at most {MAX_BOOKMARKS_PER_USER} bookmarks"
+            )));
+        }
+        let bookmark = Bookmark {
+            bookmark_id: crate::new_id("bm"),
+            owner_sub: owner_sub.to_string(),
+            post_id: post_id.to_string(),
+            note: String::new(),
+            remind_at: None,
+            created_at,
+            updated_at: created_at,
+            version: 1,
+        };
+        bookmarks.push(bookmark.clone());
+        Ok(bookmark)
+    }
+
+    async fn bookmarks_for_posts(
+        &self,
+        owner_sub: &str,
+        post_ids: &[String],
+    ) -> Result<Vec<Bookmark>, StoreError> {
+        if post_ids.len() > MAX_BOOKMARK_POST_BATCH {
+            return Err(StoreError::InvalidOperation(format!(
+                "bookmark post batch may contain at most {MAX_BOOKMARK_POST_BATCH} ids"
+            )));
+        }
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        let requested: HashSet<&str> = post_ids.iter().map(String::as_str).collect();
+        let live_posts: HashSet<String> = self
+            .posts
+            .lock()
+            .expect("posts lock poisoned")
+            .iter()
+            .map(|post| post.id.clone())
+            .collect();
+        Ok(self
+            .bookmarks
+            .lock()
+            .expect("bookmarks lock poisoned")
+            .iter()
+            .filter(|row| {
+                row.owner_sub == owner_sub
+                    && requested.contains(row.post_id.as_str())
+                    && live_posts.contains(&row.post_id)
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn bookmark_page(
+        &self,
+        owner_sub: &str,
+        state: BookmarkState,
+        cursor: Option<&BookmarkCursor>,
+        limit: i64,
+        now: i64,
+    ) -> Result<Vec<BookmarkItem>, StoreError> {
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        let threads = self.threads.lock().expect("threads lock poisoned");
+        let posts = self.posts.lock().expect("posts lock poisoned");
+        let bookmarks = self.bookmarks.lock().expect("bookmarks lock poisoned");
+        let mut items = Vec::new();
+        for bookmark in bookmarks
+            .iter()
+            .filter(|row| row.owner_sub == owner_sub)
+            .filter(|row| bookmark_state_matches(row, state, now))
+        {
+            let sort_at = match state {
+                BookmarkState::All => bookmark.created_at,
+                BookmarkState::Due | BookmarkState::Scheduled => {
+                    bookmark.remind_at.unwrap_or_default()
+                }
+            };
+            let outside_page = cursor.is_some_and(|cursor| match state {
+                BookmarkState::All => {
+                    sort_at > cursor.sort_at
+                        || (sort_at == cursor.sort_at && bookmark.post_id >= cursor.post_id)
+                }
+                BookmarkState::Due | BookmarkState::Scheduled => {
+                    sort_at < cursor.sort_at
+                        || (sort_at == cursor.sort_at && bookmark.post_id <= cursor.post_id)
+                }
+            });
+            if outside_page {
+                continue;
+            }
+            let Some(post) = posts.iter().find(|post| post.id == bookmark.post_id) else {
+                continue;
+            };
+            let Some(thread) = threads.iter().find(|thread| thread.id == post.thread_id) else {
+                continue;
+            };
+            items.push(BookmarkItem {
+                bookmark: bookmark.clone(),
+                thread_id: thread.id.clone(),
+                thread_title: thread.title.clone(),
+                post_author_email: post.author_email.clone(),
+                post_body_md: post.body_md.clone(),
+                post_created_at: post.created_at,
+            });
+        }
+        items.sort_by(|left, right| match state {
+            BookmarkState::All => right
+                .bookmark
+                .created_at
+                .cmp(&left.bookmark.created_at)
+                .then_with(|| right.bookmark.post_id.cmp(&left.bookmark.post_id)),
+            BookmarkState::Due | BookmarkState::Scheduled => left
+                .bookmark
+                .remind_at
+                .cmp(&right.bookmark.remind_at)
+                .then_with(|| left.bookmark.post_id.cmp(&right.bookmark.post_id)),
+        });
+        items.truncate(limit.clamp(0, MAX_BOOKMARK_PAGE + 1) as usize);
+        Ok(items)
+    }
+
+    async fn due_bookmark_count(&self, owner_sub: &str, now: i64) -> Result<i64, StoreError> {
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        let live_posts: HashSet<String> = self
+            .posts
+            .lock()
+            .expect("posts lock poisoned")
+            .iter()
+            .map(|post| post.id.clone())
+            .collect();
+        Ok(self
+            .bookmarks
+            .lock()
+            .expect("bookmarks lock poisoned")
+            .iter()
+            .filter(|row| {
+                row.owner_sub == owner_sub
+                    && row.remind_at.is_some_and(|at| at <= now)
+                    && live_posts.contains(&row.post_id)
+            })
+            .count() as i64)
+    }
+
+    async fn get_bookmark(
+        &self,
+        owner_sub: &str,
+        post_id: &str,
+    ) -> Result<Option<BookmarkItem>, StoreError> {
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        let threads = self.threads.lock().expect("threads lock poisoned");
+        let posts = self.posts.lock().expect("posts lock poisoned");
+        let bookmarks = self.bookmarks.lock().expect("bookmarks lock poisoned");
+        let Some(bookmark) = bookmarks
+            .iter()
+            .find(|row| row.owner_sub == owner_sub && row.post_id == post_id)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let Some(post) = posts.iter().find(|post| post.id == post_id) else {
+            return Ok(None);
+        };
+        let Some(thread) = threads.iter().find(|thread| thread.id == post.thread_id) else {
+            return Ok(None);
+        };
+        Ok(Some(BookmarkItem {
+            bookmark,
+            thread_id: thread.id.clone(),
+            thread_title: thread.title.clone(),
+            post_author_email: post.author_email.clone(),
+            post_body_md: post.body_md.clone(),
+            post_created_at: post.created_at,
+        }))
+    }
+
+    async fn update_bookmark(
+        &self,
+        owner_sub: &str,
+        post_id: &str,
+        expected: BookmarkCas<'_>,
+        note: &str,
+        reminder: BookmarkReminderUpdate,
+        changed_at: i64,
+    ) -> Result<Bookmark, StoreError> {
+        validate_bookmark_note(note)?;
+        if let BookmarkReminderUpdate::Set(remind_at) = reminder {
+            validate_future_reminder(remind_at, changed_at)?;
+        }
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        if !self
+            .posts
+            .lock()
+            .expect("posts lock poisoned")
+            .iter()
+            .any(|post| post.id == post_id)
+        {
+            return Err(StoreError::NotFound("bookmark not found".to_string()));
+        }
+        let mut bookmarks = self.bookmarks.lock().expect("bookmarks lock poisoned");
+        let row = bookmarks
+            .iter_mut()
+            .find(|row| row.owner_sub == owner_sub && row.post_id == post_id)
+            .ok_or_else(|| StoreError::NotFound("bookmark not found".to_string()))?;
+        validate_bookmark_cas(row, expected)?;
+        row.note = note.to_string();
+        match reminder {
+            BookmarkReminderUpdate::Keep => {}
+            BookmarkReminderUpdate::Clear => row.remind_at = None,
+            BookmarkReminderUpdate::Set(remind_at) => row.remind_at = Some(remind_at),
+        }
+        row.updated_at = changed_at;
+        row.version = next_bookmark_version(row.version)?;
+        Ok(row.clone())
+    }
+
+    async fn complete_due_bookmark(
+        &self,
+        owner_sub: &str,
+        post_id: &str,
+        expected: BookmarkCas<'_>,
+        changed_at: i64,
+    ) -> Result<Bookmark, StoreError> {
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        if !self
+            .posts
+            .lock()
+            .expect("posts lock poisoned")
+            .iter()
+            .any(|post| post.id == post_id)
+        {
+            return Err(StoreError::NotFound("bookmark not found".to_string()));
+        }
+        let mut bookmarks = self.bookmarks.lock().expect("bookmarks lock poisoned");
+        let row = bookmarks
+            .iter_mut()
+            .find(|row| row.owner_sub == owner_sub && row.post_id == post_id)
+            .ok_or_else(|| StoreError::NotFound("bookmark not found".to_string()))?;
+        validate_bookmark_cas(row, expected)?;
+        if row.remind_at.is_none_or(|at| at > changed_at) {
+            return Err(StoreError::InvalidOperation(
+                "bookmark reminder is not due".to_string(),
+            ));
+        }
+        row.remind_at = None;
+        row.updated_at = changed_at;
+        row.version = next_bookmark_version(row.version)?;
+        Ok(row.clone())
+    }
+
+    async fn snooze_bookmark(
+        &self,
+        owner_sub: &str,
+        post_id: &str,
+        expected: BookmarkCas<'_>,
+        remind_at: i64,
+        changed_at: i64,
+    ) -> Result<Bookmark, StoreError> {
+        validate_future_reminder(remind_at, changed_at)?;
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        if !self
+            .posts
+            .lock()
+            .expect("posts lock poisoned")
+            .iter()
+            .any(|post| post.id == post_id)
+        {
+            return Err(StoreError::NotFound("bookmark not found".to_string()));
+        }
+        let mut bookmarks = self.bookmarks.lock().expect("bookmarks lock poisoned");
+        let row = bookmarks
+            .iter_mut()
+            .find(|row| row.owner_sub == owner_sub && row.post_id == post_id)
+            .ok_or_else(|| StoreError::NotFound("bookmark not found".to_string()))?;
+        validate_bookmark_cas(row, expected)?;
+        if row.remind_at.is_none_or(|at| at > changed_at) {
+            return Err(StoreError::InvalidOperation(
+                "bookmark reminder is not due".to_string(),
+            ));
+        }
+        row.remind_at = Some(remind_at);
+        row.updated_at = changed_at;
+        row.version = next_bookmark_version(row.version)?;
+        Ok(row.clone())
+    }
+
+    async fn remove_bookmark(
+        &self,
+        owner_sub: &str,
+        post_id: &str,
+        expected: BookmarkCas<'_>,
+    ) -> Result<(), StoreError> {
+        let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+        let mut bookmarks = self.bookmarks.lock().expect("bookmarks lock poisoned");
+        let index = bookmarks
+            .iter()
+            .position(|row| row.owner_sub == owner_sub && row.post_id == post_id)
+            .ok_or_else(|| StoreError::NotFound("bookmark not found".to_string()))?;
+        validate_bookmark_cas(&bookmarks[index], expected)?;
+        bookmarks.remove(index);
+        Ok(())
+    }
+
     async fn toggle_reaction(
         &self,
         post_id: &str,
@@ -2404,8 +2894,8 @@ fn like_contains_pattern(query: &str) -> String {
 // `create_thread`/`add_reply` use a short DB transaction for their two-statement atomicity;
 // the database enforces the primary keys, so no in-process serializer is needed.
 
-use sqlx::postgres::{PgPool, PgPoolOptions};
-use sqlx::{Postgres, Row, Transaction};
+use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
+use sqlx::{Postgres, QueryBuilder, Row, Transaction};
 
 /// PostgreSQL-backed [`Store`]. Holds just a `PgPool`; the async trait methods drive sqlx
 /// natively, so no worker thread is ever blocked on a DB round-trip.
@@ -2631,6 +3121,77 @@ impl PgStore {
         Ok(())
     }
 
+    fn bookmark_from_row(row: &PgRow) -> Result<Bookmark, sqlx::Error> {
+        Ok(Bookmark {
+            bookmark_id: row.try_get("bookmark_id")?,
+            owner_sub: row.try_get("owner_sub")?,
+            post_id: row.try_get("post_id")?,
+            note: row.try_get("note")?,
+            remind_at: row.try_get("remind_at")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+            version: row.try_get("version")?,
+        })
+    }
+
+    fn bookmark_item_from_row(row: &PgRow) -> Result<BookmarkItem, sqlx::Error> {
+        Ok(BookmarkItem {
+            bookmark: Self::bookmark_from_row(row)?,
+            thread_id: row.try_get("thread_id")?,
+            thread_title: row.try_get("thread_title")?,
+            post_author_email: row.try_get("post_author_email")?,
+            post_body_md: row.try_get("post_body_md")?,
+            post_created_at: row.try_get("post_created_at")?,
+        })
+    }
+
+    async fn lock_bookmark_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        owner_sub: &str,
+        post_id: &str,
+    ) -> Result<Bookmark, StoreError> {
+        let post = sqlx::query_scalar::<_, String>("SELECT id FROM posts WHERE id = $1 FOR UPDATE")
+            .bind(post_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(backend)?;
+        if post.is_none() {
+            return Err(StoreError::NotFound("bookmark not found".to_string()));
+        }
+        let row = sqlx::query(
+            "SELECT bookmark_id, owner_sub, post_id, note, remind_at, created_at, updated_at, version \
+             FROM forum_bookmarks WHERE owner_sub = $1 AND post_id = $2 FOR UPDATE",
+        )
+        .bind(owner_sub)
+        .bind(post_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(backend)?
+        .ok_or_else(|| StoreError::NotFound("bookmark not found".to_string()))?;
+        Self::bookmark_from_row(&row).map_err(backend)
+    }
+
+    async fn persist_bookmark_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        bookmark: &Bookmark,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE forum_bookmarks SET note = $1, remind_at = $2, updated_at = $3, version = $4 \
+             WHERE owner_sub = $5 AND post_id = $6 AND bookmark_id = $7",
+        )
+        .bind(&bookmark.note)
+        .bind(bookmark.remind_at)
+        .bind(bookmark.updated_at)
+        .bind(bookmark.version)
+        .bind(&bookmark.owner_sub)
+        .bind(&bookmark.post_id)
+        .bind(&bookmark.bookmark_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
     async fn replace_mentions_tx(
         tx: &mut Transaction<'_, Postgres>,
         post_id: &str,
@@ -2763,6 +3324,85 @@ impl PgStore {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_posts_thread ON posts (thread_id)")
             .execute(&self.pool)
             .await?;
+        // Personal bookmarks are addressed only by the stable gateway subject. The Post FK is
+        // also the cross-version deletion protocol: an older binary deleting a post still removes
+        // its private bookmarks. Owner guard rows serialize quota checks for concurrent creates.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS forum_bookmark_owner_guards (\
+                 owner_sub TEXT PRIMARY KEY\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS forum_bookmarks (\
+                 bookmark_id TEXT NOT NULL, \
+                 owner_sub TEXT NOT NULL, \
+                 post_id TEXT NOT NULL, \
+                 note TEXT NOT NULL DEFAULT '', \
+                 remind_at BIGINT, \
+                 created_at BIGINT NOT NULL, \
+                 updated_at BIGINT NOT NULL, \
+                 version BIGINT NOT NULL DEFAULT 1, \
+                 PRIMARY KEY (owner_sub, post_id), \
+                 CONSTRAINT fk_forum_bookmark_post FOREIGN KEY (post_id) \
+                     REFERENCES posts(id) ON DELETE CASCADE, \
+                 CHECK (char_length(note) <= 200), \
+                 CHECK (remind_at IS NULL OR remind_at >= 0), \
+                 CHECK (version > 0)\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Existing Bookmark deployments predate the immutable row identity used by CAS. Add it
+        // nullable, backfill only missing rows with opaque ids, then make it mandatory. A restart
+        // during backfill is safe: already-assigned ids are never rewritten, and a recreated
+        // bookmark receives a new id in `ensure_bookmark_async`.
+        sqlx::query("ALTER TABLE forum_bookmarks ADD COLUMN IF NOT EXISTS bookmark_id TEXT")
+            .execute(&self.pool)
+            .await?;
+        let legacy_bookmarks = sqlx::query(
+            "SELECT owner_sub, post_id FROM forum_bookmarks \
+             WHERE bookmark_id IS NULL OR bookmark_id = ''",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for row in legacy_bookmarks {
+            let owner_sub: String = row.try_get("owner_sub")?;
+            let post_id: String = row.try_get("post_id")?;
+            sqlx::query(
+                "UPDATE forum_bookmarks SET bookmark_id = $1 \
+                 WHERE owner_sub = $2 AND post_id = $3 \
+                   AND (bookmark_id IS NULL OR bookmark_id = '')",
+            )
+            .bind(crate::new_id("bm"))
+            .bind(owner_sub)
+            .bind(post_id)
+            .execute(&self.pool)
+            .await?;
+        }
+        sqlx::query("ALTER TABLE forum_bookmarks ALTER COLUMN bookmark_id SET NOT NULL")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_forum_bookmarks_identity \
+             ON forum_bookmarks (bookmark_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_forum_bookmarks_recent \
+             ON forum_bookmarks (owner_sub, created_at DESC, post_id DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_forum_bookmarks_due \
+             ON forum_bookmarks (owner_sub, remind_at ASC, post_id ASC) \
+             WHERE remind_at IS NOT NULL",
+        )
+        .execute(&self.pool)
+        .await?;
         // Older deployments predate stable OP identity. Preserve their established display rule
         // once during migration, then every new/read path uses this explicit id rather than
         // re-inferring ownership from timestamps. Both updates are empty-only and idempotent.
@@ -5012,6 +5652,326 @@ impl PgStore {
         Ok(changed)
     }
 
+    async fn ensure_bookmark_async(
+        &self,
+        owner_sub: &str,
+        post_id: &str,
+        created_at: i64,
+    ) -> Result<Bookmark, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        let post = sqlx::query_scalar::<_, String>("SELECT id FROM posts WHERE id = $1 FOR UPDATE")
+            .bind(post_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(backend)?;
+        if post.is_none() {
+            return Err(StoreError::NotFound("post not found".to_string()));
+        }
+        sqlx::query(
+            "INSERT INTO forum_bookmark_owner_guards (owner_sub) VALUES ($1) \
+             ON CONFLICT (owner_sub) DO NOTHING",
+        )
+        .bind(owner_sub)
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        sqlx::query("SELECT owner_sub FROM forum_bookmark_owner_guards WHERE owner_sub = $1 FOR UPDATE")
+            .bind(owner_sub)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(backend)?;
+        if let Some(row) = sqlx::query(
+            "SELECT bookmark_id, owner_sub, post_id, note, remind_at, created_at, updated_at, version \
+             FROM forum_bookmarks WHERE owner_sub = $1 AND post_id = $2",
+        )
+        .bind(owner_sub)
+        .bind(post_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(backend)?
+        {
+            let bookmark = Self::bookmark_from_row(&row).map_err(backend)?;
+            tx.commit().await.map_err(backend)?;
+            return Ok(bookmark);
+        }
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM forum_bookmarks WHERE owner_sub = $1",
+        )
+        .bind(owner_sub)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(backend)?;
+        if count >= MAX_BOOKMARKS_PER_USER as i64 {
+            return Err(StoreError::InvalidOperation(format!(
+                "a user may save at most {MAX_BOOKMARKS_PER_USER} bookmarks"
+            )));
+        }
+        let bookmark = Bookmark {
+            bookmark_id: crate::new_id("bm"),
+            owner_sub: owner_sub.to_string(),
+            post_id: post_id.to_string(),
+            note: String::new(),
+            remind_at: None,
+            created_at,
+            updated_at: created_at,
+            version: 1,
+        };
+        sqlx::query(
+            "INSERT INTO forum_bookmarks \
+                 (bookmark_id, owner_sub, post_id, note, remind_at, created_at, updated_at, version) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(&bookmark.bookmark_id)
+        .bind(&bookmark.owner_sub)
+        .bind(&bookmark.post_id)
+        .bind(&bookmark.note)
+        .bind(bookmark.remind_at)
+        .bind(bookmark.created_at)
+        .bind(bookmark.updated_at)
+        .bind(bookmark.version)
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
+        Ok(bookmark)
+    }
+
+    async fn bookmarks_for_posts_async(
+        &self,
+        owner_sub: &str,
+        post_ids: &[String],
+    ) -> Result<Vec<Bookmark>, StoreError> {
+        if post_ids.len() > MAX_BOOKMARK_POST_BATCH {
+            return Err(StoreError::InvalidOperation(format!(
+                "bookmark post batch may contain at most {MAX_BOOKMARK_POST_BATCH} ids"
+            )));
+        }
+        if post_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query = QueryBuilder::<Postgres>::new(
+            "SELECT bookmark_id, owner_sub, post_id, note, remind_at, created_at, updated_at, version \
+             FROM forum_bookmarks WHERE owner_sub = ",
+        );
+        query.push_bind(owner_sub).push(" AND post_id IN (");
+        let mut ids = query.separated(", ");
+        for post_id in post_ids {
+            ids.push_bind(post_id);
+        }
+        ids.push_unseparated(")");
+        let rows = query
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(backend)?;
+        rows.iter()
+            .map(|row| Self::bookmark_from_row(row).map_err(backend))
+            .collect()
+    }
+
+    async fn bookmark_page_async(
+        &self,
+        owner_sub: &str,
+        state: BookmarkState,
+        cursor: Option<&BookmarkCursor>,
+        limit: i64,
+        now: i64,
+    ) -> Result<Vec<BookmarkItem>, StoreError> {
+        let cursor_at = cursor.map(|value| value.sort_at);
+        let cursor_id = cursor.map(|value| value.post_id.as_str()).unwrap_or_default();
+        let limit = limit.clamp(0, MAX_BOOKMARK_PAGE + 1);
+        let base = "SELECT b.bookmark_id, b.owner_sub, b.post_id, b.note, b.remind_at, b.created_at, \
+                           b.updated_at, b.version, p.thread_id, t.title AS thread_title, \
+                           p.author_email AS post_author_email, p.body_md AS post_body_md, \
+                           p.created_at AS post_created_at \
+                    FROM forum_bookmarks AS b \
+                    JOIN posts AS p ON p.id = b.post_id \
+                    JOIN threads AS t ON t.id = p.thread_id ";
+        let sql = match state {
+            BookmarkState::All => format!(
+                "{base} WHERE b.owner_sub = $1 \
+                 AND ($2::BIGINT IS NULL OR b.created_at < $2 \
+                      OR (b.created_at = $2 AND b.post_id < $3)) \
+                 ORDER BY b.created_at DESC, b.post_id DESC LIMIT $4"
+            ),
+            BookmarkState::Due => format!(
+                "{base} WHERE b.owner_sub = $1 AND b.remind_at <= $4 \
+                 AND ($2::BIGINT IS NULL OR b.remind_at > $2 \
+                      OR (b.remind_at = $2 AND b.post_id > $3)) \
+                 ORDER BY b.remind_at ASC, b.post_id ASC LIMIT $5"
+            ),
+            BookmarkState::Scheduled => format!(
+                "{base} WHERE b.owner_sub = $1 AND b.remind_at > $4 \
+                 AND ($2::BIGINT IS NULL OR b.remind_at > $2 \
+                      OR (b.remind_at = $2 AND b.post_id > $3)) \
+                 ORDER BY b.remind_at ASC, b.post_id ASC LIMIT $5"
+            ),
+        };
+        let rows = match state {
+            BookmarkState::All => sqlx::query(&sql)
+                .bind(owner_sub)
+                .bind(cursor_at)
+                .bind(cursor_id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await,
+            BookmarkState::Due | BookmarkState::Scheduled => sqlx::query(&sql)
+                .bind(owner_sub)
+                .bind(cursor_at)
+                .bind(cursor_id)
+                .bind(now)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await,
+        }
+        .map_err(backend)?;
+        rows.iter()
+            .map(|row| Self::bookmark_item_from_row(row).map_err(backend))
+            .collect()
+    }
+
+    async fn due_bookmark_count_async(
+        &self,
+        owner_sub: &str,
+        now: i64,
+    ) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM forum_bookmarks AS b \
+             JOIN posts AS p ON p.id = b.post_id \
+             WHERE b.owner_sub = $1 AND b.remind_at <= $2",
+        )
+        .bind(owner_sub)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    async fn get_bookmark_async(
+        &self,
+        owner_sub: &str,
+        post_id: &str,
+    ) -> Result<Option<BookmarkItem>, StoreError> {
+        let row = sqlx::query(
+            "SELECT b.bookmark_id, b.owner_sub, b.post_id, b.note, b.remind_at, b.created_at, \
+                    b.updated_at, b.version, p.thread_id, t.title AS thread_title, \
+                    p.author_email AS post_author_email, p.body_md AS post_body_md, \
+                    p.created_at AS post_created_at \
+             FROM forum_bookmarks AS b \
+             JOIN posts AS p ON p.id = b.post_id \
+             JOIN threads AS t ON t.id = p.thread_id \
+             WHERE b.owner_sub = $1 AND b.post_id = $2",
+        )
+        .bind(owner_sub)
+        .bind(post_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(backend)?;
+        row.as_ref()
+            .map(Self::bookmark_item_from_row)
+            .transpose()
+            .map_err(backend)
+    }
+
+    async fn update_bookmark_async(
+        &self,
+        owner_sub: &str,
+        post_id: &str,
+        expected: BookmarkCas<'_>,
+        note: &str,
+        reminder: BookmarkReminderUpdate,
+        changed_at: i64,
+    ) -> Result<Bookmark, StoreError> {
+        validate_bookmark_note(note)?;
+        if let BookmarkReminderUpdate::Set(remind_at) = reminder {
+            validate_future_reminder(remind_at, changed_at)?;
+        }
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        let mut bookmark = Self::lock_bookmark_tx(&mut tx, owner_sub, post_id).await?;
+        validate_bookmark_cas(&bookmark, expected)?;
+        bookmark.note = note.to_string();
+        match reminder {
+            BookmarkReminderUpdate::Keep => {}
+            BookmarkReminderUpdate::Clear => bookmark.remind_at = None,
+            BookmarkReminderUpdate::Set(remind_at) => bookmark.remind_at = Some(remind_at),
+        }
+        bookmark.updated_at = changed_at;
+        bookmark.version = next_bookmark_version(bookmark.version)?;
+        Self::persist_bookmark_tx(&mut tx, &bookmark).await?;
+        tx.commit().await.map_err(backend)?;
+        Ok(bookmark)
+    }
+
+    async fn complete_due_bookmark_async(
+        &self,
+        owner_sub: &str,
+        post_id: &str,
+        expected: BookmarkCas<'_>,
+        changed_at: i64,
+    ) -> Result<Bookmark, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        let mut bookmark = Self::lock_bookmark_tx(&mut tx, owner_sub, post_id).await?;
+        validate_bookmark_cas(&bookmark, expected)?;
+        if bookmark.remind_at.is_none_or(|at| at > changed_at) {
+            return Err(StoreError::InvalidOperation(
+                "bookmark reminder is not due".to_string(),
+            ));
+        }
+        bookmark.remind_at = None;
+        bookmark.updated_at = changed_at;
+        bookmark.version = next_bookmark_version(bookmark.version)?;
+        Self::persist_bookmark_tx(&mut tx, &bookmark).await?;
+        tx.commit().await.map_err(backend)?;
+        Ok(bookmark)
+    }
+
+    async fn snooze_bookmark_async(
+        &self,
+        owner_sub: &str,
+        post_id: &str,
+        expected: BookmarkCas<'_>,
+        remind_at: i64,
+        changed_at: i64,
+    ) -> Result<Bookmark, StoreError> {
+        validate_future_reminder(remind_at, changed_at)?;
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        let mut bookmark = Self::lock_bookmark_tx(&mut tx, owner_sub, post_id).await?;
+        validate_bookmark_cas(&bookmark, expected)?;
+        if bookmark.remind_at.is_none_or(|at| at > changed_at) {
+            return Err(StoreError::InvalidOperation(
+                "bookmark reminder is not due".to_string(),
+            ));
+        }
+        bookmark.remind_at = Some(remind_at);
+        bookmark.updated_at = changed_at;
+        bookmark.version = next_bookmark_version(bookmark.version)?;
+        Self::persist_bookmark_tx(&mut tx, &bookmark).await?;
+        tx.commit().await.map_err(backend)?;
+        Ok(bookmark)
+    }
+
+    async fn remove_bookmark_async(
+        &self,
+        owner_sub: &str,
+        post_id: &str,
+        expected: BookmarkCas<'_>,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        let bookmark = Self::lock_bookmark_tx(&mut tx, owner_sub, post_id).await?;
+        validate_bookmark_cas(&bookmark, expected)?;
+        sqlx::query(
+            "DELETE FROM forum_bookmarks \
+             WHERE owner_sub = $1 AND post_id = $2 AND bookmark_id = $3",
+        )
+            .bind(owner_sub)
+            .bind(post_id)
+            .bind(expected.bookmark_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
+        Ok(())
+    }
+
     async fn toggle_reaction_async(
         &self,
         post_id: &str,
@@ -5448,6 +6408,114 @@ impl Store for PgStore {
     ) -> Result<i64, StoreError> {
         self.mark_activity_batch_read_async(viewer_sub, activity_ids, changed_at)
             .await
+    }
+
+    async fn ensure_bookmark(
+        &self,
+        owner_sub: &str,
+        post_id: &str,
+        created_at: i64,
+    ) -> Result<Bookmark, StoreError> {
+        self.ensure_bookmark_async(owner_sub, post_id, created_at)
+            .await
+    }
+
+    async fn bookmarks_for_posts(
+        &self,
+        owner_sub: &str,
+        post_ids: &[String],
+    ) -> Result<Vec<Bookmark>, StoreError> {
+        self.bookmarks_for_posts_async(owner_sub, post_ids).await
+    }
+
+    async fn bookmark_page(
+        &self,
+        owner_sub: &str,
+        state: BookmarkState,
+        cursor: Option<&BookmarkCursor>,
+        limit: i64,
+        now: i64,
+    ) -> Result<Vec<BookmarkItem>, StoreError> {
+        self.bookmark_page_async(owner_sub, state, cursor, limit, now)
+            .await
+    }
+
+    async fn due_bookmark_count(&self, owner_sub: &str, now: i64) -> Result<i64, StoreError> {
+        self.due_bookmark_count_async(owner_sub, now)
+            .await
+            .map_err(backend)
+    }
+
+    async fn get_bookmark(
+        &self,
+        owner_sub: &str,
+        post_id: &str,
+    ) -> Result<Option<BookmarkItem>, StoreError> {
+        self.get_bookmark_async(owner_sub, post_id).await
+    }
+
+    async fn update_bookmark(
+        &self,
+        owner_sub: &str,
+        post_id: &str,
+        expected: BookmarkCas<'_>,
+        note: &str,
+        reminder: BookmarkReminderUpdate,
+        changed_at: i64,
+    ) -> Result<Bookmark, StoreError> {
+        self.update_bookmark_async(
+            owner_sub,
+            post_id,
+            expected,
+            note,
+            reminder,
+            changed_at,
+        )
+        .await
+    }
+
+    async fn complete_due_bookmark(
+        &self,
+        owner_sub: &str,
+        post_id: &str,
+        expected: BookmarkCas<'_>,
+        changed_at: i64,
+    ) -> Result<Bookmark, StoreError> {
+        self.complete_due_bookmark_async(
+            owner_sub,
+            post_id,
+            expected,
+            changed_at,
+        )
+        .await
+    }
+
+    async fn snooze_bookmark(
+        &self,
+        owner_sub: &str,
+        post_id: &str,
+        expected: BookmarkCas<'_>,
+        remind_at: i64,
+        changed_at: i64,
+    ) -> Result<Bookmark, StoreError> {
+        self.snooze_bookmark_async(
+            owner_sub,
+            post_id,
+            expected,
+            remind_at,
+            changed_at,
+        )
+        .await
+    }
+
+    async fn remove_bookmark(
+        &self,
+        owner_sub: &str,
+        post_id: &str,
+        expected: BookmarkCas<'_>,
+    ) -> Result<(), StoreError> {
+        self.remove_bookmark_async(owner_sub, post_id, expected)
+        .await
     }
 
     async fn toggle_reaction(

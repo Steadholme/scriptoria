@@ -7,6 +7,7 @@
 
 pub mod activity;
 pub mod admin;
+pub mod bookmarks;
 pub mod forum;
 pub mod health;
 pub mod insight;
@@ -83,10 +84,34 @@ pub fn render_page_with_activity(
     content: &str,
     unread_activity: Option<i64>,
 ) -> String {
+    render_page_with_personal_counts(
+        title,
+        email_display,
+        content,
+        PersonalCounts {
+            unread_activity,
+            due_bookmarks: None,
+        },
+    )
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PersonalCounts {
+    pub unread_activity: Option<i64>,
+    pub due_bookmarks: Option<i64>,
+}
+
+pub fn render_page_with_personal_counts(
+    title: &str,
+    email_display: &str,
+    content: &str,
+    counts: PersonalCounts,
+) -> String {
     let active = match title {
         "New thread" => "new",
         "Search" => "search",
         "Activity" => "activity",
+        "Bookmarks" | "Edit bookmark" => "bookmarks",
         _ => "home",
     };
     SHELL
@@ -94,7 +119,7 @@ pub fn render_page_with_activity(
         .replace("{{DYNAMIC}}", dynamic_js())
         .replace(
             "{{APPBAR}}",
-            &app_bar_with_activity(active, email_display, unread_activity),
+            &app_bar_with_counts(active, email_display, counts),
         )
         .replace("{{TITLE}}", &esc(title))
         .replace("{{CONTENT}}", content)
@@ -115,6 +140,21 @@ pub fn app_bar_with_activity(
     email_display: &str,
     unread_activity: Option<i64>,
 ) -> String {
+    app_bar_with_counts(
+        active,
+        email_display,
+        PersonalCounts {
+            unread_activity,
+            due_bookmarks: None,
+        },
+    )
+}
+
+pub fn app_bar_with_counts(
+    active: &str,
+    email_display: &str,
+    counts: PersonalCounts,
+) -> String {
     let nav = format!(
         concat!(
             r#"<nav class="appbar__nav" aria-label="Agora">"#,
@@ -134,7 +174,8 @@ pub fn app_bar_with_activity(
 </form>"#,
         active = if active == "search" { " is-active" } else { "" },
     );
-    let activity = activity_button(active == "activity", unread_activity);
+    let bookmarks = bookmark_button(active == "bookmarks", counts.due_bookmarks);
+    let activity = activity_button(active == "activity", counts.unread_activity);
     format!(
         r#"<header class="appbar">
   <a class="appbar__brand" href="/" aria-label="HOLDFAST Agora home">
@@ -144,13 +185,47 @@ pub fn app_bar_with_activity(
   {nav}
   {quick_search}
   <span class="appbar__spacer"></span>
-  <div class="appbar__right">{activity}{right}</div>
+  <div class="appbar__right">{bookmarks}{activity}{right}</div>
 </header>"#,
         icon = APP_ICON,
         nav = nav,
         quick_search = quick_search,
+        bookmarks = bookmarks,
         activity = activity,
         right = user_menu(email_display),
+    )
+}
+
+fn bookmark_button(active: bool, due_bookmarks: Option<i64>) -> String {
+    let count = due_bookmarks.unwrap_or(0).max(0);
+    let badge = if count > 0 {
+        format!(
+            r#"<span class="ag-bookmark-badge" aria-hidden="true">{}</span>"#,
+            if count > 99 {
+                "99+".to_string()
+            } else {
+                count.to_string()
+            }
+        )
+    } else {
+        String::new()
+    };
+    let label = match count {
+        0 => "Bookmarks".to_string(),
+        1 => "Bookmarks, 1 due".to_string(),
+        _ => format!("Bookmarks, {count} due"),
+    };
+    let href = if count > 0 {
+        "/bookmarks?state=due"
+    } else {
+        "/bookmarks"
+    };
+    format!(
+        r#"<a class="iconbtn ag-bookmark-button{active}" href="{href}" title="Bookmarks" aria-label="{label}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h12a1 1 0 0 1 1 1v17l-7-4-7 4V4a1 1 0 0 1 1-1z"/></svg>{badge}</a>"#,
+        active = if active { " is-active" } else { "" },
+        href = href,
+        label = esc(&label),
+        badge = badge,
     )
 }
 
@@ -266,6 +341,27 @@ pub async fn unread_activity_count(
         return Ok(None);
     };
     Ok(Some(state.store.unread_activity_count(&subject).await?))
+}
+
+/// Both owner-scoped app-bar counters from the same signed gateway subject. Due reminders are
+/// request-derived; this never claims that a background notification was delivered.
+pub async fn personal_counts(
+    state: &crate::AppState,
+    headers: &HeaderMap,
+    as_of: i64,
+) -> Result<PersonalCounts, crate::error::AppError> {
+    let Some(subject) = crate::auth::identity_subject(headers) else {
+        return Ok(PersonalCounts::default());
+    };
+    Ok(PersonalCounts {
+        unread_activity: Some(state.store.unread_activity_count(&subject).await?),
+        due_bookmarks: Some(
+            state
+                .store
+                .due_bookmark_count(&subject, as_of)
+                .await?,
+        ),
+    })
 }
 
 /// Compact "N ago" relative time from `ts` to `now` (both epoch seconds).

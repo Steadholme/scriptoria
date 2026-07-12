@@ -18,7 +18,7 @@ use crate::auth;
 use crate::error::AppError;
 use crate::handlers::forum::{html_response, redirect_to, render_admin_thread_toolbar};
 use crate::handlers::{
-    email_display, esc, fmt_ts, render_page_with_activity, unread_activity_count,
+    email_display, esc, fmt_ts, personal_counts, render_page_with_personal_counts,
 };
 use crate::model::{BannedAuthor, Category, CategoryFormat};
 use crate::{now_secs, AppState};
@@ -46,6 +46,7 @@ pub async fn dashboard(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
+    let now = crate::now_secs();
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
     let categories = state.store.list_categories().await?;
     let threads = state.store.recent_threads(ADMIN_THREAD_LIMIT).await?;
@@ -201,8 +202,13 @@ pub async fn dashboard(
         add_ban = add_ban,
     );
 
-    let unread = unread_activity_count(&state, &headers).await?;
-    let html = render_page_with_activity("Admin", &email_display(&headers), &content, unread);
+    let counts = personal_counts(&state, &headers, now).await?;
+    let html = render_page_with_personal_counts(
+        "Admin",
+        &email_display(&headers),
+        &content,
+        counts,
+    );
     Ok(html_response(html, set_cookie))
 }
 

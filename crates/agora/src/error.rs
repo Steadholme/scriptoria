@@ -26,6 +26,10 @@ pub enum AppError {
     #[error("not_found: {0}")]
     NotFound(String),
 
+    /// Optimistic concurrency failed; the user must reload instead of overwriting newer state.
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     /// Unexpected internal failure (store I/O).
     #[error("server_error: {0}")]
     Internal(String),
@@ -38,6 +42,7 @@ impl AppError {
             AppError::Unauthorized(d) => (StatusCode::UNAUTHORIZED, "Not signed in", d.clone()),
             AppError::Forbidden(d) => (StatusCode::FORBIDDEN, "Request blocked", d.clone()),
             AppError::NotFound(d) => (StatusCode::NOT_FOUND, "Not found", d.clone()),
+            AppError::Conflict(d) => (StatusCode::CONFLICT, "Changed elsewhere", d.clone()),
             AppError::Internal(d) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Something went wrong",
@@ -63,6 +68,7 @@ impl From<crate::store::StoreError> for AppError {
                 AppError::InvalidRequest(message)
             }
             crate::store::StoreError::NotFound(message) => AppError::NotFound(message),
+            crate::store::StoreError::Conflict(message) => AppError::Conflict(message),
             crate::store::StoreError::Backend(message) => {
                 AppError::Internal(format!("store error: {message}"))
             }

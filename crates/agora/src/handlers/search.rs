@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
 use crate::handlers::{
-    ag_tone, email_display, esc, fmt_ts, rel_time, render_page_with_activity, unread_activity_count,
+    ag_tone, email_display, esc, fmt_ts, personal_counts, rel_time,
+    render_page_with_personal_counts,
 };
 use crate::model::{Category, CategoryFormat, ThreadSearchHit};
 use crate::store::ThreadStatusFilter;
@@ -71,6 +72,7 @@ pub async fn page(
     Query(params): Query<SearchQuery>,
     headers: HeaderMap,
 ) -> Result<Html<String>, AppError> {
+    let now = now_secs();
     let query = normalize_query(params.q.as_deref());
     let category_id = normalize_category(params.category.as_deref());
     let status = normalize_status(params.status.as_deref());
@@ -97,14 +99,14 @@ pub async fn page(
         &categories,
         &category_names,
         &hits,
-        now_secs(),
+        now,
     );
-    let unread = unread_activity_count(&state, &headers).await?;
-    Ok(Html(render_page_with_activity(
+    let counts = personal_counts(&state, &headers, now).await?;
+    Ok(Html(render_page_with_personal_counts(
         "Search",
         &email_display(&headers),
         &content,
-        unread,
+        counts,
     )))
 }
 

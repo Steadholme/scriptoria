@@ -11,6 +11,7 @@ pub mod admin;
 pub mod ask;
 pub mod feed;
 pub mod health;
+pub mod library;
 pub mod posts;
 pub mod search;
 
@@ -61,6 +62,7 @@ pub fn topbar(page_title: &str, email: &str, is_admin: bool, theme: &str) -> Str
     let active = match page_title {
         "Search" => "search",
         "Ask" => "ask",
+        "Library" => "library",
         _ => "posts",
     };
     let admin_nav = if is_admin {
@@ -74,12 +76,23 @@ pub fn topbar(page_title: &str, email: &str, is_admin: bool, theme: &str) -> Str
             r#"<a class="appnav{a_posts}" href="/"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 22V12h6v10"/></svg>Posts</a>"#,
             r#"<a class="appnav{a_search}" href="/search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>Search</a>"#,
             r#"<a class="appnav{a_ask}" href="/ask"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/></svg>Ask</a>"#,
+            r#"<a class="appnav{a_library}" href="/library"{c_library}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16v14H4z"/><path d="M8 9h8M8 13h6"/></svg>Library</a>"#,
             r#"{admin_nav}"#,
             r#"</nav>"#,
         ),
         a_posts = if active == "posts" { " is-active" } else { "" },
         a_search = if active == "search" { " is-active" } else { "" },
         a_ask = if active == "ask" { " is-active" } else { "" },
+        a_library = if active == "library" {
+            " is-active"
+        } else {
+            ""
+        },
+        c_library = if active == "library" {
+            r#" aria-current="page""#
+        } else {
+            ""
+        },
         admin_nav = admin_nav,
     );
     format!(

@@ -19,6 +19,11 @@ pub enum AppError {
     #[error("forbidden: {0}")]
     Forbidden(String),
 
+    /// A submitted bulk selection changed since it was rendered. Deliberately does not reveal
+    /// whether an item was missing, foreign, moved, or already in another lifecycle state.
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     /// No such file, or no such share token.
     #[error("not_found: {0}")]
     NotFound(String),
@@ -42,6 +47,7 @@ impl AppError {
         match self {
             AppError::BadRequest(d) => (StatusCode::BAD_REQUEST, "Request rejected", d.clone()),
             AppError::Forbidden(d) => (StatusCode::FORBIDDEN, "Not allowed", d.clone()),
+            AppError::Conflict(d) => (StatusCode::CONFLICT, "Selection changed", d.clone()),
             AppError::NotFound(d) => (StatusCode::NOT_FOUND, "Not found", d.clone()),
             AppError::Gone(d) => (StatusCode::GONE, "Link expired", d.clone()),
             AppError::QuotaExceeded(d) => (StatusCode::PAYLOAD_TOO_LARGE, "Storage full", d.clone()),

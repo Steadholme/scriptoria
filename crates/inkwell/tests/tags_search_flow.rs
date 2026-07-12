@@ -12,6 +12,7 @@ use inkwell::{app, build_dev_state, AppState};
 use tower::ServiceExt;
 
 const CSRF: &str = "tok_csrf_for_tests";
+const PUBLIC_VARY: &str = "Cookie, X-Auth-Subject, X-Auth-Email, X-Auth-Groups";
 
 #[tokio::test]
 async fn tags_render_and_tag_listing_filters() {
@@ -75,6 +76,54 @@ async fn search_ranks_and_highlights_excluding_drafts() {
     let (status, html) = call(&state, get("/search?q=zzzqqqnope")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains("No matches"), "empty-match path");
+}
+
+#[tokio::test]
+async fn search_cache_boundary_varies_public_and_fences_personalized_html() {
+    let state = build_dev_state();
+    create(
+        &state,
+        "Cacheable Search",
+        "authoritative public search body",
+        "",
+        true,
+    )
+    .await;
+
+    let anonymous = app(state.clone())
+        .oneshot(get("/search?q=authoritative"))
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::OK);
+    assert!(anonymous.headers().get(header::CACHE_CONTROL).is_none());
+    assert_eq!(anonymous.headers().get(header::VARY).unwrap(), PUBLIC_VARY);
+
+    let personalized = vec![
+        Request::builder()
+            .uri("/search?q=authoritative")
+            .header(header::COOKIE, "odyssey-theme=dark")
+            .body(Body::empty())
+            .unwrap(),
+        Request::builder()
+            .uri("/search?q=authoritative")
+            .header("x-auth-email", "reader@hf")
+            .body(Body::empty())
+            .unwrap(),
+        Request::builder()
+            .uri("/search?q=authoritative")
+            .header("x-auth-groups", "admins")
+            .body(Body::empty())
+            .unwrap(),
+    ];
+    for request in personalized {
+        let response = app(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "private, no-store"
+        );
+        assert_eq!(response.headers().get(header::VARY).unwrap(), PUBLIC_VARY);
+    }
 }
 
 #[tokio::test]

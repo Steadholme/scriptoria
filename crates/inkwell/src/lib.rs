@@ -16,6 +16,8 @@
 //! - `GET  /search?q=`      full-text search over published posts (title + body), highlighted
 //! - `GET  /feed.xml`       RSS 2.0 of the published posts (newest-first)
 //! - `GET  /sitemap.xml`    sitemap of the index + published posts
+//! - `GET  /library`        private owner Content Library (search/filter/keyset)
+//! - `POST /library/posts/bulk` atomic stable-id/version author organization
 //! - `GET  /new`            compose form
 //! - `POST /new`            create a post (author from injected X-Auth-*, slug from title)
 //! - `GET  /edit/{slug}`    edit form (own post)
@@ -64,6 +66,8 @@ pub fn app(state: AppState) -> Router {
         // Public discovery feeds derived from the published posts (read-only; no schema).
         .route("/feed.xml", get(handlers::feed::feed_xml))
         .route("/sitemap.xml", get(handlers::feed::sitemap_xml))
+        .route("/library", get(handlers::library::index))
+        .route("/library/posts/bulk", post(handlers::library::bulk))
         .route(
             "/new",
             get(handlers::posts::new_form).post(handlers::posts::create),
@@ -109,6 +113,9 @@ pub fn app(state: AppState) -> Router {
         // when GATEWAY_HMAC_KEY is set, an injected identity MUST carry a valid X-Auth-Sig.
         // No-op when the key is unset or no identity is present (health/public/dev).
         .layer(axum::middleware::from_fn(require_gateway_sig))
+        // Outermost cache fence also covers router/extractor responses that never enter AppError
+        // (default 404, malformed Form 400, unsupported media type 415, method 405, and 5xx).
+        .layer(axum::middleware::from_fn(fence_error_responses))
         .with_state(state)
 }
 
@@ -117,16 +124,34 @@ async fn require_gateway_sig(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    use axum::response::IntoResponse;
     if auth::gateway_identity_ok(req.headers()) {
         next.run(req).await
     } else {
-        (
-            axum::http::StatusCode::UNAUTHORIZED,
-            "invalid or missing gateway identity signature",
-        )
-            .into_response()
+        invalid_gateway_identity_response()
     }
+}
+
+fn invalid_gateway_identity_response() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    error::AppError::Unauthorized("invalid or missing gateway identity signature".to_string())
+        .into_response()
+}
+
+/// Axum's built-in router and extractor rejections bypass [`error::AppError`]. Fence every non-2xx
+/// response at the outermost layer while leaving successful public reader/search responses
+/// cacheable. Existing authoring redirects already carry the same stricter policy.
+async fn fence_error_responses(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(req).await;
+    if !response.status().is_success() {
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("private, no-store"),
+        );
+    }
+    response
 }
 
 /// Construct dev state: dev [`Config`] + an empty [`InMemoryStore`]. Used by `main`'s memory
@@ -302,4 +327,22 @@ pub async fn build_full_index(store: &dyn Store) -> i64 {
             tracing::warn!(%error, "full public index validated read failed");
             0
         })
+}
+
+#[cfg(test)]
+mod response_cache_tests {
+    use super::*;
+
+    #[test]
+    fn gateway_signature_rejection_is_private_no_store() {
+        let response = invalid_gateway_identity_response();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .unwrap(),
+            "private, no-store"
+        );
+    }
 }

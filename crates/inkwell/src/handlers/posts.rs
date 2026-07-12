@@ -20,13 +20,15 @@ use crate::error::AppError;
 use crate::handlers::{esc, fmt_date, page_shell, post_excerpt, tag_chips, PageMeta, PageShell};
 use crate::markdown;
 use crate::store::{
-    AutosaveOutcome, Post, PostCursor, SavePostCommand, SavePostOutcome, WriterAutosave,
+    AutosaveOutcome, DeletePostCommand, DeletePostOutcome, DeletePostScope, Post, PostCursor,
+    SavePostCommand, SavePostOutcome, WriterAutosave,
 };
 use crate::{now_nanos, now_secs, unique_slug, AppState};
 
 const LIST_HTML: &str = include_str!("../../templates/list.html");
 const POST_HTML: &str = include_str!("../../templates/post.html");
 const EDITOR_HTML: &str = include_str!("../../templates/editor.html");
+const PUBLIC_REPRESENTATION_VARY: &str = "Cookie, X-Auth-Subject, X-Auth-Email, X-Auth-Groups";
 
 pub const CUSTOM_EXCERPT_MAX: usize = 500;
 pub const META_TITLE_MAX: usize = 200;
@@ -95,6 +97,10 @@ pub struct PostForm {
     pub autosave_session: String,
     #[serde(default)]
     pub client_seq: String,
+    /// Optional local Content Library return target. It is accepted only after strict path
+    /// validation and never participates in authoring or authorization.
+    #[serde(default)]
+    pub return_to: String,
     #[serde(default)]
     pub csrf_token: String,
 }
@@ -140,11 +146,18 @@ struct SaveResponse {
     redirect: String,
 }
 
-/// Minimal form body for delete: just the CSRF token (identity comes from the gateway headers).
+/// Delete authority combines gateway identity with the immutable id/version rendered by the
+/// current post. Defaults make every pre-CAS legacy form fail closed.
 #[derive(Debug, Deserialize)]
 pub struct DeleteForm {
     #[serde(default)]
     pub csrf_token: String,
+    #[serde(default)]
+    pub expected_post_id: String,
+    #[serde(default)]
+    pub expected_version: String,
+    #[serde(default)]
+    pub return_to: String,
 }
 
 /// Index query string: the keyset cursor `?before=<created_at>_<id>` and an optional `?limit=`.
@@ -163,6 +176,8 @@ pub struct EditorQuery {
     pub studio_saved: Option<String>,
     #[serde(default)]
     pub recover: Option<String>,
+    #[serde(default)]
+    pub return_to: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,6 +188,8 @@ pub struct RestoreForm {
     pub expected_version: String,
     #[serde(default)]
     pub expected_post_id: String,
+    #[serde(default)]
+    pub return_to: String,
 }
 
 #[derive(Serialize)]
@@ -330,7 +347,12 @@ pub async fn index(
         fragment: &fragment,
         metadata: None,
     });
-    Html(page).into_response()
+    public_read_response(
+        Html(page).into_response(),
+        &headers,
+        viewer.as_deref(),
+        is_admin,
+    )
 }
 
 /// `GET /tag/{slug}` — one keyset page of posts carrying the tag `slug`, newest-first. It traverses
@@ -418,7 +440,12 @@ pub async fn tag_index(
         fragment: &fragment,
         metadata: None,
     });
-    Html(page).into_response()
+    public_read_response(
+        Html(page).into_response(),
+        &headers,
+        viewer.as_deref(),
+        is_admin,
+    )
 }
 
 /// Traverse authoritative visible-post pages until one full tag page (plus one look-ahead match)
@@ -545,8 +572,13 @@ pub async fn view(
         .ok_or_else(|| AppError::NotFound("no such post".to_string()))?;
 
     let is_owner = viewer.as_deref() == Some(post.author_sub.as_str());
-    // The owner gets edit/delete controls; the delete form needs a CSRF token.
-    let (csrf, set_cookie) = auth::ensure_csrf(&headers);
+    // Only an owner representation needs a CSRF token. Anonymous public reads remain a genuinely
+    // cacheable representation and never mint a per-browser cookie.
+    let (csrf, set_cookie) = if is_owner {
+        auth::ensure_csrf(&headers)
+    } else {
+        (String::new(), None)
+    };
 
     let meta = format!(
         r#"<div class="ink-byline"><span class="ink-avatar ink-avatar--lg">{initial}</span><div class="ink-byline__col"><span class="ink-byline__author">{author}</span><span class="ink-byline__meta">{date} · {mins} min read{state}</span></div></div>"#,
@@ -563,11 +595,15 @@ pub async fn view(
   <a class="btn btn-secondary btn-sm" href="/edit/{slug}">Edit</a>
   <form class="inline-form" method="post" action="/delete/{slug}" onsubmit="return confirm('Delete this post? This cannot be undone.');">
     <input type="hidden" name="csrf_token" value="{csrf}">
+    <input type="hidden" name="expected_post_id" value="{post_id}">
+    <input type="hidden" name="expected_version" value="{version}">
     <button class="btn btn-danger btn-sm" type="submit">Delete</button>
   </form>
 </div>"#,
             slug = esc(&post.slug),
             csrf = esc(&csrf),
+            post_id = esc(&post.id),
+            version = post.edit_version,
         )
     } else {
         String::new()
@@ -625,7 +661,12 @@ pub async fn view(
         metadata: Some(&page_meta),
     });
 
-    Ok(html_with_cookie(page, set_cookie))
+    Ok(public_read_response(
+        html_with_cookie(page, set_cookie),
+        &headers,
+        viewer.as_deref(),
+        is_admin,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -633,12 +674,22 @@ pub async fn view(
 // ---------------------------------------------------------------------------
 
 /// `GET /new` — the compose form.
-pub async fn new_form(State(_state): State<AppState>, headers: HeaderMap) -> Response {
+pub async fn new_form(
+    State(_state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<EditorQuery>,
+) -> Response {
     let email = auth::display_email(&headers);
     let subject = auth::author_sub(&headers).unwrap_or_else(|| "anonymous".to_string());
     let recovery_scope = recovery_scope(&subject);
     let is_admin = auth::is_admin(&headers);
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
+    let return_to = validated_return_to(query.return_to.as_deref());
+    let cancel_href = if return_to.is_empty() {
+        "/".to_string()
+    } else {
+        return_to.clone()
+    };
     let theme = odyssey::resolve_theme(
         headers
             .get(axum::http::header::COOKIE)
@@ -659,6 +710,7 @@ pub async fn new_form(State(_state): State<AppState>, headers: HeaderMap) -> Res
         expected_post_id: "",
         client_seq: 0,
         history_href: "",
+        return_to: &return_to,
         recovery_notice: "",
         recovery_scope: &recovery_scope,
         csrf: &csrf,
@@ -675,7 +727,7 @@ pub async fn new_form(State(_state): State<AppState>, headers: HeaderMap) -> Res
         social_image_value: "",
         publish_at_value: "",
         pinned: false,
-        cancel_href: "/",
+        cancel_href: &cancel_href,
         delete_slug: None,
     });
     private_no_store(html_with_cookie(page, set_cookie))
@@ -745,7 +797,7 @@ pub async fn create(
     // Keep the ask index in step (best-effort; never fails the create).
     crate::reindex_post(state.store.as_ref(), &post).await;
 
-    Ok(save_response(&headers, &post))
+    Ok(save_response(&headers, &post, &form.return_to))
 }
 
 // ---------------------------------------------------------------------------
@@ -809,6 +861,21 @@ pub async fn edit_form(
         ));
     }
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
+    let return_to = validated_return_to(query.return_to.as_deref());
+    let cancel_href = if return_to.is_empty() {
+        format!("/p/{}", esc(&post.slug))
+    } else {
+        return_to.clone()
+    };
+    let history_href = if return_to.is_empty() {
+        format!("/edit/{}/history", esc(&post.slug))
+    } else {
+        format!(
+            "/edit/{}/history?return_to={}",
+            esc(&post.slug),
+            crate::handlers::library::percent_encode(&return_to)
+        )
+    };
     let state_label = publication_detail(&post, now_secs());
     let saved = query.studio_saved.as_deref() == Some(state_label);
     let recovery_scope = recovery_scope(&sub);
@@ -870,7 +937,8 @@ pub async fn edit_form(
         expected_version: post.edit_version,
         expected_post_id: &post.id,
         client_seq,
-        history_href: &format!("/edit/{}/history", esc(&post.slug)),
+        history_href: &history_href,
+        return_to: &return_to,
         recovery_notice: &recovery_notice,
         recovery_scope: &recovery_scope,
         csrf: &csrf,
@@ -887,7 +955,7 @@ pub async fn edit_form(
         social_image_value: &editor_post.social_image,
         publish_at_value: &publish_at_value,
         pinned: editor_post.pinned,
-        cancel_href: &format!("/p/{}", esc(&post.slug)),
+        cancel_href: &cancel_href,
         delete_slug: Some(&post.slug),
     });
     Ok(private_no_store(html_with_cookie(page, set_cookie)))
@@ -903,11 +971,12 @@ pub async fn update(
     let (sub, email) = auth::require_author(&headers)?;
     auth::verify_csrf(&headers, &form.csrf_token)?;
 
-    let mut post = state
-        .store
-        .get_post_authoritative(&slug)
-        .await?
-        .ok_or_else(|| AppError::NotFound("no such post".to_string()))?;
+    let Some(mut post) = state.store.get_post_authoritative(&slug).await? else {
+        // An editor form can outlive deletion even when the slug has not been reused. Treat that
+        // exactly like every other immutable-identity loss: return only the private submission
+        // recovery surface, never a pre-CAS 404 that discards the submitted body.
+        return Ok(identity_conflict_response(&headers, &form.body));
+    };
     let submitted_post_id = form.expected_post_id.trim();
     let legacy_form = submitted_post_id.is_empty();
     // A modern form is bound to the immutable post id. Handle a replaced identity before
@@ -988,6 +1057,7 @@ pub async fn update(
                     current_version,
                     &recovery_session,
                     &form.body,
+                    &form.return_to,
                 ),
                 None => identity_conflict_response(&headers, &form.body),
             });
@@ -1013,7 +1083,7 @@ pub async fn update(
     // Re-chunk on edit (a now-draft post is de-indexed). Best-effort; never fails the update.
     crate::reindex_post(state.store.as_ref(), &post).await;
 
-    Ok(save_response(&headers, &post))
+    Ok(save_response(&headers, &post, &form.return_to))
 }
 
 /// `POST /api/writer/autosave/{slug}` — private server recovery for an existing edit session.
@@ -1107,6 +1177,7 @@ pub async fn history(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(slug): Path<String>,
+    Query(query): Query<EditorQuery>,
 ) -> Result<Response, AppError> {
     let (sub, email) = auth::require_author(&headers)?;
     let is_admin = auth::is_admin(&headers);
@@ -1125,6 +1196,8 @@ pub async fn history(
         .list_post_revisions(&post.id, crate::config::REVISION_PAGE_LIMIT)
         .await?;
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
+    let return_to = validated_return_to(query.return_to.as_deref());
+    let return_field = esc(&return_to);
     let rows = revisions
         .iter()
         .map(|revision| {
@@ -1136,6 +1209,7 @@ pub async fn history(
   <input type="hidden" name="csrf_token" value="{csrf}">
   <input type="hidden" name="expected_version" value="{version}">
   <input type="hidden" name="expected_post_id" value="{post_id}">
+  <input type="hidden" name="return_to" value="{return_to}">
   <button class="btn btn-secondary btn-sm" type="submit">Restore content</button>
 </form>"#,
                     slug = esc(&slug),
@@ -1143,6 +1217,7 @@ pub async fn history(
                     csrf = esc(&csrf),
                     version = post.edit_version,
                     post_id = esc(&post.id),
+                    return_to = return_field,
                 )
             };
             format!(
@@ -1155,13 +1230,22 @@ pub async fn history(
             )
         })
         .collect::<String>();
+    let editor_href = if return_to.is_empty() {
+        format!("/edit/{}", esc(&slug))
+    } else {
+        format!(
+            "/edit/{}?return_to={}",
+            esc(&slug),
+            crate::handlers::library::percent_encode(&return_to)
+        )
+    };
     let fragment = format!(
         r#"<main class="console console--narrow"><div class="console__head"><h1>Post history</h1><p class="sub">{title}</p></div>
-<p><a class="btn btn-ghost" href="/edit/{slug}">Back to editor</a></p>
+<p><a class="btn btn-ghost" href="{editor_href}">Back to editor</a></p>
 <section class="card"><div class="card__body"><p class="muted">Restoring recovers content and metadata while preserving the current Draft, Scheduled, or Published state, publication time, pin, and feature flags.</p>
 <div class="table-wrap"><table class="history"><thead><tr><th>Version</th><th>Title</th><th>Editor</th><th>Source</th><th>Chars</th><th>Action</th></tr></thead><tbody>{rows}</tbody></table></div></div></section></main>"#,
         title = esc(&post.title),
-        slug = esc(&slug),
+        editor_href = esc(&editor_href),
     );
     let theme = odyssey::resolve_theme(
         headers
@@ -1245,6 +1329,7 @@ pub async fn restore_revision(
                 &slug,
                 current_version,
                 "The post changed before restore. Reload history and review the newer version.",
+                &form.return_to,
             ));
         }
         SavePostOutcome::NotFound => {
@@ -1258,7 +1343,16 @@ pub async fn restore_revision(
         &slug,
         &format!("restore {revision_id} as v{}", saved.edit_version),
     ));
-    Ok(redirect(&format!("/edit/{slug}/history")))
+    let return_to = validated_return_to(Some(&form.return_to));
+    let location = if return_to.is_empty() {
+        format!("/edit/{slug}/history")
+    } else {
+        format!(
+            "/edit/{slug}/history?return_to={}",
+            crate::handlers::library::percent_encode(&return_to)
+        )
+    };
+    Ok(redirect(&location))
 }
 
 // ---------------------------------------------------------------------------
@@ -1274,18 +1368,34 @@ pub async fn delete(
 ) -> Result<Response, AppError> {
     let (sub, _email) = auth::require_author(&headers)?;
     auth::verify_csrf(&headers, &form.csrf_token)?;
-
-    let post = state
-        .store
-        .get_post_authoritative(&slug)
-        .await?
-        .ok_or_else(|| AppError::NotFound("no such post".to_string()))?;
-    if post.author_sub != sub && !auth::is_admin(&headers) {
-        return Err(AppError::Forbidden(
-            "you can only delete your own posts".to_string(),
-        ));
+    let expected_post_id = form.expected_post_id.trim();
+    let expected_version = form
+        .expected_version
+        .trim()
+        .parse::<i64>()
+        .ok()
+        .filter(|version| *version > 0);
+    if expected_post_id.is_empty() || expected_version.is_none() {
+        return Err(delete_conflict());
     }
-    state.store.delete_post(&slug).await?;
+    let scope = if auth::is_admin(&headers) {
+        DeletePostScope::Admin
+    } else {
+        DeletePostScope::Owner(sub)
+    };
+    let post = match state
+        .store
+        .delete_post_cas(DeletePostCommand {
+            slug: slug.clone(),
+            post_id: expected_post_id.to_string(),
+            expected_version: expected_version.expect("validated delete version"),
+            scope,
+        })
+        .await?
+    {
+        DeletePostOutcome::Deleted(post) => *post,
+        DeletePostOutcome::Conflict => return Err(delete_conflict()),
+    };
     tracing::info!(slug = %slug, "post deleted");
 
     let actor = if post.author_email.is_empty() {
@@ -1300,7 +1410,18 @@ pub async fn delete(
     // Drop the post's chunks from the ask index (best-effort; never fails the delete).
     crate::deindex_post(state.store.as_ref(), &slug).await;
 
-    Ok(redirect("/"))
+    let return_to = validated_return_to(Some(&form.return_to));
+    Ok(redirect(if return_to.is_empty() {
+        "/"
+    } else {
+        &return_to
+    }))
+}
+
+fn delete_conflict() -> AppError {
+    AppError::Conflict(
+        "the post identity changed; reload the current page before deleting".to_string(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1379,10 +1500,7 @@ async fn retain_conflicting_submission(
         .saturating_add(1)
         .clamp(1, JS_MAX_SAFE_INTEGER);
     for _ in 0..3 {
-        let current = state
-            .store
-            .get_post_authoritative(slug)
-            .await?;
+        let current = state.store.get_post_authoritative(slug).await?;
         let Some(current) = current else {
             return Ok(None);
         };
@@ -1428,8 +1546,17 @@ fn save_conflict_response(
     current_version: i64,
     recovery_session: &str,
     submitted_body: &str,
+    requested_return_to: &str,
 ) -> Response {
-    let recover = format!("/edit/{slug}?recover={recovery_session}");
+    let return_to = validated_return_to(Some(requested_return_to));
+    let recover = if return_to.is_empty() {
+        format!("/edit/{slug}?recover={recovery_session}")
+    } else {
+        format!(
+            "/edit/{slug}?recover={recovery_session}&return_to={}",
+            crate::handlers::library::percent_encode(&return_to)
+        )
+    };
     let accepts_json = headers
         .get(header::ACCEPT)
         .and_then(|value| value.to_str().ok())
@@ -1482,7 +1609,8 @@ fn identity_conflict_response(headers: &HeaderMap, submitted_body: &str) -> Resp
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "ok": false,
-                "conflict": true
+                "conflict": true,
+                "submitted_body": submitted_body
             })),
         )
             .into_response()
@@ -1500,12 +1628,26 @@ fn identity_conflict_response(headers: &HeaderMap, submitted_body: &str) -> Resp
     response
 }
 
-fn simple_conflict_response(slug: &str, current_version: i64, message: &str) -> Response {
+fn simple_conflict_response(
+    slug: &str,
+    current_version: i64,
+    message: &str,
+    requested_return_to: &str,
+) -> Response {
+    let return_to = validated_return_to(Some(requested_return_to));
+    let history_href = if return_to.is_empty() {
+        format!("/edit/{slug}/history")
+    } else {
+        format!(
+            "/edit/{slug}/history?return_to={}",
+            crate::handlers::library::percent_encode(&return_to)
+        )
+    };
     let html = format!(
-        r#"<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Edit conflict · Inkwell</title><body><main><h1>Edit conflict</h1><p>{message}</p><p>Current version: {version}</p><a href="/edit/{slug}/history">Reload history</a></main></body></html>"#,
+        r#"<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Edit conflict · Inkwell</title><body><main><h1>Edit conflict</h1><p>{message}</p><p>Current version: {version}</p><a href="{history_href}">Reload history</a></main></body></html>"#,
         message = esc(message),
         version = current_version,
-        slug = esc(slug),
+        history_href = esc(&history_href),
     );
     let mut response = (StatusCode::CONFLICT, Html(html)).into_response();
     response.headers_mut().insert(
@@ -1796,9 +1938,12 @@ fn publication_detail(post: &Post, now: i64) -> &'static str {
     }
 }
 
-fn save_response(headers: &HeaderMap, post: &Post) -> Response {
+fn save_response(headers: &HeaderMap, post: &Post, requested_return_to: &str) -> Response {
     let state = publication_detail(post, now_secs());
-    let redirect_to = if state == "published" {
+    let return_to = validated_return_to(Some(requested_return_to));
+    let redirect_to = if !return_to.is_empty() {
+        return_to
+    } else if state == "published" {
         format!("/p/{}", post.slug)
     } else {
         format!("/edit/{}?studio_saved={state}", post.slug)
@@ -1823,6 +1968,11 @@ fn save_response(headers: &HeaderMap, post: &Post) -> Response {
     } else {
         redirect(&redirect_to)
     }
+}
+
+fn validated_return_to(raw: Option<&str>) -> String {
+    raw.and_then(crate::handlers::library::safe_library_return_to)
+        .unwrap_or_default()
 }
 
 /// Stable non-sensitive browser-storage scope. The gateway subject never appears in HTML or in a
@@ -2003,6 +2153,7 @@ struct EditorView<'a> {
     expected_post_id: &'a str,
     client_seq: i64,
     history_href: &'a str,
+    return_to: &'a str,
     recovery_notice: &'a str,
     recovery_scope: &'a str,
     csrf: &'a str,
@@ -2059,11 +2210,17 @@ fn render_editor(v: EditorView<'_>) -> String {
   <div class="danger-zone__text"><strong>Delete this post</strong><span>Once deleted, it cannot be recovered.</span></div>
   <form class="inline-form" method="post" action="/delete/{slug}" onsubmit="return confirm('Delete this post? This cannot be undone.');">
     <input type="hidden" name="csrf_token" value="{csrf}">
+    <input type="hidden" name="expected_post_id" value="{post_id}">
+    <input type="hidden" name="expected_version" value="{version}">
+    <input type="hidden" name="return_to" value="{return_to}">
     <button class="btn btn-danger" type="submit">Delete</button>
   </form>
 </div>"#,
             slug = esc(slug),
             csrf = esc(v.csrf),
+            post_id = esc(v.expected_post_id),
+            version = v.expected_version,
+            return_to = esc(v.return_to),
         ),
         None => String::new(),
     };
@@ -2077,6 +2234,7 @@ fn render_editor(v: EditorView<'_>) -> String {
         .replace("{{EXPECTED_VERSION}}", &v.expected_version.to_string())
         .replace("{{EXPECTED_POST_ID}}", &esc(v.expected_post_id))
         .replace("{{CLIENT_SEQ}}", &v.client_seq.to_string())
+        .replace("{{RETURN_TO}}", &esc(v.return_to))
         .replace("{{HISTORY_ACTION}}", &history_action)
         .replace("{{SERVER_RECOVERY_NOTICE}}", v.recovery_notice)
         .replace("{{RECOVERY_SCOPE}}", &esc(v.recovery_scope))
@@ -2118,14 +2276,9 @@ fn render_editor(v: EditorView<'_>) -> String {
 
 /// A 303 redirect (post/redirect/get).
 fn redirect(location: &str) -> Response {
-    (
-        StatusCode::SEE_OTHER,
-        [(
-            header::LOCATION,
-            HeaderValue::from_str(location).expect("valid location"),
-        )],
-    )
-        .into_response()
+    let location =
+        HeaderValue::from_str(location).unwrap_or_else(|_| HeaderValue::from_static("/"));
+    private_no_store((StatusCode::SEE_OTHER, [(header::LOCATION, location)]).into_response())
 }
 
 /// An HTML response, optionally attaching a freshly-minted CSRF `Set-Cookie`.
@@ -2145,4 +2298,32 @@ fn private_no_store(mut response: Response) -> Response {
         HeaderValue::from_static("private, no-store"),
     );
     response
+}
+
+pub(crate) fn public_read_response(
+    mut response: Response,
+    headers: &HeaderMap,
+    viewer_sub: Option<&str>,
+    is_admin: bool,
+) -> Response {
+    // These are exactly the request fields that can change public reader HTML: Cookie selects the
+    // theme, subject controls own-draft visibility/actions, email is rendered in the top bar, and
+    // groups control admin navigation. Vary prevents a compliant shared cache from serving an
+    // anonymous URL-keyed object before an identity-bearing request reaches Inkwell.
+    response.headers_mut().insert(
+        header::VARY,
+        HeaderValue::from_static(PUBLIC_REPRESENTATION_VARY),
+    );
+    if request_is_personalized(headers, viewer_sub, is_admin) {
+        private_no_store(response)
+    } else {
+        response
+    }
+}
+
+fn request_is_personalized(headers: &HeaderMap, viewer_sub: Option<&str>, is_admin: bool) -> bool {
+    viewer_sub.is_some()
+        || auth::author_email(headers).is_some()
+        || is_admin
+        || headers.contains_key(header::COOKIE)
 }

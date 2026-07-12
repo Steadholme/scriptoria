@@ -10,9 +10,11 @@
 //! HTML in the drive's origin. Owner raw downloads and public share fetches also honor HTTP Range
 //! so browser-native image/video/audio media can stream and seek without buffering the whole blob.
 
+use std::collections::HashMap;
+
 use axum::extract::multipart::MultipartRejection;
 use axum::extract::{Multipart, Path, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Form;
 use serde::Deserialize;
@@ -28,12 +30,15 @@ use crate::handlers::{
 };
 use crate::model::{
     library_type_for, FileComment, FileRec, FolderRec, LibraryCursor, LibraryItem, LibraryItemKind,
-    LibraryQuery, LibraryType, LibraryView, UploadRequestRec, UploadSubmission, VersionRec,
+    LibraryQuery, LibraryType, LibraryView, TrashItem, UploadRequestRec, UploadSubmission,
+    VersionRec,
 };
 use crate::store::{
-    FolderDelete, UploadReserve, UploadReserveInput, DEFAULT_REQUEST_ALLOWED_TYPES,
-    DEFAULT_REQUEST_MAX_FILES, DEFAULT_REQUEST_MAX_FILE_BYTES, DEFAULT_REQUEST_MAX_TOTAL_BYTES,
-    MAX_VERSIONS_PER_FILE,
+    BulkMutation, DriveItemRef, OwnerBlobCommit, OwnerBlobWriteIntent, OwnerReuploadInput,
+    OwnerVersionRestoreInput, TrashRootInput, UploadReserve, UploadReserveInput,
+    DEFAULT_REQUEST_ALLOWED_TYPES, DEFAULT_REQUEST_MAX_FILES, DEFAULT_REQUEST_MAX_FILE_BYTES,
+    DEFAULT_REQUEST_MAX_TOTAL_BYTES, MAX_BULK_ITEMS, OWNER_WRITE_FRESH, OWNER_WRITE_REUPLOAD,
+    OWNER_WRITE_THUMBNAIL,
 };
 use crate::{now_secs, random_alnum, AppState};
 
@@ -51,6 +56,8 @@ const UPLOAD_TOKEN_LEN: usize = 32;
 const COMMENT_ID_LEN: usize = 10;
 /// Length of an immutable upload-request receipt id.
 const SUBMISSION_ID_LEN: usize = 12;
+const TRASH_ENTRY_ID_LEN: usize = 20;
+const TRASH_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 /// Hard cap on a stored display file name (characters).
 const MAX_NAME_CHARS: usize = 255;
 /// Hard cap on a submitted comment body (characters).
@@ -147,9 +154,21 @@ pub async fn gallery(
     );
 
     if q.view.as_deref().is_some_and(|view| view.trim() == "trash") {
-        let trashed = state.store.list_trashed_by_owner(&who.subject).await?;
-        let html =
-            render_trash_gallery(&state.config, &who, &csrf, &trashed, &folders, used, quota);
+        let before = parse_library_cursor(q.before.as_deref())?;
+        let page = state
+            .store
+            .query_trash(&who.subject, before.as_ref(), limit)
+            .await?;
+        let html = render_trash_gallery(TrashRender {
+            config: &state.config,
+            who: &who,
+            csrf: &csrf,
+            items: &page.items,
+            next: page.next.as_ref(),
+            folders: &folders,
+            used,
+            quota,
+        });
         return Ok(html_with_csrf(StatusCode::OK, html, &csrf));
     }
 
@@ -382,10 +401,11 @@ pub async fn upload(
     // effective quota is the per-owner override else the configured default; unlimited (the
     // pre-quota default) skips the usage read entirely, so the fast path is unchanged. Usage
     // already includes retained version blobs, so a re-upload is checked against the true total.
-    if let Some(quota) = effective_quota(
+    let owner_quota = effective_quota(
         state.store.get_quota(&who.subject).await?,
         state.config.default_quota_bytes,
-    ) {
+    );
+    if let Some(quota) = owner_quota {
         let used = state.store.usage_for_owner(&who.subject).await?;
         if used.saturating_add(size) > quota {
             tracing::info!(
@@ -418,7 +438,19 @@ pub async fn upload(
         .find_file_in_folder(&who.subject, &name, target.as_deref())
         .await?
     {
-        return reupload_as_version(&state, &who, existing, content_type, bytes, size, now).await;
+        return reupload_as_version(
+            &state,
+            &who,
+            OwnerReuploadPayload {
+                existing,
+                content_type,
+                bytes,
+                size,
+                now,
+                owner_quota,
+            },
+        )
+        .await;
     }
 
     let mut rec = FileRec {
@@ -439,30 +471,58 @@ pub async fn upload(
         // A fresh upload lands at the level it was uploaded into (root when unset).
         folder_id: target,
         trashed_at: 0,
+        trash_entry_id: None,
+        trash_ancestor_id: None,
         view_count: 0,
     };
 
-    // Reserve a unique private row BEFORE writing the blob, retrying on the rare id collision.
-    let mut reserved = false;
+    // Persist quota + cleanup authority before touching Cairn. Metadata is finalized only after the
+    // put, consuming the intent in the same transaction as the file insert.
+    let mut committed = false;
     for _ in 0..6 {
         rec.id = random_alnum(FILE_ID_LEN);
         rec.object_key = rec.id.clone();
-        if state.store.create(&rec).await? {
-            reserved = true;
-            break;
+        let intent = OwnerBlobWriteIntent {
+            object_key: rec.object_key.clone(),
+            owner_sub: rec.owner_sub.clone(),
+            size: rec.size,
+            kind: OWNER_WRITE_FRESH.to_string(),
+            file_id: rec.id.clone(),
+            folder_id: rec.folder_id.clone(),
+            expected_object_key: None,
+            created_at: now,
+            attempts: 0,
+        };
+        match state
+            .store
+            .reserve_owner_blob_write(&intent, owner_quota)
+            .await?
+        {
+            OwnerBlobCommit::Collision => continue,
+            OwnerBlobCommit::QuotaExceeded => return Err(owner_quota_error()),
+            OwnerBlobCommit::Conflict => return Err(owner_target_conflict()),
+            OwnerBlobCommit::Applied => {}
+        }
+        // A failed/partial put deliberately leaves the durable intent for startup/periodic cleanup.
+        state.blobs.put(&rec.object_key, bytes.clone()).await?;
+        match state.store.commit_owner_upload(&rec, owner_quota).await? {
+            OwnerBlobCommit::Applied => {
+                committed = true;
+                break;
+            }
+            OwnerBlobCommit::QuotaExceeded => return Err(owner_quota_error()),
+            OwnerBlobCommit::Conflict => return Err(owner_target_conflict()),
+            OwnerBlobCommit::Collision => {
+                return Err(AppError::Internal(
+                    "could not finalize a unique file id".to_string(),
+                ))
+            }
         }
     }
-    if !reserved {
+    if !committed {
         return Err(AppError::Internal(
             "could not allocate a unique file id".to_string(),
         ));
-    }
-
-    // Write the bytes; roll the metadata row back if the object store rejects them, so we never
-    // leave a row pointing at a missing blob.
-    if let Err(e) = state.blobs.put(&rec.object_key, bytes).await {
-        let _ = state.store.delete(&rec.id, &who.subject).await;
-        return Err(e.into());
     }
 
     tracing::info!(id = rec.id, owner = who.subject, size, "file uploaded");
@@ -478,87 +538,97 @@ pub async fn upload(
 /// Re-upload path: snapshot the file's CURRENT blob as a version (it stays in place under its own
 /// object key), write the new bytes to a fresh key, repoint the file, then prune the oldest
 /// versions past the cap (deleting their blobs). Quota was already checked by the caller.
-async fn reupload_as_version(
-    state: &AppState,
-    who: &Identity,
+struct OwnerReuploadPayload {
     existing: FileRec,
     content_type: String,
     bytes: Vec<u8>,
     size: i64,
     now: i64,
-) -> Result<Response, AppError> {
-    // Snapshot the current blob as a version row (retry on the rare id collision).
-    let mut snap = VersionRec {
-        id: random_alnum(VERSION_ID_LEN),
-        file_id: existing.id.clone(),
-        object_key: existing.object_key.clone(),
-        size: existing.size,
-        content_type: existing.content_type.clone(),
-        created_at: existing.created_at,
-    };
-    let mut snapped = false;
-    for _ in 0..6 {
-        if state.store.add_version(&snap).await? {
-            snapped = true;
-            break;
-        }
-        snap.id = random_alnum(VERSION_ID_LEN);
-    }
-    if !snapped {
-        return Err(AppError::Internal(
-            "could not allocate a unique version id".to_string(),
-        ));
-    }
+    owner_quota: Option<i64>,
+}
 
-    // Allocate a fresh object key for the new current blob — never an existing file's id/key.
+async fn reupload_as_version(
+    state: &AppState,
+    who: &Identity,
+    input: OwnerReuploadPayload,
+) -> Result<Response, AppError> {
+    let OwnerReuploadPayload {
+        existing,
+        content_type,
+        bytes,
+        size,
+        now,
+        owner_quota,
+    } = input;
+    // Allocate cleanup/quota authority before the put. A purge may win after this reservation; the
+    // final CAS then fails and the retained intent authorizes idempotent blob cleanup.
     let mut new_key = String::new();
     for _ in 0..6 {
-        let k = random_alnum(FILE_ID_LEN);
-        if state.store.get(&k).await?.is_none() {
-            new_key = k;
-            break;
+        let candidate = random_alnum(FILE_ID_LEN);
+        let intent = OwnerBlobWriteIntent {
+            object_key: candidate.clone(),
+            owner_sub: who.subject.clone(),
+            size,
+            kind: OWNER_WRITE_REUPLOAD.to_string(),
+            file_id: existing.id.clone(),
+            folder_id: existing.folder_id.clone(),
+            expected_object_key: Some(existing.object_key.clone()),
+            created_at: now,
+            attempts: 0,
+        };
+        match state
+            .store
+            .reserve_owner_blob_write(&intent, owner_quota)
+            .await?
+        {
+            OwnerBlobCommit::Applied => {
+                new_key = candidate;
+                break;
+            }
+            OwnerBlobCommit::Collision => continue,
+            OwnerBlobCommit::QuotaExceeded => return Err(owner_quota_error()),
+            OwnerBlobCommit::Conflict => return Err(owner_target_conflict()),
         }
     }
     if new_key.is_empty() {
-        let _ = state.store.delete_version(&snap.id, &existing.id).await;
         return Err(AppError::Internal(
             "could not allocate a unique object key".to_string(),
         ));
     }
+    state.blobs.put(&new_key, bytes).await?;
 
-    // Write the new bytes; on failure undo the snapshot row so nothing is left half-applied.
-    if let Err(e) = state.blobs.put(&new_key, bytes).await {
-        let _ = state.store.delete_version(&snap.id, &existing.id).await;
-        return Err(e.into());
+    let mut finalized = false;
+    for _ in 0..6 {
+        let snapshot_id = random_alnum(VERSION_ID_LEN);
+        match state
+            .store
+            .commit_owner_reupload(OwnerReuploadInput {
+                owner_sub: &who.subject,
+                file_id: &existing.id,
+                expected_object_key: &existing.object_key,
+                new_object_key: &new_key,
+                new_size: size,
+                new_content_type: &content_type,
+                snapshot_id: &snapshot_id,
+                changed_at: now,
+                owner_quota,
+            })
+            .await?
+        {
+            OwnerBlobCommit::Applied => {
+                finalized = true;
+                break;
+            }
+            OwnerBlobCommit::Collision => continue,
+            OwnerBlobCommit::QuotaExceeded => return Err(owner_quota_error()),
+            OwnerBlobCommit::Conflict => return Err(owner_target_conflict()),
+        }
     }
-
-    // Repoint the file to the new blob (preserves creation time and bumps owner-visible activity).
-    state
-        .store
-        .update_file_blob(
-            &existing.id,
-            &who.subject,
-            &new_key,
-            size,
-            &content_type,
-            now,
-        )
-        .await?;
-
-    // Prune the oldest versions past the cap and delete their blobs.
-    let pruned = state
-        .store
-        .prune_versions(&existing.id, MAX_VERSIONS_PER_FILE)
-        .await
-        .unwrap_or_default();
-    for v in pruned {
-        let _ = state.blobs.delete(&v.object_key).await;
+    if !finalized {
+        return Err(AppError::Internal(
+            "could not allocate a unique version id".to_string(),
+        ));
     }
-    // The old derived thumbnail (keyed off the prior object key) is now an orphan — drop it.
-    let _ = state
-        .blobs
-        .delete(&thumb_object_key(&existing.object_key))
-        .await;
 
     tracing::info!(
         id = existing.id,
@@ -573,6 +643,20 @@ async fn reupload_as_version(
         "new version",
     ));
     Ok(redirect_found(&format!("/f/{}", existing.id)))
+}
+
+fn owner_target_conflict() -> AppError {
+    AppError::Conflict(
+        "The destination or file changed while the blob was being written. Reload and try again."
+            .to_string(),
+    )
+}
+
+fn owner_quota_error() -> AppError {
+    AppError::QuotaExceeded(
+        "Your storage changed while the upload was in progress and there is no longer enough space."
+            .to_string(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -689,60 +773,46 @@ pub async fn restore_version(
     }
     let actor = auth::identity(&headers);
     let rec = owned_file(&state, &id, &actor).await?;
-    let version = state
+    state
         .store
         .get_version(&vid, &rec.id)
         .await?
         .ok_or_else(|| AppError::NotFound("No such version.".to_string()))?;
 
-    // Snapshot the CURRENT blob as a new version first, so restoring never loses history.
-    let mut snap = VersionRec {
-        id: random_alnum(VERSION_ID_LEN),
-        file_id: rec.id.clone(),
-        object_key: rec.object_key.clone(),
-        size: rec.size,
-        content_type: rec.content_type.clone(),
-        created_at: rec.created_at,
-    };
-    let mut snapped = false;
+    let changed_at = now_secs();
+    let mut restored = false;
     for _ in 0..6 {
-        if state.store.add_version(&snap).await? {
-            snapped = true;
-            break;
+        let snapshot_id = random_alnum(VERSION_ID_LEN);
+        match state
+            .store
+            .commit_owner_version_restore(OwnerVersionRestoreInput {
+                owner_sub: &actor.subject,
+                file_id: &rec.id,
+                expected_object_key: &rec.object_key,
+                version_id: &vid,
+                snapshot_id: &snapshot_id,
+                changed_at,
+            })
+            .await?
+        {
+            OwnerBlobCommit::Applied => {
+                restored = true;
+                break;
+            }
+            OwnerBlobCommit::Collision => continue,
+            OwnerBlobCommit::Conflict => return Err(owner_target_conflict()),
+            OwnerBlobCommit::QuotaExceeded => {
+                return Err(AppError::Internal(
+                    "version restore returned an impossible quota outcome".to_string(),
+                ))
+            }
         }
-        snap.id = random_alnum(VERSION_ID_LEN);
     }
-    if !snapped {
+    if !restored {
         return Err(AppError::Internal(
             "could not allocate a unique version id".to_string(),
         ));
     }
-
-    // Repoint the file at the chosen version's blob, then consume that version's row (its blob is
-    // now the current one, so do NOT delete it).
-    state
-        .store
-        .update_file_blob(
-            &rec.id,
-            &actor.subject,
-            &version.object_key,
-            version.size,
-            &version.content_type,
-            now_secs(),
-        )
-        .await?;
-    let _ = state.store.delete_version(&vid, &rec.id).await;
-
-    // Bound history + drop the stale thumbnail of the previous current blob.
-    let pruned = state
-        .store
-        .prune_versions(&rec.id, MAX_VERSIONS_PER_FILE)
-        .await
-        .unwrap_or_default();
-    for v in pruned {
-        let _ = state.blobs.delete(&v.object_key).await;
-    }
-    let _ = state.blobs.delete(&thumb_object_key(&rec.object_key)).await;
 
     tracing::info!(
         id = rec.id,
@@ -796,6 +866,196 @@ pub struct DeleteForm {
     pub csrf_token: String,
 }
 
+fn parse_bulk_form(
+    headers: &HeaderMap,
+    form: &HashMap<String, String>,
+) -> Result<(Vec<DriveItemRef>, String), AppError> {
+    let csrf = form
+        .get("csrf_token")
+        .map(String::as_str)
+        .unwrap_or_default();
+    if !auth::verify_csrf(headers, csrf) {
+        return Err(AppError::BadRequest(
+            "Your session token expired. Reload the page and try again.".to_string(),
+        ));
+    }
+    let mut items = Vec::new();
+    for key in form.keys().filter(|key| key.starts_with("item:")) {
+        let mut parts = key.splitn(3, ':');
+        let _ = parts.next();
+        let kind = match parts.next() {
+            Some("file") => LibraryItemKind::File,
+            Some("folder") => LibraryItemKind::Folder,
+            _ => {
+                return Err(AppError::BadRequest(
+                    "The selection contains an invalid item.".to_string(),
+                ))
+            }
+        };
+        let id = parts.next().unwrap_or_default();
+        if id.is_empty() || id.len() > 128 || !id.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return Err(AppError::BadRequest(
+                "The selection contains an invalid item.".to_string(),
+            ));
+        }
+        items.push(DriveItemRef {
+            kind,
+            id: id.to_string(),
+        });
+    }
+    items.sort_by(|left, right| {
+        left.kind
+            .rank()
+            .cmp(&right.kind.rank())
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    if items.is_empty() {
+        return Err(AppError::BadRequest(
+            "Select at least one item.".to_string(),
+        ));
+    }
+    if items.len() > MAX_BULK_ITEMS {
+        return Err(AppError::BadRequest(format!(
+            "Select at most {MAX_BULK_ITEMS} items at a time."
+        )));
+    }
+    let return_to = match form.get("return_to").map(String::as_str) {
+        None => "/",
+        Some(value)
+            if (value == "/" || value.starts_with("/?"))
+                && value.is_ascii()
+                && !value.bytes().any(|byte| byte.is_ascii_control())
+                && HeaderValue::from_str(value).is_ok() =>
+        {
+            value
+        }
+        Some(_) => {
+            return Err(AppError::BadRequest(
+                "The return location is invalid.".to_string(),
+            ))
+        }
+    }
+    .to_string();
+    Ok((items, return_to))
+}
+
+fn require_bulk_applied(result: BulkMutation) -> Result<usize, AppError> {
+    match result {
+        BulkMutation::Applied { changed } => Ok(changed),
+        BulkMutation::Conflict => Err(AppError::Conflict(
+            "One or more selected items changed. Reload and try again.".to_string(),
+        )),
+    }
+}
+
+pub async fn bulk_trash(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    let (items, return_to) = parse_bulk_form(&headers, &form)?;
+    let actor = auth::identity(&headers);
+    let now = now_secs();
+    let roots: Vec<TrashRootInput> = items
+        .iter()
+        .cloned()
+        .map(|item| TrashRootInput {
+            item,
+            entry_id: random_alnum(TRASH_ENTRY_ID_LEN),
+        })
+        .collect();
+    let changed = require_bulk_applied(
+        state
+            .store
+            .bulk_trash(
+                &actor.subject,
+                &roots,
+                now,
+                now.saturating_add(TRASH_RETENTION_SECS),
+            )
+            .await?,
+    )?;
+    state.audit.emit(AuditEvent::notice(
+        "drive.bulk.trash",
+        &actor.subject,
+        "selection",
+        &format!("{changed} roots"),
+    ));
+    Ok(redirect_found(&return_to))
+}
+
+pub async fn bulk_restore(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    let (items, return_to) = parse_bulk_form(&headers, &form)?;
+    let actor = auth::identity(&headers);
+    let changed = require_bulk_applied(state.store.bulk_restore(&actor.subject, &items).await?)?;
+    state.audit.emit(AuditEvent::notice(
+        "drive.bulk.restore",
+        &actor.subject,
+        "selection",
+        &format!("{changed} roots"),
+    ));
+    Ok(redirect_found(&return_to))
+}
+
+pub async fn bulk_move(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    let (items, return_to) = parse_bulk_form(&headers, &form)?;
+    let actor = auth::identity(&headers);
+    let destination = form
+        .get("folder_id")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let changed = require_bulk_applied(
+        state
+            .store
+            .bulk_move(&actor.subject, &items, destination)
+            .await?,
+    )?;
+    state.audit.emit(AuditEvent::notice(
+        "drive.bulk.move",
+        &actor.subject,
+        "selection",
+        &format!("{changed} roots"),
+    ));
+    Ok(redirect_found(&return_to))
+}
+
+pub async fn bulk_purge(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    let (items, return_to) = parse_bulk_form(&headers, &form)?;
+    let actor = auth::identity(&headers);
+    let changed = require_bulk_applied(
+        state
+            .store
+            .bulk_purge(&actor.subject, &items, now_secs())
+            .await?,
+    )?;
+    if let Err(error) =
+        crate::drain_trash_lifecycle_once(state.store.as_ref(), state.blobs.as_ref(), now_secs())
+            .await
+    {
+        tracing::warn!(%error, "logical purge committed; object cleanup remains queued");
+    }
+    state.audit.emit(AuditEvent::warning(
+        "drive.bulk.purge",
+        &actor.subject,
+        "selection",
+        &format!("{changed} roots"),
+    ));
+    Ok(redirect_found(&return_to))
+}
+
 /// `POST /delete/{id}` — CSRF-checked, ownership-scoped soft delete, then 302 to `/`.
 pub async fn delete(
     State(state): State<AppState>,
@@ -811,10 +1071,24 @@ pub async fn delete(
     let actor = auth::identity(&headers);
     let rec = owned_file(&state, &id, &actor).await?;
 
-    state
-        .store
-        .trash_file(&rec.id, &actor.subject, now_secs())
-        .await?;
+    let now = now_secs();
+    require_bulk_applied(
+        state
+            .store
+            .bulk_trash(
+                &actor.subject,
+                &[TrashRootInput {
+                    item: DriveItemRef {
+                        kind: LibraryItemKind::File,
+                        id: rec.id.clone(),
+                    },
+                    entry_id: random_alnum(TRASH_ENTRY_ID_LEN),
+                }],
+                now,
+                now.saturating_add(TRASH_RETENTION_SECS),
+            )
+            .await?,
+    )?;
     tracing::info!(id = rec.id, owner = actor.subject, "file moved to trash");
     state.audit.emit(AuditEvent::notice(
         "file.trash",
@@ -905,7 +1179,18 @@ pub async fn restore_trashed(
     }
     let actor = auth::identity(&headers);
     let rec = owned_trashed_file(&state, &id, &actor).await?;
-    state.store.restore_file(&rec.id, &actor.subject).await?;
+    require_bulk_applied(
+        state
+            .store
+            .bulk_restore(
+                &actor.subject,
+                &[DriveItemRef {
+                    kind: LibraryItemKind::File,
+                    id: rec.id.clone(),
+                }],
+            )
+            .await?,
+    )?;
     tracing::info!(
         id = rec.id,
         owner = actor.subject,
@@ -937,16 +1222,24 @@ pub async fn purge_trashed(
     }
     let actor = auth::identity(&headers);
     let rec = owned_trashed_file(&state, &id, &actor).await?;
-    let versions = state.store.delete_versions_for_file(&rec.id).await?;
-    state.store.delete_comments_for_file(&rec.id).await?;
-    state.store.delete(&rec.id, &actor.subject).await?;
-    if let Err(e) = state.blobs.delete(&rec.object_key).await {
-        tracing::warn!(id = rec.id, error = %e, "metadata purged but blob delete failed (orphan)");
-    }
-    let _ = state.blobs.delete(&thumb_object_key(&rec.object_key)).await;
-    for v in versions {
-        let _ = state.blobs.delete(&v.object_key).await;
-        let _ = state.blobs.delete(&thumb_object_key(&v.object_key)).await;
+    require_bulk_applied(
+        state
+            .store
+            .bulk_purge(
+                &actor.subject,
+                &[DriveItemRef {
+                    kind: LibraryItemKind::File,
+                    id: rec.id.clone(),
+                }],
+                now_secs(),
+            )
+            .await?,
+    )?;
+    if let Err(error) =
+        crate::drain_trash_lifecycle_once(state.store.as_ref(), state.blobs.as_ref(), now_secs())
+            .await
+    {
+        tracing::warn!(%error, "logical purge committed; object cleanup remains queued");
     }
     tracing::info!(id = rec.id, owner = actor.subject, "trashed file purged");
     state.audit.emit(AuditEvent::warning(
@@ -1090,6 +1383,12 @@ fn share_room_response(result: Result<Response, AppError>) -> Response {
                     StatusCode::FORBIDDEN,
                     "Access denied",
                     "This capability does not grant access to that item.".to_string(),
+                ),
+                AppError::Conflict(_) => (
+                    StatusCode::CONFLICT,
+                    "Request changed",
+                    "This request changed while it was being processed. Reload and try again."
+                        .to_string(),
                 ),
                 AppError::NotFound(_) => (
                     StatusCode::NOT_FOUND,
@@ -1509,6 +1808,8 @@ async fn upload_inbox_submit_inner(
         share_password_hash: None,
         folder_id: Some(request.folder_id.clone()),
         trashed_at: 0,
+        trash_entry_id: None,
+        trash_ancestor_id: None,
         view_count: 0,
     };
 
@@ -1699,6 +2000,13 @@ async fn load_upload_request(state: &AppState, token: &str) -> Result<UploadRequ
             "This upload request is closed or expired.".to_string(),
         ));
     }
+    state
+        .store
+        .get_folder(&request.folder_id, &request.owner_sub)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound("This upload link is invalid or has been removed.".to_string())
+        })?;
     Ok(request)
 }
 
@@ -1814,7 +2122,7 @@ async fn shared_folder_file(
         .await?
         .filter(|f| {
             f.owner_sub == folder.owner_sub
-                && f.trashed_at == 0
+                && f.is_effectively_live()
                 && f.folder_id.as_deref() == Some(&folder.id)
         })
         .ok_or_else(|| AppError::NotFound("No such file in this shared folder.".to_string()))?;
@@ -2091,6 +2399,9 @@ pub async fn create_folder(
         expires_at: None,
         share_password_hash: None,
         upload_token: None,
+        trashed_at: 0,
+        trash_entry_id: None,
+        trash_ancestor_id: None,
     };
     // Reserve a unique folder id, retrying on the rare collision.
     let mut created = false;
@@ -2149,11 +2460,9 @@ pub async fn rename_folder(
     Ok(redirect_found(&format!("/?folder={id}")))
 }
 
-/// `POST /folders/{id}/delete` — delete an owner's folder, then 302 to its parent level. Without
-/// `cascade` the delete succeeds only when the folder is EMPTY (no subfolders, no files) — a
-/// non-empty folder is refused with a 400 pointing at the cascade option. With `cascade=1` the
-/// whole subtree (descendant folders + their files + version blobs) is removed. CSRF-checked,
-/// owner-scoped.
+/// `POST /folders/{id}/delete` — compatibility alias that now moves an owner's whole folder
+/// subtree to Trash. The historical `cascade` field is accepted but no longer bypasses recovery;
+/// permanent deletion exists only on the explicit Trash surface.
 pub async fn delete_folder(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2177,54 +2486,33 @@ pub async fn delete_folder(
         None => "/".to_string(),
     };
 
-    let cascade = matches!(form.cascade.trim(), "1" | "true" | "on" | "yes");
-    if cascade {
-        // Remove the subtree; drop every freed blob (and its derived thumbnail) best-effort.
-        let keys = state
+    let _legacy_cascade = &form.cascade;
+    let now = now_secs();
+    require_bulk_applied(
+        state
             .store
-            .delete_folder_cascade(&id, &actor.subject)
-            .await?;
-        for key in &keys {
-            let _ = state.blobs.delete(key).await;
-            let _ = state.blobs.delete(&thumb_object_key(key)).await;
-        }
-        tracing::info!(
-            id,
-            owner = actor.subject,
-            blobs = keys.len(),
-            "folder cascade-deleted"
-        );
-        state.audit.emit(AuditEvent::warning(
-            "folder.delete.cascade",
-            &actor.subject,
-            &id,
-            "folder subtree",
-        ));
-        return Ok(redirect_found(&up));
-    }
-
-    match state
-        .store
-        .delete_folder_if_empty(&id, &actor.subject)
-        .await?
-    {
-        FolderDelete::Deleted => {
-            tracing::info!(id, owner = actor.subject, "empty folder deleted");
-            state.audit.emit(AuditEvent::notice(
-                "folder.delete",
+            .bulk_trash(
                 &actor.subject,
-                &id,
-                "folder",
-            ));
-            Ok(redirect_found(&up))
-        }
-        FolderDelete::NotEmpty => Err(AppError::BadRequest(
-            "This folder isn't empty. Move or delete its contents first, or use \"Delete \
-             everything\" to remove the folder and everything inside it."
-                .to_string(),
-        )),
-        FolderDelete::NotFound => Err(AppError::NotFound("No such folder.".to_string())),
-    }
+                &[TrashRootInput {
+                    item: DriveItemRef {
+                        kind: LibraryItemKind::Folder,
+                        id: id.clone(),
+                    },
+                    entry_id: random_alnum(TRASH_ENTRY_ID_LEN),
+                }],
+                now,
+                now.saturating_add(TRASH_RETENTION_SECS),
+            )
+            .await?,
+    )?;
+    tracing::info!(id, owner = actor.subject, "folder moved to trash");
+    state.audit.emit(AuditEvent::notice(
+        "folder.trash",
+        &actor.subject,
+        &id,
+        "folder subtree",
+    ));
+    Ok(redirect_found(&up))
 }
 
 // ---------------------------------------------------------------------------
@@ -2642,7 +2930,7 @@ async fn owned_file(state: &AppState, id: &str, who: &Identity) -> Result<FileRe
             "You can only access your own files.".to_string(),
         ));
     }
-    if rec.trashed_at != 0 {
+    if !rec.is_effectively_live() {
         return Err(AppError::NotFound(
             "No file exists at that link.".to_string(),
         ));
@@ -2666,7 +2954,7 @@ async fn owned_trashed_file(
             "You can only access your own files.".to_string(),
         ));
     }
-    if rec.trashed_at == 0 {
+    if rec.trashed_at == 0 || rec.trash_entry_id.is_none() || rec.trash_ancestor_id.is_some() {
         return Err(AppError::NotFound(
             "No trashed file exists at that link.".to_string(),
         ));
@@ -2873,9 +3161,45 @@ async fn serve_thumb(state: &AppState, rec: &FileRec) -> Response {
         Ok(bytes) => bytes,
         Err(_) => {
             let generated = render_type_thumb(&rec.content_type, &rec.name).into_bytes();
-            // Best-effort cache; a write failure just means the next request regenerates (still ok).
-            if let Err(e) = state.blobs.put(&key, generated.clone()).await {
-                tracing::warn!(id = rec.id, error = %e, "thumbnail cache write failed (will regenerate)");
+            let intent = OwnerBlobWriteIntent {
+                object_key: key.clone(),
+                owner_sub: rec.owner_sub.clone(),
+                size: generated.len() as i64,
+                kind: OWNER_WRITE_THUMBNAIL.to_string(),
+                file_id: rec.id.clone(),
+                folder_id: rec.folder_id.clone(),
+                expected_object_key: Some(rec.object_key.clone()),
+                created_at: now_secs(),
+                attempts: 0,
+            };
+            if matches!(
+                state.store.reserve_owner_blob_write(&intent, None).await,
+                Ok(OwnerBlobCommit::Applied)
+            ) {
+                match state.blobs.put(&key, generated.clone()).await {
+                    Ok(()) => {
+                        if !matches!(
+                            state
+                                .store
+                                .finalize_owner_thumbnail(
+                                    &key,
+                                    &rec.owner_sub,
+                                    &rec.id,
+                                    &rec.object_key,
+                                )
+                                .await,
+                            Ok(OwnerBlobCommit::Applied)
+                        ) {
+                            tracing::warn!(
+                                id = rec.id,
+                                "thumbnail finalize lost its file CAS; cleanup intent retained"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(id = rec.id, error = %e, "thumbnail cache write failed; cleanup intent retained");
+                    }
+                }
             }
             generated
         }
@@ -2989,11 +3313,11 @@ pub(crate) fn html_with_csrf(status: StatusCode, html: String, csrf: &str) -> Re
 
 /// A `302 Found` redirect to `location` (the spec'd create/delete response code).
 pub(crate) fn redirect_found(location: &str) -> Response {
-    (
-        StatusCode::FOUND,
-        [(header::LOCATION, location.to_string())],
-    )
-        .into_response()
+    let mut response = StatusCode::FOUND.into_response();
+    let location =
+        HeaderValue::from_str(location).unwrap_or_else(|_| HeaderValue::from_static("/"));
+    response.headers_mut().insert(header::LOCATION, location);
+    response
 }
 
 /// Uppercase file extension label for the non-image card/preview glyph (e.g. `PDF`, `ZIP`).
@@ -3096,6 +3420,7 @@ fn render_folder_tiles(children: &[&FolderRec], up_href: Option<&str>) -> String
         }
         out.push_str(&format!(
             "<li class=\"folder-tile file-card file-card--folder\">\
+               <label class=\"ap-select\" title=\"Select {name}\"><span class=\"sr-only\">Select {name}</span><input type=\"checkbox\" name=\"item:folder:{id}\" value=\"1\" form=\"bulkSelection\" data-bulk-item></label>\
                <a class=\"file-card__link\" href=\"{href}\">\
                  <span class=\"thumb thumb--folder\">{FOLDER_SVG}</span>\
                </a>\
@@ -3105,6 +3430,7 @@ fn render_folder_tiles(children: &[&FolderRec], up_href: Option<&str>) -> String
                </div>\
              </li>",
             href = esc(&href),
+            id = esc(&f.id),
             name = esc(&f.name),
             badges = badges,
             FOLDER_SVG = FOLDER_SVG,
@@ -3259,6 +3585,7 @@ fn render_library_cards(items: &[LibraryItem], folders: &[FolderRec]) -> String 
             match item.kind {
                 LibraryItemKind::Folder => format!(
                     "<li class=\"file-card file-card--folder ap-library-item\">\
+                       <label class=\"ap-select\" title=\"Select {name}\"><span class=\"sr-only\">Select {name}</span><input type=\"checkbox\" name=\"item:folder:{id}\" value=\"1\" form=\"bulkSelection\" data-bulk-item></label>\
                        <a class=\"file-card__link\" href=\"/?folder={id}\"><span class=\"thumb thumb--folder\">{folder_svg}</span></a>\
                        <div class=\"file-card__body\">\
                          <div class=\"ap-name-row\"><a class=\"file-card__name\" href=\"/?folder={id}\" title=\"{name}\">{name}</a></div>\
@@ -3293,6 +3620,7 @@ fn render_library_cards(items: &[LibraryItem], folders: &[FolderRec]) -> String 
                     };
                     format!(
                         "<li class=\"file-card file-card--{file_type} ap-library-item\" data-file-id=\"{id}\">\
+                           <label class=\"ap-select\" title=\"Select {name}\"><span class=\"sr-only\">Select {name}</span><input type=\"checkbox\" name=\"item:file:{id}\" value=\"1\" form=\"bulkSelection\" data-bulk-item></label>\
                            <a class=\"file-card__link\" href=\"/f/{id}\" data-wire-off>{thumb}</a>\
                            <div class=\"file-card__body\">\
                              <div class=\"ap-name-row\"><span class=\"ap-glyph {tone}\">{ext}</span><a class=\"file-card__name\" href=\"/f/{id}\" title=\"{name}\">{name}</a></div>\
@@ -3384,7 +3712,16 @@ fn render_library_gallery(input: LibraryRender<'_>) -> String {
         )
         .replace(
             "{{LIBRARY_CONTROLS}}",
-            &render_library_controls(input.query),
+            &format!(
+                "{}{}",
+                render_library_controls(input.query),
+                render_bulk_controls(
+                    input.csrf,
+                    input.folders,
+                    false,
+                    &library_href(input.query, input.query.before.as_ref()).replace("&amp;", "&")
+                )
+            ),
         )
         .replace("{{BREADCRUMB}}", &breadcrumb)
         .replace("{{FOLDERS_SECTION}}", "")
@@ -3484,7 +3821,21 @@ fn render_gallery(
             "{{SIDEBAR}}",
             &render_sidebar(config, csrf, folders, active, false, None),
         )
-        .replace("{{LIBRARY_CONTROLS}}", &render_library_controls(&controls))
+        .replace(
+            "{{LIBRARY_CONTROLS}}",
+            &format!(
+                "{}{}",
+                render_library_controls(&controls),
+                render_bulk_controls(
+                    csrf,
+                    folders,
+                    false,
+                    &active
+                        .map(|folder| format!("/?folder={}", folder.id))
+                        .unwrap_or_else(|| "/".to_string())
+                )
+            ),
+        )
         .replace("{{BREADCRUMB}}", &breadcrumb)
         .replace("{{FOLDERS_SECTION}}", &folder_section)
         .replace("{{ITEMS_LABEL}}", "Files")
@@ -3518,24 +3869,74 @@ fn render_upload_form(csrf: &str, folder_id: &str) -> String {
     )
 }
 
-fn render_trash_gallery(
-    config: &Config,
-    who: &Identity,
+fn render_bulk_controls(
     csrf: &str,
-    files: &[FileRec],
     folders: &[FolderRec],
+    trash_mode: bool,
+    return_to: &str,
+) -> String {
+    let options = std::iter::once("<option value=\"\">My Drive</option>".to_string())
+        .chain(folders.iter().map(|folder| {
+            format!(
+                "<option value=\"{}\">{}</option>",
+                esc(&folder.id),
+                esc(&folder.name)
+            )
+        }))
+        .collect::<String>();
+    let actions = if trash_mode {
+        "<button class=\"btn btn-secondary btn-sm\" type=\"submit\" formaction=\"/trash/restore\">Restore</button>\
+         <button class=\"btn btn-danger btn-sm\" type=\"submit\" formaction=\"/trash/purge\" \
+           onclick=\"return confirm('Delete the selected items forever? This cannot be undone.');\">Delete forever</button>"
+            .to_string()
+    } else {
+        format!(
+            "<label class=\"ap-bulk__destination\"><span>Move to</span><select name=\"folder_id\">{options}</select></label>\
+             <button class=\"btn btn-secondary btn-sm\" type=\"submit\" formaction=\"/items/move\">Move</button>\
+             <button class=\"btn btn-danger btn-sm\" type=\"submit\" formaction=\"/items/trash\" \
+               onclick=\"return confirm('Move the selected items to Trash?');\">Move to Trash</button>"
+        )
+    };
+    format!(
+        "<form class=\"ap-bulk\" id=\"bulkSelection\" method=\"post\" action=\"{default_action}\" data-bulk-form>\
+           <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+           <input type=\"hidden\" name=\"return_to\" value=\"{return_to}\">\
+           <button class=\"btn btn-ghost btn-sm ap-bulk__all\" type=\"button\" data-bulk-select-all>Select this page</button>\
+           <span class=\"ap-bulk__count\" data-bulk-count aria-live=\"polite\">Select items to act</span>\
+           <div class=\"ap-bulk__actions\">{actions}</div>\
+         </form>",
+        default_action = if trash_mode {
+            "/trash/restore"
+        } else {
+            "/items/move"
+        },
+        csrf = esc(csrf),
+        return_to = esc(return_to),
+        actions = actions,
+    )
+}
+
+struct TrashRender<'a> {
+    config: &'a Config,
+    who: &'a Identity,
+    csrf: &'a str,
+    items: &'a [TrashItem],
+    next: Option<&'a LibraryCursor>,
+    folders: &'a [FolderRec],
     used: i64,
     quota: Option<i64>,
-) -> String {
-    let count = match files.len() {
+}
+
+fn render_trash_gallery(input: TrashRender<'_>) -> String {
+    let count = match input.items.len() {
         0 => "Trash is empty".to_string(),
-        1 => "1 trashed file".to_string(),
-        n => format!("{n} trashed files"),
+        1 => "1 trashed item".to_string(),
+        n => format!("{n} trashed items shown"),
     };
-    let cards = if files.is_empty() {
+    let cards = if input.items.is_empty() {
         "<li class=\"file-card file-card--empty ap-empty ap-empty--trash\"><div class=\"ap-empty__art\" aria-hidden=\"true\"></div><h3>Trash is empty.</h3><p>Deleted files stay here until purged.</p></li>".to_string()
     } else {
-        render_trash_cards(files, csrf)
+        render_trash_cards(input.items, input.csrf)
     };
     let breadcrumb =
         "<nav class=\"breadcrumb\" aria-label=\"Folder path\"><a class=\"breadcrumb__crumb\" href=\"/\">My Drive</a><span class=\"breadcrumb__sep\" aria-hidden=\"true\">&rsaquo;</span><span class=\"breadcrumb__here\">Trash</span></nav>";
@@ -3550,56 +3951,100 @@ fn render_trash_gallery(
         .replace("{{CSS}}", app_css())
         .replace("{{DYNAMIC}}", dynamic_js())
         .replace("{{SHIELD}}", SHIELD_SVG)
-        .replace("{{USERBOX}}", &userbox("Drive", Some(&who.email)))
-        .replace("{{USAGE}}", &render_usage_meter(used, quota))
+        .replace("{{USERBOX}}", &userbox("Drive", Some(&input.who.email)))
+        .replace("{{USAGE}}", &render_usage_meter(input.used, input.quota))
         .replace("{{UPLOAD}}", "")
         .replace(
             "{{SIDEBAR}}",
-            &render_sidebar(config, csrf, folders, None, true, None),
+            &render_sidebar(input.config, input.csrf, input.folders, None, true, None),
         )
-        .replace("{{LIBRARY_CONTROLS}}", &render_library_controls(&controls))
+        .replace(
+            "{{LIBRARY_CONTROLS}}",
+            &format!(
+                "{}{}",
+                render_library_controls(&controls),
+                render_bulk_controls(input.csrf, input.folders, true, "/?view=trash")
+            ),
+        )
         .replace("{{BREADCRUMB}}", breadcrumb)
         .replace("{{FOLDERS_SECTION}}", "")
         .replace("{{ITEMS_LABEL}}", "Files")
         .replace("{{COUNT}}", &esc(&count))
         .replace("{{CARDS}}", &cards)
-        .replace("{{PAGER}}", "")
+        .replace(
+            "{{PAGER}}",
+            &input
+                .next
+                .map(|cursor| {
+                    format!(
+                        "<nav class=\"gallery-pager\" aria-label=\"Trash results\"><a class=\"btn btn-ghost\" href=\"/?view=trash&amp;before={}_{}_{}\">Load older</a></nav>",
+                        cursor.updated_at,
+                        cursor.kind.slug(),
+                        esc(&cursor.id)
+                    )
+                })
+                .unwrap_or_default(),
+        )
 }
 
-fn render_trash_cards(files: &[FileRec], csrf: &str) -> String {
-    files
+fn render_trash_cards(items: &[TrashItem], csrf: &str) -> String {
+    items
         .iter()
-        .map(|f| {
-            let tone = ap_tone_class(&f.content_type);
-            let deleted = fmt_ts(f.trashed_at);
+        .map(|item| {
+            let tone = item
+                .content_type
+                .as_deref()
+                .map(ap_tone_class)
+                .unwrap_or("ap-tone-folder");
+            let deleted = fmt_ts(item.trashed_at);
+            let purge = fmt_ts(item.purge_after);
+            let glyph = if item.kind == LibraryItemKind::Folder {
+                FOLDER_SVG
+            } else {
+                FILE_SVG
+            };
+            let ext = if item.kind == LibraryItemKind::Folder {
+                "Folder".to_string()
+            } else {
+                ext_label(&item.name)
+            };
+            let size = item.size.map(human_size).unwrap_or_else(|| "Folder".to_string());
+            let kind = item.kind.slug();
             format!(
                 "<li class=\"file-card file-card--trash\" id=\"file-{id}\">\
+                   <label class=\"ap-select\" title=\"Select {name}\"><span class=\"sr-only\">Select {name}</span><input type=\"checkbox\" name=\"item:{kind}:{id}\" value=\"1\" form=\"bulkSelection\" data-bulk-item></label>\
                    <div class=\"thumb thumb--file {tone}\">{glyph}<span class=\"thumb__ext {tone}\">{ext}</span></div>\
                    <div class=\"file-card__body\">\
                      <span class=\"file-card__name\" title=\"{name}\">{name}</span>\
-                     <div class=\"file-card__meta\"><span>{size}</span><span>Deleted <time class=\"ap-date\" data-spark-reltime data-ts=\"{deleted_ts}\" title=\"{deleted}\">{deleted}</time></span></div>\
+                     <div class=\"file-card__meta\"><span>{size}</span><span>Deleted <time class=\"ap-date\" data-spark-reltime data-ts=\"{deleted_ts}\" title=\"{deleted}\">{deleted}</time></span><span title=\"Delete forever after {purge}\">30-day recovery</span></div>\
                      <div class=\"trash-actions\">\
-                       <form method=\"post\" action=\"/trash/{id}/restore\" data-wire data-wire-target=\"#file-{id}\" data-wire-swap=\"delete\" data-wire-optimistic data-wire-ok=\"Restored\" data-wire-err=\"Action failed — please retry\">\
+                       <form method=\"post\" action=\"/trash/restore\">\
                          <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+                         <input type=\"hidden\" name=\"return_to\" value=\"/?view=trash\">\
+                         <input type=\"hidden\" name=\"item:{kind}:{id}\" value=\"1\">\
                          <button class=\"btn btn-secondary btn-sm\" type=\"submit\">Restore</button>\
                        </form>\
-                       <form method=\"post\" action=\"/trash/{id}/purge\" \
-                         onsubmit=\"return confirm('Delete this file forever? This cannot be undone.');\">\
+                       <form method=\"post\" action=\"/trash/purge\" \
+                         onsubmit=\"return confirm('Delete this item forever? This cannot be undone.');\">\
                          <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+                         <input type=\"hidden\" name=\"return_to\" value=\"/?view=trash\">\
+                         <input type=\"hidden\" name=\"item:{kind}:{id}\" value=\"1\">\
                          <button class=\"btn btn-danger btn-sm\" type=\"submit\">Delete forever</button>\
                        </form>\
                      </div>\
                    </div>\
                  </li>",
-                glyph = FILE_SVG,
-                ext = esc(&ext_label(&f.name)),
+                glyph = glyph,
+                ext = esc(&ext),
                 tone = tone,
-                id = esc(&f.id),
+                kind = kind,
+                id = esc(&item.id),
                 csrf = esc(csrf),
-                name = esc(&f.name),
-                size = esc(&human_size(f.size)),
+                name = esc(&item.name),
+                size = esc(&size),
                 deleted = esc(&deleted),
-                deleted_ts = f.trashed_at,
+                deleted_ts = item.trashed_at,
+                purge = esc(&purge),
             )
         })
         .collect::<Vec<_>>()
@@ -4003,6 +4448,7 @@ fn render_cards(files: &[FileRec], csrf: &str) -> String {
             );
             format!(
                 "<li class=\"file-card file-card--{kind}{media_class}\" id=\"file-{id}\" data-file-id=\"{id}\"{preview_attrs}>\
+                   <label class=\"ap-select\" title=\"Select {name}\"><span class=\"sr-only\">Select {name}</span><input type=\"checkbox\" name=\"item:file:{id}\" value=\"1\" form=\"bulkSelection\" data-bulk-item></label>\
                    <a class=\"file-card__link\" href=\"/f/{id}\" data-wire-off>{thumb}</a>\
                    <div class=\"file-card__body\">\
                      <div class=\"ap-name-row\"><span class=\"ap-glyph {tone}\" aria-hidden=\"true\">{ext}</span><a class=\"file-card__name\" href=\"/f/{id}\" title=\"{name}\" data-file-name>{name}</a></div>\
@@ -4672,6 +5118,13 @@ mod tests {
         assert_eq!(ext_label("archive.tar.gz"), "GZ");
         assert_eq!(ext_label("noext"), "FILE");
         assert_eq!(ext_label("weird.name!"), "FILE");
+    }
+
+    #[test]
+    fn redirect_found_falls_back_instead_of_panicking_on_invalid_header_input() {
+        let response = redirect_found("/?ok=1\nlocation: https://evil.example");
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/");
     }
 
     #[test]

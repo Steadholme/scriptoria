@@ -51,6 +51,11 @@ async fn ask_retrieves_with_citations_and_excludes_drafts() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "private, no-store",
+        "the rendered CSRF token is never shared"
+    );
     let set_cookie = resp
         .headers()
         .get(header::SET_COOKIE)
@@ -123,6 +128,42 @@ async fn ask_retrieves_with_citations_and_excludes_drafts() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "blank question rejected");
+}
+
+#[tokio::test]
+async fn ask_get_post_and_errors_are_always_private_no_store() {
+    let state = build_dev_state();
+    let get_response = app(state.clone())
+        .oneshot(get_auth("/ask", "u_alice", "alice@hf"))
+        .await
+        .unwrap();
+    assert_eq!(get_response.status(), StatusCode::OK);
+    assert!(get_response.headers().get(header::SET_COOKIE).is_some());
+    assert_eq!(
+        get_response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "private, no-store"
+    );
+
+    let body = form(&[("question", "anything public"), ("csrf_token", CSRF)]);
+    let post_response = app(state.clone())
+        .oneshot(post_csrf("/api/ask", &body, Some(("u_alice", "alice@hf"))))
+        .await
+        .unwrap();
+    assert_eq!(post_response.status(), StatusCode::OK);
+    assert_eq!(
+        post_response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "private, no-store"
+    );
+
+    let unauthorized = app(state)
+        .oneshot(post_csrf("/api/ask", &body, None))
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        unauthorized.headers().get(header::CACHE_CONTROL).unwrap(),
+        "private, no-store"
+    );
 }
 
 #[tokio::test]

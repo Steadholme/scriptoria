@@ -66,6 +66,13 @@ pub struct FileRec {
     /// Soft-delete marker, epoch seconds. `0` means live; a positive value means the file is in the
     /// owner's trash. Trashed files stay in storage (and quota usage) until purged.
     pub trashed_at: i64,
+    /// Durable root entry when this file was explicitly moved to Trash. `None` for live files and
+    /// for files hidden only because an ancestor folder is in Trash.
+    pub trash_entry_id: Option<String>,
+    /// The nearest independently-trashed ancestor folder that currently hides this file. Keeping
+    /// this separate from `trash_entry_id` lets restoring an outer folder preserve nested items
+    /// that had already been trashed on their own.
+    pub trash_ancestor_id: Option<String>,
     /// Public landing-page open count. Only `/s/{token}/view` increments this; direct blob fetches
     /// remain byte-for-byte compatible and do not count views.
     pub view_count: i64,
@@ -155,6 +162,71 @@ pub struct FolderRec {
     /// Unguessable public upload-inbox token (`/u/{token}`) for anonymous uploads into this folder.
     /// `None` means the upload inbox is disabled/revoked.
     pub upload_token: Option<String>,
+    /// Epoch seconds when this folder was explicitly moved to Trash; `0` while it is not a Trash
+    /// root. Descendants inherit visibility through `trash_ancestor_id` instead of becoming roots.
+    pub trashed_at: i64,
+    /// Durable root entry when this folder was explicitly moved to Trash.
+    pub trash_entry_id: Option<String>,
+    /// The independently-trashed ancestor folder that currently hides this folder.
+    pub trash_ancestor_id: Option<String>,
+}
+
+impl FileRec {
+    /// Whether the file is reachable from normal owner and capability surfaces.
+    pub fn is_effectively_live(&self) -> bool {
+        self.trashed_at == 0 && self.trash_entry_id.is_none() && self.trash_ancestor_id.is_none()
+    }
+}
+
+impl FolderRec {
+    /// Whether the folder is reachable from normal owner and capability surfaces.
+    pub fn is_effectively_live(&self) -> bool {
+        self.trashed_at == 0 && self.trash_entry_id.is_none() && self.trash_ancestor_id.is_none()
+    }
+}
+
+/// One explicitly-trashed root. Descendants are hidden by `trash_ancestor_id`; they do not create
+/// duplicate rows in the Trash view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrashEntry {
+    pub id: String,
+    pub owner_sub: String,
+    pub kind: LibraryItemKind,
+    pub item_id: String,
+    pub trashed_at: i64,
+    pub purge_after: i64,
+    pub recovery_lease: Option<String>,
+    pub recovery_leased_at: Option<i64>,
+}
+
+/// Owner-facing projection for a single Trash root. It intentionally contains no capability
+/// token, object key, or password material.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrashItem {
+    pub entry_id: String,
+    pub kind: LibraryItemKind,
+    pub id: String,
+    pub name: String,
+    pub content_type: Option<String>,
+    pub size: Option<i64>,
+    pub trashed_at: i64,
+    pub purge_after: i64,
+}
+
+impl TrashItem {
+    pub fn cursor(&self) -> LibraryCursor {
+        LibraryCursor {
+            updated_at: self.trashed_at,
+            kind: self.kind,
+            id: self.id.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrashPage {
+    pub items: Vec<TrashItem>,
+    pub next: Option<LibraryCursor>,
 }
 
 /// A product-level public file request. Unlike the legacy `folders.upload_token` flag, a request
@@ -503,6 +575,8 @@ mod tests {
             share_password_hash: None,
             folder_id: None,
             trashed_at: 0,
+            trash_entry_id: None,
+            trash_ancestor_id: None,
             view_count: 0,
         }
     }
@@ -520,6 +594,9 @@ mod tests {
             expires_at: Some(1000),
             share_password_hash: None,
             upload_token: None,
+            trashed_at: 0,
+            trash_entry_id: None,
+            trash_ancestor_id: None,
         };
         assert!(!f.share_expired(999));
         assert!(f.share_expired(1000)); // inclusive

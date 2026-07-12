@@ -269,3 +269,33 @@ pub struct ActivityItem {
     pub actor_email: String,
     pub read: bool,
 }
+
+/// One private bookmark owned exclusively by a stable gateway subject. The target is always a
+/// concrete post; bookmarking the original post is therefore the topic-level case without a
+/// second polymorphic identity. `remind_at` is an optional UTC epoch second and becomes due when
+/// it is less than or equal to the current request time.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct Bookmark {
+    /// Immutable identity for this saved generation. Removing and saving the same post again
+    /// creates a fresh id so a stale form can never pass CAS against the replacement row.
+    pub bookmark_id: String,
+    pub owner_sub: String,
+    pub post_id: String,
+    pub note: String,
+    pub remind_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub version: i64,
+}
+
+/// Authoritative private bookmark read model. Public thread/post text is joined live instead of
+/// copied into `forum_bookmarks`, so edits and moderation are reflected immediately.
+#[derive(Clone, Debug)]
+pub struct BookmarkItem {
+    pub bookmark: Bookmark,
+    pub thread_id: String,
+    pub thread_title: String,
+    pub post_author_email: String,
+    pub post_body_md: String,
+    pub post_created_at: i64,
+}

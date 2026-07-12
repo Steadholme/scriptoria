@@ -337,6 +337,53 @@
 	      }
 	      document.addEventListener('wire:after', function (e) { syncNav(e.detail && e.detail.url); });
 	      window.addEventListener('popstate', function () { syncNav(location.href); });
+
+        // ---- Current-page multi-select enhancement -------------------------
+        // Checkboxes and the external `form=` association are the no-JS contract. This layer only
+        // adds Shift ranges, select-this-page, selected styling, and a live count.
+        var lastBulkItem = null;
+        function bulkItems() {
+          return Array.prototype.slice.call(document.querySelectorAll('[data-bulk-item]'));
+        }
+        function syncBulk() {
+          var form = document.querySelector('[data-bulk-form]');
+          if (!form) { return; }
+          var items = bulkItems();
+          var selected = items.filter(function (item) { return item.checked; });
+          items.forEach(function (item) {
+            var card = item.closest('.file-card, .folder-tile');
+            if (card) { card.classList.toggle('is-selected', item.checked); }
+          });
+          var count = form.querySelector('[data-bulk-count]');
+          if (count) { count.textContent = selected.length ? (selected.length + ' selected') : 'Select items to act'; }
+          var all = form.querySelector('[data-bulk-select-all]');
+          if (all) { all.textContent = items.length && selected.length === items.length ? 'Clear selection' : ('Select this page (' + items.length + ')'); }
+          form.querySelectorAll('button[type=submit]').forEach(function (button) { button.disabled = selected.length === 0; });
+        }
+        document.addEventListener('click', function (event) {
+          var all = event.target.closest && event.target.closest('[data-bulk-select-all]');
+          if (all) {
+            var items = bulkItems();
+            var shouldCheck = items.some(function (item) { return !item.checked; });
+            items.forEach(function (item) { item.checked = shouldCheck; });
+            syncBulk();
+            return;
+          }
+          var item = event.target.closest && event.target.closest('[data-bulk-item]');
+          if (!item) { return; }
+          var items = bulkItems();
+          if (event.shiftKey && lastBulkItem && items.indexOf(lastBulkItem) >= 0) {
+            var start = items.indexOf(lastBulkItem);
+            var end = items.indexOf(item);
+            var low = Math.min(start, end);
+            var high = Math.max(start, end);
+            for (var i = low; i <= high; i++) { items[i].checked = item.checked; }
+          }
+          lastBulkItem = item;
+          setTimeout(syncBulk, 0);
+        });
+	      document.addEventListener('wire:after', function () { lastBulkItem = null; syncBulk(); });
+	      syncBulk();
 	
 	      document.addEventListener('submit', function (e) {
 	        var form = e.target;

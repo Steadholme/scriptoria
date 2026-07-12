@@ -91,6 +91,9 @@ pub struct Config {
     /// absent. Enabled only by [`Config::dev`]; `HOLDFAST_PROFILE=prod` and
     /// `REQUIRE_PERSISTENCE` boots always disable it.
     pub allow_dev_identity: bool,
+    /// Run the bounded Trash-retention and durable object-delete worker. Disabled for the
+    /// in-memory development/test profile; enabled automatically by production profiles.
+    pub trash_worker_enabled: bool,
     /// S3 / Cairn settings.
     pub s3: S3Config,
 }
@@ -104,6 +107,7 @@ impl Config {
             public_base: DEFAULT_PUBLIC_BASE.to_string(),
             default_quota_bytes: DEFAULT_QUOTA_BYTES,
             allow_dev_identity: true,
+            trash_worker_enabled: false,
             s3: S3Config {
                 endpoint: "http://cairn:9000".to_string(),
                 bucket: DEFAULT_S3_BUCKET.to_string(),
@@ -139,6 +143,7 @@ impl Config {
             || env_truthy("REQUIRE_PERSISTENCE");
         if production {
             config.allow_dev_identity = false;
+            config.trash_worker_enabled = true;
         }
         config.s3 = S3Config::from_env();
         config
