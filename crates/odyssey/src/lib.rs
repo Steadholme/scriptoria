@@ -269,6 +269,12 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_runtime_propagates_synchronous_fallback_update_errors() {
+        assert!(MOTION_JS.contains("typeof d.startViewTransition !== 'function'){\n      update();"));
+        assert!(!MOTION_JS.contains("try{ update(); }catch(e){}"));
+    }
+
+    #[test]
     fn app_css_contains_view_transition_layer() {
         // The cross-document continuity headline: @view-transition opt-in + the reduced-motion guard
         // that reaches the ::view-transition-* pseudos the global `*{animation:none}` rule cannot.

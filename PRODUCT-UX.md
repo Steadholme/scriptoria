@@ -589,10 +589,12 @@ network rendering.
   wording. The first immutable-image audit additionally caught a browser-skipped View Transition
   surfacing as a global page error during competing navigation. Each issue is fixed in the product
   or Foundation layer that owns it; Odyssey now observes skipped presentation promises while
-  preserving the original transition and its DOM update failure semantics for explicit callers.
-- Canonical Odyssey canary passes 67/67 tests plus `odysseyctl` 5/5; the stable backport passes
-  64/64 plus `odysseyctl` 4/4. Scriptoria consumes stable `1.1.1` fingerprint
-  `fnv1a64:bfd9c0ff58cd44d3`; the reproducible stable check
+  preserving the original transition's failure semantics for explicit callers, and the reduced-
+  motion/unsupported fallback propagates synchronous DOM update errors instead of reporting a
+  successful navigation.
+- Canonical Odyssey canary passes 68/68 tests plus `odysseyctl` 5/5; the stable backport passes
+  65/65 plus `odysseyctl` 4/4. Scriptoria consumes stable `1.1.1` fingerprint
+  `fnv1a64:ad66b297b913388c`; the reproducible stable check
   `cargo run --locked --manifest-path ../odyssey-1.1.1/tools/odysseyctl/Cargo.toml -- check --repo scriptoria`
   is clean. The PATH canary binary is deliberately not the verifier for a stable consumer.
 

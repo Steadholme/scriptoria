@@ -31,7 +31,7 @@
      transition-like object so callers can await .finished uniformly. */
   function swap(update){
     if(REDUCE || typeof d.startViewTransition !== 'function'){
-      try{ update(); }catch(e){}
+      update();
       return { finished:Promise.resolve(), ready:Promise.resolve(), updateCallbackDone:Promise.resolve() };
     }
     return observeTransition(d.startViewTransition(update));
