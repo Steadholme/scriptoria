@@ -22,10 +22,10 @@ use crate::handlers::{
     ag_initial, ag_tone, email_display, esc, fmt_ts, personal_counts, rel_time,
     render_page_with_personal_counts, replies_label,
 };
-use crate::model::{Bookmark, Post, ReactionCount, Thread, ThreadReadingState};
+use crate::model::{Bookmark, Post, ReactionCount, Thread, ThreadFollowLevel, ThreadReadingState};
 use crate::store::{
-    AcceptedAnswerAction, ReplyAnchor, ThreadSort, ThreadStatusFilter,
-    MAX_KLAXON_RECIPIENTS_PER_REPLY,
+    AcceptedAnswerAction, ReplyAnchor, ThreadPersonalSignals, ThreadSort, ThreadStatusFilter,
+    MAX_FOR_YOU_CANDIDATES, MAX_KLAXON_RECIPIENTS_PER_REPLY,
 };
 use crate::{markdown, new_id, now_secs, AppState};
 
@@ -36,6 +36,8 @@ const RECENT_LIMIT: i64 = 20;
 pub const REPLIES_PER_PAGE: i64 = 20;
 /// Threads listed on a category page.
 const CATEGORY_LIMIT: i64 = 200;
+/// Final `/for-you` surface bound after a larger authoritative candidate set is projected.
+const FOR_YOU_LIMIT: usize = 30;
 /// Caps on user input (defense against absurd payloads; the store columns are TEXT).
 const MAX_TITLE: usize = 200;
 const MAX_BODY: usize = 20_000;
@@ -269,6 +271,7 @@ pub async fn home(
     <div class="ag-rail__group ag-rail__group--personal">
       <p class="ag-rail__label">For you</p>
       <nav class="ag-rail__nav" aria-label="For you">
+      <a class="ag-cat" href="/for-you"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 1.7 5.3L19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7L12 3z"/><path d="M19 15v4"/><path d="M21 17h-4"/></svg><span class="ag-cat__name">For You</span></a>
       <a class="ag-cat" href="/activity"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg><span class="ag-cat__name">Activity</span>{activity_count}</a>
       <a class="ag-cat" href="/bookmarks"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h12a1 1 0 0 1 1 1v17l-7-4-7 4V4a1 1 0 0 1 1-1z"/></svg><span class="ag-cat__name">Saved</span>{bookmark_count}</a>
       <a class="ag-cat{following_active}" href="/?filter=subscribed"{following_current}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 5h8"/><path d="M6 9h12"/><path d="M4 13h16"/><path d="m9 17 3 3 3-3"/></svg><span class="ag-cat__name">Following</span></a>
@@ -319,6 +322,169 @@ pub async fn home(
 
     Ok(Html(render_page_with_personal_counts(
         "Forum",
+        &email_display(&headers),
+        &content,
+        counts,
+    )))
+}
+
+// ===========================================================================
+// GET /for-you — private, explainable personal feed
+// ===========================================================================
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForYouReason {
+    Watch,
+    Follow,
+    Authored,
+    Bookmarked,
+    Participated,
+    ContinueReading,
+}
+
+impl ForYouReason {
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Watch => "watch",
+            Self::Follow => "follow",
+            Self::Authored => "authored",
+            Self::Bookmarked => "bookmarked",
+            Self::Participated => "participated",
+            Self::ContinueReading => "reading",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Watch => "Watching · new replies also enter Activity",
+            Self::Follow => "Following · kept in your personal feeds",
+            Self::Authored => "You started this thread",
+            Self::Bookmarked => "You bookmarked a post here",
+            Self::Participated => "You joined this conversation",
+            Self::ContinueReading => "Continue reading · unread posts remain",
+        }
+    }
+
+    const fn priority(self) -> u8 {
+        match self {
+            Self::Watch => 0,
+            Self::Follow => 1,
+            Self::Authored => 2,
+            Self::Bookmarked => 3,
+            Self::Participated => 4,
+            Self::ContinueReading => 5,
+        }
+    }
+}
+
+fn explain_personal_candidate(signals: ThreadPersonalSignals) -> Option<ForYouReason> {
+    if signals.follow_level == ThreadFollowLevel::Mute {
+        return None;
+    }
+    match signals.follow_level {
+        ThreadFollowLevel::Watch => Some(ForYouReason::Watch),
+        ThreadFollowLevel::Follow => Some(ForYouReason::Follow),
+        ThreadFollowLevel::None | ThreadFollowLevel::Mute if signals.authored => {
+            Some(ForYouReason::Authored)
+        }
+        ThreadFollowLevel::None | ThreadFollowLevel::Mute if signals.bookmarked => {
+            Some(ForYouReason::Bookmarked)
+        }
+        ThreadFollowLevel::None | ThreadFollowLevel::Mute if signals.participated => {
+            Some(ForYouReason::Participated)
+        }
+        ThreadFollowLevel::None | ThreadFollowLevel::Mute
+            if signals.reading_started && signals.has_unread =>
+        {
+            Some(ForYouReason::ContinueReading)
+        }
+        ThreadFollowLevel::None | ThreadFollowLevel::Mute => None,
+    }
+}
+
+pub async fn for_you(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, AppError> {
+    let identity = auth::require_author(&headers)?;
+    let now = now_secs();
+
+    // Authorization comes first. The personal projection can only score ids returned by the
+    // same authoritative list path used by Latest; it can never introduce an otherwise-hidden
+    // thread through a bookmark, receipt, or stale preference row.
+    let candidates = state
+        .store
+        .list_threads(
+            None,
+            ThreadSort::Latest,
+            None,
+            ThreadStatusFilter::Any,
+            MAX_FOR_YOU_CANDIDATES as i64,
+            now,
+        )
+        .await?;
+    let candidate_ids: Vec<String> = candidates.iter().map(|thread| thread.id.clone()).collect();
+    let signals = state
+        .store
+        .thread_personal_signals(&identity.sub, &candidate_ids)
+        .await?;
+    let mut personalized: Vec<(Thread, ForYouReason)> = candidates
+        .into_iter()
+        .filter_map(|thread| {
+            signals
+                .get(&thread.id)
+                .copied()
+                .and_then(explain_personal_candidate)
+                .map(|reason| (thread, reason))
+        })
+        .collect();
+    // `sort_by_key` is stable: within one explainable reason the authoritative Latest order is
+    // preserved, including its pinned semantics and deterministic id tie-break.
+    personalized.sort_by_key(|(_, reason)| reason.priority());
+    personalized.truncate(FOR_YOU_LIMIT);
+    let reasons: HashMap<String, ForYouReason> = personalized
+        .iter()
+        .map(|(thread, reason)| (thread.id.clone(), *reason))
+        .collect();
+    let threads: Vec<Thread> = personalized.into_iter().map(|(thread, _)| thread).collect();
+
+    let categories = state.store.list_categories().await?;
+    let category_names: HashMap<&str, &str> = categories
+        .iter()
+        .map(|category| (category.id.as_str(), category.name.as_str()))
+        .collect();
+    let question_categories: HashSet<&str> = categories
+        .iter()
+        .filter(|category| category.format.is_question())
+        .map(|category| category.id.as_str())
+        .collect();
+    // Exact unread details are loaded once only for the final rendered page, not for the larger
+    // candidate set. Candidate reading signals were already projected in the bounded batch.
+    let reading_states = load_reading_states(&state, Some(&identity.sub), &threads).await?;
+    let rows = render_for_you_rows(
+        &threads,
+        now,
+        &category_names,
+        &question_categories,
+        &reading_states,
+        &reasons,
+    );
+    let content = format!(
+        r#"<nav class="crumbs"><a href="/">Home</a><span class="crumbs__sep">/</span><span>For You</span></nav>
+<div class="page-head ag-for-you-head">
+  <div><p class="ag-for-you-eyebrow">Private · explainable</p><h1>For You</h1><p class="muted">A bounded view built only from your Forum relationships — never from hidden content or an external recommender.</p></div>
+  <a class="btn btn-secondary" href="/?filter=subscribed">Open Following</a>
+</div>
+<aside class="ag-for-you-note" role="note"><strong>Why these threads?</strong><span>Every row names one authoritative reason. Watch, Follow, Mute or reset a thread from its page; Mute always wins here.</span></aside>
+<section class="section ag-for-you-feed" aria-labelledby="for-you-heading">
+  <h2 id="for-you-heading" class="section__title">Your current threads</h2>
+  <div class="thread-list">{rows}</div>
+</section>"#,
+        rows = rows,
+    );
+    let counts = personal_counts(&state, &headers, now).await?;
+    Ok(Html(render_page_with_personal_counts(
+        "For You",
         &email_display(&headers),
         &content,
         counts,
@@ -712,8 +878,8 @@ pub async fn thread(
     let is_admin = auth::is_admin(&headers);
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
     let subscription_action = if let Some(sub) = viewer.as_deref() {
-        let subscribed = state.store.is_thread_subscribed(&thread.id, sub).await?;
-        render_subscription_form(&thread.id, &csrf, subscribed)
+        let follow_level = state.store.thread_follow_level(&thread.id, sub).await?;
+        render_subscription_form(&thread.id, &csrf, follow_level)
     } else {
         String::new()
     };
@@ -1836,13 +2002,16 @@ pub async fn accept_answer(
 }
 
 // ===========================================================================
-// POST /t/{id}/subscribe — explicitly follow/unfollow a thread
+// POST /t/{id}/subscribe — explicitly set a result-oriented thread preference
 // ===========================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct SubscribeForm {
     #[serde(default)]
     pub csrf: String,
+    #[serde(default)]
+    pub level: String,
+    /// Backwards-compatible JSON/form seam for clients from the boolean subscription release.
     #[serde(default)]
     pub action: String,
 }
@@ -1861,18 +2030,26 @@ pub async fn toggle_subscription(
         .await?
         .ok_or_else(|| AppError::NotFound("thread not found".to_string()))?;
 
-    let subscribed = match form.action.trim() {
-        "follow" => true,
-        "unfollow" => false,
-        _ => {
-            return Err(AppError::InvalidRequest(
-                "follow action must be follow or unfollow".to_string(),
-            ));
+    let follow_level = if form.level.trim().is_empty() {
+        match form.action.trim() {
+            "follow" => ThreadFollowLevel::Watch,
+            "unfollow" => ThreadFollowLevel::None,
+            _ => {
+                return Err(AppError::InvalidRequest(
+                    "thread preference must be watch, follow, mute, or none".to_string(),
+                ));
+            }
         }
+    } else {
+        ThreadFollowLevel::parse(&form.level).ok_or_else(|| {
+            AppError::InvalidRequest(
+                "thread preference must be watch, follow, mute, or none".to_string(),
+            )
+        })?
     };
     state
         .store
-        .set_thread_subscription(&tid, &author.sub, subscribed, now_secs())
+        .set_thread_follow_level(&tid, &author.sub, follow_level, now_secs())
         .await?;
     let actor = if author.email.is_empty() {
         &author.sub
@@ -1880,25 +2057,18 @@ pub async fn toggle_subscription(
         &author.email
     };
     state.audit.emit(AuditEvent::info(
-        if subscribed {
-            "thread.subscribe"
-        } else {
-            "thread.unsubscribe"
-        },
+        "thread.follow_preference",
         actor,
         &tid,
-        if subscribed {
-            "subscribed"
-        } else {
-            "unsubscribed"
-        },
+        follow_level.as_str(),
     ));
 
     if wants_json(&headers) {
         return Ok(axum::Json(serde_json::json!({
             "ok": true,
             "thread_id": tid,
-            "subscribed": subscribed,
+            "follow_level": follow_level.as_str(),
+            "subscribed": follow_level.appears_in_personal_feeds(),
         }))
         .into_response());
     }
@@ -2167,25 +2337,44 @@ fn render_thread_read_progress(
     )
 }
 
-fn render_subscription_form(thread_id: &str, csrf: &str, subscribed: bool) -> String {
-    let label = if subscribed { "Unfollow" } else { "Follow" };
-    let class = if subscribed {
-        "btn btn-secondary btn-sm"
-    } else {
-        "btn btn-ghost btn-sm"
+fn render_subscription_form(
+    thread_id: &str,
+    csrf: &str,
+    follow_level: ThreadFollowLevel,
+) -> String {
+    let option = |level: ThreadFollowLevel, label: &str| {
+        format!(
+            r#"<option value="{value}"{selected}>{label}</option>"#,
+            value = level.as_str(),
+            selected = if follow_level == level {
+                " selected"
+            } else {
+                ""
+            },
+            label = esc(label),
+        )
     };
-    let action = if subscribed { "unfollow" } else { "follow" };
     format!(
-        r#"<form class="inline-form subscription-form" method="post" action="/t/{tid}/subscribe" data-wire data-wire-target=".subscription-form" data-wire-err="Could not update your subscription">
+        r#"<form class="inline-form subscription-form" method="post" action="/t/{tid}/subscribe" data-wire data-wire-target=".subscription-form" data-wire-ok="Thread preference saved" data-wire-err="Could not update your thread preference">
   <input type="hidden" name="csrf" value="{csrf}">
-  <input type="hidden" name="action" value="{action}">
-  <button class="{class}" type="submit">{label}</button>
+  <span class="subscription-form__field">
+    <label class="subscription-form__label" for="thread-follow-{tid}">Thread updates</label>
+    <select id="thread-follow-{tid}" name="level" aria-describedby="thread-follow-help-{tid}">
+      {watch}
+      {follow}
+      {mute}
+      {none}
+    </select>
+    <span class="subscription-form__help" id="thread-follow-help-{tid}">Direct replies, mentions and accepted answers still appear in Activity.</span>
+  </span>
+  <button class="btn btn-secondary btn-sm" type="submit">Apply</button>
 </form>"#,
         tid = esc(thread_id),
         csrf = esc(csrf),
-        action = action,
-        class = class,
-        label = label,
+        watch = option(ThreadFollowLevel::Watch, "Watch · replies in Activity"),
+        follow = option(ThreadFollowLevel::Follow, "Follow · personal feeds only"),
+        mute = option(ThreadFollowLevel::Mute, "Mute · hide from personal feeds"),
+        none = option(ThreadFollowLevel::None, "None · reset preference"),
     )
 }
 
@@ -2521,6 +2710,48 @@ fn render_thread_rows(
     question_categories: &HashSet<&str>,
     reading_states: &HashMap<String, ThreadReadingState>,
 ) -> String {
+    render_thread_rows_with_reasons(
+        threads,
+        now,
+        cat_names,
+        counts,
+        question_categories,
+        reading_states,
+        None,
+    )
+}
+
+fn render_for_you_rows(
+    threads: &[Thread],
+    now: i64,
+    cat_names: &HashMap<&str, &str>,
+    question_categories: &HashSet<&str>,
+    reading_states: &HashMap<String, ThreadReadingState>,
+    reasons: &HashMap<String, ForYouReason>,
+) -> String {
+    if threads.is_empty() {
+        return r#"<div class="empty ag-for-you-empty"><div class="empty__ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 1.7 5.3L19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7L12 3z"/><path d="M19 15v4"/><path d="M21 17h-4"/></svg></div><h3>Your personal feed is ready when you are.</h3><p>Watch or Follow a thread, bookmark a post, join a conversation, or begin reading. Muted threads stay out.</p><a class="btn btn-primary btn-sm" href="/">Explore Latest</a></div>"#.to_string();
+    }
+    render_thread_rows_with_reasons(
+        threads,
+        now,
+        Some(cat_names),
+        None,
+        question_categories,
+        reading_states,
+        Some(reasons),
+    )
+}
+
+fn render_thread_rows_with_reasons(
+    threads: &[Thread],
+    now: i64,
+    cat_names: Option<&HashMap<&str, &str>>,
+    counts: Option<&HashMap<String, i64>>,
+    question_categories: &HashSet<&str>,
+    reading_states: &HashMap<String, ThreadReadingState>,
+    reasons: Option<&HashMap<String, ForYouReason>>,
+) -> String {
     if threads.is_empty() {
         return r#"<div class="empty"><div class="empty__ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div><h3>No threads yet — start the conversation.</h3><p>Every thread supports Markdown, reactions and @mentions.</p><a class="btn btn-primary btn-sm" href="/new">New thread</a></div>"#.to_string();
     }
@@ -2570,6 +2801,16 @@ fn render_thread_rows(
         } else {
             String::new()
         };
+        let personal_reason = reasons
+            .and_then(|reasons| reasons.get(&t.id))
+            .map(|reason| {
+                format!(
+                    r#"<span class="ag-for-you-reason" data-for-you-reason="{key}">{label}</span>"#,
+                    key = reason.key(),
+                    label = esc(reason.label()),
+                )
+            })
+            .unwrap_or_default();
         let replies = counts
             .and_then(|map| map.get(&t.id))
             .map(|count| {
@@ -2586,7 +2827,7 @@ fn render_thread_rows(
   <span class="avatar ag-avatar ag-tone-{tone}" aria-hidden="true">{initial}</span>
   <span class="thread-row__main">
     <span class="thread-row__title">{glyphs}<span class="ag-title">{title}</span></span>
-    <span class="thread-row__sub">{cat}{answer_state}{reading_badge}<span class="ag-row__by">started by {author}</span></span>
+    <span class="thread-row__sub">{personal_reason}{cat}{answer_state}{reading_badge}<span class="ag-row__by">started by {author}</span></span>
   </span>
   <span class="ag-row__side">{replies}<span class="thread-row__time" title="{abs}">{when}</span></span>
 </a>"#,
@@ -2597,6 +2838,7 @@ fn render_thread_rows(
             glyphs = glyphs,
             title = esc(&t.title),
             cat = cat_part,
+            personal_reason = personal_reason,
             answer_state = answer_state,
             reading_badge = reading_badge,
             author = esc(&t.author_email),

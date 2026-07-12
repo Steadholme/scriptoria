@@ -576,10 +576,17 @@ fn format_cursor(cursor: &PostCursor) -> String {
 
 /// `GET /p/{slug}` — a full post, body markdown rendered to sanitized HTML. Unpublished drafts
 /// are visible only to their author; otherwise 404.
+#[derive(Debug, Default, Deserialize)]
+pub struct PostViewQuery {
+    #[serde(default)]
+    preview: String,
+}
+
 pub async fn view(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(slug): Path<String>,
+    Query(query): Query<PostViewQuery>,
 ) -> Result<Response, AppError> {
     let viewer = auth::author_sub(&headers);
     let email = auth::display_email(&headers);
@@ -593,6 +600,8 @@ pub async fn view(
         .ok_or_else(|| AppError::NotFound("no such post".to_string()))?;
 
     let is_owner = viewer.as_deref() == Some(post.author_sub.as_str());
+    let is_public = post.is_public_at(now);
+    let preview_mode = is_owner && !is_public && query.preview.trim() == "1";
     // Only an owner representation needs a CSRF token. Anonymous public reads remain a genuinely
     // cacheable representation and never mint a per-browser cookie.
     let (csrf, set_cookie) = if is_owner {
@@ -610,7 +619,7 @@ pub async fn view(
         state = state_badge(&post, now),
     );
 
-    let actions = if is_owner {
+    let actions = if is_owner && !preview_mode {
         format!(
             r#"<div class="article__actions">
   <a class="btn btn-secondary btn-sm" href="/edit/{slug}">Edit</a>
@@ -640,7 +649,7 @@ pub async fn view(
         .await;
     let related = render_related(&related_posts);
 
-    let fragment = POST_HTML
+    let article = POST_HTML
         .replace("{{TITLE}}", &esc(&post.title))
         .replace(
             "{{COVER}}",
@@ -651,12 +660,39 @@ pub async fn view(
         .replace("{{ACTIONS}}", &actions)
         .replace("{{BODY}}", &body_html)
         .replace("{{RELATED}}", &related);
+    let preview_surface_note = if preview_mode {
+        " Article actions are hidden to mirror the Reader surface."
+    } else {
+        ""
+    };
+    let preview_notice = if is_owner && !is_public {
+        let state = if post.is_scheduled_at(now) {
+            format!(
+                "Scheduled for {} · this saved Reader preview is visible only to you until then.{}",
+                esc(&format_utc_instant(post.publish_at)),
+                preview_surface_note,
+            )
+        } else {
+            format!(
+                "Draft · this is your private saved Reader preview, not a shareable public link.{}",
+                preview_surface_note,
+            )
+        };
+        format!(
+            r#"<aside class="ink-saved-preview" role="status"><div><strong>Private Reader preview</strong><span>{state}</span></div><a class="btn btn-secondary btn-sm" href="/edit/{slug}?return_to=%2Flibrary">Edit saved version</a></aside>"#,
+            state = state,
+            slug = esc(&post.slug),
+        )
+    } else {
+        String::new()
+    };
+    let fragment = format!("{preview_notice}{article}");
     let theme = odyssey::resolve_theme(
         headers
             .get(axum::http::header::COOKIE)
             .and_then(|v| v.to_str().ok()),
     );
-    let page_meta = if post.is_public_at(now) {
+    let page_meta = if is_public {
         public_post_meta(&post)
     } else {
         PageMeta {
@@ -664,7 +700,7 @@ pub async fn view(
             ..PageMeta::default()
         }
     };
-    let document_title = if post.is_public_at(now) && !post.meta_title.trim().is_empty() {
+    let document_title = if is_public && !post.meta_title.trim().is_empty() {
         post.meta_title.trim()
     } else {
         post.title.as_str()

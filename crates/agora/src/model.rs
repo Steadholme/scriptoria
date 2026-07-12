@@ -144,6 +144,53 @@ pub struct ThreadReadingState {
     pub last_contiguous_read: Option<Post>,
 }
 
+/// One user's explicit relationship with a thread. `None` is represented by the absence of a
+/// persistence row; the other three values are stored as operator-readable text. The names are
+/// deliberately product language rather than transport language:
+///
+/// - `Watch` delivers every new reply into generic Activity and appears in personal feeds.
+/// - `Follow` appears in personal feeds without generic follower Activity.
+/// - `Mute` suppresses the thread from personal feeds and generic follower Activity. Direct
+///   mention/reply/accepted-answer authority remains independent from this preference.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThreadFollowLevel {
+    #[default]
+    None,
+    Watch,
+    Follow,
+    Mute,
+}
+
+impl ThreadFollowLevel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Watch => "watch",
+            Self::Follow => "follow",
+            Self::Mute => "mute",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "none" => Some(Self::None),
+            "watch" => Some(Self::Watch),
+            "follow" => Some(Self::Follow),
+            "mute" => Some(Self::Mute),
+            _ => None,
+        }
+    }
+
+    pub const fn appears_in_personal_feeds(self) -> bool {
+        matches!(self, Self::Watch | Self::Follow)
+    }
+
+    pub const fn delivers_generic_activity(self) -> bool {
+        matches!(self, Self::Watch)
+    }
+}
+
 /// One parsed `@username` occurrence for a post. Usernames are normalised to lowercase at write
 /// time and are matched against the viewer's gateway email local-part.
 #[derive(Clone, Debug, Serialize)]

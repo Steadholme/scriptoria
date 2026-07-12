@@ -1252,6 +1252,7 @@ async fn folder_purge_wins_pending_owner_upload_and_closes_its_request_room() {
         })
         .await
         .unwrap());
+
     let intent = OwnerBlobWriteIntent {
         object_key: "pending-upload".to_string(),
         owner_sub: "alice".to_string(),
@@ -4214,18 +4215,104 @@ async fn request_rooms_owner_lifecycle_rotation_and_receipts() {
     )
     .await;
 
-    let list = send(&app, get("/requests", Some("alice"))).await;
+    let foreign_token = "foreign-request-capability-must-not-leak";
+    assert!(store
+        .create_folder(&FolderRec {
+            id: "foreign-request-folder".to_string(),
+            owner_sub: "bob".to_string(),
+            parent_id: None,
+            name: "Bob private destination".to_string(),
+            created_at: now_secs(),
+            updated_at: now_secs(),
+            share_token: None,
+            expires_at: None,
+            share_password_hash: None,
+            upload_token: None,
+            trashed_at: 0,
+            trash_entry_id: None,
+            trash_ancestor_id: None,
+        })
+        .await
+        .unwrap());
+    assert!(store
+        .create_upload_request(&UploadRequestRec {
+            id: "foreign-request".to_string(),
+            owner_sub: "bob".to_string(),
+            folder_id: "foreign-request-folder".to_string(),
+            token: foreign_token.to_string(),
+            title: "Bob confidential request".to_string(),
+            description: "Bob only".to_string(),
+            status: "open".to_string(),
+            expires_at: None,
+            max_file_bytes: 1024,
+            max_total_bytes: 4096,
+            max_files: 4,
+            used_bytes: 0,
+            used_files: 0,
+            allowed_types: "*/*".to_string(),
+            created_at: now_secs(),
+            updated_at: now_secs(),
+        })
+        .await
+        .unwrap());
+
+    let foreign_detail = send(
+        &app,
+        get("/requests/foreign-request", Some("alice")),
+    )
+    .await;
+    assert_eq!(foreign_detail.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        foreign_detail.header(header::CACHE_CONTROL),
+        "private, no-store"
+    );
+    assert!(!foreign_detail.text().contains(foreign_token));
+    assert!(!foreign_detail.text().contains("Bob confidential request"));
+
+    let list = send(&app, get("/requests?view=all", Some("alice"))).await;
     assert_eq!(list.status, StatusCode::OK);
-    assert!(list.text().contains("Evidence intake"));
-    assert!(list.text().contains("Create request"));
+    assert_eq!(list.header(header::CACHE_CONTROL), "private, no-store");
+    let list_html = list.text();
+    assert!(list_html.contains("Evidence intake"));
+    assert!(list_html.contains("Create request"));
+    assert!(list_html.contains("Request Inbox"));
+    assert!(list_html.contains("Inbox cap 100"));
+    assert!(list_html.contains("href=\"/requests?view=all\""));
+    assert!(list_html.contains("href=\"/requests?view=open\""));
+    assert!(list_html.contains("href=\"/requests?view=expiring\""));
+    assert!(list_html.contains("href=\"/requests?view=closed\""));
+    assert!(list_html.contains("href=\"/requests?view=expired\""));
+    assert!(list_html.contains(&format!("href=\"/requests/{}\"", request.id)));
+    assert!(!list_html.contains(&request.token));
+    assert!(!list_html.contains(&format!("/u/{}", request.token)));
+    assert!(!list_html.contains("data-copy="));
+    assert!(!list_html.contains(foreign_token));
+    assert!(!list_html.contains("Bob confidential request"));
+    let open = send(&app, get("/requests?view=open", Some("alice"))).await;
+    assert_eq!(open.status, StatusCode::OK);
+    assert!(open.text().contains("Evidence intake"));
+    assert!(!open.text().contains(&request.token));
+    let empty_expired = send(&app, get("/requests?view=expired", Some("alice"))).await;
+    assert_eq!(empty_expired.status, StatusCode::OK);
+    assert!(empty_expired.text().contains("No expired requests"));
+    assert!(empty_expired.text().contains("href=\"/requests?view=all\""));
+    let unknown = send(&app, get("/requests?view=unknown", Some("alice"))).await;
+    assert_eq!(unknown.status, StatusCode::BAD_REQUEST);
     let detail = send(
         &app,
         get(&format!("/requests/{}", request.id), Some("alice")),
     )
     .await;
     assert_eq!(detail.status, StatusCode::OK);
+    assert_eq!(detail.header(header::CACHE_CONTROL), "private, no-store");
     assert!(detail.text().contains("Request limits"));
     assert!(detail.text().contains("Files received"));
+    assert!(detail.text().contains("Public upload capability"));
+    assert!(detail.text().contains("copy-btn"));
+    assert!(detail.text().contains(&format!(
+        "value=\"https://drive.w33d.xyz/u/{}\"",
+        request.token
+    )));
     assert!(detail.text().contains(&format!(
         "name=\"expected_token\" value=\"{}\"",
         request.token
@@ -4290,6 +4377,14 @@ async fn request_rooms_owner_lifecycle_rotation_and_receipts() {
     )
     .await;
     assert_eq!(closed.status, StatusCode::FOUND);
+    let closed_list = send(&app, get("/requests?view=closed", Some("alice"))).await;
+    assert_eq!(closed_list.status, StatusCode::OK);
+    assert!(closed_list.text().contains("Updated request"));
+    assert!(!closed_list.text().contains(&request.token));
+    assert!(!send(&app, get("/requests?view=open", Some("alice")))
+        .await
+        .text()
+        .contains("Updated request"));
     assert_eq!(
         send(&app, get(&format!("/u/{}", request.token), None))
             .await
@@ -4332,6 +4427,21 @@ async fn request_rooms_owner_lifecycle_rotation_and_receipts() {
         .unwrap()
         .token;
     assert_ne!(new_token, request.token);
+    let rotated_detail = send(
+        &app,
+        get(&format!("/requests/{}", request.id), Some("alice")),
+    )
+    .await;
+    assert_eq!(
+        rotated_detail.header(header::CACHE_CONTROL),
+        "private, no-store"
+    );
+    let rotated_detail_html = rotated_detail.text();
+    assert!(rotated_detail_html.contains("copy-btn"));
+    assert!(
+        rotated_detail_html.contains(&format!("value=\"https://drive.w33d.xyz/u/{new_token}\""))
+    );
+    assert!(!rotated_detail_html.contains(&request.token));
     assert_eq!(
         send(&app, get(&format!("/u/{}", request.token), None))
             .await

@@ -1,6 +1,6 @@
 //! Owner control plane for product-level public upload requests.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::Form;
@@ -11,7 +11,10 @@ use crate::auth;
 use crate::error::AppError;
 use crate::handlers::files::{html_with_csrf, redirect_found};
 use crate::handlers::{app_css, dynamic_js, esc, fmt_ts, human_size, userbox};
-use crate::model::{FolderRec, UploadRequestRec, UploadSubmission};
+use crate::model::{
+    FolderRec, UploadRequestInbox, UploadRequestInboxView, UploadRequestRec, UploadRequestSummary,
+    UploadSubmission, UPLOAD_REQUEST_INBOX_CAP,
+};
 use crate::store::{
     DEFAULT_REQUEST_ALLOWED_TYPES, DEFAULT_REQUEST_MAX_FILES, DEFAULT_REQUEST_MAX_FILE_BYTES,
     DEFAULT_REQUEST_MAX_TOTAL_BYTES,
@@ -29,6 +32,13 @@ const MAX_DESCRIPTION_CHARS: usize = 2000;
 
 const REQUESTS_HTML: &str = include_str!("../../templates/requests.html");
 const REQUEST_DETAIL_HTML: &str = include_str!("../../templates/request_detail.html");
+
+#[derive(Debug, Deserialize)]
+pub struct RequestInboxQuery {
+    /// Stable owner-facing URL state: all/open/expiring/closed/expired.
+    #[serde(default)]
+    pub view: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct RequestConfigForm {
@@ -70,18 +80,18 @@ pub struct RequestRotateForm {
 pub async fn index(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<RequestInboxQuery>,
 ) -> Result<Response, AppError> {
     let actor = auth::identity(&headers);
     let csrf = auth::new_csrf_token();
-    let requests = state.store.list_upload_requests(&actor.subject).await?;
+    let view = parse_inbox_view(query.view.as_deref())?;
+    let as_of = now_secs();
+    let inbox = state
+        .store
+        .upload_request_inbox(&actor.subject, view, as_of)
+        .await?;
     let folders = state.store.list_folders(&actor.subject).await?;
-    let html = render_index(
-        &actor.email,
-        &csrf,
-        &requests,
-        &folders,
-        &state.config.public_base,
-    );
+    let html = render_index(&actor.email, &csrf, &inbox, &folders);
     Ok(html_with_csrf(StatusCode::OK, html, &csrf))
 }
 
@@ -105,6 +115,7 @@ pub async fn detail(
         .list_upload_submissions(&request.id, &actor.subject)
         .await?;
     let csrf = auth::new_csrf_token();
+    let as_of = now_secs();
     let html = render_detail(
         &actor.email,
         &csrf,
@@ -112,6 +123,7 @@ pub async fn detail(
         folder.as_ref(),
         &submissions,
         &state.config.public_base,
+        as_of,
     );
     Ok(html_with_csrf(StatusCode::OK, html, &csrf))
 }
@@ -463,37 +475,92 @@ fn normalize_allowed_types(raw: &str) -> Result<String, AppError> {
     Ok(out.join(","))
 }
 
+fn parse_inbox_view(raw: Option<&str>) -> Result<UploadRequestInboxView, AppError> {
+    let value = raw.map(str::trim).filter(|value| !value.is_empty());
+    match value {
+        None => Ok(UploadRequestInboxView::All),
+        Some(value) => UploadRequestInboxView::from_slug(value).ok_or_else(|| {
+            AppError::BadRequest(
+                "Unknown request view. Use all, open, expiring, closed, or expired.".to_string(),
+            )
+        }),
+    }
+}
+
 fn render_index(
     email: &str,
     csrf: &str,
-    requests: &[UploadRequestRec],
+    inbox: &UploadRequestInbox,
     folders: &[FolderRec],
-    public_base: &str,
 ) -> String {
-    let rows = if requests.is_empty() {
-        "<div class=\"empty\"><h2>No upload requests yet</h2><p>Create one for a private destination folder below.</p></div>".to_string()
+    let filters = UploadRequestInboxView::ALL
+        .into_iter()
+        .map(|view| {
+            let current = if view == inbox.view {
+                " is-active"
+            } else {
+                ""
+            };
+            let aria_current = if view == inbox.view {
+                " aria-current=\"page\""
+            } else {
+                ""
+            };
+            format!(
+                "<a class=\"request-filter{current}\" href=\"/requests?view={slug}\"{aria_current}><span>{label}</span><b>{count}</b></a>",
+                slug = view.slug(),
+                label = view.label(),
+                count = inbox.counts.for_view(view),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let rows = if inbox.items.is_empty() {
+        let (heading, body) = if inbox.view == UploadRequestInboxView::All {
+            (
+                "No upload requests yet".to_string(),
+                "Create one for a private destination folder below.".to_string(),
+            )
+        } else {
+            (
+                format!("No {} requests", inbox.view.label().to_ascii_lowercase()),
+                "This status filter is empty at the Inbox snapshot. Try another view.".to_string(),
+            )
+        };
+        let reset = if inbox.view == UploadRequestInboxView::All {
+            String::new()
+        } else {
+            "<a class=\"btn btn-ghost btn-sm\" href=\"/requests?view=all\">Show all requests</a>"
+                .to_string()
+        };
+        format!(
+            "<div class=\"request-empty\"><span class=\"request-empty__mark\" aria-hidden=\"true\">⇧</span><h2>{heading}</h2><p>{body}</p>{reset}</div>",
+            heading = esc(&heading),
+            body = esc(&body),
+        )
     } else {
-        requests
+        inbox
+            .items
             .iter()
-            .map(|request| {
-                let state = request_state(request);
-                let url = format!("{}/u/{}", public_base, request.token);
-                format!(
-                    "<article class=\"card request-card\"><div class=\"card__head\"><div><span class=\"badge\">{state}</span><h2><a href=\"/requests/{id}\">{title}</a></h2></div><span class=\"mono\">{used_files}/{max_files}</span></div><p>{description}</p><div class=\"request-card__meta\"><span>{used} of {total}</span><span>{expiry}</span></div><div class=\"embed-box__row\"><input class=\"embed-box__input\" readonly value=\"{url}\"><button class=\"btn btn-secondary btn-sm copy-btn\" type=\"button\" data-copy=\".embed-box__input\" data-label=\"Copy\">Copy</button></div></article>",
-                    state = esc(state),
-                    id = esc(&request.id),
-                    title = esc(&request.title),
-                    description = esc(&request.description),
-                    used_files = request.used_files,
-                    max_files = request.max_files,
-                    used = esc(&human_size(request.used_bytes)),
-                    total = esc(&human_size(request.max_total_bytes)),
-                    expiry = esc(&expiry_label(request.expires_at)),
-                    url = esc(&url),
-                )
-            })
+            .map(|request| render_inbox_row(request, inbox.as_of))
             .collect::<Vec<_>>()
             .join("")
+    };
+    let scope = if inbox.truncated {
+        format!(
+            "Showing the newest {} of {} matching requests · Inbox cap {} · as of {}",
+            inbox.items.len(),
+            inbox.matched_total,
+            UPLOAD_REQUEST_INBOX_CAP,
+            fmt_ts(inbox.as_of),
+        )
+    } else {
+        format!(
+            "Showing all {} matching requests · Inbox cap {} · as of {}",
+            inbox.matched_total,
+            UPLOAD_REQUEST_INBOX_CAP,
+            fmt_ts(inbox.as_of),
+        )
     };
     let folder_rows = if folders.is_empty() {
         "<p class=\"muted\">Create a folder in Files before opening an upload request.</p>"
@@ -516,8 +583,34 @@ fn render_index(
         .replace("{{CSS}}", app_css())
         .replace("{{DYNAMIC}}", dynamic_js())
         .replace("{{USERBOX}}", &userbox("Drive", Some(email)))
+        .replace("{{FILTERS}}", &filters)
+        .replace("{{SCOPE}}", &esc(&scope))
         .replace("{{REQUESTS}}", &rows)
         .replace("{{FOLDERS}}", &folder_rows)
+}
+
+fn render_inbox_row(request: &UploadRequestSummary, as_of: i64) -> String {
+    let description = if request.description.is_empty() {
+        "<p class=\"request-inbox-row__description muted\">No public instructions.</p>".to_string()
+    } else {
+        format!(
+            "<p class=\"request-inbox-row__description\">{}</p>",
+            esc(&request.description)
+        )
+    };
+    format!(
+        "<article class=\"card request-inbox-row\"><div class=\"request-inbox-row__lead\"><span class=\"badge request-state request-state--{state_slug}\">{state}</span><div><h2><a href=\"/requests/{id}\">{title}</a></h2>{description}</div></div><dl class=\"request-inbox-row__facts\"><div><dt>Files</dt><dd>{used_files} / {max_files}</dd></div><div><dt>Storage</dt><dd>{used_bytes} / {max_bytes}</dd></div><div><dt>Deadline</dt><dd>{deadline}</dd></div><div><dt>Updated</dt><dd>{updated}</dd></div></dl><a class=\"btn btn-ghost btn-sm request-inbox-row__detail\" href=\"/requests/{id}\">Open details</a></article>",
+        state_slug = request.state.slug(),
+        state = request.state.label(),
+        id = esc(&request.id),
+        title = esc(&request.title),
+        used_files = request.used_files,
+        max_files = request.max_files,
+        used_bytes = esc(&human_size(request.used_bytes)),
+        max_bytes = esc(&human_size(request.max_total_bytes)),
+        deadline = esc(&deadline_label(request.expires_at, as_of)),
+        updated = esc(&fmt_ts(request.updated_at)),
+    )
 }
 
 fn render_detail(
@@ -527,6 +620,7 @@ fn render_detail(
     folder: Option<&FolderRec>,
     submissions: &[UploadSubmission],
     public_base: &str,
+    as_of: i64,
 ) -> String {
     let url = format!("{}/u/{}", public_base, request.token);
     let receipts = if submissions.is_empty() {
@@ -547,7 +641,7 @@ fn render_detail(
             .collect::<Vec<_>>()
             .join("")
     };
-    let action = if request.is_open() && !request.is_expired(now_secs()) {
+    let action = if request.is_open() && !request.is_expired(as_of) {
         format!(
             "<form method=\"post\" action=\"/requests/{id}/close\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\"><button class=\"btn btn-danger\" type=\"submit\">Close request</button></form>",
             id = esc(&request.id), csrf = esc(csrf)
@@ -565,13 +659,16 @@ fn render_detail(
         .replace("{{ID}}", &esc(&request.id))
         .replace("{{TITLE}}", &esc(&request.title))
         .replace("{{DESCRIPTION}}", &esc(&request.description))
-        .replace("{{STATE}}", &esc(request_state(request)))
+        .replace("{{STATE}}", &esc(request_state_at(request, as_of)))
         .replace(
             "{{FOLDER}}",
             &esc(folder.map_or("Missing folder", |item| &item.name)),
         )
         .replace("{{URL}}", &esc(&url))
-        .replace("{{EXPIRY}}", &esc(&expiry_label(request.expires_at)))
+        .replace(
+            "{{EXPIRY}}",
+            &esc(&deadline_label(request.expires_at, as_of)),
+        )
         .replace(
             "{{MAX_FILE_MIB}}",
             &(request.max_file_bytes / 1024 / 1024).to_string(),
@@ -590,20 +687,22 @@ fn render_detail(
         .replace("{{RECEIPTS}}", &receipts)
 }
 
-fn request_state(request: &UploadRequestRec) -> &'static str {
+fn request_state_at(request: &UploadRequestRec, as_of: i64) -> &'static str {
     if !request.is_open() {
         "Closed"
-    } else if request.is_expired(now_secs()) {
+    } else if request.is_expired(as_of) {
         "Expired"
     } else {
         "Open"
     }
 }
 
-fn expiry_label(expires_at: Option<i64>) -> String {
-    expires_at
-        .map(|expiry| format!("Expires {}", fmt_ts(expiry)))
-        .unwrap_or_else(|| "Legacy · no expiry".to_string())
+fn deadline_label(expires_at: Option<i64>, as_of: i64) -> String {
+    match expires_at {
+        Some(expiry) if expiry <= as_of => format!("Expired {}", fmt_ts(expiry)),
+        Some(expiry) => format!("Due {}", fmt_ts(expiry)),
+        None => "No deadline".to_string(),
+    }
 }
 
 #[cfg(test)]

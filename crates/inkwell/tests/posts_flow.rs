@@ -383,8 +383,54 @@ async fn drafts_are_private_to_their_author() {
         "author sees own draft on index"
     );
     assert!(idx.contains("Draft"), "draft badge shown to author");
-    let (status, _) = call(&state, get_auth("/p/secret-draft", "u_alice", "alice@hf")).await;
+    let (status, preview) =
+        call(&state, get_auth("/p/secret-draft", "u_alice", "alice@hf")).await;
     assert_eq!(status, StatusCode::OK, "author can read own draft");
+    assert!(preview.contains("Private Reader preview"));
+    assert!(preview.contains("not a shareable public link"));
+    assert!(preview.contains(r#"href="/edit/secret-draft?return_to=%2Flibrary""#));
+    assert!(preview.contains(r#"action="/delete/secret-draft""#));
+    let response = app(state.clone())
+        .oneshot(get_auth(
+            "/p/secret-draft?preview=1",
+            "u_alice",
+            "alice@hf",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "private, no-store"
+    );
+    assert_eq!(response.headers().get(header::VARY).unwrap(), PUBLIC_VARY);
+    let reader_preview = String::from_utf8(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(reader_preview.contains("Article actions are hidden"));
+    assert!(reader_preview.contains(r#"<meta name="robots" content="noindex,nofollow">"#));
+    assert!(!reader_preview.contains(r#"<link rel="canonical""#));
+    assert!(!reader_preview.contains(r#"<meta property="og:""#));
+    assert!(!reader_preview.contains(r#"<meta name="twitter:""#));
+    assert!(!reader_preview.contains(r#"class="article__actions""#));
+    assert!(!reader_preview.contains(r#"action="/delete/secret-draft""#));
+    assert!(
+        reader_preview.contains(r#"href="/edit/secret-draft?return_to=%2Flibrary""#),
+        "the preview keeps one explicit exit back to Writer Studio"
+    );
+    for request in [
+        get("/p/secret-draft?preview=1"),
+        get_auth("/p/secret-draft?preview=1", "u_mallory", "mallory@hf"),
+    ] {
+        let (status, hidden) = call(&state, request).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(!hidden.contains("secret body"));
+        assert!(!hidden.contains("Private Reader preview"));
+    }
 }
 
 #[tokio::test]
@@ -434,8 +480,11 @@ async fn scheduled_posts_are_public_only_after_publish_at() {
         owner_idx.contains("Scheduled"),
         "scheduled badge shown to author"
     );
-    let (status, _) = call(&state, get_auth("/p/scheduled-post", "u_alice", "alice@hf")).await;
+    let (status, scheduled_preview) =
+        call(&state, get_auth("/p/scheduled-post", "u_alice", "alice@hf")).await;
     assert_eq!(status, StatusCode::OK, "author can read own scheduled post");
+    assert!(scheduled_preview.contains("Private Reader preview"));
+    assert!(scheduled_preview.contains("Scheduled for"));
 
     let scheduled_id = state.store.get_post("scheduled-post").await.unwrap().id;
     let body = form(&[

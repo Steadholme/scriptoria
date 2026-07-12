@@ -78,7 +78,7 @@ async fn quote_reply_renders_escaped_blockquote_and_deduplicated_activity() {
 }
 
 #[tokio::test]
-async fn thread_subscription_toggle_and_filter() {
+async fn thread_follow_preference_form_and_filter() {
     let state = build_dev_state().await;
     let subscribed_loc = create_thread(&state, "Subscribed target", "First body.").await;
     let other_loc = create_thread(&state, "Unsubscribed target", "Second body.").await;
@@ -91,17 +91,21 @@ async fn thread_subscription_toggle_and_filter() {
             TOK,
             ALICE_SUB,
             ALICE_EMAIL,
-            form(&[("csrf", TOK), ("action", "follow")]),
+            form(&[("csrf", TOK), ("level", "watch")]),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
 
     let (_s, _h, thread_page) = send(&state, get_as(&subscribed_loc, ALICE_SUB, ALICE_EMAIL)).await;
-    assert!(
-        thread_page.contains("Unfollow"),
-        "subscribed thread shows the reverse action"
-    );
+    assert!(thread_page.contains(r#"name="level""#));
+    assert!(thread_page.contains(r#"value="watch" selected"#));
+    assert!(thread_page.contains("Watch · replies in Activity"));
+    assert!(thread_page.contains("Follow · personal feeds only"));
+    assert!(thread_page.contains("Mute · hide from personal feeds"));
+    assert!(thread_page
+        .contains("Direct replies, mentions and accepted answers still appear in Activity."));
+    assert!(thread_page.contains("None · reset preference"));
     assert!(thread_page.contains(r#"data-wire-target=".subscription-form""#));
     assert!(thread_page.contains(r#"class="ag-thread-toolbar""#));
     assert!(thread_page.contains(r##"href="#reply">Reply</a>"##));
@@ -139,7 +143,7 @@ async fn thread_subscription_toggle_and_filter() {
             TOK,
             ALICE_SUB,
             ALICE_EMAIL,
-            form(&[("csrf", TOK), ("action", "unfollow")]),
+            form(&[("csrf", TOK), ("level", "none")]),
         ),
     )
     .await;
@@ -156,8 +160,8 @@ async fn thread_subscription_toggle_and_filter() {
 
     let (_s, _h, other_page) = send(&state, get_as(&other_loc, ALICE_SUB, ALICE_EMAIL)).await;
     assert!(
-        other_page.contains("Follow"),
-        "thread outside Following still offers follow"
+        other_page.contains(r#"value="none" selected"#),
+        "thread outside Following defaults to an explicit reset state"
     );
 }
 

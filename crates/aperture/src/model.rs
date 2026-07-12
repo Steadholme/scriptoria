@@ -288,6 +288,188 @@ impl UploadRequestRec {
     }
 }
 
+/// Fixed owner-Inbox ceiling. Counts remain exact, but the HTML surface deliberately renders only
+/// the newest bounded slice so one owner cannot turn a control-plane GET into an unbounded read.
+pub const UPLOAD_REQUEST_INBOX_CAP: i64 = 100;
+
+/// A live request enters the attention-oriented Expiring bucket during its final 72 hours. The
+/// classification always receives an explicit `as_of`; callers must not sample the wall clock per
+/// row or per count.
+pub const UPLOAD_REQUEST_EXPIRING_WINDOW_SECS: i64 = 72 * 60 * 60;
+
+/// URL-selected, mutually-exclusive owner Inbox view. `All` is the only aggregate view; the other
+/// variants partition every request at one shared `as_of` instant.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UploadRequestInboxView {
+    #[default]
+    All,
+    Open,
+    Expiring,
+    Closed,
+    Expired,
+}
+
+impl UploadRequestInboxView {
+    pub const ALL: [Self; 5] = [
+        Self::All,
+        Self::Open,
+        Self::Expiring,
+        Self::Closed,
+        Self::Expired,
+    ];
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Open => "open",
+            Self::Expiring => "expiring",
+            Self::Closed => "closed",
+            Self::Expired => "expired",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Open => "Open",
+            Self::Expiring => "Expiring",
+            Self::Closed => "Closed",
+            Self::Expired => "Expired",
+        }
+    }
+
+    pub fn from_slug(value: &str) -> Option<Self> {
+        match value {
+            "all" => Some(Self::All),
+            "open" => Some(Self::Open),
+            "expiring" => Some(Self::Expiring),
+            "closed" => Some(Self::Closed),
+            "expired" => Some(Self::Expired),
+            _ => None,
+        }
+    }
+}
+
+/// Effective request state at one owner-Inbox snapshot. Expiring is a display bucket, not a
+/// persisted lifecycle mutation. Explicit closure wins over a passed deadline; only persisted
+/// `open` requests can classify as Expired or Expiring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UploadRequestInboxState {
+    Open,
+    Expiring,
+    Closed,
+    Expired,
+}
+
+impl UploadRequestInboxState {
+    pub fn classify(status: &str, expires_at: Option<i64>, as_of: i64) -> Self {
+        if status != "open" {
+            return Self::Closed;
+        }
+        let Some(expires_at) = expires_at else {
+            return Self::Open;
+        };
+        if expires_at <= as_of {
+            return Self::Expired;
+        }
+        if expires_at <= as_of.saturating_add(UPLOAD_REQUEST_EXPIRING_WINDOW_SECS) {
+            return Self::Expiring;
+        }
+        Self::Open
+    }
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Expiring => "expiring",
+            Self::Closed => "closed",
+            Self::Expired => "expired",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Open => "Open",
+            Self::Expiring => "Expiring",
+            Self::Closed => "Closed",
+            Self::Expired => "Expired",
+        }
+    }
+
+    pub fn from_slug(value: &str) -> Option<Self> {
+        match value {
+            "open" => Some(Self::Open),
+            "expiring" => Some(Self::Expiring),
+            "closed" => Some(Self::Closed),
+            "expired" => Some(Self::Expired),
+            _ => None,
+        }
+    }
+
+    pub fn is_in_view(self, view: UploadRequestInboxView) -> bool {
+        view == UploadRequestInboxView::All
+            || matches!(
+                (self, view),
+                (Self::Open, UploadRequestInboxView::Open)
+                    | (Self::Expiring, UploadRequestInboxView::Expiring)
+                    | (Self::Closed, UploadRequestInboxView::Closed)
+                    | (Self::Expired, UploadRequestInboxView::Expired)
+            )
+    }
+}
+
+/// Dedicated, token-free owner Inbox projection. It intentionally has no owner subject,
+/// destination folder id, raw token, public URL, MIME policy, object key, bucket, or other storage
+/// material. The owner can reach the authorized canonical detail page through `id`; only that
+/// explicit Access panel projects the current public capability.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UploadRequestSummary {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub state: UploadRequestInboxState,
+    pub expires_at: Option<i64>,
+    pub max_total_bytes: i64,
+    pub max_files: i64,
+    pub used_bytes: i64,
+    pub used_files: i64,
+    pub updated_at: i64,
+}
+
+/// Exact counts from the same owner query and `as_of` used to classify the bounded rows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UploadRequestInboxCounts {
+    pub all: i64,
+    pub open: i64,
+    pub expiring: i64,
+    pub closed: i64,
+    pub expired: i64,
+}
+
+impl UploadRequestInboxCounts {
+    pub fn for_view(self, view: UploadRequestInboxView) -> i64 {
+        match view {
+            UploadRequestInboxView::All => self.all,
+            UploadRequestInboxView::Open => self.open,
+            UploadRequestInboxView::Expiring => self.expiring,
+            UploadRequestInboxView::Closed => self.closed,
+            UploadRequestInboxView::Expired => self.expired,
+        }
+    }
+}
+
+/// One bounded owner Inbox snapshot. `matched_total` can exceed `items.len()`; `truncated` makes
+/// that condition explicit to the renderer instead of silently hiding older requests.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UploadRequestInbox {
+    pub as_of: i64,
+    pub view: UploadRequestInboxView,
+    pub counts: UploadRequestInboxCounts,
+    pub matched_total: i64,
+    pub items: Vec<UploadRequestSummary>,
+    pub truncated: bool,
+}
+
 /// Immutable receipt for one file accepted through an [`UploadRequestRec`]. File metadata is
 /// snapshotted here so the request history remains intelligible after the file is moved or purged.
 #[derive(Clone, Debug, PartialEq, Eq)]

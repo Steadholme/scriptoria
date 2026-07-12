@@ -453,8 +453,21 @@ a.ag-chip:hover {
   display:flex;
   align-items:center;
   gap:var(--sp-2);
+  flex-wrap:wrap;
   min-width:0;
   font-size:var(--fs-sm);
+}
+.ag-for-you-reason {
+  display:inline-flex;
+  align-items:center;
+  min-height:22px;
+  padding:2px 8px;
+  border:1px solid var(--brand-border);
+  border-radius:var(--r-pill);
+  background:linear-gradient(135deg,var(--brand-soft),var(--surface));
+  color:var(--brand-ink);
+  font-size:var(--fs-micro);
+  font-weight:var(--fw-semibold);
 }
 .ag-row__by {
   min-width:0;
@@ -681,7 +694,40 @@ a.ag-chip:hover {
 }
 .ag-thread-toolbar .subscription-form {
   display:flex;
+  align-items:flex-end;
+  gap:6px;
   margin:0;
+}
+.subscription-form__field {
+  display:grid;
+  gap:2px;
+  min-width:0;
+}
+.subscription-form__label {
+  color:var(--ink-3);
+  font-size:var(--fs-micro);
+  font-weight:var(--fw-semibold);
+}
+.subscription-form__help {
+  max-width:270px;
+  color:var(--ink-4);
+  font-size:10px;
+  line-height:1.25;
+}
+.subscription-form select {
+  width:auto;
+  max-width:230px;
+  min-height:32px;
+  padding:4px 28px 4px 9px;
+  border-color:var(--border);
+  background-color:var(--surface);
+  color:var(--ink-2);
+  font-size:var(--fs-xs);
+}
+.subscription-form select:focus-visible {
+  outline:none;
+  border-color:var(--brand);
+  box-shadow:0 0 0 3px var(--ring);
 }
 .ag-thread-toolbar__locked { cursor:not-allowed; opacity:.7; }
 .ag-thread-toolbar__continue { gap:7px; }
@@ -772,6 +818,32 @@ a.ag-chip:hover {
   border-radius:var(--r-sm);
   background:var(--surface-2);
 }
+
+/* ag S5.5 explainable personal feed */
+.ag-for-you-head { align-items:flex-end; }
+.ag-for-you-eyebrow {
+  margin:0 0 var(--sp-2);
+  color:var(--brand-ink);
+  font-size:var(--fs-micro);
+  font-weight:var(--fw-bold);
+  letter-spacing:var(--track-eyebrow);
+  text-transform:uppercase;
+}
+.ag-for-you-note {
+  display:flex;
+  align-items:baseline;
+  gap:var(--sp-3);
+  margin:0 0 var(--sp-5);
+  padding:var(--sp-3) var(--sp-4);
+  border:1px solid var(--brand-border);
+  border-radius:var(--r-sm);
+  background:linear-gradient(135deg,var(--brand-soft),var(--surface) 72%);
+  color:var(--ink-3);
+  font-size:var(--fs-sm);
+}
+.ag-for-you-note strong { color:var(--brand-ink); white-space:nowrap; }
+.ag-for-you-feed .thread-list { border-color:var(--brand-border); }
+.ag-for-you-empty { padding-block:var(--sp-8); }
 
 /* ag S6 post stream */
 .posts {
@@ -1748,7 +1820,7 @@ a.ag-chip:hover {
 }
 @media (max-width:640px) {
   body:has(.ag-thread-toolbar) .wrap {
-    padding-bottom:calc(120px + env(safe-area-inset-bottom));
+    padding-bottom:calc(190px + env(safe-area-inset-bottom));
   }
   .ag-thread-toolbar {
     position:fixed;
@@ -1766,10 +1838,22 @@ a.ag-chip:hover {
     justify-content:stretch;
     flex-wrap:wrap;
   }
-  .ag-thread-toolbar__actions > .btn,
+  .ag-thread-toolbar__actions > .btn { flex:1 1 0; }
   .ag-thread-toolbar__actions > .subscription-form {
-    flex:1 1 0;
+    flex:1 0 100%;
   }
+  .ag-thread-toolbar .subscription-form {
+    width:100%;
+    flex-wrap:wrap;
+  }
+  .ag-thread-toolbar .subscription-form select {
+    flex:1 1 auto;
+    max-width:none;
+    min-width:0;
+  }
+  .ag-thread-toolbar .subscription-form__field { flex:1 1 100%; }
+  .ag-thread-toolbar .subscription-form__help { max-width:none; }
+  .ag-thread-toolbar .subscription-form > .btn { flex:1 0 100%; }
   .ag-thread-toolbar__actions .btn {
     width:100%;
     justify-content:center;
@@ -1777,6 +1861,7 @@ a.ag-chip:hover {
   .ag-thread-toolbar__continue,
   .ag-thread-toolbar__caught { flex:1 0 100% !important; justify-content:center; }
   .ag-read-progress { align-items:stretch; flex-direction:column; }
+  .ag-for-you-note { align-items:flex-start; flex-direction:column; gap:var(--sp-1); }
   .ag-read-progress form,
   .ag-read-progress .btn { width:100%; margin-left:0; }
   #reply,

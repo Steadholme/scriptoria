@@ -28,8 +28,9 @@
       <div class="request-head__actions">{{ACTION}}</div>
     </div>
 
-    <section class="card">
-      <div class="card__head"><div><p class="eyebrow">Public capability</p><h2>Share this upload-only link</h2></div><span class="badge">{{STATE}}</span></div>
+    <section class="card request-access" aria-labelledby="request-access-title">
+      <div class="card__head"><div><p class="eyebrow">Access</p><h2 id="request-access-title">Public upload capability</h2></div><span class="badge">{{STATE}}</span></div>
+      <p class="muted">This is the only owner panel that reveals the current request link. It can upload, but it cannot browse the destination.</p>
       <div class="embed-box__row"><input class="embed-box__input" readonly value="{{URL}}"><button class="btn btn-secondary copy-btn" type="button" data-copy=".embed-box__input" data-label="Copy">Copy</button></div>
       <div class="request-facts"><span>Destination <b>{{FOLDER}}</b></span><span>{{EXPIRY}}</span><span>{{USED_FILES}} files · {{USED_BYTES}}</span></div>
       <form method="post" action="/requests/{{ID}}/rotate" onsubmit="return confirm('Rotate this capability? The old link will stop working immediately.');">

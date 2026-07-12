@@ -16,28 +16,24 @@ const CSRF: &str = "library_csrf_token";
 async fn library_is_private_owner_scoped_and_composable_without_javascript() {
     let state = build_dev_state();
     let now = now_secs();
-    seed(
-        &state,
-        fixture("alice-published", "alice", true, 0, "Rust, Notes", 30),
-    )
-    .await;
-    seed(
-        &state,
-        fixture("alice-draft-needle", "alice", false, 0, "Rust", 40),
-    )
-    .await;
-    seed(
-        &state,
-        fixture(
-            "alice-scheduled",
-            "alice",
-            true,
-            now + 3_600,
-            "Planning",
-            50,
-        ),
-    )
-    .await;
+    let mut published =
+        fixture("alice-published", "alice", true, 0, "Rust, Notes", 30);
+    published.created_at = 100;
+    seed(&state, published).await;
+    let mut draft =
+        fixture("alice-draft-needle", "alice", false, 0, "Rust", 40);
+    draft.created_at = 20;
+    seed(&state, draft).await;
+    let mut scheduled = fixture(
+        "alice-scheduled",
+        "alice",
+        true,
+        now + 3_600,
+        "Planning",
+        50,
+    );
+    scheduled.created_at = 30;
+    seed(&state, scheduled).await;
     seed(
         &state,
         fixture("bob-private-needle", "bob", false, 0, "Rust", 60),
@@ -61,6 +57,8 @@ async fn library_is_private_owner_scoped_and_composable_without_javascript() {
     assert!(body.contains("<h1>Studio</h1>"));
     assert!(body.contains("Author library"));
     assert!(body.contains(r#"method="get" action="/library""#));
+    assert!(body.contains(r#"id="library-sort" name="sort""#));
+    assert!(body.contains(r#"value="updated" selected"#));
     assert!(body.contains(r#"method="post" action="/library/posts/bulk""#));
     assert!(body.contains(r#"aria-label="Author library status""#));
     assert!(body.contains(r#"data-select-page"#));
@@ -84,6 +82,9 @@ async fn library_is_private_owner_scoped_and_composable_without_javascript() {
     assert!(body.contains("alice-published"));
     assert!(body.contains("alice-draft-needle"));
     assert!(body.contains("alice-scheduled"));
+    assert!(body.contains("Preview saved"));
+    assert!(body.contains(r#"href="/p/alice-draft-needle?preview=1""#));
+    assert!(body.contains("View live"));
     assert!(!body.contains("bob-private-needle"));
     assert!(body.contains(
         r#"class="appnav appnav--studio is-active" href="/library" aria-current="page""#
@@ -113,6 +114,33 @@ async fn library_is_private_owner_scoped_and_composable_without_javascript() {
     ));
     assert!(filtered.contains(r#"class="ink-library__advanced" open"#));
     assert!(filtered.contains(r#"name="tag" type="text" maxlength="40" value="Rust""#));
+
+    let created_uri = format!("/library?sort=created&as_of={now}&limit=10");
+    let (status, _, created_order) = call(&state, get(&created_uri, "alice", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(created_order.contains(r#"value="created" selected"#));
+    assert!(created_order.contains(
+        r#"href="/library?status=draft&amp;sort=created&amp;as_of="#
+    ));
+    assert!(created_order.contains(r#"href="/library?tag=Rust&amp;sort=created&amp;as_of="#));
+    assert!(created_order.contains(
+        r#"name="return_to" value="/library?sort=created&amp;as_of="#
+    ));
+    let published_at = created_order.find("alice-published").unwrap();
+    let scheduled_at = created_order.find("alice-scheduled").unwrap();
+    let draft_at = created_order.find("alice-draft-needle").unwrap();
+    assert!(published_at < scheduled_at && scheduled_at < draft_at);
+    let (_, _, created_page) = call(
+        &state,
+        get(
+            &format!("/library?sort=created&as_of={now}&limit=1"),
+            "alice",
+            None,
+        ),
+    )
+    .await;
+    assert!(created_page.contains("sort=created&amp;as_of="));
+    assert!(created_page.contains("cursor=created."));
 
     // Admin membership does not widen the author workspace; site-wide moderation stays /admin.
     let (_, _, admin_library) = call(&state, get("/library", "alice", Some("admins"))).await;

@@ -28,6 +28,7 @@
 //! - `POST /t/{tid}/p/{pid}/react`      toggle a reaction (up/heart) on a post
 //! - `POST /t/{id}/accept`   thread author/admin explicitly accept or clear an accepted answer
 //! - `POST /t/{id}/subscribe` toggle the current user's thread subscription
+//! - `GET  /for-you`          private, explainable personal thread feed
 //! - `GET  /bookmarks`       personal All/Due/Scheduled bookmark queue
 //! - `GET  /search`           shareable thread + accepted-answer search (`?q=&category=&status=`)
 //! - `GET  /api/search/suggest` bounded same-origin quick-search suggestions
@@ -77,6 +78,7 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(handlers::health::healthz))
         .route("/", get(handlers::forum::home))
+        .route("/for-you", get(handlers::forum::for_you))
         .route("/questions", get(handlers::forum::questions))
         .route("/activity", get(handlers::activity::page))
         .route(

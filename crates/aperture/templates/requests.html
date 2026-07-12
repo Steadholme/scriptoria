@@ -24,9 +24,16 @@
 
   <main class="console console--narrow request-console">
     <div class="console__head console__head--row">
-      <div><p class="eyebrow">External intake</p><h1>Upload requests</h1><p class="sub">Finite, upload-only rooms that never reveal your Drive.</p></div>
+      <div><p class="eyebrow">Request Inbox</p><h1>External intake</h1><p class="sub">Track finite, upload-only rooms without exposing their capabilities.</p></div>
     </div>
-    <section class="request-grid" aria-label="Upload requests">{{REQUESTS}}</section>
+    <section class="request-inbox" aria-labelledby="request-inbox-title">
+      <div class="request-inbox__head">
+        <div><p class="eyebrow">Owner control plane</p><h2 id="request-inbox-title">Upload requests</h2></div>
+        <p class="request-inbox__scope">{{SCOPE}}</p>
+      </div>
+      <nav class="request-filters" aria-label="Filter upload requests">{{FILTERS}}</nav>
+      <div class="request-inbox__rows">{{REQUESTS}}</div>
+    </section>
     <section class="card request-create">
       <div class="card__head"><div><p class="eyebrow">New request</p><h2>Choose a destination folder</h2></div></div>
       <p class="muted">The public room can add files only. You can tune its deadline, budgets and MIME allow-list after creation.</p>
@@ -34,30 +41,5 @@
     </section>
   </main>
   {{DYNAMIC}}
-  <script>
-    (function () {
-      var buttons = document.querySelectorAll('.copy-btn');
-      Array.prototype.forEach.call(buttons, function (button) {
-        button.addEventListener('click', function () {
-          var row = button.closest ? button.closest('.embed-box__row') : button.parentNode;
-          var input = row ? row.querySelector(button.getAttribute('data-copy') || '') : null;
-          if (!input) { return; }
-          input.select();
-          if (input.setSelectionRange) { input.setSelectionRange(0, input.value.length); }
-          var done = function () {
-            button.textContent = 'Copied';
-            setTimeout(function () { button.textContent = button.getAttribute('data-label') || 'Copy'; }, 1200);
-          };
-          if (navigator.clipboard) {
-            navigator.clipboard.writeText(input.value).then(done, function () {
-              try { document.execCommand('copy'); done(); } catch (error) {}
-            });
-          } else {
-            try { document.execCommand('copy'); done(); } catch (error) {}
-          }
-        });
-      });
-    })();
-  </script>
 </body>
 </html>

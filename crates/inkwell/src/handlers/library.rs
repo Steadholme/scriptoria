@@ -17,7 +17,7 @@ use crate::error::AppError;
 use crate::handlers::{esc, fmt_date, page_shell, PageShell};
 use crate::store::{
     LibraryBulkAction, LibraryBulkCommand, LibraryBulkOutcome, LibraryCursor, LibraryQuery,
-    LibrarySelection, LibraryStatus, Post,
+    LibrarySelection, LibrarySort, LibraryStatus, Post,
 };
 use crate::{now_secs, AppState};
 
@@ -34,6 +34,8 @@ pub struct LibraryParams {
     #[serde(default)]
     tag: String,
     #[serde(default)]
+    sort: String,
+    #[serde(default)]
     as_of: String,
     #[serde(default)]
     cursor: String,
@@ -48,6 +50,7 @@ struct ViewState {
     q: String,
     status: LibraryStatus,
     tag: String,
+    sort: LibrarySort,
     as_of: i64,
     limit: i64,
     cursor: Option<LibraryCursor>,
@@ -70,6 +73,7 @@ pub async fn index(
             q: view.q.clone(),
             status: view.status,
             tag: view.tag.clone(),
+            sort: view.sort,
             as_of: view.as_of,
             cursor: view.cursor.clone(),
             limit: view.limit,
@@ -97,6 +101,7 @@ pub async fn index(
         })
         .unwrap_or_default();
     let status_tabs = render_status_tabs(&view);
+    let sort_options = render_sort_options(view.sort);
     let result_summary = if page.posts.len() == 1 {
         "1 post on this page".to_string()
     } else {
@@ -109,6 +114,7 @@ pub async fn index(
         .replace("{{NOTICE}}", &notice)
         .replace("{{QUERY}}", &esc(&view.q))
         .replace("{{TAG}}", &esc(&view.tag))
+        .replace("{{SORT_OPTIONS}}", &sort_options)
         .replace("{{STATUS_TABS}}", &status_tabs)
         .replace("{{STATUS_KEY}}", status_key(view.status))
         .replace(
@@ -214,6 +220,7 @@ fn normalize_view(params: LibraryParams, now: i64) -> Result<ViewState, AppError
         .take(crate::tags::MAX_TAG_CHARS)
         .collect();
     let status = parse_status(&params.status)?;
+    let sort = parse_sort(&params.sort)?;
     let as_of = if params.as_of.trim().is_empty() {
         now
     } else {
@@ -229,7 +236,7 @@ fn normalize_view(params: LibraryParams, now: i64) -> Result<ViewState, AppError
     let cursor = if params.cursor.trim().is_empty() {
         None
     } else {
-        Some(parse_cursor(params.cursor.trim())?)
+        Some(parse_cursor(params.cursor.trim(), sort)?)
     };
     let limit = if params.limit.trim().is_empty() {
         crate::config::LIBRARY_DEFAULT_PAGE
@@ -245,6 +252,7 @@ fn normalize_view(params: LibraryParams, now: i64) -> Result<ViewState, AppError
         q,
         status,
         tag,
+        sort,
         as_of,
         limit,
         cursor,
@@ -276,6 +284,38 @@ fn status_key(status: LibraryStatus) -> &'static str {
         LibraryStatus::Scheduled => "scheduled",
         LibraryStatus::Published => "published",
     }
+}
+
+fn parse_sort(raw: &str) -> Result<LibrarySort, AppError> {
+    match raw.trim() {
+        "" | "updated" => Ok(LibrarySort::Updated),
+        "created" => Ok(LibrarySort::Created),
+        _ => Err(AppError::InvalidRequest("unknown library sort".to_string())),
+    }
+}
+
+fn sort_key(sort: LibrarySort) -> &'static str {
+    match sort {
+        LibrarySort::Updated => "updated",
+        LibrarySort::Created => "created",
+    }
+}
+
+fn render_sort_options(sort: LibrarySort) -> String {
+    [
+        (LibrarySort::Updated, "Recently updated"),
+        (LibrarySort::Created, "Newest created"),
+    ]
+    .into_iter()
+    .map(|(value, label)| {
+        format!(
+            r#"<option value="{}"{}>{label}</option>"#,
+            sort_key(value),
+            if value == sort { " selected" } else { "" },
+        )
+    })
+    .collect::<Vec<_>>()
+    .join("")
 }
 
 fn render_status_tabs(view: &ViewState) -> String {
@@ -351,6 +391,16 @@ fn render_row(post: &Post, view: &ViewState, current_url: &str) -> String {
     } else {
         String::new()
     };
+    let view_label = if post.is_public_at(view.as_of) {
+        "View live"
+    } else {
+        "Preview saved"
+    };
+    let view_href = if post.is_public_at(view.as_of) {
+        format!("/p/{}", esc(&post.slug))
+    } else {
+        format!("/p/{}?preview=1", esc(&post.slug))
+    };
     format!(
         r#"        <article class="ink-library__row" role="listitem">
           <label class="ink-library__select"><input type="checkbox" name="items" form="library-bulk" value="{selection}" data-library-item aria-label="Select {title}"></label>
@@ -360,7 +410,7 @@ fn render_row(post: &Post, view: &ViewState, current_url: &str) -> String {
             <div class="tags">{tags}</div>
           </div>
           <div class="ink-library__rowactions">
-            <a class="btn btn-ghost btn-sm" href="/p/{slug}">View</a>
+            <a class="btn btn-ghost btn-sm" href="{view_href}">{view_label}</a>
             <a class="btn btn-ghost btn-sm" href="{history_href}">History</a>
             <a class="btn btn-secondary btn-sm" href="{edit_href}">Edit</a>
           </div>
@@ -375,7 +425,8 @@ fn render_row(post: &Post, view: &ViewState, current_url: &str) -> String {
         schedule = schedule,
         version = post.edit_version,
         tags = tags,
-        slug = esc(&post.slug),
+        view_href = view_href,
+        view_label = view_label,
     )
 }
 
@@ -435,22 +486,39 @@ fn parse_selection(raw: &str) -> Result<LibrarySelection, AppError> {
 
 fn encode_cursor(cursor: &LibraryCursor) -> String {
     format!(
-        "{}.{}",
-        cursor.updated_at,
+        "{}.{}.{}",
+        sort_key(cursor.sort),
+        cursor.sort_at,
         hex::encode(cursor.post_id.as_bytes())
     )
 }
 
-fn parse_cursor(raw: &str) -> Result<LibraryCursor, AppError> {
-    let (updated_at, encoded_id) = raw
-        .split_once('.')
-        .ok_or_else(|| AppError::InvalidRequest("invalid library cursor".to_string()))?;
+fn parse_cursor(raw: &str, expected_sort: LibrarySort) -> Result<LibraryCursor, AppError> {
+    let parts = raw.split('.').collect::<Vec<_>>();
+    let (cursor_sort, sort_at, encoded_id) = match parts.as_slice() {
+        // v5/v6 updated-at cursor. Keeping it valid avoids turning an open Studio tab into a 400
+        // when v7 adds an explicit sort discriminator.
+        [sort_at, encoded_id] if expected_sort == LibrarySort::Updated => {
+            (LibrarySort::Updated, *sort_at, *encoded_id)
+        }
+        [sort, sort_at, encoded_id] => (parse_sort(sort)?, *sort_at, *encoded_id),
+        _ => {
+            return Err(AppError::InvalidRequest(
+                "invalid library cursor".to_string(),
+            ));
+        }
+    };
+    if cursor_sort != expected_sort {
+        return Err(AppError::InvalidRequest(
+            "library cursor does not match sort".to_string(),
+        ));
+    }
     if encoded_id.len() > 512 {
         return Err(AppError::InvalidRequest(
             "invalid library cursor".to_string(),
         ));
     }
-    let updated_at = updated_at
+    let sort_at = sort_at
         .parse::<i64>()
         .map_err(|_| AppError::InvalidRequest("invalid library cursor".to_string()))?;
     let post_id = hex::decode(encoded_id)
@@ -459,7 +527,8 @@ fn parse_cursor(raw: &str) -> Result<LibraryCursor, AppError> {
         .filter(|id| !id.is_empty())
         .ok_or_else(|| AppError::InvalidRequest("invalid library cursor".to_string()))?;
     Ok(LibraryCursor {
-        updated_at,
+        sort: cursor_sort,
+        sort_at,
         post_id,
     })
 }
@@ -474,6 +543,9 @@ fn library_url(view: &ViewState, cursor: Option<&LibraryCursor>) -> String {
     }
     if !view.tag.is_empty() {
         pairs.push(format!("tag={}", percent_encode(&view.tag)));
+    }
+    if view.sort != LibrarySort::Updated {
+        pairs.push(format!("sort={}", sort_key(view.sort)));
     }
     pairs.push(format!("as_of={}", view.as_of));
     pairs.push(format!("limit={}", view.limit));
@@ -623,10 +695,31 @@ mod tests {
     #[test]
     fn cursor_and_selection_round_trip_stable_identity() {
         let cursor = LibraryCursor {
-            updated_at: 42,
+            sort: LibrarySort::Updated,
+            sort_at: 42,
             post_id: "post.with:odd/id".to_string(),
         };
-        assert_eq!(parse_cursor(&encode_cursor(&cursor)).unwrap(), cursor);
+        assert_eq!(
+            parse_cursor(&encode_cursor(&cursor), LibrarySort::Updated).unwrap(),
+            cursor
+        );
+        assert!(parse_cursor(&encode_cursor(&cursor), LibrarySort::Created).is_err());
+        assert_eq!(
+            parse_cursor("42.706f7374", LibrarySort::Updated).unwrap(),
+            LibraryCursor {
+                sort: LibrarySort::Updated,
+                sort_at: 42,
+                post_id: "post".to_string(),
+            }
+        );
+        assert!(parse_cursor("42.706f7374", LibrarySort::Created).is_err());
+        assert_eq!(
+            render_sort_options(LibrarySort::Created)
+                .matches(" selected")
+                .count(),
+            1
+        );
+        assert!(render_sort_options(LibrarySort::Created).contains(r#"value="created" selected"#));
         let post = Post {
             id: "post.with:odd/id".to_string(),
             slug: "safe".to_string(),

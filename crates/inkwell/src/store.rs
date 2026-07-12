@@ -223,10 +223,25 @@ pub enum LibraryStatus {
     Published,
 }
 
-/// Exclusive keyset for `updated_at DESC, id DESC` author-library traversal.
+/// Author Library ordering. Both modes use an integer authority already stored on the post, so
+/// Memory and PostgreSQL can share byte-for-byte cursor semantics without collation-dependent
+/// title ordering.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LibrarySort {
+    /// Work touched most recently, useful for returning to an active draft.
+    #[default]
+    Updated,
+    /// Work created most recently, useful for reconstructing the publication backlog independently
+    /// of later metadata edits.
+    Created,
+}
+
+/// Exclusive keyset for the selected author-library sort plus `id DESC`. Carrying the sort inside
+/// the cursor prevents a cursor copied from one URL order being interpreted in another order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LibraryCursor {
-    pub updated_at: i64,
+    pub sort: LibrarySort,
+    pub sort_at: i64,
     pub post_id: String,
 }
 
@@ -238,6 +253,7 @@ pub struct LibraryQuery {
     pub q: String,
     pub status: LibraryStatus,
     pub tag: String,
+    pub sort: LibrarySort,
     pub as_of: i64,
     pub cursor: Option<LibraryCursor>,
     pub limit: i64,
@@ -335,19 +351,30 @@ fn library_tag_matches(post: &Post, tag: &str) -> bool {
             .any(|candidate| candidate.to_lowercase() == tag.to_lowercase())
 }
 
-fn after_library_cursor(post: &Post, cursor: &LibraryCursor) -> bool {
-    post.updated_at < cursor.updated_at
-        || (post.updated_at == cursor.updated_at && post.id < cursor.post_id)
+fn library_sort_at(post: &Post, sort: LibrarySort) -> i64 {
+    match sort {
+        LibrarySort::Updated => post.updated_at,
+        LibrarySort::Created => post.created_at,
+    }
 }
 
-fn finish_library_page(mut posts: Vec<Post>, limit: i64) -> LibraryPage {
+fn after_library_cursor(post: &Post, cursor: &LibraryCursor, sort: LibrarySort) -> bool {
+    if cursor.sort != sort {
+        return false;
+    }
+    let sort_at = library_sort_at(post, sort);
+    sort_at < cursor.sort_at || (sort_at == cursor.sort_at && post.id < cursor.post_id)
+}
+
+fn finish_library_page(mut posts: Vec<Post>, limit: i64, sort: LibrarySort) -> LibraryPage {
     let limit = limit.clamp(1, crate::config::LIBRARY_MAX_PAGE) as usize;
     let has_more = posts.len() > limit;
     posts.truncate(limit);
     let next = has_more.then(|| {
         let post = posts.last().expect("a page with look-ahead has one item");
         LibraryCursor {
-            updated_at: post.updated_at,
+            sort,
+            sort_at: library_sort_at(post, sort),
             post_id: post.id.clone(),
         }
     });
@@ -542,7 +569,7 @@ pub trait Store: Send + Sync {
     /// Fail-closed post read for authoring commands; database errors must never look like a 404.
     async fn get_post_authoritative(&self, slug: &str) -> Result<Option<Post>, StoreError>;
     /// One fail-closed, owner-scoped Content Library page. Every implementation applies all filters
-    /// before the stable `updated_at DESC, id DESC` keyset and returns backend failures as errors.
+    /// before the selected stable timestamp + id keyset and returns backend failures as errors.
     async fn list_library(&self, query: LibraryQuery) -> Result<LibraryPage, StoreError>;
     /// Apply one bounded author action to stable id/version selections atomically. All selections
     /// are authorized and compared before any write; autosaves are neither read nor consumed.
@@ -734,6 +761,16 @@ impl Store for InMemoryStore {
 
     async fn list_library(&self, query: LibraryQuery) -> Result<LibraryPage, StoreError> {
         let limit = query.limit.clamp(1, crate::config::LIBRARY_MAX_PAGE);
+        if query
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.sort != query.sort)
+        {
+            return Ok(LibraryPage {
+                posts: Vec::new(),
+                next: None,
+            });
+        }
         let search: String = query.q.trim().chars().take(200).collect();
         let tag: String = query
             .tag
@@ -752,17 +789,17 @@ impl Store for InMemoryStore {
                 query
                     .cursor
                     .as_ref()
-                    .is_none_or(|cursor| after_library_cursor(post, cursor))
+                    .is_none_or(|cursor| after_library_cursor(post, cursor, query.sort))
             })
             .cloned()
             .collect();
         rows.sort_by(|a, b| {
-            b.updated_at
-                .cmp(&a.updated_at)
+            library_sort_at(b, query.sort)
+                .cmp(&library_sort_at(a, query.sort))
                 .then_with(|| b.id.cmp(&a.id))
         });
         rows.truncate(limit as usize + 1);
-        Ok(finish_library_page(rows, limit))
+        Ok(finish_library_page(rows, limit, query.sort))
     }
 
     async fn bulk_update_library(
@@ -2127,6 +2164,16 @@ impl PgStore {
 
     async fn list_library_async(&self, query: LibraryQuery) -> Result<LibraryPage, sqlx::Error> {
         let limit = query.limit.clamp(1, crate::config::LIBRARY_MAX_PAGE);
+        if query
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.sort != query.sort)
+        {
+            return Ok(LibraryPage {
+                posts: Vec::new(),
+                next: None,
+            });
+        }
         let mut sql = QueryBuilder::<Postgres>::new(POST_COLS);
         sql.push(" WHERE author_sub = ")
             .push_bind(query.owner_sub.clone());
@@ -2170,20 +2217,24 @@ impl PgStore {
                 .push_bind(tag)
                 .push(" || ', ') IN LOWER(', ' || COALESCE(tags, '') || ', ')) > 0");
         }
+        let sort_column = match query.sort {
+            LibrarySort::Updated => "updated_at",
+            LibrarySort::Created => "created_at",
+        };
         if let Some(cursor) = query.cursor {
-            sql.push(" AND (updated_at < ")
-                .push_bind(cursor.updated_at)
-                .push(" OR (updated_at = ")
-                .push_bind(cursor.updated_at)
+            sql.push(format!(" AND ({sort_column} < "))
+                .push_bind(cursor.sort_at)
+                .push(format!(" OR ({sort_column} = "))
+                .push_bind(cursor.sort_at)
                 .push(" AND id < ")
                 .push_bind(cursor.post_id)
                 .push("))");
         }
-        sql.push(" ORDER BY updated_at DESC, id DESC LIMIT ")
+        sql.push(format!(" ORDER BY {sort_column} DESC, id DESC LIMIT "))
             .push_bind(limit + 1);
         let rows = sql.build().fetch_all(&self.pool).await?;
         let posts: Result<Vec<Post>, sqlx::Error> = rows.iter().map(Self::post_from_row).collect();
-        Ok(finish_library_page(posts?, limit))
+        Ok(finish_library_page(posts?, limit, query.sort))
     }
 
     async fn bulk_update_library_async(
@@ -3726,17 +3777,18 @@ mod tests {
         foreign.updated_at = 50;
         store.create_post(&foreign).await.unwrap();
 
-        let query = |status, cursor, limit| LibraryQuery {
+        let query = |status, cursor, limit, sort| LibraryQuery {
             owner_sub: "alice".to_string(),
             q: "needle".to_string(),
             status,
             tag: "rust".to_string(),
+            sort,
             as_of: now,
             cursor,
             limit,
         };
         let first = store
-            .list_library(query(LibraryStatus::All, None, 1))
+            .list_library(query(LibraryStatus::All, None, 1, LibrarySort::Updated))
             .await
             .unwrap();
         assert_eq!(
@@ -3744,7 +3796,12 @@ mod tests {
             "id breaks updated_at tie"
         );
         let second = store
-            .list_library(query(LibraryStatus::All, first.next, 2))
+            .list_library(query(
+                LibraryStatus::All,
+                first.next,
+                2,
+                LibrarySort::Updated,
+            ))
             .await
             .unwrap();
         assert_eq!(
@@ -3758,7 +3815,7 @@ mod tests {
         assert!(second.posts.iter().all(|post| post.author_sub == "alice"));
         assert_eq!(
             store
-                .list_library(query(LibraryStatus::Draft, None, 10))
+                .list_library(query(LibraryStatus::Draft, None, 10, LibrarySort::Updated))
                 .await
                 .unwrap()
                 .posts
@@ -3769,7 +3826,12 @@ mod tests {
         );
         assert_eq!(
             store
-                .list_library(query(LibraryStatus::Scheduled, None, 10))
+                .list_library(query(
+                    LibraryStatus::Scheduled,
+                    None,
+                    10,
+                    LibrarySort::Updated,
+                ))
                 .await
                 .unwrap()
                 .posts[0]
@@ -3778,13 +3840,46 @@ mod tests {
         );
         assert_eq!(
             store
-                .list_library(query(LibraryStatus::Published, None, 10))
+                .list_library(query(
+                    LibraryStatus::Published,
+                    None,
+                    10,
+                    LibrarySort::Updated,
+                ))
                 .await
                 .unwrap()
                 .posts[0]
                 .id,
             "alice-published"
         );
+        let created = store
+            .list_library(query(LibraryStatus::All, None, 10, LibrarySort::Created))
+            .await
+            .unwrap();
+        assert_eq!(
+            created
+                .posts
+                .iter()
+                .map(|post| post.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alice-scheduled", "alice-draft", "alice-published"]
+        );
+        assert_eq!(created.next, None);
+        let mismatched = store
+            .list_library(query(
+                LibraryStatus::All,
+                Some(LibraryCursor {
+                    sort: LibrarySort::Created,
+                    sort_at: 30,
+                    post_id: "alice-scheduled".to_string(),
+                }),
+                10,
+                LibrarySort::Updated,
+            ))
+            .await
+            .unwrap();
+        assert!(mismatched.posts.is_empty());
+        assert_eq!(mismatched.next, None);
     }
 
     #[tokio::test]

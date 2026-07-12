@@ -3,7 +3,7 @@
     <div>
       <p class="ink-library__eyebrow">Private author workspace</p>
       <h1>Studio</h1>
-      <p class="sub">Draft, schedule, and organize your own work away from the public reader.</p>
+      <p class="sub">Draft, schedule, preview, and organize your own work with durable URL state.</p>
     </div>
     <a class="btn btn-primary" href="{{NEW_HREF}}">New post</a>
   </header>
@@ -22,6 +22,10 @@
         <div class="field ink-library__query">
           <label for="library-q">Search your content</label>
           <input id="library-q" name="q" type="search" maxlength="200" value="{{QUERY}}" placeholder="Title, slug, body, or tag">
+        </div>
+        <div class="field ink-library__sort">
+          <label for="library-sort">Order</label>
+          <select id="library-sort" name="sort">{{SORT_OPTIONS}}</select>
         </div>
         <details class="ink-library__advanced"{{ADVANCED_OPEN}}>
           <summary>Advanced filters</summary>

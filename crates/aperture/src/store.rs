@@ -19,7 +19,9 @@ use crate::config::clamp_page;
 use crate::model::{
     library_type_for, FileComment, FileRec, FolderRec, LibraryCursor, LibraryItem, LibraryItemKind,
     LibraryPage, LibraryQuery, LibraryType, LibraryView, OwnerUsage, TrashEntry, TrashItem,
-    TrashPage, UploadRequestRec, UploadSubmission, VersionRec,
+    TrashPage, UploadRequestInbox, UploadRequestInboxCounts, UploadRequestInboxState,
+    UploadRequestInboxView, UploadRequestRec, UploadRequestSummary, UploadSubmission, VersionRec,
+    UPLOAD_REQUEST_EXPIRING_WINDOW_SECS, UPLOAD_REQUEST_INBOX_CAP,
 };
 
 const DEFAULT_TRASH_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
@@ -184,6 +186,61 @@ fn request_allows_unverified_type(request: &UploadRequestRec) -> bool {
         .allowed_types
         .split(',')
         .any(|pattern| pattern.trim() == "*/*")
+}
+
+fn upload_request_summary(request: &UploadRequestRec, as_of: i64) -> UploadRequestSummary {
+    UploadRequestSummary {
+        id: request.id.clone(),
+        title: request.title.clone(),
+        description: request.description.clone(),
+        state: UploadRequestInboxState::classify(&request.status, request.expires_at, as_of),
+        expires_at: request.expires_at,
+        max_total_bytes: request.max_total_bytes,
+        max_files: request.max_files,
+        used_bytes: request.used_bytes,
+        used_files: request.used_files,
+        updated_at: request.updated_at,
+    }
+}
+
+fn finish_upload_request_inbox(
+    requests: impl IntoIterator<Item = UploadRequestRec>,
+    view: UploadRequestInboxView,
+    as_of: i64,
+) -> UploadRequestInbox {
+    let mut counts = UploadRequestInboxCounts::default();
+    let mut items = Vec::new();
+    for request in requests {
+        let summary = upload_request_summary(&request, as_of);
+        counts.all = counts.all.saturating_add(1);
+        match summary.state {
+            UploadRequestInboxState::Open => counts.open = counts.open.saturating_add(1),
+            UploadRequestInboxState::Expiring => {
+                counts.expiring = counts.expiring.saturating_add(1)
+            }
+            UploadRequestInboxState::Closed => counts.closed = counts.closed.saturating_add(1),
+            UploadRequestInboxState::Expired => counts.expired = counts.expired.saturating_add(1),
+        }
+        if summary.state.is_in_view(view) {
+            items.push(summary);
+        }
+    }
+    items.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    let matched_total = items.len().min(i64::MAX as usize) as i64;
+    items.truncate(UPLOAD_REQUEST_INBOX_CAP as usize);
+    UploadRequestInbox {
+        as_of,
+        view,
+        counts,
+        matched_total,
+        truncated: matched_total > items.len() as i64,
+        items,
+    }
 }
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
@@ -717,6 +774,16 @@ pub trait Store: Send + Sync {
         &self,
         owner_sub: &str,
     ) -> Result<Vec<UploadRequestRec>, StoreError>;
+
+    /// Return one exact-count, bounded, token-free owner Inbox snapshot. Every effective state and
+    /// count is classified against the caller's single `as_of`; implementations keep stable
+    /// `updated_at DESC, id DESC` ordering and never project capability or storage material.
+    async fn upload_request_inbox(
+        &self,
+        owner_sub: &str,
+        view: UploadRequestInboxView,
+        as_of: i64,
+    ) -> Result<UploadRequestInbox, StoreError>;
 
     async fn get_upload_request(
         &self,
@@ -3075,6 +3142,25 @@ impl Store for InMemoryStore {
                 .then_with(|| b.id.cmp(&a.id))
         });
         Ok(out)
+    }
+
+    async fn upload_request_inbox(
+        &self,
+        owner_sub: &str,
+        view: UploadRequestInboxView,
+        as_of: i64,
+    ) -> Result<UploadRequestInbox, StoreError> {
+        let state = self
+            .request_state
+            .lock()
+            .expect("request state lock poisoned");
+        let requests = state
+            .requests
+            .iter()
+            .filter(|request| request.owner_sub == owner_sub)
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(finish_upload_request_inbox(requests, view, as_of))
     }
 
     async fn get_upload_request(
@@ -7190,6 +7276,116 @@ impl PgStore {
         rows.iter().map(Self::upload_request_from_row).collect()
     }
 
+    async fn upload_request_inbox_async(
+        &self,
+        owner_sub: &str,
+        view: UploadRequestInboxView,
+        as_of: i64,
+    ) -> Result<UploadRequestInbox, sqlx::Error> {
+        // One statement gives the bounded page and every tab count the same PostgreSQL snapshot
+        // and the same explicit classification instant. The CTE deliberately never selects the
+        // raw token, owner, destination folder, MIME policy, or any storage column.
+        let rows = sqlx::query(
+            r#"WITH classified AS (
+                   SELECT id, title, description, expires_at, max_total_bytes, max_files,
+                          used_bytes, used_files, updated_at,
+                          CASE
+                            WHEN status <> 'open' THEN 'closed'
+                            WHEN expires_at IS NOT NULL AND expires_at <= $2 THEN 'expired'
+                            WHEN expires_at IS NOT NULL AND expires_at <= $3 THEN 'expiring'
+                            ELSE 'open'
+                          END AS inbox_state
+                     FROM upload_requests
+                    WHERE owner_sub = $1
+                 ), totals AS (
+                   SELECT COUNT(*)::BIGINT AS all_count,
+                          COUNT(*) FILTER (WHERE inbox_state = 'open')::BIGINT AS open_count,
+                          COUNT(*) FILTER (WHERE inbox_state = 'expiring')::BIGINT AS expiring_count,
+                          COUNT(*) FILTER (WHERE inbox_state = 'closed')::BIGINT AS closed_count,
+                          COUNT(*) FILTER (WHERE inbox_state = 'expired')::BIGINT AS expired_count
+                     FROM classified
+                 ), page AS (
+                   SELECT *
+                     FROM classified
+                    WHERE $4 = 'all' OR inbox_state = $4
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT $5
+                 )
+                 SELECT page.id, page.title, page.description, page.inbox_state,
+                        page.expires_at, page.max_total_bytes, page.max_files,
+                        page.used_bytes, page.used_files, page.updated_at,
+                        totals.all_count, totals.open_count, totals.expiring_count,
+                        totals.closed_count, totals.expired_count
+                   FROM totals
+                   LEFT JOIN page ON TRUE
+                  ORDER BY page.updated_at DESC NULLS LAST, page.id DESC NULLS LAST"#,
+        )
+        .bind(owner_sub)
+        .bind(as_of)
+        .bind(as_of.saturating_add(UPLOAD_REQUEST_EXPIRING_WINDOW_SECS))
+        .bind(view.slug())
+        .bind(UPLOAD_REQUEST_INBOX_CAP)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let totals = rows
+            .first()
+            .expect("aggregate-left-join Inbox query always returns one totals row");
+        let counts = UploadRequestInboxCounts {
+            all: totals.try_get("all_count")?,
+            open: totals.try_get("open_count")?,
+            expiring: totals.try_get("expiring_count")?,
+            closed: totals.try_get("closed_count")?,
+            expired: totals.try_get("expired_count")?,
+        };
+        let mut items = Vec::with_capacity(rows.len().min(UPLOAD_REQUEST_INBOX_CAP as usize));
+        for row in rows {
+            let Some(id) = row.try_get::<Option<String>, _>("id")? else {
+                continue;
+            };
+            let state = row
+                .try_get::<Option<String>, _>("inbox_state")?
+                .as_deref()
+                .and_then(UploadRequestInboxState::from_slug)
+                .ok_or_else(|| sqlx::Error::Decode("unknown upload request Inbox state".into()))?;
+            items.push(UploadRequestSummary {
+                id,
+                title: row
+                    .try_get::<Option<String>, _>("title")?
+                    .ok_or_else(|| sqlx::Error::Decode("missing Inbox title".into()))?,
+                description: row
+                    .try_get::<Option<String>, _>("description")?
+                    .ok_or_else(|| sqlx::Error::Decode("missing Inbox description".into()))?,
+                state,
+                expires_at: row.try_get("expires_at")?,
+                max_total_bytes: row
+                    .try_get::<Option<i64>, _>("max_total_bytes")?
+                    .ok_or_else(|| sqlx::Error::Decode("missing Inbox byte budget".into()))?,
+                max_files: row
+                    .try_get::<Option<i64>, _>("max_files")?
+                    .ok_or_else(|| sqlx::Error::Decode("missing Inbox file budget".into()))?,
+                used_bytes: row
+                    .try_get::<Option<i64>, _>("used_bytes")?
+                    .ok_or_else(|| sqlx::Error::Decode("missing Inbox used bytes".into()))?,
+                used_files: row
+                    .try_get::<Option<i64>, _>("used_files")?
+                    .ok_or_else(|| sqlx::Error::Decode("missing Inbox used files".into()))?,
+                updated_at: row
+                    .try_get::<Option<i64>, _>("updated_at")?
+                    .ok_or_else(|| sqlx::Error::Decode("missing Inbox updated time".into()))?,
+            });
+        }
+        let matched_total = counts.for_view(view);
+        Ok(UploadRequestInbox {
+            as_of,
+            view,
+            counts,
+            matched_total,
+            truncated: matched_total > items.len() as i64,
+            items,
+        })
+    }
+
     async fn get_upload_request_async(
         &self,
         id: &str,
@@ -8418,6 +8614,17 @@ impl Store for PgStore {
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
+    async fn upload_request_inbox(
+        &self,
+        owner_sub: &str,
+        view: UploadRequestInboxView,
+        as_of: i64,
+    ) -> Result<UploadRequestInbox, StoreError> {
+        self.upload_request_inbox_async(owner_sub, view, as_of)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
     async fn get_upload_request(
         &self,
         id: &str,
@@ -9058,6 +9265,171 @@ mod tests {
             trash_entry_id: None,
             trash_ancestor_id: None,
         }
+    }
+
+    fn inbox_request(
+        id: &str,
+        owner: &str,
+        folder_id: &str,
+        status: &str,
+        expires_at: Option<i64>,
+        updated_at: i64,
+    ) -> UploadRequestRec {
+        UploadRequestRec {
+            id: id.into(),
+            owner_sub: owner.into(),
+            folder_id: folder_id.into(),
+            token: format!("capability-{owner}-{id}"),
+            title: format!("Request {id}"),
+            description: format!("Instructions for {id}"),
+            status: status.into(),
+            expires_at,
+            max_file_bytes: 10,
+            max_total_bytes: 100,
+            max_files: 10,
+            used_bytes: 20,
+            used_files: 2,
+            allowed_types: "*/*".into(),
+            created_at: updated_at.saturating_sub(1),
+            updated_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn request_inbox_is_owner_scoped_and_classifies_one_stable_snapshot() {
+        let store = InMemoryStore::new();
+        let as_of: i64 = 1_000_000;
+        assert!(store
+            .create_folder(&folder("inbox-u", "u", "Inbox", 1))
+            .await
+            .unwrap());
+        assert!(store
+            .create_folder(&folder("inbox-v", "v", "Foreign", 1))
+            .await
+            .unwrap());
+        let requests = [
+            inbox_request(
+                "request-open",
+                "u",
+                "inbox-u",
+                "open",
+                Some(
+                    as_of
+                        .saturating_add(UPLOAD_REQUEST_EXPIRING_WINDOW_SECS)
+                        .saturating_add(1),
+                ),
+                9,
+            ),
+            inbox_request(
+                "request-expiring",
+                "u",
+                "inbox-u",
+                "open",
+                Some(as_of.saturating_add(UPLOAD_REQUEST_EXPIRING_WINDOW_SECS)),
+                9,
+            ),
+            inbox_request("request-expired", "u", "inbox-u", "open", Some(as_of), 9),
+            inbox_request(
+                "request-closed",
+                "u",
+                "inbox-u",
+                "closed",
+                Some(as_of.saturating_sub(1)),
+                9,
+            ),
+            inbox_request("request-foreign", "v", "inbox-v", "open", None, 99),
+        ];
+        for request in requests {
+            assert!(store.create_upload_request(&request).await.unwrap());
+        }
+
+        let first = store
+            .upload_request_inbox("u", UploadRequestInboxView::All, as_of)
+            .await
+            .unwrap();
+        let second = store
+            .upload_request_inbox("u", UploadRequestInboxView::All, as_of)
+            .await
+            .unwrap();
+        assert_eq!(first, second, "the same as_of is classification-stable");
+        assert_eq!(
+            first.counts,
+            UploadRequestInboxCounts {
+                all: 4,
+                open: 1,
+                expiring: 1,
+                closed: 1,
+                expired: 1,
+            }
+        );
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|request| request.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "request-open",
+                "request-expiring",
+                "request-expired",
+                "request-closed"
+            ],
+            "updated_at ties use descending id order"
+        );
+        assert!(first
+            .items
+            .iter()
+            .all(|request| request.id != "request-foreign"));
+        for view in [
+            UploadRequestInboxView::Open,
+            UploadRequestInboxView::Expiring,
+            UploadRequestInboxView::Closed,
+            UploadRequestInboxView::Expired,
+        ] {
+            let filtered = store.upload_request_inbox("u", view, as_of).await.unwrap();
+            assert_eq!(filtered.counts, first.counts);
+            assert_eq!(filtered.matched_total, 1);
+            assert_eq!(filtered.items.len(), 1);
+            assert_eq!(filtered.items[0].state.slug(), view.slug());
+        }
+        let later = store
+            .upload_request_inbox(
+                "u",
+                UploadRequestInboxView::All,
+                as_of
+                    .saturating_add(UPLOAD_REQUEST_EXPIRING_WINDOW_SECS)
+                    .saturating_add(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(later.counts.expired, 3);
+        assert_eq!(later.counts.open, 0);
+        assert_eq!(later.counts.expiring, 0);
+    }
+
+    #[tokio::test]
+    async fn request_inbox_has_an_explicit_newest_first_cap() {
+        let store = InMemoryStore::new();
+        assert!(store
+            .create_folder(&folder("bounded-inbox", "u", "Bounded", 1))
+            .await
+            .unwrap());
+        for index in 0..=UPLOAD_REQUEST_INBOX_CAP {
+            let id = format!("request-{index:03}");
+            assert!(store
+                .create_upload_request(&inbox_request(&id, "u", "bounded-inbox", "open", None, 10,))
+                .await
+                .unwrap());
+        }
+        let inbox = store
+            .upload_request_inbox("u", UploadRequestInboxView::All, 10)
+            .await
+            .unwrap();
+        assert_eq!(inbox.matched_total, UPLOAD_REQUEST_INBOX_CAP + 1);
+        assert_eq!(inbox.items.len(), UPLOAD_REQUEST_INBOX_CAP as usize);
+        assert!(inbox.truncated);
+        assert_eq!(inbox.items.first().unwrap().id, "request-100");
+        assert_eq!(inbox.items.last().unwrap().id, "request-001");
     }
 
     /// A child folder under `parent`.

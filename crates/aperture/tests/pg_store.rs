@@ -21,8 +21,9 @@ use std::time::Duration;
 
 use aperture::blobs::{BlobError, Blobs, MemoryBlobs};
 use aperture::model::{
-    FileRec, FolderRec, LibraryItemKind, LibraryQuery, LibraryType, LibraryView, UploadRequestRec,
-    UploadSubmission, VersionRec,
+    FileRec, FolderRec, LibraryItemKind, LibraryQuery, LibraryType, LibraryView,
+    UploadRequestInboxCounts, UploadRequestInboxView, UploadRequestRec, UploadSubmission,
+    VersionRec, UPLOAD_REQUEST_EXPIRING_WINDOW_SECS,
 };
 use aperture::store::{
     BlobDeleteClaim, BulkMutation, DriveItemRef, FolderDelete, OwnerBlobCommit,
@@ -1319,6 +1320,173 @@ async fn pg_store_full_integration() {
         .await
         .unwrap()
         .is_none());
+
+    // The PostgreSQL Inbox is the same token-free, one-as_of projection as Memory. A dedicated
+    // owner keeps exact counts independent from legacy fixtures in this integration database.
+    let inbox_as_of = now + 50_000;
+    let inbox_folder = FolderRec {
+        id: "pg-request-inbox-folder".to_string(),
+        owner_sub: "pg-request-inbox-owner".to_string(),
+        parent_id: None,
+        name: "PG request Inbox".to_string(),
+        created_at: inbox_as_of - 10,
+        updated_at: inbox_as_of - 10,
+        share_token: None,
+        expires_at: None,
+        share_password_hash: None,
+        upload_token: None,
+        trashed_at: 0,
+        trash_entry_id: None,
+        trash_ancestor_id: None,
+    };
+    assert!(store.create_folder(&inbox_folder).await.unwrap());
+    let inbox_request = |id: &str, status: &str, expires_at: Option<i64>| UploadRequestRec {
+        id: id.to_string(),
+        owner_sub: inbox_folder.owner_sub.clone(),
+        folder_id: inbox_folder.id.clone(),
+        token: format!("pg-inbox-capability-{id}"),
+        title: format!("PG Inbox {id}"),
+        description: format!("PG summary {id}"),
+        status: status.to_string(),
+        expires_at,
+        max_file_bytes: 1024,
+        max_total_bytes: 4096,
+        max_files: 4,
+        used_bytes: 1024,
+        used_files: 1,
+        allowed_types: "*/*".to_string(),
+        created_at: inbox_as_of - 2,
+        updated_at: inbox_as_of - 1,
+    };
+    for request in [
+        inbox_request(
+            "open",
+            "open",
+            Some(
+                inbox_as_of
+                    .saturating_add(UPLOAD_REQUEST_EXPIRING_WINDOW_SECS)
+                    .saturating_add(1),
+            ),
+        ),
+        inbox_request(
+            "expiring",
+            "open",
+            Some(inbox_as_of.saturating_add(UPLOAD_REQUEST_EXPIRING_WINDOW_SECS)),
+        ),
+        inbox_request("expired", "open", Some(inbox_as_of)),
+        inbox_request("closed", "closed", Some(inbox_as_of - 1)),
+    ] {
+        assert!(store.create_upload_request(&request).await.unwrap());
+    }
+    let pg_inbox = store
+        .upload_request_inbox(
+            &inbox_folder.owner_sub,
+            UploadRequestInboxView::All,
+            inbox_as_of,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        pg_inbox.counts,
+        UploadRequestInboxCounts {
+            all: 4,
+            open: 1,
+            expiring: 1,
+            closed: 1,
+            expired: 1,
+        }
+    );
+    assert_eq!(
+        pg_inbox
+            .items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["open", "expiring", "expired", "closed"],
+        "PostgreSQL uses the same updated_at/id ordering as Memory"
+    );
+    assert_eq!(
+        store
+            .upload_request_inbox(
+                &inbox_folder.owner_sub,
+                UploadRequestInboxView::All,
+                inbox_as_of,
+            )
+            .await
+            .unwrap(),
+        pg_inbox,
+        "the same as_of is stable in one-statement PostgreSQL snapshots"
+    );
+    let pg_expiring = store
+        .upload_request_inbox(
+            &inbox_folder.owner_sub,
+            UploadRequestInboxView::Expiring,
+            inbox_as_of,
+        )
+        .await
+        .unwrap();
+    assert_eq!(pg_expiring.counts, pg_inbox.counts);
+    assert_eq!(pg_expiring.matched_total, 1);
+    assert_eq!(pg_expiring.items[0].id, "expiring");
+    assert!(store
+        .upload_request_inbox("alice", UploadRequestInboxView::All, inbox_as_of)
+        .await
+        .unwrap()
+        .items
+        .iter()
+        .all(|item| !item.title.starts_with("PG Inbox")));
+    let empty_pg_inbox = store
+        .upload_request_inbox(
+            "pg-request-inbox-missing-owner",
+            UploadRequestInboxView::Expired,
+            inbox_as_of,
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty_pg_inbox.counts, UploadRequestInboxCounts::default());
+    assert_eq!(empty_pg_inbox.matched_total, 0);
+    assert!(empty_pg_inbox.items.is_empty());
+    assert!(!empty_pg_inbox.truncated);
+
+    let cap_folder = FolderRec {
+        id: "pg-request-inbox-cap-folder".to_string(),
+        owner_sub: "pg-request-inbox-cap-owner".to_string(),
+        parent_id: None,
+        name: "PG capped request Inbox".to_string(),
+        created_at: inbox_as_of,
+        updated_at: inbox_as_of,
+        share_token: None,
+        expires_at: None,
+        share_password_hash: None,
+        upload_token: None,
+        trashed_at: 0,
+        trash_entry_id: None,
+        trash_ancestor_id: None,
+    };
+    assert!(store.create_folder(&cap_folder).await.unwrap());
+    for index in 0..=100 {
+        let id = format!("pg-inbox-cap-{index:03}");
+        let mut request = inbox_request(&id, "open", None);
+        request.owner_sub = cap_folder.owner_sub.clone();
+        request.folder_id = cap_folder.id.clone();
+        request.token = format!("pg-inbox-capability-cap-{index:03}");
+        request.updated_at = inbox_as_of;
+        assert!(store.create_upload_request(&request).await.unwrap());
+    }
+    let capped_pg_inbox = store
+        .upload_request_inbox(
+            &cap_folder.owner_sub,
+            UploadRequestInboxView::All,
+            inbox_as_of,
+        )
+        .await
+        .unwrap();
+    assert_eq!(capped_pg_inbox.counts.all, 101);
+    assert_eq!(capped_pg_inbox.matched_total, 101);
+    assert_eq!(capped_pg_inbox.items.len(), 100);
+    assert!(capped_pg_inbox.truncated);
+    assert_eq!(capped_pg_inbox.items.first().unwrap().id, "pg-inbox-cap-100");
+    assert_eq!(capped_pg_inbox.items.last().unwrap().id, "pg-inbox-cap-001");
 
     let rotate_request = request(
         "request-rotate",

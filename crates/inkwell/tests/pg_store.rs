@@ -21,8 +21,8 @@ use axum::http::{header, Request, StatusCode};
 use inkwell::store::{
     AutosaveOutcome, Chunk, DeletePostCommand, DeletePostOutcome, DeletePostScope,
     DeletePostSelection, DeletePostsCommand, DeletePostsOutcome, LibraryBulkAction,
-    LibraryBulkCommand, LibraryBulkOutcome, LibraryQuery, LibrarySelection, LibraryStatus, PgStore,
-    Post, SavePostCommand, SavePostOutcome, Store, WriterAutosave,
+    LibraryBulkCommand, LibraryBulkOutcome, LibraryQuery, LibrarySelection, LibrarySort,
+    LibraryStatus, PgStore, Post, SavePostCommand, SavePostOutcome, Store, WriterAutosave,
 };
 use inkwell::{app, build_dev_state, now_secs, AppState};
 use tower::ServiceExt;
@@ -568,7 +568,7 @@ async fn pg_store_full_integration() {
     library_one.slug = "pg-library-one".to_string();
     library_one.title = "LibraryNeedle draft".to_string();
     library_one.body_md = "private LibraryNeedle body".to_string();
-    library_one.created_at = now - 900;
+    library_one.created_at = now - 800;
     library_one.updated_at = now - 900;
     library_one.published = false;
     library_one.tags = "Rust, Private".to_string();
@@ -579,7 +579,7 @@ async fn pg_store_full_integration() {
     library_two.id = "post_pg_library_two".to_string();
     library_two.slug = "pg-library-two".to_string();
     library_two.title = "LibraryNeedle scheduled".to_string();
-    library_two.created_at = now - 899;
+    library_two.created_at = library_one.created_at;
     library_two.updated_at = now - 899;
     library_two.published = true;
     library_two.publish_at = now + 7_200;
@@ -596,22 +596,23 @@ async fn pg_store_full_integration() {
         .await
         .expect("create foreign library row");
 
-    let library_query = |cursor, limit| LibraryQuery {
+    let library_query = |cursor, limit, sort| LibraryQuery {
         owner_sub: "u_alice".to_string(),
         q: "libraryneedle".to_string(),
         status: LibraryStatus::All,
         tag: "rust".to_string(),
+        sort,
         as_of: now,
         cursor,
         limit,
     };
     let library_first = pg
-        .list_library(library_query(None, 1))
+        .list_library(library_query(None, 1, LibrarySort::Updated))
         .await
         .expect("PG library first page");
     assert_eq!(library_first.posts[0].id, library_two.id);
     let library_second = pg
-        .list_library(library_query(library_first.next, 2))
+        .list_library(library_query(library_first.next, 2, LibrarySort::Updated))
         .await
         .expect("PG library continuation");
     assert_eq!(
@@ -623,12 +624,41 @@ async fn pg_store_full_integration() {
         vec![library_one.id.as_str()],
         "foreign matching draft never crosses owner scope"
     );
+    let library_created = pg
+        .list_library(library_query(None, 1, LibrarySort::Created))
+        .await
+        .expect("PG library created first page");
+    assert_eq!(
+        library_created.posts[0].id, library_two.id,
+        "equal created_at uses id DESC"
+    );
+    let created_cursor = library_created.next.clone().unwrap();
+    let library_created_second = pg
+        .list_library(library_query(
+            library_created.next,
+            1,
+            LibrarySort::Created,
+        ))
+        .await
+        .expect("PG library created continuation");
+    assert_eq!(library_created_second.posts[0].id, library_one.id);
+    assert!(library_created_second.next.is_none());
+    let mismatched_cursor = pg
+        .list_library(library_query(
+            Some(created_cursor),
+            2,
+            LibrarySort::Updated,
+        ))
+        .await
+        .expect("PG mismatched cursor fails closed");
+    assert!(mismatched_cursor.posts.is_empty());
+    assert!(mismatched_cursor.next.is_none());
     let scheduled_only = pg
         .list_library(LibraryQuery {
             status: LibraryStatus::Scheduled,
             cursor: None,
             limit: 10,
-            ..library_query(None, 10)
+            ..library_query(None, 10, LibrarySort::Updated)
         })
         .await
         .expect("PG scheduled library filter");

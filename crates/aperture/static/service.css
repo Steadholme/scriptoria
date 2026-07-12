@@ -1741,12 +1741,136 @@ body.has-preview { overflow:hidden; }
 
 /* Request Rooms: owner control plane. Public upload rooms keep their independent stylesheet. */
 .request-console { display:grid; gap:20px; }
-.request-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:16px; }
-.request-card { display:grid; min-width:0; align-content:start; gap:12px; }
-.request-card h2 { margin:5px 0 0; overflow-wrap:anywhere; }
-.request-card p { min-width:0; margin:0; color:var(--muted); overflow-wrap:anywhere; }
-.request-card__meta,
+.request-inbox {
+  min-width:0;
+  overflow:hidden;
+  border:1px solid var(--border);
+  border-radius:var(--r);
+  background:var(--surface);
+  box-shadow:var(--sh-sm);
+}
+.request-inbox__head {
+  display:flex;
+  align-items:flex-end;
+  justify-content:space-between;
+  gap:18px;
+  padding:20px 22px 15px;
+}
+.request-inbox__head h2 { margin:2px 0 0; font-size:1.25rem; }
+.request-inbox__scope {
+  max-width:54ch;
+  margin:0;
+  color:var(--muted);
+  font-size:.76rem;
+  line-height:1.45;
+  text-align:right;
+}
+.request-filters {
+  display:flex;
+  gap:6px;
+  overflow-x:auto;
+  padding:0 22px 14px;
+  scrollbar-width:thin;
+}
+.request-filter {
+  display:inline-flex;
+  align-items:center;
+  gap:7px;
+  flex:0 0 auto;
+  min-height:34px;
+  padding:6px 10px;
+  border:1px solid var(--border);
+  border-radius:var(--r-pill);
+  color:var(--ink-2);
+  font-size:.78rem;
+  font-weight:650;
+  text-decoration:none;
+}
+.request-filter:hover { border-color:var(--brand); color:var(--brand-ink); text-decoration:none; }
+.request-filter.is-active {
+  border-color:color-mix(in srgb, var(--brand) 26%, var(--border));
+  background:var(--brand-soft);
+  color:var(--brand-ink);
+}
+.request-filter b {
+  min-width:20px;
+  padding:1px 6px;
+  border-radius:var(--r-pill);
+  background:color-mix(in srgb, currentColor 9%, transparent);
+  font-family:var(--mono);
+  font-size:.68rem;
+  text-align:center;
+}
+.request-inbox__rows { display:grid; border-top:1px solid var(--border); }
+.request-inbox-row {
+  display:grid;
+  grid-template-columns:minmax(210px,1.15fr) minmax(340px,1.7fr) auto;
+  gap:18px;
+  align-items:center;
+  min-width:0;
+  padding:17px 22px;
+  border:0;
+  border-bottom:1px solid var(--border);
+  border-radius:0;
+  box-shadow:none;
+}
+.request-inbox-row:last-child { border-bottom:0; }
+.request-inbox-row__lead { display:flex; align-items:flex-start; gap:11px; min-width:0; }
+.request-inbox-row__lead > div { min-width:0; }
+.request-inbox-row h2 { margin:1px 0 4px; font-size:.96rem; overflow-wrap:anywhere; }
+.request-inbox-row__description {
+  display:-webkit-box;
+  min-width:0;
+  margin:0;
+  overflow:hidden;
+  color:var(--muted);
+  font-size:.78rem;
+  line-height:1.45;
+  overflow-wrap:anywhere;
+  -webkit-box-orient:vertical;
+  -webkit-line-clamp:2;
+}
+.request-state { flex:0 0 auto; margin-top:1px; border:1px solid transparent; }
+.request-state--open { border-color:var(--ok-border); background:var(--ok-soft); color:var(--ok-ink); }
+.request-state--expiring { border-color:var(--warn-border); background:var(--warn-soft); color:var(--warn-ink); }
+.request-state--expired { border-color:var(--down-border); background:var(--down-soft); color:var(--down-ink); }
+.request-state--closed { border-color:var(--border); background:var(--surface-2); color:var(--ink-3); }
+.request-inbox-row__facts {
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:9px 18px;
+  min-width:0;
+  margin:0;
+}
+.request-inbox-row__facts > div { display:grid; grid-template-columns:auto minmax(0,1fr); gap:7px; min-width:0; }
+.request-inbox-row__facts dt { color:var(--ink-3); font-size:.7rem; }
+.request-inbox-row__facts dd {
+  min-width:0;
+  margin:0;
+  overflow-wrap:anywhere;
+  color:var(--ink-2);
+  font-family:var(--mono);
+  font-size:.7rem;
+  text-align:right;
+}
+.request-inbox-row__detail { justify-self:end; white-space:nowrap; }
+.request-empty { display:grid; justify-items:center; gap:7px; padding:46px 24px; text-align:center; }
+.request-empty__mark {
+  display:grid;
+  place-items:center;
+  width:42px;
+  height:42px;
+  margin-bottom:3px;
+  border:1px solid color-mix(in srgb, var(--brand) 22%, var(--border));
+  border-radius:14px;
+  background:var(--brand-soft);
+  color:var(--brand-ink);
+  font-size:1.15rem;
+}
+.request-empty h2 { margin:0; font-size:1rem; }
+.request-empty p { max-width:48ch; margin:0 0 5px; color:var(--muted); font-size:.82rem; }
 .request-facts { display:flex; flex-wrap:wrap; gap:8px 16px; color:var(--muted); font-size:.86rem; }
+.request-access > .muted { margin-top:-4px; }
 .request-create-list { display:grid; gap:10px; margin-top:16px; }
 .request-create-row { display:grid; grid-template-columns:minmax(130px,.7fr) minmax(180px,1fr) auto; gap:10px; align-items:center; padding:10px 0; border-top:1px solid var(--border); }
 .request-policy { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; }
@@ -1768,6 +1892,8 @@ body.has-preview { overflow:hidden; }
 .request-policy small { min-width:0; overflow-wrap:anywhere; }
 
 @media (max-width:900px) {
+  .request-inbox-row { grid-template-columns:minmax(210px,1fr) minmax(300px,1.5fr); }
+  .request-inbox-row__detail { grid-column:1/-1; justify-self:start; }
   .console--drive .drive-layout {
     grid-template-columns:1fr;
     grid-template-areas:"content" "rail";
@@ -1807,6 +1933,13 @@ body.has-preview { overflow:hidden; }
     padding:0;
     justify-content:center;
   }
+  .request-inbox__head { align-items:flex-start; flex-direction:column; padding:18px 16px 13px; }
+  .request-inbox__scope { text-align:left; }
+  .request-filters { flex-wrap:wrap; overflow-x:visible; padding:0 16px 13px; }
+  .request-inbox-row { grid-template-columns:1fr; gap:13px; padding:16px; }
+  .request-inbox-row__facts { grid-template-columns:1fr; gap:7px; }
+  .request-inbox-row__facts dd { text-align:right; }
+  .request-inbox-row__detail { grid-column:auto; width:100%; justify-content:center; }
   .request-policy { grid-template-columns:1fr; }
   .request-create-row { grid-template-columns:1fr; }
   .request-receipt { align-items:flex-start; flex-direction:column; }

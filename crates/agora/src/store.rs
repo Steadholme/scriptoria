@@ -19,7 +19,8 @@
 //!    author_email TEXT, created_at BIGINT)`
 //! - `post_mentions(post_id TEXT, thread_id TEXT, mentioned_username TEXT, created_at BIGINT)`
 //! - `forum_identity_aliases(alias TEXT, subject TEXT, created_at BIGINT)`
-//! - `thread_subscriptions(thread_id TEXT, subscriber_sub TEXT, created_at BIGINT)`
+//! - `thread_subscriptions(thread_id TEXT, subscriber_sub TEXT, created_at BIGINT)` (Watch only)
+//! - `thread_follow_preferences(thread_id TEXT, subscriber_sub TEXT, level TEXT, created_at BIGINT)`
 //! - `forum_activity_events(id TEXT PK, kind TEXT, thread_id TEXT, post_id TEXT, actor_sub TEXT,
 //!    created_at BIGINT)`
 //! - `forum_activity_deliveries(activity_id TEXT, recipient_kind TEXT, recipient_key TEXT,
@@ -38,7 +39,8 @@ use thiserror::Error;
 use crate::model::{
     ActivityDelivery, ActivityEvent, ActivityItem, ActivityKind, ActivityReason,
     ActivityRecipientKind, BannedAuthor, Bookmark, BookmarkItem, Category, CategoryFormat, Mention,
-    Post, ReactionCount, Thread, ThreadDigest, ThreadReadingState, ThreadSearchHit,
+    Post, ReactionCount, Thread, ThreadDigest, ThreadFollowLevel, ThreadReadingState,
+    ThreadSearchHit,
 };
 
 /// Storage failure surfaced to the handler layer (mapped to a 500 `server_error`).
@@ -124,6 +126,19 @@ pub struct ActivityMutation {
     pub delivery_subjects: Vec<String>,
 }
 
+/// One bounded, owner-scoped projection used to explain a `/for-you` candidate. The candidate
+/// thread itself is deliberately not returned here: the handler must obtain its authoritative,
+/// visible candidate set first and then pass only those ids into this projection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ThreadPersonalSignals {
+    pub follow_level: ThreadFollowLevel,
+    pub authored: bool,
+    pub participated: bool,
+    pub bookmarked: bool,
+    pub reading_started: bool,
+    pub has_unread: bool,
+}
+
 /// Keyset cursor for the personal activity stream.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActivityCursor {
@@ -179,8 +194,12 @@ pub const MAX_ACTIVITY_BATCH: usize = 30;
 pub const MAX_THREAD_READ_BATCH: usize = 24;
 /// Home/category list projection bound; prevents an accidental unbounded metadata query.
 pub const MAX_THREAD_READING_STATE_BATCH: usize = 200;
-/// A thread cannot accumulate an unbounded reply fan-out.
+/// A thread cannot accumulate an unbounded generic Watch reply fan-out. Follow and Mute
+/// preferences do not create generic deliveries and therefore do not consume this budget.
 pub const MAX_THREAD_FOLLOWERS: usize = 256;
+/// `/for-you` first obtains at most this many authoritative list candidates, then performs one
+/// owner-scoped signal projection over the same bounded id set.
+pub const MAX_FOR_YOU_CANDIDATES: usize = 200;
 /// Parsed aliases are deduplicated before this per-post bound is enforced.
 pub const MAX_MENTIONS_PER_POST: usize = 32;
 /// OP + quoted author + followers + mentions. Klaxon is best-effort and never exceeds this bound.
@@ -351,6 +370,22 @@ fn bounded_thread_ids(thread_ids: &[String]) -> Result<Vec<String>, StoreError> 
     if unique.len() > MAX_THREAD_READING_STATE_BATCH {
         return Err(StoreError::InvalidOperation(format!(
             "reading state accepts at most {MAX_THREAD_READING_STATE_BATCH} threads"
+        )));
+    }
+    Ok(unique.into_iter().collect())
+}
+
+fn bounded_personal_thread_ids(thread_ids: &[String]) -> Result<Vec<String>, StoreError> {
+    let mut unique = BTreeSet::new();
+    for thread_id in thread_ids {
+        let thread_id = thread_id.trim();
+        if !thread_id.is_empty() {
+            unique.insert(thread_id.to_string());
+        }
+    }
+    if unique.len() > MAX_FOR_YOU_CANDIDATES {
+        return Err(StoreError::InvalidOperation(format!(
+            "personal signals accept at most {MAX_FOR_YOU_CANDIDATES} threads"
         )));
     }
     Ok(unique.into_iter().collect())
@@ -580,21 +615,64 @@ pub trait Store: Send + Sync {
         created_at: i64,
     ) -> Result<AcceptedAnswerMutation, StoreError>;
 
-    /// Explicitly set one user's following state. The desired state makes retries and concurrent
-    /// duplicate form submissions idempotent; the Store also rechecks the thread under its guard.
+    /// Explicitly set one user's thread relationship. `None` removes the persistence row. The
+    /// desired state makes retries and concurrent duplicate form submissions idempotent; the
+    /// Store also rechecks the thread under its guard and removes obsolete generic follower
+    /// deliveries when leaving Watch.
+    async fn set_thread_follow_level(
+        &self,
+        thread_id: &str,
+        subscriber_sub: &str,
+        level: ThreadFollowLevel,
+        created_at: i64,
+    ) -> Result<(), StoreError>;
+    /// The current explicit level; a missing row returns `None` rather than a nullable result.
+    async fn thread_follow_level(
+        &self,
+        thread_id: &str,
+        subscriber_sub: &str,
+    ) -> Result<ThreadFollowLevel, StoreError>;
+    /// One owner-scoped, bounded batch for explainable personal-feed signals. Implementations
+    /// must issue no per-thread backend query and must return rows only for live input threads.
+    async fn thread_personal_signals(
+        &self,
+        viewer_sub: &str,
+        thread_ids: &[String],
+    ) -> Result<HashMap<String, ThreadPersonalSignals>, StoreError>;
+
+    /// Compatibility seam for older callers: the historical boolean subscription maps to Watch.
+    /// New product code must use [`Store::set_thread_follow_level`].
     async fn set_thread_subscription(
         &self,
         thread_id: &str,
         subscriber_sub: &str,
         subscribed: bool,
         created_at: i64,
-    ) -> Result<(), StoreError>;
-    /// Whether a user is currently subscribed to a thread.
+    ) -> Result<(), StoreError> {
+        self.set_thread_follow_level(
+            thread_id,
+            subscriber_sub,
+            if subscribed {
+                ThreadFollowLevel::Watch
+            } else {
+                ThreadFollowLevel::None
+            },
+            created_at,
+        )
+        .await
+    }
+
+    /// Historical `subscribed` means present in Following, not merely any preference row.
     async fn is_thread_subscribed(
         &self,
         thread_id: &str,
         subscriber_sub: &str,
-    ) -> Result<bool, StoreError>;
+    ) -> Result<bool, StoreError> {
+        Ok(self
+            .thread_follow_level(thread_id, subscriber_sub)
+            .await?
+            .appears_in_personal_feeds())
+    }
 
     /// Exact per-post reading projection for one stable gateway subject and thread.
     async fn thread_reading_state(
@@ -779,11 +857,13 @@ struct Reaction {
     created_at: i64,
 }
 
-/// A single stored subscription (in-memory mirror of a `thread_subscriptions` row).
+/// One effective in-memory relationship. PostgreSQL projects the same value from its rollback-
+/// compatible Watch table plus the separate Follow/Mute preference table.
 #[derive(Clone, Debug)]
 struct ThreadSubscription {
     thread_id: String,
     subscriber_sub: String,
+    level: ThreadFollowLevel,
     _created_at: i64,
 }
 
@@ -1020,7 +1100,7 @@ impl Store for InMemoryStore {
                 .lock()
                 .expect("subscriptions lock poisoned")
                 .iter()
-                .filter(|s| s.subscriber_sub == sub)
+                .filter(|s| s.subscriber_sub == sub && s.level.appears_in_personal_feeds())
                 .map(|s| s.thread_id.clone())
                 .collect()
         });
@@ -1563,7 +1643,10 @@ impl Store for InMemoryStore {
             .expect("subscriptions lock poisoned");
         let follower_count = subscriptions
             .iter()
-            .filter(|subscription| subscription.thread_id == post.thread_id)
+            .filter(|subscription| {
+                subscription.thread_id == post.thread_id
+                    && subscription.level.delivers_generic_activity()
+            })
             .count();
         if follower_count > MAX_THREAD_FOLLOWERS {
             return Err(StoreError::InvalidOperation(format!(
@@ -1586,7 +1669,10 @@ impl Store for InMemoryStore {
         deliveries.extend(
             subscriptions
                 .iter()
-                .filter(|subscription| subscription.thread_id == post.thread_id)
+                .filter(|subscription| {
+                    subscription.thread_id == post.thread_id
+                        && subscription.level.delivers_generic_activity()
+                })
                 .filter_map(|subscription| {
                     subject_delivery(
                         &subscription.subscriber_sub,
@@ -2150,11 +2236,11 @@ impl Store for InMemoryStore {
         })
     }
 
-    async fn set_thread_subscription(
+    async fn set_thread_follow_level(
         &self,
         thread_id: &str,
         subscriber_sub: &str,
-        subscribed: bool,
+        level: ThreadFollowLevel,
         created_at: i64,
     ) -> Result<(), StoreError> {
         let _domain = self.qa_guard.lock().expect("qa guard poisoned");
@@ -2174,40 +2260,189 @@ impl Store for InMemoryStore {
         let existing = subscriptions
             .iter()
             .position(|s| s.thread_id == thread_id && s.subscriber_sub == subscriber_sub);
-        if subscribed && existing.is_none() {
-            let follower_count = subscriptions
+        let was_watch = existing
+            .is_some_and(|position| subscriptions[position].level.delivers_generic_activity());
+        if level.delivers_generic_activity() && !was_watch {
+            let watcher_count = subscriptions
                 .iter()
-                .filter(|row| row.thread_id == thread_id)
+                .filter(|row| row.thread_id == thread_id && row.level.delivers_generic_activity())
                 .count();
-            if follower_count >= MAX_THREAD_FOLLOWERS {
+            if watcher_count >= MAX_THREAD_FOLLOWERS {
                 return Err(StoreError::InvalidOperation(format!(
-                    "a thread may have at most {MAX_THREAD_FOLLOWERS} followers"
+                    "a thread may have at most {MAX_THREAD_FOLLOWERS} watchers"
                 )));
             }
-            subscriptions.push(ThreadSubscription {
-                thread_id: thread_id.to_string(),
-                subscriber_sub: subscriber_sub.to_string(),
-                _created_at: created_at,
-            });
-        } else if !subscribed {
-            if let Some(position) = existing {
+        }
+        match (level, existing) {
+            (ThreadFollowLevel::None, Some(position)) => {
                 subscriptions.remove(position);
             }
+            (ThreadFollowLevel::None, None) => {}
+            (next, Some(position)) => {
+                subscriptions[position].level = next;
+                subscriptions[position]._created_at = created_at;
+            }
+            (next, None) => subscriptions.push(ThreadSubscription {
+                thread_id: thread_id.to_string(),
+                subscriber_sub: subscriber_sub.to_string(),
+                level: next,
+                _created_at: created_at,
+            }),
+        }
+        drop(subscriptions);
+
+        // Leaving Watch is immediately authoritative for generic follower Activity. Remove only
+        // that delivery path; a direct reply, mention, or accepted-answer delivery for the same
+        // event survives together with its existing read receipt.
+        if !level.delivers_generic_activity() {
+            let mut events = self
+                .activity_events
+                .lock()
+                .expect("activity_events lock poisoned");
+            let thread_event_ids: HashSet<String> = events
+                .iter()
+                .filter(|event| event.thread_id == thread_id)
+                .map(|event| event.id.clone())
+                .collect();
+            let mut deliveries = self
+                .activity_deliveries
+                .lock()
+                .expect("activity_deliveries lock poisoned");
+            deliveries.retain(|stored| {
+                !thread_event_ids.contains(&stored.activity_id)
+                    || stored.delivery.recipient_kind != ActivityRecipientKind::Subject
+                    || stored.delivery.recipient_key != subscriber_sub
+                    || stored.delivery.reason != ActivityReason::Following
+            });
+            let remaining_for_viewer: HashSet<String> = deliveries
+                .iter()
+                .filter(|stored| {
+                    stored.delivery.recipient_kind == ActivityRecipientKind::Subject
+                        && stored.delivery.recipient_key == subscriber_sub
+                })
+                .map(|stored| stored.activity_id.clone())
+                .collect();
+            let delivered_event_ids: HashSet<String> = deliveries
+                .iter()
+                .map(|stored| stored.activity_id.clone())
+                .collect();
+            let orphan_event_ids: HashSet<String> = thread_event_ids
+                .iter()
+                .filter(|activity_id| !delivered_event_ids.contains(*activity_id))
+                .cloned()
+                .collect();
+            events.retain(|event| !orphan_event_ids.contains(&event.id));
+            deliveries.retain(|stored| !orphan_event_ids.contains(&stored.activity_id));
+            drop(deliveries);
+            drop(events);
+            self.activity_receipts
+                .lock()
+                .expect("activity_receipts lock poisoned")
+                .retain(|receipt| {
+                    !orphan_event_ids.contains(&receipt.activity_id)
+                        && (receipt.viewer_sub != subscriber_sub
+                            || !thread_event_ids.contains(&receipt.activity_id)
+                            || remaining_for_viewer.contains(&receipt.activity_id))
+                });
         }
         Ok(())
     }
 
-    async fn is_thread_subscribed(
+    async fn thread_follow_level(
         &self,
         thread_id: &str,
         subscriber_sub: &str,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<ThreadFollowLevel, StoreError> {
         Ok(self
             .subscriptions
             .lock()
             .expect("subscriptions lock poisoned")
             .iter()
-            .any(|s| s.thread_id == thread_id && s.subscriber_sub == subscriber_sub))
+            .find(|s| s.thread_id == thread_id && s.subscriber_sub == subscriber_sub)
+            .map(|row| row.level)
+            .unwrap_or_default())
+    }
+
+    async fn thread_personal_signals(
+        &self,
+        viewer_sub: &str,
+        thread_ids: &[String],
+    ) -> Result<HashMap<String, ThreadPersonalSignals>, StoreError> {
+        let thread_ids = bounded_personal_thread_ids(thread_ids)?;
+        if thread_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let requested: HashSet<&str> = thread_ids.iter().map(String::as_str).collect();
+        let (threads, posts) = {
+            let _domain = self.qa_guard.lock().expect("qa guard poisoned");
+            let threads = self
+                .threads
+                .lock()
+                .expect("threads lock poisoned")
+                .iter()
+                .filter(|thread| requested.contains(thread.id.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            let posts = self.posts.lock().expect("posts lock poisoned").clone();
+            (threads, posts)
+        };
+        let subscriptions = self
+            .subscriptions
+            .lock()
+            .expect("subscriptions lock poisoned")
+            .clone();
+        let bookmarks = self
+            .bookmarks
+            .lock()
+            .expect("bookmarks lock poisoned")
+            .clone();
+        let receipts = self
+            .post_read_receipts
+            .lock()
+            .expect("post_read_receipts lock poisoned")
+            .clone();
+        let bookmarked_posts: HashSet<&str> = bookmarks
+            .iter()
+            .filter(|bookmark| bookmark.owner_sub == viewer_sub)
+            .map(|bookmark| bookmark.post_id.as_str())
+            .collect();
+        let read_posts: HashSet<&str> = receipts
+            .keys()
+            .filter(|(subject, _)| subject == viewer_sub)
+            .map(|(_, post_id)| post_id.as_str())
+            .collect();
+        let mut signals = HashMap::new();
+        for thread in threads {
+            let thread_posts: Vec<&Post> = posts
+                .iter()
+                .filter(|post| post.thread_id == thread.id)
+                .collect();
+            let follow_level = subscriptions
+                .iter()
+                .find(|row| row.thread_id == thread.id && row.subscriber_sub == viewer_sub)
+                .map(|row| row.level)
+                .unwrap_or_default();
+            signals.insert(
+                thread.id.clone(),
+                ThreadPersonalSignals {
+                    follow_level,
+                    authored: thread.author_sub == viewer_sub,
+                    participated: thread_posts
+                        .iter()
+                        .any(|post| post.author_sub == viewer_sub),
+                    bookmarked: thread_posts
+                        .iter()
+                        .any(|post| bookmarked_posts.contains(post.id.as_str())),
+                    reading_started: thread_posts
+                        .iter()
+                        .any(|post| read_posts.contains(post.id.as_str())),
+                    has_unread: thread_posts
+                        .iter()
+                        .any(|post| !read_posts.contains(post.id.as_str())),
+                },
+            );
+        }
+        Ok(signals)
     }
 
     async fn thread_reading_state(
@@ -3726,7 +3961,8 @@ impl PgStore {
             Self::register_identity_alias_tx(&mut alias_tx, &subject, &email, created_at).await?;
         }
         alias_tx.commit().await?;
-        // Per-thread subscriptions. The composite primary key gives one subscription per user/thread.
+        // Keep the legacy v6 subscription table as a Watch-only compatibility projection. An
+        // image-only rollback therefore never interprets Follow or Mute as a generic watcher.
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS thread_subscriptions (\
                  thread_id TEXT NOT NULL, \
@@ -3737,9 +3973,109 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS thread_follow_preferences (\
+                 thread_id TEXT NOT NULL, \
+                 subscriber_sub TEXT NOT NULL, \
+                 level TEXT NOT NULL, \
+                 created_at BIGINT NOT NULL, \
+                 CONSTRAINT ck_thread_follow_preferences_level \
+                     CHECK (level IN ('follow', 'mute')), \
+                 CONSTRAINT fk_thread_follow_preference_thread \
+                     FOREIGN KEY (thread_id) REFERENCES threads(id) ON DELETE CASCADE, \
+                 PRIMARY KEY (thread_id, subscriber_sub)\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        let mut follow_schema_tx = self.pool.begin().await?;
+        // A development candidate briefly stored all levels in the legacy table. It was never a
+        // production release, but migrate it forward safely if an operator evaluated that build:
+        // move only Follow/Mute into the new table, then leave only Watch rows for v6 readers.
+        let candidate_level_column = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (\
+                 SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = CURRENT_SCHEMA \
+                   AND table_name = 'thread_subscriptions' AND column_name = 'level'\
+             )",
+        )
+        .fetch_one(&mut *follow_schema_tx)
+        .await?;
+        if candidate_level_column {
+            sqlx::query(
+                "INSERT INTO thread_follow_preferences \
+                     (thread_id, subscriber_sub, level, created_at) \
+                 SELECT subscription.thread_id, subscription.subscriber_sub, \
+                        subscription.level, subscription.created_at \
+                   FROM thread_subscriptions AS subscription \
+                   JOIN threads AS thread ON thread.id = subscription.thread_id \
+                  WHERE subscription.level IN ('follow', 'mute') \
+                 ON CONFLICT (thread_id, subscriber_sub) DO UPDATE \
+                 SET level = EXCLUDED.level, created_at = EXCLUDED.created_at",
+            )
+            .execute(&mut *follow_schema_tx)
+            .await?;
+            sqlx::query("DELETE FROM thread_subscriptions WHERE level <> 'watch'")
+                .execute(&mut *follow_schema_tx)
+                .await?;
+            let watch_only_check = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (\
+                     SELECT 1 FROM information_schema.table_constraints \
+                     WHERE constraint_schema = CURRENT_SCHEMA \
+                       AND table_name = 'thread_subscriptions' \
+                       AND constraint_name = 'ck_thread_subscriptions_watch_only' \
+                       AND constraint_type = 'CHECK'\
+                 )",
+            )
+            .fetch_one(&mut *follow_schema_tx)
+            .await?;
+            if !watch_only_check {
+                sqlx::query(
+                    "ALTER TABLE thread_subscriptions \
+                     ADD CONSTRAINT ck_thread_subscriptions_watch_only CHECK (level = 'watch')",
+                )
+                .execute(&mut *follow_schema_tx)
+                .await?;
+            }
+        }
+        sqlx::query(
+            "DELETE FROM thread_follow_preferences AS preference \
+             WHERE NOT EXISTS (\
+                 SELECT 1 FROM threads AS thread WHERE thread.id = preference.thread_id\
+             )",
+        )
+        .execute(&mut *follow_schema_tx)
+        .await?;
+        let preference_fk = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (\
+                 SELECT 1 FROM information_schema.table_constraints \
+                 WHERE constraint_schema = CURRENT_SCHEMA \
+                   AND table_name = 'thread_follow_preferences' \
+                   AND constraint_name = 'fk_thread_follow_preference_thread' \
+                   AND constraint_type = 'FOREIGN KEY'\
+             )",
+        )
+        .fetch_one(&mut *follow_schema_tx)
+        .await?;
+        if !preference_fk {
+            sqlx::query(
+                "ALTER TABLE thread_follow_preferences \
+                 ADD CONSTRAINT fk_thread_follow_preference_thread FOREIGN KEY (thread_id) \
+                 REFERENCES threads(id) ON DELETE CASCADE",
+            )
+            .execute(&mut *follow_schema_tx)
+            .await?;
+        }
+        follow_schema_tx.commit().await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_subscriptions_user ON thread_subscriptions (subscriber_sub)")
             .execute(&self.pool)
             .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_follow_preferences_user \
+             ON thread_follow_preferences (subscriber_sub, thread_id)",
+        )
+        .execute(&self.pool)
+        .await?;
         // Durable personal activity. Event rows contain no title/body snapshot: every read joins
         // through the live thread/post rows, and moderation deletes explicitly remove the event.
         // Fresh tables intentionally begin empty; migration never turns historical lifetime
@@ -3844,6 +4180,25 @@ impl PgStore {
         sqlx::query("DELETE FROM forum_activity_deliveries WHERE recipient_kind <> 'subject'")
             .execute(&mut *activity_schema_tx)
             .await?;
+        // A v6 rollback can delete a Watch row without knowing about v7's Activity cleanup. On
+        // the next forward boot, reconcile only generic Following deliveries against the legacy
+        // Watch projection; direct replies, mentions and accepted answers remain authoritative.
+        sqlx::query(
+            "DELETE FROM forum_activity_deliveries AS delivery \
+             WHERE delivery.recipient_kind = 'subject' \
+               AND delivery.reason = 'following' \
+               AND EXISTS (\
+                   SELECT 1 FROM forum_activity_events AS event \
+                   WHERE event.id = delivery.activity_id \
+                     AND NOT EXISTS (\
+                         SELECT 1 FROM thread_subscriptions AS watcher \
+                         WHERE watcher.thread_id = event.thread_id \
+                           AND watcher.subscriber_sub = delivery.recipient_key\
+                     )\
+               )",
+        )
+        .execute(&mut *activity_schema_tx)
+        .await?;
         sqlx::query(
             "DELETE FROM forum_activity_receipts AS r \
              WHERE NOT EXISTS (\
@@ -4263,9 +4618,17 @@ impl PgStore {
         }
         if let Some(n) = subscriber_param {
             sql.push_str(
-                " JOIN thread_subscriptions s ON s.thread_id = t.id AND s.subscriber_sub = $",
+                " JOIN (\
+                    SELECT thread_id FROM thread_subscriptions WHERE subscriber_sub = $",
             );
             sql.push_str(&n.to_string());
+            sql.push_str(
+                " UNION \
+                    SELECT thread_id FROM thread_follow_preferences \
+                     WHERE level = 'follow' AND subscriber_sub = $",
+            );
+            sql.push_str(&n.to_string());
+            sql.push_str(") s ON s.thread_id = t.id");
         }
         match status {
             ThreadStatusFilter::Any => {}
@@ -4936,7 +5299,8 @@ impl PgStore {
             };
             let follower_rows = sqlx::query(
                 "SELECT subscriber_sub FROM thread_subscriptions \
-                 WHERE thread_id = $1 ORDER BY subscriber_sub LIMIT $2",
+                 WHERE thread_id = $1 \
+                 ORDER BY subscriber_sub LIMIT $2",
             )
             .bind(&post.thread_id)
             .bind((MAX_THREAD_FOLLOWERS + 1) as i64)
@@ -5178,6 +5542,11 @@ impl PgStore {
                 .await
                 .map_err(backend)?;
             sqlx::query("DELETE FROM thread_subscriptions WHERE thread_id = $1")
+                .bind(thread_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(backend)?;
+            sqlx::query("DELETE FROM thread_follow_preferences WHERE thread_id = $1")
                 .bind(thread_id)
                 .execute(&mut *tx)
                 .await
@@ -5588,11 +5957,11 @@ impl PgStore {
         ))
     }
 
-    async fn set_thread_subscription_async(
+    async fn set_thread_follow_level_async(
         &self,
         thread_id: &str,
         subscriber_sub: &str,
-        subscribed: bool,
+        level: ThreadFollowLevel,
         created_at: i64,
     ) -> Result<(), StoreError> {
         for _ in 0..4 {
@@ -5621,52 +5990,147 @@ impl PgStore {
             if current_category != category_hint {
                 continue;
             }
-            if subscribed {
-                let already_following = sqlx::query_scalar::<_, String>(
+            let legacy_watch = sqlx::query_scalar::<_, String>(
+                "SELECT subscriber_sub FROM thread_subscriptions \
+                 WHERE thread_id = $1 AND subscriber_sub = $2",
+            )
+            .bind(thread_id)
+            .bind(subscriber_sub)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(backend)?;
+            if level == ThreadFollowLevel::Watch && legacy_watch.is_none() {
+                let watchers = sqlx::query_scalar::<_, String>(
                     "SELECT subscriber_sub FROM thread_subscriptions \
-                     WHERE thread_id = $1 AND subscriber_sub = $2",
-                )
-                .bind(thread_id)
-                .bind(subscriber_sub)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(backend)?
-                .is_some();
-                if already_following {
-                    tx.commit().await.map_err(backend)?;
-                    return Ok(());
-                }
-                let followers = sqlx::query_scalar::<_, String>(
-                    "SELECT subscriber_sub FROM thread_subscriptions \
-                     WHERE thread_id = $1 ORDER BY subscriber_sub LIMIT $2",
+                     WHERE thread_id = $1 \
+                     ORDER BY subscriber_sub LIMIT $2",
                 )
                 .bind(thread_id)
                 .bind((MAX_THREAD_FOLLOWERS + 1) as i64)
                 .fetch_all(&mut *tx)
                 .await
                 .map_err(backend)?;
-                if followers.len() >= MAX_THREAD_FOLLOWERS {
+                if watchers.len() >= MAX_THREAD_FOLLOWERS {
                     return Err(StoreError::InvalidOperation(format!(
-                        "a thread may have at most {MAX_THREAD_FOLLOWERS} followers"
+                        "a thread may have at most {MAX_THREAD_FOLLOWERS} watchers"
                     )));
                 }
+            }
+            match level {
+                ThreadFollowLevel::None => {
+                    sqlx::query(
+                        "DELETE FROM thread_subscriptions \
+                         WHERE thread_id = $1 AND subscriber_sub = $2",
+                    )
+                    .bind(thread_id)
+                    .bind(subscriber_sub)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(backend)?;
+                    sqlx::query(
+                        "DELETE FROM thread_follow_preferences \
+                         WHERE thread_id = $1 AND subscriber_sub = $2",
+                    )
+                    .bind(thread_id)
+                    .bind(subscriber_sub)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(backend)?;
+                }
+                ThreadFollowLevel::Watch => {
+                    sqlx::query(
+                        "INSERT INTO thread_subscriptions \
+                             (thread_id, subscriber_sub, created_at) \
+                         VALUES ($1, $2, $3) \
+                         ON CONFLICT (thread_id, subscriber_sub) DO UPDATE \
+                         SET created_at = EXCLUDED.created_at",
+                    )
+                    .bind(thread_id)
+                    .bind(subscriber_sub)
+                    .bind(created_at)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(backend)?;
+                    sqlx::query(
+                        "DELETE FROM thread_follow_preferences \
+                         WHERE thread_id = $1 AND subscriber_sub = $2",
+                    )
+                    .bind(thread_id)
+                    .bind(subscriber_sub)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(backend)?;
+                }
+                ThreadFollowLevel::Follow | ThreadFollowLevel::Mute => {
+                    sqlx::query(
+                        "DELETE FROM thread_subscriptions \
+                         WHERE thread_id = $1 AND subscriber_sub = $2",
+                    )
+                    .bind(thread_id)
+                    .bind(subscriber_sub)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(backend)?;
+                    sqlx::query(
+                        "INSERT INTO thread_follow_preferences \
+                             (thread_id, subscriber_sub, level, created_at) \
+                         VALUES ($1, $2, $3, $4) \
+                         ON CONFLICT (thread_id, subscriber_sub) DO UPDATE \
+                         SET level = EXCLUDED.level, created_at = EXCLUDED.created_at",
+                    )
+                    .bind(thread_id)
+                    .bind(subscriber_sub)
+                    .bind(level.as_str())
+                    .bind(created_at)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(backend)?;
+                }
+            }
+
+            if !level.delivers_generic_activity() {
+                // Preference changes serialize on the same category -> thread locks as reply
+                // creation. Removing only `following` keeps direct reply/mention/answer authority.
                 sqlx::query(
-                    "INSERT INTO thread_subscriptions (thread_id, subscriber_sub, created_at) \
-                     VALUES ($1, $2, $3) \
-                     ON CONFLICT (thread_id, subscriber_sub) DO NOTHING",
+                    "DELETE FROM forum_activity_deliveries \
+                     WHERE recipient_kind = 'subject' AND recipient_key = $1 \
+                       AND reason = 'following' \
+                       AND activity_id IN (\
+                           SELECT id FROM forum_activity_events WHERE thread_id = $2\
+                       )",
                 )
-                .bind(thread_id)
                 .bind(subscriber_sub)
-                .bind(created_at)
+                .bind(thread_id)
                 .execute(&mut *tx)
                 .await
                 .map_err(backend)?;
-            } else {
                 sqlx::query(
-                    "DELETE FROM thread_subscriptions WHERE thread_id = $1 AND subscriber_sub = $2",
+                    "DELETE FROM forum_activity_receipts AS receipt \
+                     WHERE receipt.viewer_sub = $1 \
+                       AND receipt.activity_id IN (\
+                           SELECT id FROM forum_activity_events WHERE thread_id = $2\
+                       ) \
+                       AND NOT EXISTS (\
+                           SELECT 1 FROM forum_activity_deliveries AS delivery \
+                           WHERE delivery.activity_id = receipt.activity_id \
+                             AND delivery.recipient_kind = 'subject' \
+                             AND delivery.recipient_key = $1\
+                       )",
+                )
+                .bind(subscriber_sub)
+                .bind(thread_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(backend)?;
+                sqlx::query(
+                    "DELETE FROM forum_activity_events AS event \
+                     WHERE event.thread_id = $1 \
+                       AND NOT EXISTS (\
+                           SELECT 1 FROM forum_activity_deliveries AS delivery \
+                           WHERE delivery.activity_id = event.id\
+                       )",
                 )
                 .bind(thread_id)
-                .bind(subscriber_sub)
                 .execute(&mut *tx)
                 .await
                 .map_err(backend)?;
@@ -5679,21 +6143,110 @@ impl PgStore {
         ))
     }
 
-    async fn is_thread_subscribed_async(
+    async fn thread_follow_level_async(
         &self,
         thread_id: &str,
         subscriber_sub: &str,
-    ) -> Result<bool, sqlx::Error> {
-        let row = sqlx::query(
-            "SELECT COUNT(*) AS n FROM thread_subscriptions \
-             WHERE thread_id = $1 AND subscriber_sub = $2",
+    ) -> Result<ThreadFollowLevel, StoreError> {
+        let stored = sqlx::query_scalar::<_, String>(
+            "SELECT CASE \
+                 WHEN EXISTS (\
+                     SELECT 1 FROM thread_subscriptions \
+                     WHERE thread_id = $1 AND subscriber_sub = $2\
+                 ) THEN 'watch' \
+                 ELSE COALESCE((\
+                     SELECT level FROM thread_follow_preferences \
+                     WHERE thread_id = $1 AND subscriber_sub = $2\
+                 ), 'none') \
+             END",
         )
         .bind(thread_id)
         .bind(subscriber_sub)
         .fetch_one(&self.pool)
-        .await?;
-        let n: i64 = row.try_get("n")?;
-        Ok(n > 0)
+        .await
+        .map_err(backend)?;
+        ThreadFollowLevel::parse(&stored).ok_or_else(|| {
+            StoreError::Backend(format!(
+                "unknown thread follow level for {thread_id}: {stored}"
+            ))
+        })
+    }
+
+    async fn thread_personal_signals_async(
+        &self,
+        viewer_sub: &str,
+        thread_ids: &[String],
+    ) -> Result<HashMap<String, ThreadPersonalSignals>, StoreError> {
+        let thread_ids = bounded_personal_thread_ids(thread_ids)?;
+        if thread_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = (0..thread_ids.len())
+            .map(|index| format!("${}", index + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT t.id AS thread_id, \
+                    CASE WHEN watcher.subscriber_sub IS NOT NULL THEN 'watch' \
+                         ELSE COALESCE(preference.level, 'none') END AS follow_level, \
+                    CASE WHEN t.author_sub = $1 THEN TRUE ELSE FALSE END AS authored, \
+                    EXISTS (\
+                        SELECT 1 FROM posts AS participant \
+                        WHERE participant.thread_id = t.id AND participant.author_sub = $1\
+                    ) AS participated, \
+                    EXISTS (\
+                        SELECT 1 FROM forum_bookmarks AS bookmark \
+                        JOIN posts AS bookmarked_post ON bookmarked_post.id = bookmark.post_id \
+                        WHERE bookmark.owner_sub = $1 AND bookmarked_post.thread_id = t.id\
+                    ) AS bookmarked, \
+                    EXISTS (\
+                        SELECT 1 FROM forum_post_read_receipts AS receipt \
+                        JOIN posts AS read_post ON read_post.id = receipt.post_id \
+                        WHERE receipt.viewer_sub = $1 AND read_post.thread_id = t.id\
+                    ) AS reading_started, \
+                    EXISTS (\
+                        SELECT 1 FROM posts AS unread_post \
+                        WHERE unread_post.thread_id = t.id \
+                          AND NOT EXISTS (\
+                              SELECT 1 FROM forum_post_read_receipts AS receipt \
+                              WHERE receipt.viewer_sub = $1 \
+                                AND receipt.post_id = unread_post.id\
+                          )\
+                    ) AS has_unread \
+             FROM threads AS t \
+             LEFT JOIN thread_subscriptions AS watcher \
+               ON watcher.thread_id = t.id AND watcher.subscriber_sub = $1 \
+             LEFT JOIN thread_follow_preferences AS preference \
+               ON preference.thread_id = t.id AND preference.subscriber_sub = $1 \
+             WHERE t.id IN ({placeholders})"
+        );
+        let mut query = sqlx::query(&sql).bind(viewer_sub);
+        for thread_id in &thread_ids {
+            query = query.bind(thread_id);
+        }
+        let rows = query.fetch_all(&self.pool).await.map_err(backend)?;
+        let mut signals = HashMap::new();
+        for row in rows {
+            let thread_id: String = row.try_get("thread_id").map_err(backend)?;
+            let stored_level: String = row.try_get("follow_level").map_err(backend)?;
+            let follow_level = ThreadFollowLevel::parse(&stored_level).ok_or_else(|| {
+                StoreError::Backend(format!(
+                    "unknown thread follow level for {thread_id}: {stored_level}"
+                ))
+            })?;
+            signals.insert(
+                thread_id,
+                ThreadPersonalSignals {
+                    follow_level,
+                    authored: row.try_get("authored").map_err(backend)?,
+                    participated: row.try_get("participated").map_err(backend)?,
+                    bookmarked: row.try_get("bookmarked").map_err(backend)?,
+                    reading_started: row.try_get("reading_started").map_err(backend)?,
+                    has_unread: row.try_get("has_unread").map_err(backend)?,
+                },
+            );
+        }
+        Ok(signals)
     }
 
     async fn thread_reading_states_async(
@@ -6686,25 +7239,33 @@ impl Store for PgStore {
         .await
     }
 
-    async fn set_thread_subscription(
+    async fn set_thread_follow_level(
         &self,
         thread_id: &str,
         subscriber_sub: &str,
-        subscribed: bool,
+        level: ThreadFollowLevel,
         created_at: i64,
     ) -> Result<(), StoreError> {
-        self.set_thread_subscription_async(thread_id, subscriber_sub, subscribed, created_at)
+        self.set_thread_follow_level_async(thread_id, subscriber_sub, level, created_at)
             .await
     }
 
-    async fn is_thread_subscribed(
+    async fn thread_follow_level(
         &self,
         thread_id: &str,
         subscriber_sub: &str,
-    ) -> Result<bool, StoreError> {
-        self.is_thread_subscribed_async(thread_id, subscriber_sub)
+    ) -> Result<ThreadFollowLevel, StoreError> {
+        self.thread_follow_level_async(thread_id, subscriber_sub)
             .await
-            .map_err(backend)
+    }
+
+    async fn thread_personal_signals(
+        &self,
+        viewer_sub: &str,
+        thread_ids: &[String],
+    ) -> Result<HashMap<String, ThreadPersonalSignals>, StoreError> {
+        self.thread_personal_signals_async(viewer_sub, thread_ids)
+            .await
     }
 
     async fn thread_reading_state(
@@ -7098,6 +7659,83 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn in_memory_follow_levels_and_personal_signals_are_bounded() {
+        let store = InMemoryStore::new();
+        seed_thread(&store, "t_personal", "Personal", 100).await;
+        let reply = post("p_personal_reply", "t_personal", "joined", "", 101);
+        store.add_reply(&reply).await.unwrap();
+        store
+            .set_thread_follow_level("t_personal", "u_bob", ThreadFollowLevel::Follow, 200)
+            .await
+            .unwrap();
+        store
+            .ensure_bookmark("u_bob", &reply.id, 201)
+            .await
+            .unwrap();
+        store
+            .mark_thread_posts_read("u_bob", "t_personal", std::slice::from_ref(&reply.id), 202)
+            .await
+            .unwrap();
+
+        let signals = store
+            .thread_personal_signals("u_bob", &["t_personal".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(
+            signals["t_personal"],
+            ThreadPersonalSignals {
+                follow_level: ThreadFollowLevel::Follow,
+                authored: false,
+                participated: true,
+                bookmarked: true,
+                reading_started: true,
+                has_unread: true,
+            }
+        );
+        assert!(store
+            .list_threads(
+                None,
+                ThreadSort::Latest,
+                Some("u_bob"),
+                ThreadStatusFilter::Any,
+                10,
+                300,
+            )
+            .await
+            .unwrap()
+            .iter()
+            .any(|thread| thread.id == "t_personal"));
+
+        store
+            .set_thread_follow_level("t_personal", "u_bob", ThreadFollowLevel::Mute, 203)
+            .await
+            .unwrap();
+        assert!(store
+            .list_threads(
+                None,
+                ThreadSort::Latest,
+                Some("u_bob"),
+                ThreadStatusFilter::Any,
+                10,
+                300,
+            )
+            .await
+            .unwrap()
+            .is_empty());
+
+        let too_many = (0..=MAX_FOR_YOU_CANDIDATES)
+            .map(|index| format!("t_candidate_{index}"))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            store
+                .thread_personal_signals("u_bob", &too_many)
+                .await
+                .unwrap_err(),
+            StoreError::InvalidOperation(_)
+        ));
     }
 
     #[tokio::test]

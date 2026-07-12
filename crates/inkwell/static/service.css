@@ -753,6 +753,24 @@ body.page {
 /* S7 ARTICLE --------------------------------------------------------------- */
 .ink-article { max-width:728px; }
 
+.ink-saved-preview {
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:var(--sp-4);
+  width:min(728px,calc(100% - 32px));
+  margin:var(--sp-5) auto 0;
+  padding:12px 14px;
+  border:1px solid var(--accent-border);
+  border-radius:var(--r);
+  background:var(--brand-soft);
+  color:var(--ink-2);
+}
+
+.ink-saved-preview > div { display:flex; flex-direction:column; gap:2px; min-width:0; }
+.ink-saved-preview strong { color:var(--brand-ink); font-size:13px; }
+.ink-saved-preview span { font-size:12.5px; line-height:1.45; }
+
 .back-link {
   display:inline-flex;
   align-items:center;
@@ -2236,12 +2254,13 @@ body.page {
 
 .ink-library__filterform {
   display:grid;
-  grid-template-columns:minmax(280px,1fr) minmax(190px,.45fr) auto;
+  grid-template-columns:minmax(260px,1fr) minmax(160px,.34fr) minmax(190px,.42fr) auto;
   align-items:end;
   gap:var(--sp-4);
 }
 
 .ink-library__filterform .field { margin:0; }
+.ink-library__sort select { width:100%; }
 
 .ink-library__advanced {
   min-height:42px;
@@ -2406,8 +2425,9 @@ body.page {
     border-right:0;
     border-bottom:1px solid var(--hairline);
   }
-  .ink-library__filterform { grid-template-columns:1fr auto; }
+  .ink-library__filterform { grid-template-columns:repeat(2,minmax(0,1fr)); }
   .ink-library__query { grid-column:1 / -1; }
+  .ink-library__filteractions { grid-column:1 / -1; }
   .ink-library__resultshead { flex-direction:column; }
   .ink-library__selectpage { align-self:flex-start; }
 }
@@ -2424,6 +2444,8 @@ body.page {
     padding-left:var(--sp-4);
     padding-right:var(--sp-4);
   }
+  .ink-saved-preview { align-items:stretch; flex-direction:column; width:calc(100% - 32px); }
+  .ink-saved-preview .btn { width:100%; }
   .article__title { font-size:clamp(26px,7.5vw,32px); }
   .article__body { font-size:17px; }
   .article__cover img {
@@ -2466,6 +2488,7 @@ body.page {
   .ink-library__status-tab { flex:1 0 auto; }
   .ink-library__filterform { grid-template-columns:1fr; }
   .ink-library__query { grid-column:auto; }
+  .ink-library__filteractions { grid-column:auto; }
   .ink-library__advanced { width:100%; }
   .ink-library__filteractions { flex-wrap:wrap; }
   .ink-library__bulk {

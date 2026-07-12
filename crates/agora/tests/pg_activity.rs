@@ -5,13 +5,440 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use agora::model::{ActivityReason, Post, Thread};
+use agora::model::{ActivityReason, Post, Thread, ThreadFollowLevel};
 use agora::store::{
     AcceptedAnswerAction, ActivityFilter, PgStore, Store, StoreError, MAX_ACTIVITY_BATCH,
     MAX_MENTIONS_PER_POST, MAX_THREAD_FOLLOWERS,
 };
 use agora::{default_categories, new_id, now_secs};
 use sqlx::postgres::PgPoolOptions;
+
+#[tokio::test]
+async fn pg_follow_levels_migrate_and_match_memory_authority() {
+    let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+        eprintln!("NOTE: TEST_DATABASE_URL not set — skipping PostgreSQL follow-level test");
+        return;
+    };
+    let schema = new_id("agora_follow_level_migration");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .unwrap();
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(&format!("SET search_path TO {schema}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE thread_subscriptions (\
+             thread_id TEXT NOT NULL, subscriber_sub TEXT NOT NULL, created_at BIGINT NOT NULL, \
+             PRIMARY KEY (thread_id, subscriber_sub)\
+         )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO thread_subscriptions (thread_id, subscriber_sub, created_at) \
+         VALUES ('t_legacy_watch', 'u_legacy_watch', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let store = PgStore::from_pool(pool.clone());
+    store.migrate().await.unwrap();
+    assert_eq!(
+        store
+            .thread_follow_level("t_legacy_watch", "u_legacy_watch")
+            .await
+            .unwrap(),
+        ThreadFollowLevel::Watch,
+        "a historical boolean row migrates to Watch"
+    );
+    store
+        .migrate()
+        .await
+        .expect("follow-level migration is idempotent");
+    let legacy_level_column: bool = sqlx::query_scalar(
+        "SELECT EXISTS (\
+             SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = $1 AND table_name = 'thread_subscriptions' \
+               AND column_name = 'level'\
+         )",
+    )
+    .bind(&schema)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        !legacy_level_column,
+        "the v6 table stays byte-for-byte Watch-only for rollback readers"
+    );
+    let level_check: bool = sqlx::query_scalar(
+        "SELECT EXISTS (\
+             SELECT 1 FROM information_schema.table_constraints \
+             WHERE constraint_schema = $1 AND table_name = 'thread_follow_preferences' \
+               AND constraint_name = 'ck_thread_follow_preferences_level' \
+               AND constraint_type = 'CHECK'\
+         )",
+    )
+    .bind(&schema)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(level_check, "the new preference table constrains Follow/Mute");
+    let preference_fk: bool = sqlx::query_scalar(
+        "SELECT EXISTS (\
+             SELECT 1 FROM information_schema.table_constraints \
+             WHERE constraint_schema = $1 AND table_name = 'thread_follow_preferences' \
+               AND constraint_name = 'fk_thread_follow_preference_thread' \
+               AND constraint_type = 'FOREIGN KEY'\
+         )",
+    )
+    .bind(&schema)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(preference_fk, "v6 thread deletion cascades v7 preferences");
+    let preference_delete_rule: String = sqlx::query_scalar(
+        "SELECT delete_rule FROM information_schema.referential_constraints \
+         WHERE constraint_schema = $1 \
+           AND constraint_name = 'fk_thread_follow_preference_thread'",
+    )
+    .bind(&schema)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(preference_delete_rule, "CASCADE");
+    assert!(sqlx::query(
+        "INSERT INTO thread_follow_preferences \
+             (thread_id, subscriber_sub, level, created_at) \
+         VALUES ('invalid', 'invalid', 'surprise', 1)",
+    )
+    .execute(&pool)
+    .await
+    .is_err());
+    store
+        .seed_categories_if_empty(&default_categories())
+        .await
+        .unwrap();
+
+    let now = now_secs();
+    let mut thread_ids = Vec::new();
+    for (suffix, level) in [
+        ("pg_level_watch", ThreadFollowLevel::Watch),
+        ("pg_level_follow", ThreadFollowLevel::Follow),
+        ("pg_level_mute", ThreadFollowLevel::Mute),
+    ] {
+        let (thread, op) = fixture_thread(suffix, "u_alice", "alice@holdfast.local", now);
+        store.create_thread(&thread, &op).await.unwrap();
+        store
+            .set_thread_follow_level(&thread.id, "u_carol", level, now + 1)
+            .await
+            .unwrap();
+        let reply = fixture_reply(
+            &thread.id,
+            "u_bob",
+            "bob@holdfast.local",
+            suffix,
+            "",
+            now + 2,
+        );
+        store
+            .add_reply_with_activity(&reply, &[], &new_id("a"))
+            .await
+            .unwrap();
+        thread_ids.push(thread.id);
+    }
+    let activity = store
+        .activity_page("u_carol", ActivityFilter::All, false, None, 20)
+        .await
+        .unwrap();
+    assert_eq!(activity.len(), 1);
+    assert_eq!(activity[0].reason, ActivityReason::Following);
+    assert_eq!(activity[0].post_body_md, "pg_level_watch");
+
+    let following = store
+        .list_threads(
+            None,
+            agora::store::ThreadSort::Latest,
+            Some("u_carol"),
+            agora::store::ThreadStatusFilter::Any,
+            20,
+            now + 10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(following.len(), 2);
+    assert!(following.iter().all(|thread| thread.id != thread_ids[2]));
+    let legacy_watch_rows: Vec<String> = sqlx::query_scalar(
+        "SELECT thread_id FROM thread_subscriptions \
+         WHERE subscriber_sub = 'u_carol' ORDER BY thread_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(legacy_watch_rows, vec![thread_ids[0].clone()]);
+    let typed_preferences: Vec<(String, String)> = sqlx::query_as(
+        "SELECT thread_id, level FROM thread_follow_preferences \
+         WHERE subscriber_sub = 'u_carol' ORDER BY thread_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(typed_preferences.len(), 2);
+    assert!(typed_preferences.contains(&(thread_ids[1].clone(), "follow".to_string())));
+    assert!(typed_preferences.contains(&(thread_ids[2].clone(), "mute".to_string())));
+    let signals = store
+        .thread_personal_signals("u_carol", &thread_ids)
+        .await
+        .unwrap();
+    assert_eq!(
+        signals[&thread_ids[0]].follow_level,
+        ThreadFollowLevel::Watch
+    );
+    assert_eq!(
+        signals[&thread_ids[1]].follow_level,
+        ThreadFollowLevel::Follow
+    );
+    assert_eq!(
+        signals[&thread_ids[2]].follow_level,
+        ThreadFollowLevel::Mute
+    );
+
+    // A rollback v6 Follow inserts only the legacy Watch row. Watch wins a transient conflict,
+    // and the next v7 command converges back to exactly one physical representation.
+    sqlx::query(
+        "INSERT INTO thread_subscriptions (thread_id, subscriber_sub, created_at) \
+         VALUES ($1, 'u_carol', $2)",
+    )
+    .bind(&thread_ids[1])
+    .bind(now + 10)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        store
+            .thread_follow_level(&thread_ids[1], "u_carol")
+            .await
+            .unwrap(),
+        ThreadFollowLevel::Watch
+    );
+    store
+        .set_thread_follow_level(
+            &thread_ids[1],
+            "u_carol",
+            ThreadFollowLevel::Follow,
+            now + 10,
+        )
+        .await
+        .unwrap();
+    let reconciled_legacy: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM thread_subscriptions \
+         WHERE thread_id = $1 AND subscriber_sub = 'u_carol'",
+    )
+    .bind(&thread_ids[1])
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(reconciled_legacy, 0);
+    assert_eq!(
+        store
+            .thread_follow_level(&thread_ids[1], "u_carol")
+            .await
+            .unwrap(),
+        ThreadFollowLevel::Follow
+    );
+
+    // v6 Unfollow knows only the legacy table and can leave generic Following deliveries behind.
+    // A v7 forward migration removes that one path while preserving the direct Reply reason.
+    let (repair_thread, repair_op) = fixture_thread(
+        "pg_rollback_repair",
+        "u_carol",
+        "carol@holdfast.local",
+        now + 12,
+    );
+    store
+        .create_thread(&repair_thread, &repair_op)
+        .await
+        .unwrap();
+    store
+        .set_thread_follow_level(
+            &repair_thread.id,
+            "u_carol",
+            ThreadFollowLevel::Watch,
+            now + 13,
+        )
+        .await
+        .unwrap();
+    let repair_reply = fixture_reply(
+        &repair_thread.id,
+        "u_bob",
+        "bob@holdfast.local",
+        "rollback repair",
+        "",
+        now + 14,
+    );
+    let repair_event_id = new_id("a");
+    store
+        .add_reply_with_activity(&repair_reply, &[], &repair_event_id)
+        .await
+        .unwrap();
+    let repair_reasons_before: Vec<String> = sqlx::query_scalar(
+        "SELECT reason FROM forum_activity_deliveries \
+         WHERE activity_id = $1 AND recipient_kind = 'subject' \
+           AND recipient_key = 'u_carol' ORDER BY reason",
+    )
+    .bind(&repair_event_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        repair_reasons_before,
+        vec!["following".to_string(), "reply".to_string()]
+    );
+    sqlx::query(
+        "DELETE FROM thread_subscriptions \
+         WHERE thread_id = $1 AND subscriber_sub = 'u_carol'",
+    )
+    .bind(&repair_thread.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    store.migrate().await.unwrap();
+    let repair_reasons_after: Vec<String> = sqlx::query_scalar(
+        "SELECT reason FROM forum_activity_deliveries \
+         WHERE activity_id = $1 AND recipient_kind = 'subject' \
+           AND recipient_key = 'u_carol' ORDER BY reason",
+    )
+    .bind(&repair_event_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(repair_reasons_after, vec!["reply".to_string()]);
+
+    store
+        .set_thread_follow_level(
+            &thread_ids[0],
+            "u_carol",
+            ThreadFollowLevel::Follow,
+            now + 11,
+        )
+        .await
+        .unwrap();
+    assert!(store
+        .activity_page("u_carol", ActivityFilter::All, false, None, 20)
+        .await
+        .unwrap()
+        .iter()
+        .all(|item| item.event.thread_id != thread_ids[0]));
+
+    let (direct_thread, direct_op) = fixture_thread(
+        "pg_level_direct",
+        "u_carol",
+        "carol@holdfast.local",
+        now + 20,
+    );
+    store
+        .create_thread(&direct_thread, &direct_op)
+        .await
+        .unwrap();
+    store
+        .set_thread_follow_level(
+            &direct_thread.id,
+            "u_carol",
+            ThreadFollowLevel::Mute,
+            now + 21,
+        )
+        .await
+        .unwrap();
+    let direct_reply = fixture_reply(
+        &direct_thread.id,
+        "u_bob",
+        "bob@holdfast.local",
+        "direct survives mute",
+        "",
+        now + 22,
+    );
+    store
+        .add_reply_with_activity(&direct_reply, &[], &new_id("a"))
+        .await
+        .unwrap();
+    let direct = store
+        .activity_page("u_carol", ActivityFilter::All, false, None, 20)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| item.event.thread_id == direct_thread.id)
+        .unwrap();
+    assert_eq!(direct.reason, ActivityReason::Reply);
+
+    store.delete_thread(&direct_thread.id).await.unwrap();
+    let remaining_preference: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM thread_subscriptions WHERE thread_id = $1) + \
+                (SELECT COUNT(*) FROM thread_follow_preferences WHERE thread_id = $1)",
+    )
+    .bind(&direct_thread.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        remaining_preference, 0,
+        "thread deletion cleans preferences"
+    );
+
+    let (rollback_deleted, rollback_deleted_op) = fixture_thread(
+        "pg_v6_delete_cascade",
+        "u_alice",
+        "alice@holdfast.local",
+        now + 30,
+    );
+    store
+        .create_thread(&rollback_deleted, &rollback_deleted_op)
+        .await
+        .unwrap();
+    store
+        .set_thread_follow_level(
+            &rollback_deleted.id,
+            "u_carol",
+            ThreadFollowLevel::Mute,
+            now + 31,
+        )
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM posts WHERE thread_id = $1")
+        .bind(&rollback_deleted.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM threads WHERE id = $1")
+        .bind(&rollback_deleted.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let rollback_orphan: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM thread_follow_preferences WHERE thread_id = $1",
+    )
+    .bind(&rollback_deleted.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rollback_orphan, 0, "v6-style delete cascades v7 preference");
+
+    sqlx::query("SET search_path TO public")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .unwrap();
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pg_activity_is_atomic_bounded_and_authoritative() {
@@ -90,6 +517,7 @@ async fn pg_activity_is_atomic_bounded_and_authoritative() {
         "post_reactions",
         "post_mentions",
         "forum_identity_aliases",
+        "thread_follow_preferences",
         "thread_subscriptions",
         "banned_authors",
         "posts",

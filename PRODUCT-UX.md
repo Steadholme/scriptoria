@@ -598,14 +598,120 @@ network rendering.
   `cargo run --locked --manifest-path ../odyssey-1.1.1/tools/odysseyctl/Cargo.toml -- check --repo scriptoria`
   is clean. The PATH canary binary is deliberately not the verifier for a stable consumer.
 
+## Iteration 7: relationships, intake, and saved-state preview
+
+Iteration 7 gives each public product one new product-owned control plane. Odyssey still supplies
+the shell, tokens, focus and responsive primitives; Forum relationships, Drive capability
+governance and Blog author ordering remain service authority and service runtime.
+
+### Forum: outcome-oriented relationships and explainable For You
+
+- Replace the ambiguous boolean Follow control with four explicit outcomes. `Watch` appears in
+  Following and For You and sends ordinary new replies to Activity. `Follow` appears in the two
+  personal feeds without ordinary reply Activity. `Mute` is a hard exclusion from those feeds and
+  generic follower Activity. `None` removes the stored preference.
+- Mute is not a block. Direct replies, mentions and accepted-answer consequences remain in
+  Activity, and that exception is visible beside the selector rather than hidden in documentation.
+  The CSRF-protected native form is authoritative without JavaScript; Wire uses the same endpoint
+  and the JSON response retains the previous `subscribed` compatibility field.
+- `/for-you` authenticates first, obtains at most 200 threads from the authoritative visible Latest
+  path, projects all owner signals in one bounded Store call, and renders at most 30 rows. Every row
+  has exactly one deterministic reason: Watch, Follow, Authored, Bookmarked, Participated, or
+  Continue Reading. Mute wins over every other reason.
+- Keep the v6 `thread_subscriptions` table as a Watch-only rollback projection. Follow and Mute live
+  in `thread_follow_preferences`, whose value check and thread `ON DELETE CASCADE` are database
+  constraints. A v6 image can therefore never reinterpret Mute as a watcher or count quiet
+  preferences against the 256-Watch reply budget. v7 setters converge both tables on every command,
+  and forward migration removes stale generic Following deliveries left by a v6 Unfollow while
+  preserving direct Reply, Mention and Answer deliveries.
+
+This separates saving, personal-feed membership and notification delivery in the same spirit as
+[Stack Exchange Follow](https://meta.stackexchange.com/questions/345661/the-follow-questions-and-answers-feature-is-now-live-across-the-network),
+[Discourse notification levels](https://meta.discourse.org/t/configuring-default-notification-settings-for-users/285619),
+and [GitHub notification reasons](https://docs.github.com/en/subscriptions-and-notifications/concepts/about-notifications).
+Agora deliberately uses result labels and deterministic local signals instead of importing their
+terminology, ranking runtime or opaque recommendations.
+
+Acceptance: Memory and PostgreSQL agree on all four outcomes; Watch alone fans out ordinary reply
+Activity; leaving Watch removes its existing generic path without deleting a direct delivery for
+the same event; legacy boolean clients map Follow/Unfollow to Watch/None; no candidate or stale
+preference can introduce a hidden thread; For You is private and `no-store`.
+
+### Drive: token-free Request Inbox
+
+- `/requests?view=all|open|expiring|closed|expired` is a durable owner URL surface. The four states
+  are mutually exclusive at one explicit `as_of`; Expiring is the final 72 hours, and explicit
+  closure wins over a passed deadline. Counts and rows use the same snapshot.
+- Return exact counts but render only the newest 100 matching rows in `updated_at DESC, id DESC`
+  order. The page names the cap, matched total and snapshot time instead of implying an unbounded
+  history. Native filter links and empty states work without JavaScript.
+- Project a dedicated `UploadRequestSummary`: id, title, public instructions, effective state,
+  deadline, file/byte budgets and `updated_at`. It contains no token, public URL, owner subject,
+  folder id, MIME policy, bucket, object key or storage key. The PostgreSQL CTE likewise never
+  selects those fields, and HTTP tests use distinctive owner and foreign tokens to prove neither
+  enters Inbox HTML.
+- The canonical owner detail remains the only Access panel that projects the current `/u/{token}`
+  capability and rotation command. Inbox and detail are both owner-scoped and `private, no-store`;
+  a foreign detail is a generic 404. Activity is not fabricated from `updated_at`.
+
+The control plane combines the intake clarity of
+[Dropbox file requests](https://help.dropbox.com/share/create-file-request) and
+[Box File Request](https://support.box.com/hc/en-us/articles/360045304813-Using-File-Request-to-get-Content-from-Anyone)
+with Aperture's stricter capability boundary. It does not claim uploader identity, malware
+quarantine, a durable event ledger, or per-request rate limiting that the service does not yet own.
+
+### Blog: stable Studio order and private saved Reader preview
+
+- Studio supports `updated` (default) and `created` order as URL state. Each cursor carries its
+  sort discriminator, selected timestamp and immutable post id; Memory and PostgreSQL use the same
+  descending keyset. A cursor from another order is rejected/fails closed. Two-part v5/v6
+  `updated_at.id` cursors remain valid only under Updated.
+- Status tabs, exact-tag links, pager, bulk `return_to` and Writer return links preserve the
+  selected order. Applying the native GET form deliberately samples a new status-classification
+  instant while navigation within the result set preserves its existing `as_of`.
+- Draft and scheduled Library rows say `Preview saved` and link to `/p/{slug}?preview=1`. The
+  route still resolves the canonical owner-only post representation: anonymous and foreign users
+  receive 404, responses are `private, no-store` and `noindex,nofollow`, and no canonical, Open
+  Graph or Twitter metadata is emitted. Article Edit/Delete actions are hidden; one explicit
+  `Edit saved version` exit returns the owner to Writer Studio.
+- This is intentionally not a shareable preview. A revocable anonymous preview capability changes
+  public exposure and token authority, so it remains a later product feature rather than a query
+  parameter pretending to grant access.
+
+The ordering and saved-state decision borrow the explicit pre-publication posture of
+[Ghost post settings and preview](https://ghost.org/help/post-settings/) and
+[WordPress pre-publish checks](https://wordpress.com/support/posts/), while retaining Inkwell's
+server-owned visibility, immutable identity and edit-version CAS.
+
+### Iteration 7 candidate verification
+
+- The six public product crates pass 556/556 Rust tests: Forum 119, Blog 116, Wiki 71, Comments 41,
+  Paste 71 and Drive 138. Writer recovery passes 5/5 Node tests. All six crates and the composed
+  Scriptoria binary pass strict Clippy with `-D warnings`, `git diff --check`, and the release build.
+- Six isolated PostgreSQL 18 databases pass 16/16 real tests: eleven Forum migration/activity/
+  bookmark/search/store paths and one complete store path for each other product. The matrix covers
+  the Watch-only rollback projection, both-table convergence, v6 Activity repair, Follow/Mute
+  constraints and cascade, Blog equal-created-at pagination/cross-sort rejection, and Drive's exact
+  101-row count with a 100-row cap.
+- Real Chromium passes the v7 workflows at 320 / 390 / 1440 px plus no-JavaScript at 390 px:
+  Watch/Follow/Mute, explainable For You, five Request Inbox filters with zero capability material,
+  updated/created Studio order, and owner-only saved Reader preview. All six Host arms pass with no
+  horizontal overflow, console warning/error, page error or unexpected request failure.
+- The complete v6 browser matrix also remains green on the same candidate: exact five-unread Forum
+  resume, Drive Inspector History/focus/Escape/PDF/no-JS detail, Blog SSR review/edit/confirm, exact
+  Europe/Berlin DST-fold schedule, and all six Host arms.
+- Three independent read-only reviews found and closed the release-level Forum rollback hazard,
+  then found no remaining P0/P1 in Forum, Drive or Blog. Drive additionally locks capability detail
+  cache/foreign-scope evidence; Blog locks preview metadata and real PostgreSQL keyset parity.
+
 ## Next iterations
 
-1. Forum: three-level Follow preferences and an explainable For-you feed built only from real local
-   reading, following and activity signals.
-2. Drive: an Open/Closed/Expired Request Inbox, then a capability-governance center backed by real
-   owner event authority rather than inferred activity.
-3. Blog: URL-backed Studio sorting/filters, then revocable draft preview and a bounded
-   publication-identity model.
+1. Forum: paginate or directly union old explicit relationships beyond the current 200-candidate
+   Latest window, then add user-controlled category/tag signals before any learned ranking.
+2. Drive: paginate beyond the newest 100 requests, then add a real owner event ledger, quarantine
+   state and request-specific abuse controls before presenting an Activity or security story.
+3. Blog: design a revocable anonymous preview capability and a bounded publication-identity model;
+   neither may reuse the private owner query parameter as public authority.
 
 ## Rollout gate
 
@@ -638,6 +744,11 @@ Cross-product review additionally makes these invariants release blockers:
   their baseline task.
 - Forum bookmarks are authorized only by gateway subject and immutable bookmark CAS. The Due
   queue is request-derived and must never imply an outbound delivery that does not exist.
+- Forum v7 keeps the v6 table Watch-only, so an old image cannot turn Follow/Mute into generic
+  Activity. However, a v7 Follow/Mute -> v6 Follow -> v6 Unfollow -> v7 round trip has no portable
+  deletion tombstone and can revive the earlier v7 preference. During an emergency v6 rollback,
+  freeze thread-preference mutation, use a schema-aware compatibility image, or restore the paired
+  pre-v7 Agora checkpoint; do not claim the preference round trip is lossless.
 - Drive Trash, upload requests, object intents, and delete jobs use one owner guard and deterministic
   lock order. A metadata commit cannot leave bytes without an intent/delete-job authority, and
   capability URLs are inactive throughout inherited Trash scope.
