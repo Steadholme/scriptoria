@@ -586,10 +586,13 @@ network rendering.
 - Browser and read-only cross-review found issues that string tests did not: multipart `415` on the
   automatic Forum receipt, 320 px appbar/post overflow, an Inspector scrim entering the focus ring,
   stale focus restoration, ambiguous schedule epoch, stale Review recovery and self-canonical
-  wording. Each is fixed in the product or Foundation layer that owns it.
-- Canonical Odyssey canary passes 66/66 tests plus `odysseyctl` 5/5; the stable backport passes
-  63/63 plus `odysseyctl` 4/4. Scriptoria consumes stable `1.1.1` fingerprint
-  `fnv1a64:03ea328c48069dc7`; the reproducible stable check
+  wording. The first immutable-image audit additionally caught a browser-skipped View Transition
+  surfacing as a global page error during competing navigation. Each issue is fixed in the product
+  or Foundation layer that owns it; Odyssey now observes skipped presentation promises while
+  preserving the original transition and its DOM update failure semantics for explicit callers.
+- Canonical Odyssey canary passes 67/67 tests plus `odysseyctl` 5/5; the stable backport passes
+  64/64 plus `odysseyctl` 4/4. Scriptoria consumes stable `1.1.1` fingerprint
+  `fnv1a64:bfd9c0ff58cd44d3`; the reproducible stable check
   `cargo run --locked --manifest-path ../odyssey-1.1.1/tools/odysseyctl/Cargo.toml -- check --repo scriptoria`
   is clean. The PATH canary binary is deliberately not the verifier for a stable consumer.
 

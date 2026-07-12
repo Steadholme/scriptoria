@@ -27,13 +27,18 @@
     return{u:u,region:region};
   }
   function reduced(){return w.matchMedia&&w.matchMedia('(prefers-reduced-motion:reduce)').matches;}
+  function observeTransition(transition){
+    if(transition&&transition.ready&&transition.ready.catch)transition.ready.catch(function(){});
+    if(transition&&transition.finished&&transition.finished.catch)transition.finished.catch(function(){});
+    return transition;
+  }
   // Run the DOM mutation inside a View Transition when boost-navigating: prefer OdysseyMotion
   // (shared timing) but fall back to a direct startViewTransition so boost animates even if the
   // motion module was not loaded; plain call when VT is unsupported or motion is reduced.
   function vtCommit(commit,vt){
     if(vt&&!reduced()){
-      if(w.OdysseyMotion&&w.OdysseyMotion.swap){w.OdysseyMotion.swap(commit);return;}
-      if(d.startViewTransition){d.startViewTransition(commit);return;}
+      if(w.OdysseyMotion&&w.OdysseyMotion.swap){observeTransition(w.OdysseyMotion.swap(commit));return;}
+      if(d.startViewTransition){observeTransition(d.startViewTransition(commit));return;}
     }
     commit();
   }

@@ -260,6 +260,15 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_runtime_observes_skipped_view_transition_rejections() {
+        for runtime in [WIRE_JS, MOTION_JS] {
+            assert!(runtime.contains("function observeTransition(transition)"));
+            assert!(runtime.contains("transition.ready.catch(function(){})"));
+            assert!(runtime.contains("transition.finished.catch(function(){})"));
+        }
+    }
+
+    #[test]
     fn app_css_contains_view_transition_layer() {
         // The cross-document continuity headline: @view-transition opt-in + the reduced-motion guard
         // that reaches the ::view-transition-* pseudos the global `*{animation:none}` rule cannot.

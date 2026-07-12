@@ -17,6 +17,15 @@
   var seen = new WeakSet();          // containers already wired
   var rects = new WeakMap();         // child element -> last-known {top,left}
 
+  /* A browser may skip a transition when another navigation wins. Observe the two presentation
+     promises so that expected AbortError/InvalidState rejections do not become global page errors;
+     keep the original promises unchanged for callers that explicitly await them. */
+  function observeTransition(transition){
+    if(transition&&transition.ready&&transition.ready.catch)transition.ready.catch(function(){});
+    if(transition&&transition.finished&&transition.finished.catch)transition.finished.catch(function(){});
+    return transition;
+  }
+
   /* Wrap a synchronous DOM update in a same-document View Transition when the browser supports it
      and motion is allowed; otherwise run it straight (the optimistic write still lands). Returns a
      transition-like object so callers can await .finished uniformly. */
@@ -25,7 +34,7 @@
       try{ update(); }catch(e){}
       return { finished:Promise.resolve(), ready:Promise.resolve(), updateCallbackDone:Promise.resolve() };
     }
-    return d.startViewTransition(update);
+    return observeTransition(d.startViewTransition(update));
   }
 
   function snapshot(container){
