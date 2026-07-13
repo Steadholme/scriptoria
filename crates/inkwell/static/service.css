@@ -1228,6 +1228,7 @@ body.page {
   bottom:0;
   z-index:20;
   display:flex;
+  flex-wrap:wrap;
   align-items:center;
   gap:var(--sp-3);
   padding:var(--sp-3) 0;

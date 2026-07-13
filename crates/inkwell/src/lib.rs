@@ -357,4 +357,18 @@ mod response_cache_tests {
             "private, no-store"
         );
     }
+
+    #[test]
+    fn writer_actionbar_wraps_before_the_mobile_breakpoint() {
+        let css = handlers::SERVICE_CSS;
+        let base_rule = css
+            .split_once(".ink-editor__actionbar {")
+            .and_then(|(_, rest)| rest.split_once('}').map(|(rule, _)| rule))
+            .expect("writer action bar base rule");
+
+        assert!(
+            base_rule.contains("flex-wrap:wrap;"),
+            "the full edit action set must wrap in the narrower desktop canvas"
+        );
+    }
 }
