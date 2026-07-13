@@ -987,6 +987,32 @@ JavaScript disabled at 390 px, with zero horizontal page overflow, console/page 
 resources. The Review Hold schema is forward-only after its first disposition write: rollback then
 requires a forward fix or the matching pre-v9 database and Cairn checkpoints.
 
+## Iteration 10: Lattice Knowledge Workspace
+
+Lattice is a knowledge foundation rather than a generic page list. This iteration reorganizes the
+existing hierarchy, revision, backlink, related-page and coherence capabilities into three stable
+product contexts without changing their storage or authorization models.
+
+- **Library** is the orientation surface. It combines a bounded page tree, the paginated document
+  directory, six recent revision summaries, one native create form and a prominent Coherence entry.
+  Activity never copies revision bodies into the response.
+- **Document** uses a page tree, a focused article canvas and an Inspector. Outline, backlinks,
+  related pages, revision history, owner/update metadata, structure controls and stale/isolation
+  signals remain visible in the reading context instead of becoming unrelated cards below it.
+- **Editor** uses a Markdown/source and safe-preview split. The first preview is rendered by the
+  existing server sanitizer; progressive input preview creates inert DOM nodes with `textContent`.
+  Native form submission, CSRF, append-only history and `base_rev` conflict rejection remain the
+  authority when JavaScript is disabled or fails.
+- Lattice owns its editorial layout and responsive behavior. Odyssey remains the foundation for
+  tokens, theme, locale preferences, focus and reduced motion; it does not constrain the product
+  DOM or turn the workspace into a shared card template.
+
+No route, schema or anonymous capability is added. `wiki.w33d.xyz` remains an SSO root, and the
+shared Scriptoria candidate must still pass all six product crates, the Writer recovery suite,
+strict Clippy, isolated PostgreSQL 18 and Chromium at 320 / 390 / 1440 px plus 390 px no-JavaScript.
+Acceptance additionally requires no horizontal overflow, no failed resources, a usable collapsed
+Inspector on narrow screens, and unchanged Blog Review / Drive capability boundaries.
+
 ## Next iterations
 
 1. Forum: add an admin-owned tag taxonomy and thread-tag membership before Tag Focus, then add

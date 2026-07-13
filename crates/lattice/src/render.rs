@@ -6,7 +6,10 @@
 //! builds only its inner `content` HTML and hands it to [`layout`].
 
 use crate::auth;
-use axum::http::HeaderMap;
+use axum::http::{
+    header::{ACCEPT_LANGUAGE, COOKIE},
+    HeaderMap,
+};
 
 /// Lattice-only CSS layered after Odyssey's canonical font, tokens, and components.
 const SERVICE_CSS: &str = include_str!("../static/service.css");
@@ -38,6 +41,12 @@ const LOGOUT_URL: &str = "https://sso.w33d.xyz/_gw/auth/logout";
 /// the handler.
 pub fn layout(page_title: &str, headers: &HeaderMap, content: &str) -> String {
     let email = auth::signed_in_email(headers);
+    let cookie = headers.get(COOKIE).and_then(|value| value.to_str().ok());
+    let accept_language = headers
+        .get(ACCEPT_LANGUAGE)
+        .and_then(|value| value.to_str().ok());
+    let locale = odyssey::resolve_locale(cookie, accept_language);
+    let theme = odyssey::resolve_theme(cookie);
     let active = if page_title == "Recent changes" {
         "recent"
     } else if page_title == "Coherence" {
@@ -49,18 +58,23 @@ pub fn layout(page_title: &str, headers: &HeaderMap, content: &str) -> String {
     };
     LAYOUT
         .replace("{{STYLE}}", app_css())
+        .replace("{{LANG}}", locale.bcp47())
+        .replace("{{HTML_THEME}}", odyssey::html_theme_attr(theme))
+        .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(theme))
         .replace("{{PAGE_TITLE}}", &esc(page_title))
-        .replace("{{APPBAR}}", &app_bar(active, email.as_deref()))
+        .replace(
+            "{{APPBAR}}",
+            &app_bar(active, email.as_deref(), locale, theme),
+        )
         .replace("{{CONTENT}}", content)
 }
 
-/// The Lattice (Wiki) app-tile icon — a Lucide-style `book-open` glyph.
+/// The Lattice app-tile icon — a Lucide-style `book-open` glyph.
 pub const APP_ICON: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>"##;
 
-/// The full Odyssey v2 app-bar: the Wiki app-tile + name ("HOLDFAST Lattice" retained in the
-/// brand aria-label), the wiki nav (current marked `.is-active`), then the "All apps" waffle and
-/// the avatar user-menu. Public/no-session renders keep a minimal, no-identity avatar.
-fn app_bar(active: &str, email: Option<&str>) -> String {
+/// The full Odyssey v2 app-bar: Lattice brand + workspace nav + estate preferences, then the
+/// "All apps" waffle and avatar user-menu. Public/no-session renders keep a minimal avatar.
+fn app_bar(active: &str, email: Option<&str>, locale: odyssey::Locale, theme: &str) -> String {
     let nav = format!(
         concat!(
             r#"<nav class="appbar__nav" aria-label="Lattice">"#,
@@ -79,18 +93,24 @@ fn app_bar(active: &str, email: Option<&str>) -> String {
             ""
         },
     );
+    let preferences = format!(
+        "<div class=\"appbar__preferences\">{}{}</div>",
+        odyssey::theme_switcher(theme, locale).0,
+        odyssey::lang_switcher(locale).0,
+    );
     format!(
         r#"<header class="appbar">
   <a class="appbar__brand" href="/" aria-label="HOLDFAST Lattice home">
     <span class="app-tile" aria-hidden="true">{icon}</span>
-    <span class="appbar__name"><b>Wiki</b><span>wiki.w33d.xyz</span></span>
+    <span class="appbar__name"><b>Lattice</b><span>Knowledge workspace</span></span>
   </a>
   {nav}
   <span class="appbar__spacer"></span>
-  <div class="appbar__right">{right}</div>
+  <div class="appbar__right">{preferences}{right}</div>
 </header>"#,
         icon = APP_ICON,
         nav = nav,
+        preferences = preferences,
         right = user_menu(email),
     )
 }
@@ -222,5 +242,20 @@ mod tests {
         assert!(html.contains("allapps"));
         assert!(html.contains("https://w33d.xyz"));
         assert!(html.contains("userchip"));
+    }
+
+    #[test]
+    fn layout_resolves_theme_and_locale_from_request_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            COOKIE,
+            "__Secure-theme=dark; __Secure-lang=ja".parse().unwrap(),
+        );
+        let html = layout("Home", &headers, "<p>hi</p>");
+
+        assert!(html.contains("<html lang=\"ja\" data-theme=\"dark\">"));
+        assert!(html.contains("content=\"dark\""));
+        assert!(html.contains("/_gw/theme?to=auto"));
+        assert!(html.contains("/_gw/lang?to=zh"));
     }
 }

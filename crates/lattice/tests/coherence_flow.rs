@@ -49,11 +49,31 @@ async fn page_shows_backlinks_and_related_panel() {
     let state = seeded_state(
         120,
         &[
-            ("runbook", "Runbook", "database backup restore snapshot retention steps", 10),
+            (
+                "runbook",
+                "Runbook",
+                "database backup restore snapshot retention steps",
+                10,
+            ),
             ("home", "Home", "Start at the [[Runbook]].", 10),
-            ("guide", "Guide", "Follow the [[Runbook]] before deploy.", 10),
-            ("restore", "Restore Drill", "database restore snapshot retention recovery rehearsal", 10),
-            ("salad", "Salad", "lettuce tomato cucumber olive oil vinegar", 10),
+            (
+                "guide",
+                "Guide",
+                "Follow the [[Runbook]] before deploy.",
+                10,
+            ),
+            (
+                "restore",
+                "Restore Drill",
+                "database restore snapshot retention recovery rehearsal",
+                10,
+            ),
+            (
+                "salad",
+                "Salad",
+                "lettuce tomato cucumber olive oil vinegar",
+                10,
+            ),
         ],
     )
     .await;
@@ -68,19 +88,31 @@ async fn page_shows_backlinks_and_related_panel() {
     assert!(body.contains(r#"href="/w/guide""#), "guide backlink");
     // Related: keyword neighbour surfaces; the unrelated salad page does not.
     assert!(body.contains("Related"), "related heading present");
-    assert!(body.contains(r#"href="/w/restore""#), "restore is keyword-related");
-    assert!(!body.contains(r#"href="/w/salad""#), "no overlap -> not shown");
+    assert!(
+        body.contains(r#"class="relation-link" href="/w/restore""#),
+        "restore is keyword-related"
+    );
+    assert!(
+        !body.contains(r#"class="relation-link" href="/w/salad""#),
+        "unrelated pages may appear in the structure sidebar, but not the relation map"
+    );
 }
 
 #[tokio::test]
-async fn plain_page_has_no_relations_panel() {
-    // A lone page with no inbound links and no keyword neighbours renders exactly as before.
-    let state = seeded_state(120, &[("solo", "Solo", "a wholly unique isolated note", 10)]).await;
+async fn plain_page_exposes_isolation_as_a_coherence_signal() {
+    // A lone page makes missing connections explicit instead of silently hiding the panel.
+    let state = seeded_state(
+        120,
+        &[("solo", "Solo", "a wholly unique isolated note", 10)],
+    )
+    .await;
     let (status, _h, body) = call(&state, get("/w/solo")).await;
     assert_eq!(status, StatusCode::OK);
-    // The rendered panel markup is absent. Match the actual aside element — bare class names all
-    // appear in the embedded stylesheet, but `card relations` together only appears as the panel.
-    assert!(!body.contains("<aside class=\"card relations\">"), "no panel for an isolated page");
+    assert!(body.contains("Coherence signals"));
+    assert!(body.contains("Isolated"));
+    assert!(body.contains("Linked from"));
+    assert!(body.contains("Related"));
+    assert_eq!(body.matches("None yet").count(), 2);
 }
 
 #[tokio::test]
@@ -91,11 +123,31 @@ async fn coherence_lists_stale_and_contradictions() {
     let state = seeded_state(
         120,
         &[
-            ("fresh-note", "Fresh Note", "recently touched content here today", fresh),
-            ("ancient", "Ancient Policy", "this has not changed in a long time", old),
+            (
+                "fresh-note",
+                "Fresh Note",
+                "recently touched content here today",
+                fresh,
+            ),
+            (
+                "ancient",
+                "Ancient Policy",
+                "this has not changed in a long time",
+                old,
+            ),
             // Same title topic ("deploy process"), divergent bodies -> contradiction candidate.
-            ("deploy-a", "Deploy Process", "ship via kubernetes helm rollout canary staging cluster", fresh),
-            ("deploy-b", "Deploy Process Legacy", "deploy process copies tarballs over ftp by hand manually", fresh),
+            (
+                "deploy-a",
+                "Deploy Process",
+                "ship via kubernetes helm rollout canary staging cluster",
+                fresh,
+            ),
+            (
+                "deploy-b",
+                "Deploy Process Legacy",
+                "deploy process copies tarballs over ftp by hand manually",
+                fresh,
+            ),
         ],
     )
     .await;
@@ -105,8 +157,14 @@ async fn coherence_lists_stale_and_contradictions() {
     assert!(body.contains("Coherence"));
     // Stale section flags the ancient page (and links to it), not the fresh one.
     assert!(body.contains("Stale pages"));
-    assert!(body.contains(r#"href="/w/ancient""#), "stale page linked: {body}");
-    assert!(!body.contains(r#"href="/w/fresh-note""#), "fresh page not stale");
+    assert!(
+        body.contains(r#"href="/w/ancient""#),
+        "stale page linked: {body}"
+    );
+    assert!(
+        !body.contains(r#"href="/w/fresh-note""#),
+        "fresh page not stale"
+    );
     // Contradiction section flags the same-topic divergent pair.
     assert!(body.contains("Contradiction candidates"));
     assert!(body.contains(r#"href="/w/deploy-a""#));
@@ -128,7 +186,9 @@ async fn call(state: &AppState, req: Request<Body>) -> (StatusCode, axum::http::
     let resp = app(state.clone()).oneshot(req).await.unwrap();
     let status = resp.status();
     let headers = resp.headers().clone();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     (status, headers, String::from_utf8(bytes.to_vec()).unwrap())
 }
 

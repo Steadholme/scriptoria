@@ -29,6 +29,11 @@ async fn full_create_edit_history_flow() {
     let (status, _h, body) = call(&state, get("/")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("Knowledge base"));
+    assert!(body.contains("<h1>Library</h1>"));
+    assert!(body.contains("<div class=\"knowledge-library\">"));
+    assert!(body.contains("Knowledge map"));
+    assert!(body.contains("Recently updated"));
+    assert!(body.contains("href=\"/coherence\""));
     assert!(body.contains("No pages yet"));
 
     // Missing page offers creation.
@@ -46,6 +51,10 @@ async fn full_create_edit_history_flow() {
         body.contains(&format!("value=\"{csrf}\"")),
         "hidden field matches cookie"
     );
+    assert!(body.contains("<form class=\"editor editor-workspace\""));
+    assert!(body.contains("data-editor-source"));
+    assert!(body.contains("data-editor-preview"));
+    assert!(body.contains("name=\"base_rev\""));
 
     // Save the page (gateway injects the editor email; CSRF cookie + field present).
     let save = post_form(
@@ -75,6 +84,12 @@ async fn full_create_edit_history_flow() {
     // (slug `home`) exists.
     let (status, _h, body) = call(&state, get("/w/home")).await;
     assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("<div class=\"knowledge-document\">"));
+    assert!(body.contains("<article class=\"page document-article\">"));
+    assert!(body.contains("<aside class=\"document-inspector\""));
+    assert!(body.contains("<summary>Outline</summary>"));
+    assert!(body.contains("<summary>Connections</summary>"));
+    assert!(body.contains("<summary>Coherence signals</summary>"));
     assert!(body.contains("<p>Welcome.</p>"));
     assert!(body.contains(r#"href="/w/runbook""#));
     assert!(
@@ -232,6 +247,15 @@ async fn recent_feed_never_leaks_body() {
     assert!(
         !body.contains(sentinel),
         "recent feed must not emit revision body_md"
+    );
+
+    let (status, _headers, library) = call(&state, get("/")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(library.contains("Recently updated"));
+    assert!(library.contains(">Secret</a>"));
+    assert!(
+        !library.contains(sentinel),
+        "Library activity must not emit revision body_md"
     );
 }
 
@@ -424,7 +448,7 @@ async fn persisted_backlinks_are_updated_on_each_save() {
         "persisted backlinks list is rendered"
     );
     assert!(
-        body.contains(r#"href="/w/home""#),
+        body.contains(r#"class="relation-link" href="/w/home""#),
         "home is a persisted backlink: {body}"
     );
 
@@ -440,8 +464,8 @@ async fn persisted_backlinks_are_updated_on_each_save() {
     let (status, _headers, body) = call(&state, get("/w/runbook")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        !body.contains(r#"href="/w/home""#),
-        "stale backlink was removed: {body}"
+        !body.contains(r#"class="relation-link" href="/w/home""#),
+        "stale backlink was removed from connections: {body}"
     );
 }
 
@@ -671,6 +695,14 @@ async fn stored_html_is_sanitized() {
         "script must be escaped"
     );
     assert!(body.contains("&lt;script&gt;"));
+
+    let (_s, _h, editor) = call(&state, get("/edit/xss")).await;
+    assert!(editor.contains("data-editor-preview"));
+    assert!(
+        !editor.contains("<script>alert(1)</script>"),
+        "server preview and source textarea both keep the stored draft inert"
+    );
+    assert!(editor.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
 }
 
 #[tokio::test]

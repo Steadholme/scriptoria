@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="{{LANG}}"{{HTML_THEME}}>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
+  <meta name="color-scheme" content="{{COLOR_SCHEME}}">
   <meta name="robots" content="noindex">
   <link rel="icon" href="data:,">
   <title>{{PAGE_TITLE}} · Lattice · HOLDFAST</title>
@@ -47,6 +47,42 @@
         }
       }, { rootMargin: '-90px 0px -70% 0px', threshold: 0 });
       order.forEach(function (t) { obs.observe(t); });
+    })();
+
+    // Progressive editor preview. It deliberately builds DOM with textContent instead of
+    // assigning HTML, so a draft remains inert even before the server-side Markdown sanitizer
+    // sees it. Saving and conflict protection stay ordinary HTML form behavior without JS.
+    (function () {
+      var source = document.querySelector('[data-editor-source]');
+      var preview = document.querySelector('[data-editor-preview]');
+      if (!source || !preview) { return; }
+      function append(tag, text) {
+        var node = document.createElement(tag);
+        node.textContent = text;
+        preview.appendChild(node);
+      }
+      function render() {
+        while (preview.firstChild) { preview.removeChild(preview.firstChild); }
+        var inCode = false;
+        var code = [];
+        source.value.split(/\r?\n/).forEach(function (line) {
+          if (/^```/.test(line)) {
+            if (inCode) { append('pre', code.join('\n')); code = []; }
+            inCode = !inCode;
+            return;
+          }
+          if (inCode) { code.push(line); return; }
+          var heading = line.match(/^(#{1,3})\s+(.+)$/);
+          if (heading) { append('h' + heading[1].length, heading[2]); return; }
+          var item = line.match(/^[-*]\s+(.+)$/);
+          if (item) { append('p', '• ' + item[1]); return; }
+          if (line.trim()) { append('p', line); }
+        });
+        if (code.length) { append('pre', code.join('\n')); }
+        if (!preview.firstChild) { append('p', 'Preview appears as you write.'); }
+      }
+      source.addEventListener('input', render);
+      preview.setAttribute('aria-live', 'polite');
     })();
   </script>
 </body>

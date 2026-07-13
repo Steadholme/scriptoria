@@ -147,6 +147,9 @@ pub async fn index(
     let before = q.before.as_deref().and_then(parse_before);
     let limit = clamp_page_limit(q.limit.unwrap_or(DEFAULT_PAGE));
     let pages = state.store.list_pages(before, limit).await?;
+    // The Library orientation uses the bounded hierarchy alongside the paginated directory.
+    // Its activity pulse is derived from this same result, avoiding another revision-body query.
+    let structure_pages = state.store.list_pages(None, MAX_PAGE).await?;
     // A full page means older pages may exist: derive the next cursor from the last row. A short
     // (or empty) page is the end of the walk, so no "Load older" link is rendered.
     let next = if pages.len() as i64 == limit {
@@ -154,8 +157,8 @@ pub async fn index(
     } else {
         None
     };
-    let content = render_index(&pages, next.as_ref());
-    Ok(Html(layout("Knowledge base", &headers, &content)))
+    let content = render_index(&pages, &structure_pages, next.as_ref());
+    Ok(Html(layout("Library", &headers, &content)))
 }
 
 /// Parse a `?before=<created_at>_<slug>` cursor. Slugs are alnum + hyphen only (never `_`, per
@@ -171,50 +174,94 @@ fn parse_before(raw: &str) -> Option<(i64, String)> {
     }
 }
 
-fn render_index(pages: &[Page], next: Option<&(i64, String)>) -> String {
-    let count = pages.len();
-    let head = format!(
-        "<div class=\"page-head\">\
-           <div>\
-             <h1>Knowledge base</h1>\
-             <p class=\"muted\">{count} page{plural}</p>\
-	           </div>\
-	           <form class=\"newpage\" method=\"get\" action=\"/new\">\
-	             <input type=\"text\" name=\"title\" placeholder=\"New page title…\" autocomplete=\"off\" aria-label=\"New page title\">\
-	             <select name=\"template\" aria-label=\"Page template\">{templates}</select>\
-	             <button class=\"btn btn-primary\" type=\"submit\">Create page</button>\
-	           </form>\
-	         </div>",
-        count = count,
-        plural = if count == 1 { "" } else { "s" },
+fn render_index(
+    pages: &[Page],
+    structure_pages: &[Page],
+    next: Option<&(i64, String)>,
+) -> String {
+    let total = structure_pages.len();
+    let roots = structure_pages
+        .iter()
+        .filter(|page| page.parent_id.is_none())
+        .count();
+    let hero = format!(
+        "<section class=\"library-hero\">\
+           <div class=\"library-hero__copy\">\
+             <p class=\"eyebrow\">Knowledge base</p>\
+             <h1>Library</h1>\
+             <p>Find the source of truth, follow its context, and keep operational knowledge coherent.</p>\
+           </div>\
+           <form class=\"newpage library-create\" method=\"get\" action=\"/new\">\
+             <label for=\"library-title\">Start a document</label>\
+             <div class=\"library-create__row\">\
+               <input id=\"library-title\" type=\"text\" name=\"title\" placeholder=\"Document title…\" autocomplete=\"off\" required>\
+               <select name=\"template\" aria-label=\"Page template\">{templates}</select>\
+               <button class=\"btn btn-primary\" type=\"submit\">Create</button>\
+             </div>\
+           </form>\
+         </section>",
         templates = render_template_options(""),
     );
 
-    let list = if pages.is_empty() {
-        "<div class=\"list-empty\">No pages yet. Create the first one above — or link to it with \
-         <code>[[double brackets]]</code> from any page.</div>"
-            .to_string()
+    let structure = if structure_pages.is_empty() {
+        "<div class=\"list-empty library-empty\"><strong>No pages yet.</strong> Create the first document above, or connect one with <code>[[double brackets]]</code>.</div>".to_string()
+    } else {
+        format!(
+            "<ul class=\"library-tree\">{}</ul>",
+            render_tree_items(structure_pages, "")
+        )
+    };
+
+    let directory = if pages.is_empty() {
+        "<div class=\"list-empty\">No pages yet.</div>".to_string()
     } else {
         let items: String = pages
             .iter()
-            .map(|p| {
+            .map(|page| {
                 format!(
                     "<li class=\"page-list__item\">\
                        <a class=\"page-list__title\" href=\"/w/{slug}\">{title}</a>\
-                       <span class=\"page-list__meta\">edited by {email} · {time}</span>\
+                       <span class=\"page-list__meta\">{email} · {time}</span>\
                      </li>",
-                    slug = esc(&p.slug),
-                    title = esc(&p.title),
-                    email = esc(&p.updated_by_email),
-                    time = esc(&fmt_ts(p.updated_at)),
+                    slug = esc(&page.slug),
+                    title = esc(&page.title),
+                    email = esc(&page.updated_by_email),
+                    time = esc(&fmt_ts(page.updated_at)),
                 )
             })
             .collect();
         format!("<ul class=\"page-list\">{items}</ul>")
     };
 
-    // "Load older" only when a full page came back (a next cursor exists). The slug is alnum +
-    // hyphen (URL-safe) but still escaped for the attribute; created_at is a plain integer.
+    let mut latest: Vec<&Page> = structure_pages.iter().collect();
+    latest.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| b.slug.cmp(&a.slug))
+    });
+    latest.truncate(6);
+    let activity = if latest.is_empty() {
+        "<p class=\"library-rail__empty\">No changes yet.</p>".to_string()
+    } else {
+        let items: String = latest
+            .iter()
+            .map(|page| {
+                format!(
+                    "<li>\
+                       <span class=\"library-timeline__mark\" aria-hidden=\"true\"></span>\
+                       <div><a href=\"/w/{slug}\">{title}</a>\
+                       <span>{editor} · {time}</span></div>\
+                     </li>",
+                    slug = esc(&page.slug),
+                    title = esc(&page.title),
+                    editor = esc(&page.updated_by_email),
+                    time = esc(&fmt_ts(page.updated_at)),
+                )
+            })
+            .collect();
+        format!("<ol class=\"library-timeline\">{items}</ol>")
+    };
+
     let older = match next {
         Some((ts, slug)) => format!(
             "<nav class=\"pager\"><a class=\"btn btn-secondary\" rel=\"next\" href=\"/?before={ts}_{slug}\">Load older</a></nav>",
@@ -225,8 +272,37 @@ fn render_index(pages: &[Page], next: Option<&(i64, String)>) -> String {
     };
 
     format!(
-        "{head}<section class=\"card\">{list}</section>{older}\
-         <p class=\"site-foot\">HOLDFAST Lattice · server-rendered wiki · Markdown with <code>[[wiki-links]]</code> · <a href=\"/coherence\">Coherence report</a></p>"
+        "{hero}\
+         <div class=\"knowledge-library\">\
+           <div class=\"library-main\">\
+             <section class=\"library-section library-structure\">\
+               <div class=\"section-heading\"><div><p class=\"eyebrow\">Browse</p><h2>Knowledge map</h2></div><span>{total} page{plural} · {roots} root{root_plural}</span></div>\
+               {structure}\
+             </section>\
+             <section class=\"library-section library-directory\">\
+               <div class=\"section-heading\"><div><p class=\"eyebrow\">Directory</p><h2>All documents</h2></div></div>\
+               {directory}{older}\
+             </section>\
+           </div>\
+           <aside class=\"library-rail\" aria-label=\"Workspace overview\">\
+             <a class=\"coherence-entry\" href=\"/coherence\">\
+               <span class=\"coherence-entry__signal\" aria-hidden=\"true\"></span>\
+               <span><strong>Coherence</strong><small>Review stale or contradictory knowledge</small></span>\
+               <span aria-hidden=\"true\">→</span>\
+             </a>\
+             <section class=\"library-activity\">\
+               <div class=\"section-heading\"><div><p class=\"eyebrow\">Activity</p><h2>Recently updated</h2></div><a href=\"/recent\">View all</a></div>\
+               {activity}\
+             </section>\
+             <section class=\"library-principle\">\
+               <p class=\"eyebrow\">Working model</p>\
+               <p>Documents become useful when their ownership, history, and relationships stay visible.</p>\
+             </section>\
+           </aside>\
+         </div>\
+         <p class=\"site-foot\">HOLDFAST Lattice · Markdown with <code>[[wiki-links]]</code> · revision-safe by default</p>",
+        plural = if total == 1 { "" } else { "s" },
+        root_plural = if roots == 1 { "" } else { "s" },
     )
 }
 
@@ -392,16 +468,20 @@ pub async fn view(
                 })
                 .collect();
             let path = state.store.page_path(&slug).await?;
+            let outgoing_count = state.store.outgoing_links(&slug).await?.len();
             let csrf = auth::new_csrf_token();
-            let content = render_view(
-                &page,
-                &rendered.html,
-                &rendered.toc,
-                &panel,
-                &pages,
-                &path,
-                &csrf,
-            );
+            let content = render_view(DocumentView {
+                page: &page,
+                body_html: &rendered.html,
+                toc: &rendered.toc,
+                panel: &panel,
+                pages: &pages,
+                path: &path,
+                csrf: &csrf,
+                outgoing_count,
+                stale_days: state.config.stale_days,
+                now: now_ms(),
+            });
             let html = layout(&page.title, &headers, &content);
             Ok(html_with_csrf_cookie(html, &csrf))
         }
@@ -413,64 +493,134 @@ pub async fn view(
     }
 }
 
-fn render_view(
-    page: &Page,
-    body_html: &str,
-    toc: &[markdown::TocEntry],
-    panel: &PagePanel,
-    pages: &[Page],
-    path: &[Page],
-    csrf: &str,
-) -> String {
+struct DocumentView<'a> {
+    page: &'a Page,
+    body_html: &'a str,
+    toc: &'a [markdown::TocEntry],
+    panel: &'a PagePanel,
+    pages: &'a [Page],
+    path: &'a [Page],
+    csrf: &'a str,
+    outgoing_count: usize,
+    stale_days: i64,
+    now: i64,
+}
+
+fn render_view(view: DocumentView<'_>) -> String {
+    let page = view.page;
     let article = format!(
-        "<article class=\"card page\">\
-           {breadcrumb}\
-           <div class=\"page__bar\">\
-             <div>\
-               <h1>{title}</h1>\
-               <p class=\"meta\">Last edited by {email} · {time}</p>\
+        "<article class=\"page document-article\">\
+           <header class=\"document-header\">\
+             {breadcrumb}\
+             <p class=\"eyebrow\">Document</p>\
+             <div class=\"page__bar\">\
+               <div>\
+                 <h1>{title}</h1>\
+                 <p class=\"meta\">Last edited by {email} · {time}</p>\
+               </div>\
+               <div class=\"page__actions\">\
+                 <a class=\"btn btn-secondary btn-sm\" href=\"/history/{slug}\">History</a>\
+                 <a class=\"btn btn-primary btn-sm\" href=\"/edit/{slug}\">Edit</a>\
+               </div>\
              </div>\
-             <div class=\"page__actions\">\
-               <a class=\"btn btn-secondary btn-sm\" href=\"/history/{slug}\">History</a>\
-               <a class=\"btn btn-primary btn-sm\" href=\"/edit/{slug}\">Edit</a>\
-             </div>\
-           </div>\
-           {toc}\
-           <div class=\"prose\">{body}</div>\
+           </header>\
+           <div class=\"prose document-body\">{body}</div>\
+           <footer class=\"document-end\"><span>End of document</span><a href=\"/edit/{slug}\">Improve this page</a></footer>\
          </article>",
-        breadcrumb = render_breadcrumb(path),
+        breadcrumb = render_breadcrumb(view.path),
         title = esc(&page.title),
         email = esc(&page.updated_by_email),
         time = esc(&fmt_ts(page.updated_at)),
         slug = esc(&page.slug),
-        toc = render_toc(toc),
-        body = body_html,
+        body = view.body_html,
     );
-    let move_form = render_move_form(page, pages, csrf);
-    let relations = render_relations(panel);
 
-    if pages.iter().any(|p| p.parent_id.is_some()) {
-        format!(
-            "<div class=\"wiki-shell\">\
-               {tree}\
-               <div class=\"wiki-main\">{article}{move_form}{relations}</div>\
-             </div>",
-            tree = render_page_tree(pages, &page.slug),
-            article = article,
-            move_form = move_form,
-            relations = relations,
-        )
+    format!(
+        "<div class=\"knowledge-document\">\
+           {tree}\
+           <section class=\"document-canvas\" aria-label=\"Document\">{article}</section>\
+           {inspector}\
+         </div>",
+        tree = render_page_tree(view.pages, &page.slug),
+        inspector = render_document_inspector(&view),
+    )
+}
+
+fn render_document_inspector(view: &DocumentView<'_>) -> String {
+    let page = view.page;
+    let age_days = view.now.saturating_sub(page.updated_at).max(0) / 86_400_000;
+    let stale_cutoff = view
+        .now
+        .saturating_sub(view.stale_days.max(0).saturating_mul(86_400_000));
+    let stale = page.updated_at < stale_cutoff;
+    let freshness_class = if stale { " is-warning" } else { " is-healthy" };
+    let freshness_label = if stale { "Review due" } else { "Current" };
+    let freshness_detail = if stale {
+        format!("Last touched {age_days} days ago")
     } else {
-        format!("{article}{move_form}{relations}")
-    }
+        format!("Updated {age_days} days ago")
+    };
+    let connected = !view.panel.backlinks.is_empty()
+        || view.outgoing_count > 0
+        || !view.panel.related.is_empty();
+    let connection_label = if connected { "Connected" } else { "Isolated" };
+    let move_form = render_move_form(page, view.pages, view.csrf);
+    let move_form = if move_form.is_empty() {
+        "<p class=\"inspector-empty\">This is the only page in the workspace.</p>".to_string()
+    } else {
+        move_form
+    };
+
+    format!(
+        "<aside class=\"document-inspector\" aria-label=\"Document inspector\">\
+           <div class=\"inspector-head\"><p class=\"eyebrow\">Context</p><h2>Inspector</h2></div>\
+           <details class=\"inspector-section\" open>\
+             <summary>Outline</summary>\
+             {outline}\
+           </details>\
+           <details class=\"inspector-section\" open>\
+             <summary>Connections</summary>\
+             {relations}\
+           </details>\
+           <details class=\"inspector-section\">\
+             <summary>Document</summary>\
+             <dl class=\"document-meta\">\
+               <div><dt>Owner</dt><dd>{owner}</dd></div>\
+               <div><dt>Updated</dt><dd>{updated}</dd></div>\
+               <div><dt>History</dt><dd><a href=\"/history/{slug}\">View revisions</a></dd></div>\
+               <div><dt>Slug</dt><dd><code>{slug}</code></dd></div>\
+             </dl>\
+           </details>\
+           <details class=\"inspector-section\" open>\
+             <summary>Coherence signals</summary>\
+             <div class=\"signal-line{freshness_class}\"><span aria-hidden=\"true\"></span><div><strong>{freshness_label}</strong><small>{freshness_detail}</small></div></div>\
+             <div class=\"signal-line\"><span aria-hidden=\"true\"></span><div><strong>{connection_label}</strong><small>{incoming} inbound · {outgoing} outbound · {related} related</small></div></div>\
+             <a class=\"inspector-link\" href=\"/coherence\">Open workspace report →</a>\
+           </details>\
+           <details class=\"inspector-section\">\
+             <summary>Structure</summary>\
+             {move_form}\
+           </details>\
+         </aside>",
+        outline = render_toc(view.toc),
+        relations = render_relations(view.panel),
+        owner = esc(&page.updated_by_email),
+        updated = esc(&fmt_ts(page.updated_at)),
+        slug = esc(&page.slug),
+        freshness_class = freshness_class,
+        freshness_label = freshness_label,
+        freshness_detail = esc(&freshness_detail),
+        connection_label = connection_label,
+        incoming = view.panel.backlinks.len(),
+        outgoing = view.outgoing_count,
+        related = view.panel.related.len(),
+        move_form = move_form,
+    )
 }
 
 fn render_breadcrumb(path: &[Page]) -> String {
-    if path.len() <= 1 {
-        return String::new();
-    }
-    let last = path.len() - 1;
-    let items: String = path
+    let last = path.len().saturating_sub(1);
+    let path_items: String = path
         .iter()
         .enumerate()
         .map(|(i, p)| {
@@ -485,10 +635,22 @@ fn render_breadcrumb(path: &[Page]) -> String {
             }
         })
         .collect();
-    format!("<nav class=\"breadcrumb\" aria-label=\"Breadcrumb\">{items}</nav>")
+    format!(
+        "<nav class=\"breadcrumb\" aria-label=\"Breadcrumb\"><a href=\"/\">Library</a>{path_items}</nav>"
+    )
 }
 
 fn render_page_tree(pages: &[Page], current_slug: &str) -> String {
+    let items = render_tree_items(pages, current_slug);
+    format!(
+        "<aside class=\"page-tree\" aria-label=\"Page tree\">\
+           <div class=\"page-tree__head\"><p class=\"eyebrow\">Workspace</p><h2>Page tree</h2></div>\
+           <ul class=\"page-tree__list\">{items}</ul>\
+         </aside>",
+    )
+}
+
+fn render_tree_items(pages: &[Page], current_slug: &str) -> String {
     let known: BTreeSet<&str> = pages.iter().map(|p| p.slug.as_str()).collect();
     let mut children: BTreeMap<String, Vec<&Page>> = BTreeMap::new();
     for page in pages {
@@ -508,13 +670,7 @@ fn render_page_tree(pages: &[Page], current_slug: &str) -> String {
         });
     }
     let mut visited = BTreeSet::new();
-    let items = render_tree_children("", &children, current_slug, &mut visited);
-    format!(
-        "<aside class=\"card page-tree\" aria-label=\"Page tree\">\
-           <h2>Page tree</h2>\
-           <ul class=\"page-tree__list\">{items}</ul>\
-         </aside>",
-    )
+    render_tree_children("", &children, current_slug, &mut visited)
 }
 
 fn render_tree_children(
@@ -589,14 +745,14 @@ fn render_move_form(page: &Page, pages: &[Page], csrf: &str) -> String {
         ));
     }
     format!(
-        "<section class=\"card move-card\">\
+        "<div class=\"move-card\">\
            <form class=\"move-form\" method=\"post\" action=\"/move/{slug}\">\
              <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
              <label for=\"parent_id\">Parent page</label>\
              <select id=\"parent_id\" name=\"parent_id\">{options}</select>\
              <button class=\"btn btn-secondary btn-sm\" type=\"submit\">Move</button>\
            </form>\
-         </section>",
+         </div>",
         slug = esc(&page.slug),
         csrf = esc(csrf),
         options = options,
@@ -620,12 +776,10 @@ fn descendant_slugs<'a>(slug: &str, pages: &'a [Page]) -> BTreeSet<&'a str> {
     out
 }
 
-/// The on-page "Contents" box. Rendered only for pages with at least two headings — a single
-/// heading is not worth a TOC. Each entry links to the heading's `#id` anchor; the level drives
-/// an indent class. All heading text is escaped; the id is slug-safe but escaped defensively.
+/// Inspector outline. Heading text is escaped and every link points at a sanitizer-produced id.
 fn render_toc(toc: &[markdown::TocEntry]) -> String {
-    if toc.len() < 2 {
-        return String::new();
+    if toc.is_empty() {
+        return "<p class=\"inspector-empty\">No headings in this document.</p>".to_string();
     }
     let items: String = toc
         .iter()
@@ -640,18 +794,14 @@ fn render_toc(toc: &[markdown::TocEntry]) -> String {
         .collect();
     format!(
         "<nav class=\"toc\" aria-label=\"Table of contents\">\
-           <p class=\"toc__title\">Contents</p>\
            <ul class=\"toc__list\">{items}</ul>\
          </nav>"
     )
 }
 
-/// The "Linked from / Related" panel beneath a page. Renders nothing when the page has neither
-/// explicit backlinks nor keyword-related neighbours, so simple pages look exactly as before.
+/// The inspector's stable connection map. Empty groups remain visible so an isolated document is
+/// an explicit coherence signal instead of silently looking complete.
 fn render_relations(panel: &PagePanel) -> String {
-    if panel.is_empty() {
-        return String::new();
-    }
     let backlinks = render_link_group(
         "Linked from",
         "Pages that reference this one.",
@@ -662,23 +812,24 @@ fn render_relations(panel: &PagePanel) -> String {
         "Pages with overlapping terms (heuristic).",
         &panel.related,
     );
-    format!("<aside class=\"card relations\">{backlinks}{related}</aside>")
+    format!("<div class=\"relations\">{backlinks}{related}</div>")
 }
 
 fn render_link_group(heading: &str, hint: &str, links: &[graph::LinkRef]) -> String {
-    if links.is_empty() {
-        return String::new();
-    }
-    let items: String = links
-        .iter()
-        .map(|l| {
-            format!(
-                "<li><a href=\"/w/{slug}\">{title}</a></li>",
-                slug = esc(&l.slug),
-                title = esc(&l.title),
-            )
-        })
-        .collect();
+    let items = if links.is_empty() {
+        "<li class=\"relations__empty\">None yet</li>".to_string()
+    } else {
+        links
+            .iter()
+            .map(|link| {
+                format!(
+                    "<li><a class=\"relation-link\" href=\"/w/{slug}\">{title}</a></li>",
+                    slug = esc(&link.slug),
+                    title = esc(&link.title),
+                )
+            })
+            .collect()
+    };
     format!(
         "<div class=\"relations__group\">\
            <h2 class=\"relations__title\">{heading}</h2>\
@@ -738,8 +889,18 @@ pub async fn edit_form(
         .map(|r| r.id)
         .unwrap_or_default();
 
+    let known_slugs: HashSet<String> = state.store.all_slugs().await?.into_iter().collect();
+    let preview = markdown::render(&body, &known_slugs);
     let csrf = auth::new_csrf_token();
-    let content = render_editor(&slug, &title, &body, &csrf, exists, &base_rev);
+    let content = render_editor(
+        &slug,
+        &title,
+        &body,
+        &preview.html,
+        &csrf,
+        exists,
+        &base_rev,
+    );
     let page_title = format!("{} {}", if exists { "Edit" } else { "Create" }, title);
     let html = layout(&page_title, &headers, &content);
     Ok(html_with_csrf_cookie(html, &csrf))
@@ -749,31 +910,40 @@ fn render_editor(
     slug: &str,
     title: &str,
     body: &str,
+    preview_html: &str,
     csrf: &str,
     exists: bool,
     base_rev: &str,
 ) -> String {
     format!(
-        "<form class=\"card editor\" method=\"post\" action=\"/edit/{slug}\">\
-           <div class=\"editor__head\">\
-             <h1>{verb} page</h1>\
-             <code>/w/{slug}</code>\
-           </div>\
+        "<form class=\"editor editor-workspace\" method=\"post\" action=\"/edit/{slug}\">\
            <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
            <input type=\"hidden\" name=\"base_rev\" value=\"{base_rev}\">\
-           <div class=\"editor__field\">\
-             <label for=\"title\">Title</label>\
+           <header class=\"editor__head\">\
+             <div><p class=\"eyebrow\">Writing workspace</p><h1>{verb} document</h1></div>\
+             <code>/w/{slug}</code>\
+           </header>\
+           <div class=\"editor__title-field\">\
+             <label for=\"title\">Document title</label>\
              <input id=\"title\" type=\"text\" name=\"title\" value=\"{title}\" autocomplete=\"off\" required>\
            </div>\
-           <div class=\"editor__field\">\
-             <label for=\"body\">Body</label>\
-             <textarea id=\"body\" name=\"body_md\" rows=\"22\" spellcheck=\"false\">{body}</textarea>\
-             <p class=\"editor__hint\">Markdown supported. Link to other pages with <code>[[Page Name]]</code> or <code>[[slug|label]]</code>. Raw HTML is escaped.</p>\
+           <div class=\"editor-split\">\
+             <section class=\"editor-pane editor-pane--source\" aria-labelledby=\"source-label\">\
+               <div class=\"editor-pane__head\"><h2 id=\"source-label\">Markdown</h2><span>Source</span></div>\
+               <textarea id=\"body\" name=\"body_md\" rows=\"28\" spellcheck=\"true\" data-editor-source>{body}</textarea>\
+             </section>\
+             <section class=\"editor-pane editor-pane--preview\" aria-labelledby=\"preview-label\">\
+               <div class=\"editor-pane__head\"><h2 id=\"preview-label\">Preview</h2><span>Safe rendering</span></div>\
+               <div class=\"prose editor-preview\" data-editor-preview>{preview}</div>\
+             </section>\
            </div>\
-           <div class=\"editor__actions\">\
-             <a class=\"btn btn-secondary\" href=\"/w/{slug}\">Cancel</a>\
-             <button class=\"btn btn-primary\" type=\"submit\">Save page</button>\
-           </div>\
+           <footer class=\"editor-footer\">\
+             <p class=\"editor__hint\">Use Markdown and <code>[[Page Name]]</code> links. Raw HTML remains escaped.</p>\
+             <div class=\"editor__actions\">\
+               <a class=\"btn btn-secondary\" href=\"/w/{slug}\">Cancel</a>\
+               <button class=\"btn btn-primary\" type=\"submit\">Save document</button>\
+             </div>\
+           </footer>\
          </form>",
         slug = esc(slug),
         verb = if exists { "Edit" } else { "Create" },
@@ -781,6 +951,7 @@ fn render_editor(
         base_rev = esc(base_rev),
         title = esc(title),
         body = esc(body),
+        preview = preview_html,
     )
 }
 
