@@ -2,7 +2,7 @@
 name = "inkwell"
 version = "0.1.0"
 edition = "2021"
-description = "Inkwell — personal blog / CMS with SSO authoring for the HOLDFAST stack."
+description = "Inkwell — personal blog / CMS with SSO authoring for the Steadholme stack."
 license = "MIT OR Apache-2.0"
 
 [lib]

@@ -601,7 +601,7 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             title: "Inkwell".to_string(),
-            tagline: "Notes, essays, and changelog from the HOLDFAST estate.".to_string(),
+            tagline: "Notes, essays, and changelog from the Steadholme estate.".to_string(),
             posts_per_page: crate::config::DEFAULT_PAGE,
         }
     }

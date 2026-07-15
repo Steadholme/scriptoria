@@ -1,6 +1,6 @@
 # Echo — embeddable comments
 
-One owned comment layer for the HOLDFAST estate, reusable across blog / wiki / paste. Echo is a
+One owned comment layer for the Steadholme estate, reusable across blog / wiki / paste. Echo is a
 standalone threaded-comments service plus a minimal, iframe-able embed view (later other services
 iframe `/embed/{key}`).
 

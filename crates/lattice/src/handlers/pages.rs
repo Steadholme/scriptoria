@@ -300,7 +300,7 @@ fn render_index(
              </section>\
            </aside>\
          </div>\
-         <p class=\"site-foot\">HOLDFAST Lattice · Markdown with <code>[[wiki-links]]</code> · revision-safe by default</p>",
+         <p class=\"site-foot\">Steadholme Lattice · Markdown with <code>[[wiki-links]]</code> · revision-safe by default</p>",
         plural = if total == 1 { "" } else { "s" },
         root_plural = if roots == 1 { "" } else { "s" },
     )

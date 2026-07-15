@@ -1,4 +1,4 @@
-//! Echo — embeddable threaded-comments service for the HOLDFAST stack.
+//! Echo — embeddable threaded-comments service for the Steadholme stack.
 //!
 //! Library root: defines [`AppState`], wires the routes via [`app`], and provides
 //! [`build_dev_state`] (in-memory store, disabled audit — no database, no network) and

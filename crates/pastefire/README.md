@@ -1,14 +1,14 @@
 # Pastefire
 
-> HOLDFAST 主权基础设施中的企业级 **代码片段 / 粘贴板（pastebin）** 服务。
+> Steadholme 主权基础设施中的企业级 **代码片段 / 粘贴板（pastebin）** 服务。
 
 Pastefire 让登录用户快速分享代码片段：新建粘贴、按语言标注、设置过期时间、生成短链接（`/p/{id}`），
 并提供 `text/plain` 原始视图（`/raw/{id}`）。它部署在 `paste.w33d.xyz` 子域，**只**通过网关 Sluice
 对外暴露，由网关完成单点登录（SSO）。
 
-## 设计要点（遵循 HOLDFAST 共享服务模板）
+## 设计要点（遵循 Steadholme 共享服务模板）
 
-- **Rust + axum**，服务端渲染的企业级界面（HOLDFAST 设计语言，CSS 经 `include_str!` 内联，无静态资源往返）。
+- **Rust + axum**，服务端渲染的企业级界面（Steadholme 设计语言，CSS 经 `include_str!` 内联，无静态资源往返）。
 - **不做自己的登录**：位于 Sluice `auth=sso` 路由之后。网关执行 OIDC 浏览器登录，剥离入站的 `X-Auth-*`，
   再注入受信任的 `X-Auth-Subject` / `X-Auth-Email`。Pastefire 属于内网服务，因此**信任**这些头部作为
   已认证作者。粘贴的作者**永远**取自 `X-Auth-*`，绝不采信客户端字段。退出登录指向

@@ -1,6 +1,6 @@
-# Lattice — HOLDFAST Knowledge Workspace
+# Lattice — Steadholme Knowledge Workspace
 
-Lattice 是 HOLDFAST 主权基础设施中的**知识工作区**：它把服务端渲染的 Markdown 文档、层级结构、
+Lattice 是 Steadholme 主权基础设施中的**知识工作区**：它把服务端渲染的 Markdown 文档、层级结构、
 `[[wiki-链接]]`、反向链接、修订历史与 coherence（知识一致性）信号放在同一个阅读和编辑上下文中。
 它**自身不做任何登录**——坐落在 Sluice 网关 `auth=sso` 路由之后（子域 `wiki.w33d.xyz`），
 信任网关注入的身份头来标记编辑者。
@@ -57,7 +57,7 @@ Sluice **不剥离路径前缀**：服务落在子域**根路径** `/`，上游�
 | POST | `/move/{slug}` | 调整父页面；拒绝循环层级 |
 | GET | `/coherence` | 维护视图：陈旧页面（超 `LATTICE_STALE_DAYS` 天未编辑）+ 矛盾候选（标题/术语高度重叠但正文分歧的启发式标记） |
 
-未匹配路由渲染 HOLDFAST 风格的 404 页。
+未匹配路由渲染 Steadholme 风格的 404 页。
 
 页面视图（`/w/{slug}`）在 Inspector 中持续展示 **Linked from / Related**：显式反向链接（其他页面
 通过 `[[链接]]` 或 `/w/` Markdown 链接引用本页）+ 关键词重叠的相关页面（本地 TF-IDF 余弦，

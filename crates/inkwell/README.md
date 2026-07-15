@@ -1,6 +1,6 @@
 # Inkwell — 个人博客 / CMS（SSO 写作）
 
-Inkwell 是 HOLDFAST 主权基础设施栈中的 **个人博客 / CMS** 服务：一个干净的阅读视图 + 一个 Markdown 写作表单。访客通过 **Sluice 网关** 的 SSO 登录后即可撰写、编辑、删除 **自己的** 文章；文章正文以 Markdown 撰写，渲染为 **经过净化的 HTML**。
+Inkwell 是 Steadholme 主权基础设施栈中的 **个人博客 / CMS** 服务：一个干净的阅读视图 + 一个 Markdown 写作表单。访客通过 **Sluice 网关** 的 SSO 登录后即可撰写、编辑、删除 **自己的** 文章；文章正文以 Markdown 撰写，渲染为 **经过净化的 HTML**。
 
 技术栈与 keystone/keyward/beacon 一致：**Rust + axum**，sqlx 运行期查询（无编译期宏、无数据库即可构建），rustls（无 OpenSSL）。数据层只用 **可移植标准 SQL**（`TEXT/BIGINT/BOOLEAN` + `PK/UNIQUE/NOT NULL/DEFAULT`），日后可在 FusionDB 上经 pgwire 原样运行。
 

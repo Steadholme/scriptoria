@@ -119,7 +119,7 @@ body.page { max-width:none; margin:0; padding:0; }
 @media (prefers-reduced-motion:reduce){ * { transition:none !important; animation:none !important; } }
 
 /* ==========================================================================
-   Agora — forum components layered on the HOLDFAST Okta-Odyssey kit.
+   Agora — forum components layered on the Steadholme Okta-Odyssey kit.
    Only the classes the base kit lacks (forum chrome: app-bar lead, breadcrumb,
    category grid, thread lists, posts + markdown, compose forms, the local
    similar/summary text-intelligence cards). Pure Odyssey tokens — flat

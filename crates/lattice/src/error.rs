@@ -1,6 +1,6 @@
 //! Error responses.
 //!
-//! Failures render a small HOLDFAST-styled HTML error page with the correct status code, so a
+//! Failures render a small Steadholme-styled HTML error page with the correct status code, so a
 //! browser hitting the wiki always sees a coherent page (never a raw framework string).
 
 use axum::http::StatusCode;

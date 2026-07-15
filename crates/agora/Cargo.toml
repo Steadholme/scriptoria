@@ -2,7 +2,7 @@
 name = "agora"
 version = "0.1.0"
 edition = "2021"
-description = "Agora — server-rendered discussion forum + SSO identity for the HOLDFAST stack."
+description = "Agora — server-rendered discussion forum + SSO identity for the Steadholme stack."
 license = "MIT OR Apache-2.0"
 
 [lib]

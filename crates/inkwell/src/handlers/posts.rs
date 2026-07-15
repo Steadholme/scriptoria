@@ -399,7 +399,7 @@ pub async fn index(
             .get(axum::http::header::COOKIE)
             .and_then(|v| v.to_str().ok()),
     );
-    let head_title = format!("{} · HOLDFAST", settings.title);
+    let head_title = format!("{} · Steadholme", settings.title);
     let page = page_shell(PageShell {
         head_title: &head_title,
         body_class: "page-reading",
@@ -492,7 +492,7 @@ pub async fn tag_index(
             .get(axum::http::header::COOKIE)
             .and_then(|v| v.to_str().ok()),
     );
-    let head_title = format!("{heading} · HOLDFAST");
+    let head_title = format!("{heading} · Steadholme");
     let page = page_shell(PageShell {
         head_title: &head_title,
         body_class: "page-reading",

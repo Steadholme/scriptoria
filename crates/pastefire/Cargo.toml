@@ -2,7 +2,7 @@
 name = "pastefire"
 version = "0.1.0"
 edition = "2021"
-description = "Pastefire — enterprise pastebin / snippet host for the HOLDFAST stack (SSO-gated, append-then-read)."
+description = "Pastefire — enterprise pastebin / snippet host for the Steadholme stack (SSO-gated, append-then-read)."
 license = "MIT OR Apache-2.0"
 
 [lib]

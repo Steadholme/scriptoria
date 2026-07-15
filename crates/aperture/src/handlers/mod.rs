@@ -6,7 +6,7 @@
 //! - [`admin`] — the admin panel (per-owner storage usage + quota overrides; admin groups only).
 //!
 //! The shared design tokens / CSS are embedded (via `include_str!`) and inlined into every page,
-//! matching the HOLDFAST enterprise brand: brand gradient, indigo accent, cards, buttons, the
+//! matching the Steadholme enterprise brand: brand gradient, indigo accent, cards, buttons, the
 //! app-bar with the shield + wordmark. All producer-supplied text (file names, types) is
 //! HTML-escaped on render (defense-in-depth against stored XSS); blob bytes are served as inline
 //! images only when magic-sniffed, otherwise as downloads.
@@ -107,7 +107,7 @@ pub async fn share_room_js_asset() -> Response {
     share_room_asset("text/javascript; charset=utf-8", SHARE_ROOM_JS)
 }
 
-/// The HOLDFAST shield glyph (small, for the app-bar brand lockup).
+/// The Steadholme shield glyph (small, for the app-bar brand lockup).
 pub const SHIELD_SVG: &str = r##"<svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="hf-shield-sm" x1="8" y1="4" x2="40" y2="44" gradientUnits="userSpaceOnUse"><stop stop-color="#818CF8"/><stop offset="1" stop-color="#4F46E5"/></linearGradient></defs><path d="M24 4 8 9.5V22c0 11 7 17.4 16 21.5C33 39.4 40 33 40 22V9.5L24 4Z" fill="url(#hf-shield-sm)"/><rect x="20" y="19" width="8" height="13" rx="1" fill="#fff" fill-opacity="0.92"/><path d="M20 19v-2.5a4 4 0 0 1 8 0V19" stroke="#fff" stroke-width="2" stroke-opacity="0.92" fill="none"/></svg>"##;
 
 /// A generic document glyph shown on gallery cards / detail previews for non-image files.

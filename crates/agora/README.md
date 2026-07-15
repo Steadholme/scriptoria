@@ -1,6 +1,6 @@
 # Agora
 
-HOLDFAST 的讨论论坛（discussion forum）。服务端渲染（server-rendered）的企业级 UI，身份认证完全交给
+Steadholme 的讨论论坛（discussion forum）。服务端渲染（server-rendered）的企业级 UI，身份认证完全交给
 网关 SSO，自身不做任何登录。
 
 - **子域名**：`forum.w33d.xyz`（经 Sluice 网关，`auth=sso`）
@@ -169,5 +169,5 @@ docker build -t holdfast/agora:dev .
 
 ## 设计
 
-Rust + axum，沿用 HOLDFAST 共享品牌令牌（brand tokens）：深蓝渐变品牌、靛蓝强调色、柔和卡片与阴影，
-顶栏含 HOLDFAST 盾徽 + 服务名 + 当前登录邮箱 + 退出链接。CSS 通过 `include_str!` 内联，无静态资源往返。
+Rust + axum，沿用 Steadholme 共享品牌令牌（brand tokens）：深蓝渐变品牌、靛蓝强调色、柔和卡片与阴影，
+顶栏含 Steadholme 盾徽 + 服务名 + 当前登录邮箱 + 退出链接。CSS 通过 `include_str!` 内联，无静态资源往返。

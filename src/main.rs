@@ -1,4 +1,4 @@
-//! Scriptoria — one container hosting the HOLDFAST content surfaces
+//! Scriptoria — one container hosting the Steadholme content surfaces
 //! (blog / forum / wiki / comments / paste / drive).
 //!
 //! Each surface is its OWN library crate (Inkwell/Agora/Lattice/Echo/Pastefire/Aperture), reused

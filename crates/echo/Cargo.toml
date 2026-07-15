@@ -2,7 +2,7 @@
 name = "echo"
 version = "0.1.0"
 edition = "2021"
-description = "Echo — embeddable threaded-comments service for the HOLDFAST stack (one owned comment layer reusable across blog/wiki/paste)."
+description = "Echo — embeddable threaded-comments service for the Steadholme stack (one owned comment layer reusable across blog/wiki/paste)."
 license = "MIT OR Apache-2.0"
 
 [lib]

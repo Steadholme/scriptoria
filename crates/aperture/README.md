@@ -1,6 +1,6 @@
 # Aperture — 图床 / 截图托管 + 文件网盘
 
-Aperture 是 HOLDFAST 主权基础设施中的 **图片/截图托管 + 文件网盘** 服务，落子域
+Aperture 是 Steadholme 主权基础设施中的 **图片/截图托管 + 文件网盘** 服务，落子域
 `drive.w33d.xyz`。Portal 磁贴名 **Drive**，Beacon 组件名 **Drive**。
 
 - **栈**：Rust + axum，服务端渲染 HTML；owner 控制台建立在 Odyssey tokens/components 上，

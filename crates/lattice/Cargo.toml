@@ -2,7 +2,7 @@
 name = "lattice"
 version = "0.1.0"
 edition = "2021"
-description = "Lattice — server-rendered knowledge-base wiki for the HOLDFAST stack."
+description = "Lattice — server-rendered knowledge-base wiki for the Steadholme stack."
 license = "MIT OR Apache-2.0"
 
 [lib]

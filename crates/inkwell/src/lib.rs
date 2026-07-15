@@ -1,4 +1,4 @@
-//! Inkwell — personal blog / CMS with SSO authoring for the HOLDFAST stack.
+//! Inkwell — personal blog / CMS with SSO authoring for the Steadholme stack.
 //!
 //! Library root: defines [`AppState`], wires the routes via [`app`], and provides
 //! [`build_dev_state`] (in-memory store) and [`build_state_from_env`] (env-selected store).

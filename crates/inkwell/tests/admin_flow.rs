@@ -406,7 +406,7 @@ async fn admin_settings_apply_to_the_index() {
 
     // Default title on the index head.
     assert!(
-        index_body(&state).await.contains("Inkwell · HOLDFAST"),
+        index_body(&state).await.contains("Inkwell · Steadholme"),
         "default title"
     );
 
@@ -422,7 +422,7 @@ async fn admin_settings_apply_to_the_index() {
 
     let idx = index_body(&state).await;
     assert!(
-        idx.contains("Wanderlust · HOLDFAST"),
+        idx.contains("Wanderlust · Steadholme"),
         "custom title in head"
     );
     assert!(

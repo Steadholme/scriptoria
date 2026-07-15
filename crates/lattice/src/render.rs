@@ -1,6 +1,6 @@
 //! Server-side HTML rendering helpers: escaping, the page shell, timestamps, error pages.
 //!
-//! The enterprise HOLDFAST shell (top app-bar with the shield + wordmark + page name, and the
+//! The enterprise Steadholme shell (top app-bar with the shield + wordmark + page name, and the
 //! signed-in email + Logout on the right) and the design-system CSS are embedded via
 //! `include_str!`, so every page is self-contained with no asset round-trips. Each handler
 //! builds only its inner `content` HTML and hands it to [`layout`].
@@ -34,7 +34,7 @@ const LAYOUT: &str = include_str!("../templates/layout.html");
 /// Cross-subdomain SSO logout (terminated at the Keystone IdP behind the gateway).
 const LOGOUT_URL: &str = "https://sso.w33d.xyz/_gw/auth/logout";
 
-/// Wrap inner `content` HTML in the full HOLDFAST shell.
+/// Wrap inner `content` HTML in the full Steadholme shell.
 ///
 /// `page_title` is escaped into the `<title>` and the app-bar; `headers` supplies the
 /// gateway-injected signed-in email shown on the right. `content` is already-safe HTML built by
@@ -100,7 +100,7 @@ fn app_bar(active: &str, email: Option<&str>, locale: odyssey::Locale, theme: &s
     );
     format!(
         r#"<header class="appbar">
-  <a class="appbar__brand" href="/" aria-label="HOLDFAST Lattice home">
+  <a class="appbar__brand" href="/" aria-label="Steadholme Lattice home">
     <span class="app-tile" aria-hidden="true">{icon}</span>
     <span class="appbar__name"><b>Lattice</b><span>Knowledge workspace</span></span>
   </a>
@@ -163,7 +163,7 @@ fn user_menu(email: Option<&str>) -> String {
     )
 }
 
-/// A standalone HOLDFAST-styled error page (used by [`crate::error::AppError`]).
+/// A standalone Steadholme-styled error page (used by [`crate::error::AppError`]).
 pub fn error_page(status: u16, title: &str, detail: &str) -> String {
     let content = format!(
         "<section class=\"card empty-state\">\
@@ -234,7 +234,7 @@ mod tests {
         let html = layout("Home", &headers, "<p>hi</p>");
         assert!(html.contains("<p>hi</p>"));
         assert!(html.contains("me@holdfast.local"));
-        assert!(html.contains("HOLDFAST"));
+        assert!(html.contains("Steadholme"));
         assert!(html.contains("sso.w33d.xyz/_gw/auth/logout"));
         // Odyssey v2 app-bar chrome: the "All apps" waffle back to the apex portal + the avatar
         // user-menu. The legacy `allapps`/`userchip` hooks are retained on the new elements.

@@ -1,4 +1,4 @@
-//! Aperture — enterprise image/screenshot host + file drive for the HOLDFAST stack.
+//! Aperture — enterprise image/screenshot host + file drive for the Steadholme stack.
 //!
 //! Library root: defines [`AppState`], wires the routes via [`app`], and provides
 //! [`build_dev_state`] (in-memory metadata + in-memory blobs) and [`build_state_from_env`]
