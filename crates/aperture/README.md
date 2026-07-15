@@ -135,7 +135,7 @@ docker rm -f ap-testpg
 ## 构建镜像
 
 ```bash
-docker build -t holdfast/aperture:dev .
+docker build -t steadholme/aperture:dev .
 ```
 
 多阶段、非 root（uid 10001）、仅 glibc（无 OpenSSL）。HEALTHCHECK 走内建

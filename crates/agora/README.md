@@ -157,7 +157,7 @@ TEST_DATABASE_URL=postgres://postgres:pw@127.0.0.1:55461/agora \
 docker rm -f agora-testpg
 
 # 容器镜像
-docker build -t holdfast/agora:dev .
+docker build -t steadholme/agora:dev .
 ```
 
 ## 安全要点

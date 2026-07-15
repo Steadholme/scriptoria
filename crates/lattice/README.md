@@ -174,7 +174,7 @@ TEST_DATABASE_URL=postgres://postgres:pw@127.0.0.1:55462/lattice \
 docker rm -f lattice-testpg
 
 # 容器镜像
-docker build -t holdfast/lattice:dev .
+docker build -t steadholme/lattice:dev .
 
 # 健康检查子命令（容器 HEALTHCHECK 用，无需 curl）
 lattice healthcheck    # GET 127.0.0.1:$PORT/healthz，200 → exit 0

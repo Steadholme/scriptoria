@@ -77,10 +77,10 @@ TEST_DATABASE_URL=postgres://postgres:pw@127.0.0.1:55460/inkwell \
 多阶段、非 root（uid 10001）、纯 Rust + rustls（无 OpenSSL）、内置 `inkwell healthcheck` 子命令、`EXPOSE 8700`。
 
 ```bash
-docker build -t holdfast/inkwell:dev .
+docker build -t steadholme/inkwell:dev .
 docker run -d --name inkwell -p 127.0.0.1:8700:8700 \
   -e INKWELL_STORE=postgres -e DATABASE_URL=$DATABASE_URL \
-  holdfast/inkwell:dev
+  steadholme/inkwell:dev
 curl -fsS http://127.0.0.1:8700/healthz       # ok
 ```
 

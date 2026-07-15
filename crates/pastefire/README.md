@@ -73,8 +73,8 @@ TEST_DATABASE_URL=postgres://postgres:pw@127.0.0.1:55463/pastefire \
 docker rm -f pf-testpg
 
 # 容器镜像
-docker build -t holdfast/pastefire:dev .
-docker run --rm -p 127.0.0.1:8730:8730 holdfast/pastefire:dev
+docker build -t steadholme/pastefire:dev .
+docker run --rm -p 127.0.0.1:8730:8730 steadholme/pastefire:dev
 curl -fsS http://127.0.0.1:8730/healthz   # -> ok
 ```
 
