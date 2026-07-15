@@ -60,7 +60,7 @@ async fn full_create_edit_history_flow() {
     let save = post_form(
         "/edit/home",
         &cookie,
-        Some("alice@holdfast.local"),
+        Some("alice@steadholme.local"),
         &[
             ("csrf_token", &csrf),
             ("title", "Home"),
@@ -78,7 +78,7 @@ async fn full_create_edit_history_flow() {
     let (_s, _h, body) = call(&state, get("/")).await;
     assert!(body.contains("1 page"));
     assert!(body.contains(">Home</a>"));
-    assert!(body.contains("alice@holdfast.local"));
+    assert!(body.contains("alice@steadholme.local"));
 
     // The page renders markdown + wiki-links: [[Runbook]] is missing (red), the body itself
     // (slug `home`) exists.
@@ -102,7 +102,7 @@ async fn full_create_edit_history_flow() {
     // History shows one revision by the gateway editor.
     let (status, _h, body) = call(&state, get("/history/home")).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("alice@holdfast.local"));
+    assert!(body.contains("alice@steadholme.local"));
     assert!(body.contains("chars"));
 
     // A second edit by a different editor records a second revision and updates the page. The
@@ -114,7 +114,7 @@ async fn full_create_edit_history_flow() {
     let save2 = post_form(
         "/edit/home",
         &cookie2,
-        Some("bob@holdfast.local"),
+        Some("bob@steadholme.local"),
         &[
             ("csrf_token", &csrf2),
             ("base_rev", &base2),
@@ -127,12 +127,12 @@ async fn full_create_edit_history_flow() {
 
     let (_s, _h, body) = call(&state, get("/w/home")).await;
     assert!(body.contains("Updated body."));
-    assert!(body.contains("bob@holdfast.local"));
+    assert!(body.contains("bob@steadholme.local"));
 
     let (_s, _h, body) = call(&state, get("/history/home")).await;
     // Both editors appear in the history list.
-    assert!(body.contains("alice@holdfast.local"));
-    assert!(body.contains("bob@holdfast.local"));
+    assert!(body.contains("alice@steadholme.local"));
+    assert!(body.contains("bob@steadholme.local"));
 }
 
 #[tokio::test]
@@ -143,18 +143,18 @@ async fn recent_feed_lists_cross_page_edits_newest_first() {
         "alpha",
         "Alpha",
         "alpha created",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
     )
     .await;
     pause_for_distinct_ts().await;
-    save_page_http(&state, "beta", "Beta", "beta created", "bob@holdfast.local").await;
+    save_page_http(&state, "beta", "Beta", "beta created", "bob@steadholme.local").await;
     pause_for_distinct_ts().await;
     save_page_http(
         &state,
         "alpha",
         "Alpha",
         "alpha edited",
-        "carol@holdfast.local",
+        "carol@steadholme.local",
     )
     .await;
 
@@ -162,17 +162,17 @@ async fn recent_feed_lists_cross_page_edits_newest_first() {
     assert_eq!(status, StatusCode::OK);
     assert!(set_cookie(&headers).is_none(), "recent feed is read-only");
     assert!(body.contains("Recent changes"));
-    assert!(body.contains("alice@holdfast.local"));
-    assert!(body.contains("bob@holdfast.local"));
-    assert!(body.contains("carol@holdfast.local"));
+    assert!(body.contains("alice@steadholme.local"));
+    assert!(body.contains("bob@steadholme.local"));
+    assert!(body.contains("carol@steadholme.local"));
     assert!(body.contains(r#"href="/w/alpha""#));
     assert!(body.contains(r#"href="/w/beta""#));
     assert!(body.contains(r#"href="/history/alpha""#));
     assert!(body.contains(">created</span>"));
     assert!(body.contains(">edited</span>"));
 
-    let carol = body.find("carol@holdfast.local").unwrap();
-    let alice = body.find("alice@holdfast.local").unwrap();
+    let carol = body.find("carol@steadholme.local").unwrap();
+    let alice = body.find("alice@steadholme.local").unwrap();
     assert!(
         carol < alice,
         "newest alpha edit appears before its creation"
@@ -187,7 +187,7 @@ async fn recent_feed_escapes_untrusted_title() {
         "unsafe-title",
         "<b>x</b>",
         "body",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
     )
     .await;
 
@@ -205,18 +205,18 @@ async fn recent_feed_keyset_paginates() {
         "alpha",
         "Alpha",
         "alpha created",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
     )
     .await;
     pause_for_distinct_ts().await;
-    save_page_http(&state, "beta", "Beta", "beta created", "bob@holdfast.local").await;
+    save_page_http(&state, "beta", "Beta", "beta created", "bob@steadholme.local").await;
     pause_for_distinct_ts().await;
     save_page_http(
         &state,
         "alpha",
         "Alpha",
         "alpha edited",
-        "carol@holdfast.local",
+        "carol@steadholme.local",
     )
     .await;
 
@@ -237,7 +237,7 @@ async fn recent_feed_never_leaks_body() {
         "secret",
         "Secret",
         &format!("visible title only\n{sentinel}"),
-        "alice@holdfast.local",
+        "alice@steadholme.local",
     )
     .await;
 
@@ -296,7 +296,7 @@ async fn move_page_flow_renders_tree_breadcrumb_and_rejects_cycles() {
         "parent",
         "Parent",
         "Parent body.",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
     )
     .await;
     save_page_http(
@@ -304,7 +304,7 @@ async fn move_page_flow_renders_tree_breadcrumb_and_rejects_cycles() {
         "child",
         "Child",
         "Child body.",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
     )
     .await;
 
@@ -313,7 +313,7 @@ async fn move_page_flow_renders_tree_breadcrumb_and_rejects_cycles() {
         post_form(
             "/move/child",
             "",
-            Some("alice@holdfast.local"),
+            Some("alice@steadholme.local"),
             &[("csrf_token", "anything"), ("parent_id", "parent")],
         ),
     )
@@ -344,7 +344,7 @@ async fn move_page_flow_renders_tree_breadcrumb_and_rejects_cycles() {
         post_form(
             "/move/child",
             &cookie,
-            Some("alice@holdfast.local"),
+            Some("alice@steadholme.local"),
             &[("csrf_token", &csrf), ("parent_id", "parent")],
         ),
     )
@@ -386,7 +386,7 @@ async fn move_page_flow_renders_tree_breadcrumb_and_rejects_cycles() {
         post_form(
             "/move/parent",
             &cycle_cookie,
-            Some("alice@holdfast.local"),
+            Some("alice@steadholme.local"),
             &[("csrf_token", &cycle_csrf), ("parent_id", "child")],
         ),
     )
@@ -417,7 +417,7 @@ async fn persisted_backlinks_are_updated_on_each_save() {
         "runbook",
         "Runbook",
         "Target page.",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
     )
     .await;
     save_page_http(
@@ -425,7 +425,7 @@ async fn persisted_backlinks_are_updated_on_each_save() {
         "guide",
         "Guide",
         "Another target.",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
     )
     .await;
     save_page_http(
@@ -433,7 +433,7 @@ async fn persisted_backlinks_are_updated_on_each_save() {
         "home",
         "Home",
         "See [[Runbook]] and [Guide](/w/guide#top).",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
     )
     .await;
 
@@ -457,7 +457,7 @@ async fn persisted_backlinks_are_updated_on_each_save() {
         "home",
         "Home",
         "No explicit links now.",
-        "bob@holdfast.local",
+        "bob@steadholme.local",
     )
     .await;
     assert!(state.store.outgoing_links("home").await.unwrap().is_empty());
@@ -482,7 +482,7 @@ async fn history_diff_and_revert_flow() {
         post_form(
             "/edit/notes",
             &c1,
-            Some("alice@holdfast.local"),
+            Some("alice@steadholme.local"),
             &[
                 ("csrf_token", &t1),
                 ("title", "Notes"),
@@ -508,7 +508,7 @@ async fn history_diff_and_revert_flow() {
         post_form(
             "/edit/notes",
             &c2,
-            Some("bob@holdfast.local"),
+            Some("bob@steadholme.local"),
             &[
                 ("csrf_token", &t2),
                 ("base_rev", &base2),
@@ -571,7 +571,7 @@ async fn history_diff_and_revert_flow() {
         post_form(
             "/revert/notes",
             &revert_cookie,
-            Some("carol@holdfast.local"),
+            Some("carol@steadholme.local"),
             &[("csrf_token", &revert_csrf), ("rev_id", &oldest.id)],
         ),
     )
@@ -592,7 +592,7 @@ async fn history_diff_and_revert_flow() {
         3,
         "revert appends a new revision (append-only history)"
     );
-    assert_eq!(revs2[0].editor_email, "carol@holdfast.local");
+    assert_eq!(revs2[0].editor_email, "carol@steadholme.local");
     assert_eq!(revs2[0].body_md, "line one\nline two\nline three");
 }
 
@@ -608,7 +608,7 @@ async fn revert_requires_csrf() {
         post_form(
             "/edit/doc",
             &c,
-            Some("alice@holdfast.local"),
+            Some("alice@steadholme.local"),
             &[("csrf_token", &t), ("title", "Doc"), ("body_md", "v1")],
         ),
     )
@@ -622,7 +622,7 @@ async fn revert_requires_csrf() {
         post_form(
             "/revert/doc",
             "",
-            Some("alice@holdfast.local"),
+            Some("alice@steadholme.local"),
             &[("csrf_token", "anything"), ("rev_id", &rid)],
         ),
     )
@@ -643,7 +643,7 @@ async fn csrf_required_on_post() {
     let req = post_form(
         "/edit/home",
         "", // no cookie
-        Some("alice@holdfast.local"),
+        Some("alice@steadholme.local"),
         &[
             ("csrf_token", "anything"),
             ("title", "Home"),
@@ -679,7 +679,7 @@ async fn stored_html_is_sanitized() {
     let save = post_form(
         "/edit/xss",
         &cookie,
-        Some("alice@holdfast.local"),
+        Some("alice@steadholme.local"),
         &[
             ("csrf_token", &csrf),
             ("title", "XSS"),
@@ -716,7 +716,7 @@ async fn toc_and_heading_anchors_render() {
         post_form(
             "/edit/guide",
             &cookie,
-            Some("alice@holdfast.local"),
+            Some("alice@steadholme.local"),
             &[
                 ("csrf_token", &csrf),
                 ("base_rev", ""),
@@ -759,7 +759,7 @@ async fn edit_conflict_is_rejected_with_both_versions() {
         post_form(
             "/edit/spec",
             &c0,
-            Some("alice@holdfast.local"),
+            Some("alice@steadholme.local"),
             &[
                 ("csrf_token", &t0),
                 ("base_rev", ""),
@@ -784,7 +784,7 @@ async fn edit_conflict_is_rejected_with_both_versions() {
         post_form(
             "/edit/spec",
             &ca,
-            Some("alice@holdfast.local"),
+            Some("alice@steadholme.local"),
             &[
                 ("csrf_token", &ta),
                 ("base_rev", &base),
@@ -805,7 +805,7 @@ async fn edit_conflict_is_rejected_with_both_versions() {
         post_form(
             "/edit/spec",
             &cb,
-            Some("bob@holdfast.local"),
+            Some("bob@steadholme.local"),
             &[
                 ("csrf_token", &tb),
                 ("base_rev", &base),
@@ -850,7 +850,7 @@ async fn matching_base_rev_saves_normally() {
         post_form(
             "/edit/doc2",
             &c0,
-            Some("alice@holdfast.local"),
+            Some("alice@steadholme.local"),
             &[
                 ("csrf_token", &t0),
                 ("base_rev", ""),
@@ -877,7 +877,7 @@ async fn matching_base_rev_saves_normally() {
         post_form(
             "/edit/doc2",
             &c1,
-            Some("alice@holdfast.local"),
+            Some("alice@steadholme.local"),
             &[
                 ("csrf_token", &t1),
                 ("base_rev", &head.id),

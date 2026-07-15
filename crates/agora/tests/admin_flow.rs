@@ -14,7 +14,7 @@ use agora::{app, build_dev_state, AppState};
 const TOK: &str = "csrftoken123";
 const ADMIN_GROUPS: &str = "admins";
 const ALICE_SUB: &str = "u_sub_1";
-const ALICE_EMAIL: &str = "alice@holdfast.local";
+const ALICE_EMAIL: &str = "alice@steadholme.local";
 
 // ---------------------------------------------------------------------------
 // Gate: non-admins are refused, admins pass
@@ -229,7 +229,7 @@ async fn admin_delete_any_thread_and_post() {
     // Add a reply from another author, then admin deletes THAT post (not the admin's own).
     let reply = form(&[("csrf", TOK), ("body", "a reply")]);
     let (s, _h, _b) =
-        send(&state, post_as(&format!("{loc}/reply"), TOK, "u_bob", "bob@holdfast.local", "", reply)).await;
+        send(&state, post_as(&format!("{loc}/reply"), TOK, "u_bob", "bob@steadholme.local", "", reply)).await;
     assert_eq!(s, StatusCode::SEE_OTHER);
     let posts = state
         .store

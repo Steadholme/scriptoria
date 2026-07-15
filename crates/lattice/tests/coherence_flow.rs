@@ -26,7 +26,7 @@ async fn seeded_state(stale_days: i64, pages: &[(&str, &str, &str, i64)]) -> App
                 slug: slug.to_string(),
                 title: title.to_string(),
                 body_md: body.to_string(),
-                editor_email: "curator@holdfast.local".to_string(),
+                editor_email: "curator@steadholme.local".to_string(),
                 now: *updated_at,
                 revision_id: format!("rev-{slug}-{updated_at}"),
             })

@@ -10,9 +10,9 @@ use agora::model::{Post, Thread};
 use agora::{app, build_dev_state, now_secs, AppState};
 
 const ALICE_SUB: &str = "u_sub_1";
-const ALICE_EMAIL: &str = "alice@holdfast.local";
+const ALICE_EMAIL: &str = "alice@steadholme.local";
 const BOB_SUB: &str = "u_sub_bob";
-const BOB_EMAIL: &str = "bob@holdfast.local";
+const BOB_EMAIL: &str = "bob@steadholme.local";
 const TOK: &str = "csrftoken123";
 
 #[tokio::test]
@@ -42,7 +42,7 @@ async fn quote_reply_renders_escaped_blockquote_and_deduplicated_activity() {
         "quote block rendered"
     );
     assert!(
-        page.contains("alice@holdfast.local wrote:"),
+        page.contains("alice@steadholme.local wrote:"),
         "quoted author attributed"
     );
     assert!(

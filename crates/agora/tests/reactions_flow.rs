@@ -13,9 +13,9 @@ use tower::ServiceExt;
 use agora::{app, build_dev_state, AppState};
 
 const ALICE_SUB: &str = "u_sub_1";
-const ALICE_EMAIL: &str = "alice@holdfast.local";
+const ALICE_EMAIL: &str = "alice@steadholme.local";
 const BOB_SUB: &str = "u_sub_bob";
-const BOB_EMAIL: &str = "bob@holdfast.local";
+const BOB_EMAIL: &str = "bob@steadholme.local";
 const TOK: &str = "csrftoken123";
 
 #[tokio::test]

@@ -9283,7 +9283,7 @@ mod tests {
             category_id: "general".to_string(),
             title: title.to_string(),
             author_sub: "u_alice".to_string(),
-            author_email: "alice@holdfast.local".to_string(),
+            author_email: "alice@steadholme.local".to_string(),
             created_at,
             last_at: created_at,
             locked: false,
@@ -9305,7 +9305,7 @@ mod tests {
             body_md: body_md.to_string(),
             quoted_post_id: quoted_post_id.to_string(),
             author_sub: "u_bob".to_string(),
-            author_email: "bob@holdfast.local".to_string(),
+            author_email: "bob@steadholme.local".to_string(),
             created_at,
         }
     }

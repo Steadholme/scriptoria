@@ -11,9 +11,9 @@ use agora::store::{
 use agora::{app, build_dev_state, AppState};
 
 const ALICE_SUB: &str = "u_v9_focus_alice";
-const ALICE_EMAIL: &str = "alice@holdfast.local";
+const ALICE_EMAIL: &str = "alice@steadholme.local";
 const BOB_SUB: &str = "u_v9_focus_bob";
-const BOB_EMAIL: &str = "bob@holdfast.local";
+const BOB_EMAIL: &str = "bob@steadholme.local";
 const TOK: &str = "v9categoryfocuscsrftoken";
 
 #[tokio::test]

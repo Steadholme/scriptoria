@@ -230,10 +230,10 @@ mod tests {
     #[test]
     fn layout_embeds_title_and_email() {
         let mut headers = HeaderMap::new();
-        headers.insert(auth::HEADER_EMAIL, "me@holdfast.local".parse().unwrap());
+        headers.insert(auth::HEADER_EMAIL, "me@steadholme.local".parse().unwrap());
         let html = layout("Home", &headers, "<p>hi</p>");
         assert!(html.contains("<p>hi</p>"));
-        assert!(html.contains("me@holdfast.local"));
+        assert!(html.contains("me@steadholme.local"));
         assert!(html.contains("Steadholme"));
         assert!(html.contains("sso.w33d.xyz/_gw/auth/logout"));
         // Odyssey v2 app-bar chrome: the "All apps" waffle back to the apex portal + the avatar

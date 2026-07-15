@@ -33,7 +33,7 @@ async fn pg_search_matches_title_and_original_body_with_literal_like_text() {
         category_id: "general".to_string(),
         title: format!("Postgres discovery {marker}"),
         author_sub: "u_pg_search".to_string(),
-        author_email: "pg-search@holdfast.local".to_string(),
+        author_email: "pg-search@steadholme.local".to_string(),
         created_at: now,
         last_at: now,
         locked: false,
@@ -60,7 +60,7 @@ async fn pg_search_matches_title_and_original_body_with_literal_like_text() {
         body_md: "One reply".to_string(),
         quoted_post_id: String::new(),
         author_sub: "u_pg_reply".to_string(),
-        author_email: "reply@holdfast.local".to_string(),
+        author_email: "reply@steadholme.local".to_string(),
         created_at: now,
     };
     pg.add_reply(&reply)
@@ -176,7 +176,7 @@ async fn pg_question_status_and_solution_body_are_one_bounded_read_model() {
         category_id: category_id.clone(),
         title: format!("Answered fixture {marker}"),
         author_sub: "u_pg_question".to_string(),
-        author_email: "pg-question@holdfast.local".to_string(),
+        author_email: "pg-question@steadholme.local".to_string(),
         created_at: now,
         last_at: now,
         locked: false,
@@ -200,7 +200,7 @@ async fn pg_question_status_and_solution_body_are_one_bounded_read_model() {
         body_md: format!("Accepted body contains {solution_needle}"),
         quoted_post_id: String::new(),
         author_sub: "u_pg_expert".to_string(),
-        author_email: "pg-expert@holdfast.local".to_string(),
+        author_email: "pg-expert@steadholme.local".to_string(),
         created_at: now + 1,
     };
     pg.add_reply(&solution).await.unwrap();
@@ -218,7 +218,7 @@ async fn pg_question_status_and_solution_body_are_one_bounded_read_model() {
         category_id: category_id.clone(),
         title: format!("Unanswered fixture {marker}"),
         author_sub: "u_pg_question_2".to_string(),
-        author_email: "pg-question-2@holdfast.local".to_string(),
+        author_email: "pg-question-2@steadholme.local".to_string(),
         created_at: now + 2,
         last_at: now + 2,
         locked: false,
@@ -311,7 +311,7 @@ async fn pg_migrate_backfills_legacy_original_body_without_overwriting_current_c
     sqlx::query(
         "INSERT INTO threads \
          (id, category_id, title, author_sub, author_email, created_at, last_at, first_body_md, locked, pinned, accepted_post_id) \
-         VALUES ($1, 'general', $2, 'u_legacy', 'legacy@holdfast.local', $3, $3, '', FALSE, FALSE, '')",
+         VALUES ($1, 'general', $2, 'u_legacy', 'legacy@steadholme.local', $3, $3, '', FALSE, FALSE, '')",
     )
     .bind(&legacy_thread_id)
     .bind(format!("Legacy search fixture {marker}"))
@@ -322,7 +322,7 @@ async fn pg_migrate_backfills_legacy_original_body_without_overwriting_current_c
     sqlx::query(
         "INSERT INTO posts \
          (id, thread_id, body_md, quoted_post_id, author_sub, author_email, created_at) \
-         VALUES ($1, $2, $3, '', 'u_legacy', 'legacy@holdfast.local', $4)",
+         VALUES ($1, $2, $3, '', 'u_legacy', 'legacy@steadholme.local', $4)",
     )
     .bind(&legacy_op_id)
     .bind(&legacy_thread_id)
@@ -334,7 +334,7 @@ async fn pg_migrate_backfills_legacy_original_body_without_overwriting_current_c
     sqlx::query(
         "INSERT INTO posts \
          (id, thread_id, body_md, quoted_post_id, author_sub, author_email, created_at) \
-         VALUES ($1, $2, $3, '', 'u_reply', 'reply@holdfast.local', $4)",
+         VALUES ($1, $2, $3, '', 'u_reply', 'reply@steadholme.local', $4)",
     )
     .bind(&legacy_reply_id)
     .bind(&legacy_thread_id)
@@ -347,7 +347,7 @@ async fn pg_migrate_backfills_legacy_original_body_without_overwriting_current_c
     sqlx::query(
         "INSERT INTO threads \
          (id, category_id, title, author_sub, author_email, created_at, last_at, first_body_md, locked, pinned, accepted_post_id) \
-         VALUES ($1, 'general', $2, 'u_current', 'current@holdfast.local', $3, $3, $4, FALSE, FALSE, '')",
+         VALUES ($1, 'general', $2, 'u_current', 'current@steadholme.local', $3, $3, $4, FALSE, FALSE, '')",
     )
     .bind(&preserved_thread_id)
     .bind(format!("Current search fixture {marker}"))
@@ -359,7 +359,7 @@ async fn pg_migrate_backfills_legacy_original_body_without_overwriting_current_c
     sqlx::query(
         "INSERT INTO posts \
          (id, thread_id, body_md, quoted_post_id, author_sub, author_email, created_at) \
-         VALUES ($1, $2, $3, '', 'u_current', 'current@holdfast.local', $4)",
+         VALUES ($1, $2, $3, '', 'u_current', 'current@steadholme.local', $4)",
     )
     .bind(&preserved_op_id)
     .bind(&preserved_thread_id)
@@ -1143,7 +1143,7 @@ fn fixture_thread(id: &str, category_id: &str, title: &str, created_at: i64) -> 
         category_id: category_id.to_string(),
         title: title.to_string(),
         author_sub: "u_pg_fixture".to_string(),
-        author_email: "pg-fixture@holdfast.local".to_string(),
+        author_email: "pg-fixture@steadholme.local".to_string(),
         created_at,
         last_at: created_at,
         locked: false,
@@ -1159,7 +1159,7 @@ fn fixture_post(id: &str, thread_id: &str, body: &str, created_at: i64) -> Post 
         body_md: body.to_string(),
         quoted_post_id: String::new(),
         author_sub: "u_pg_fixture".to_string(),
-        author_email: "pg-fixture@holdfast.local".to_string(),
+        author_email: "pg-fixture@steadholme.local".to_string(),
         created_at,
     }
 }

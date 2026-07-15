@@ -12,11 +12,11 @@ use agora::store::{
 use agora::{app, build_dev_state, new_id, now_secs, AppState};
 
 const ALICE_SUB: &str = "u_activity_alice";
-const ALICE_EMAIL: &str = "alice@holdfast.local";
+const ALICE_EMAIL: &str = "alice@steadholme.local";
 const BOB_SUB: &str = "u_activity_bob";
-const BOB_EMAIL: &str = "bob@holdfast.local";
+const BOB_EMAIL: &str = "bob@steadholme.local";
 const CAROL_SUB: &str = "u_activity_carol";
-const CAROL_EMAIL: &str = "carol@holdfast.local";
+const CAROL_EMAIL: &str = "carol@steadholme.local";
 const TOK: &str = "activitycsrftoken123";
 
 #[tokio::test]
@@ -336,7 +336,7 @@ async fn subject_aliases_are_resolved_once_and_collisions_fail_closed() {
         &state,
         &bob_location,
         ALICE_SUB,
-        "alice-renamed@holdfast.local",
+        "alice-renamed@steadholme.local",
         None,
         "register renamed alias",
     )
@@ -516,7 +516,7 @@ async fn admin_accept_uses_actor_subject_and_activity_filters_are_navigation() {
         post_as_groups(
             &format!("/t/{thread_id}/accept"),
             "u_admin_without_profile",
-            "admin@holdfast.local",
+            "admin@steadholme.local",
             "admins",
             form(&[("csrf", TOK), ("action", "accept"), ("post_id", &answer_id)]),
         ),
@@ -533,7 +533,7 @@ async fn admin_accept_uses_actor_subject_and_activity_filters_are_navigation() {
 
     let (_, _, page) = send(&state, get_as("/activity", BOB_SUB, BOB_EMAIL)).await;
     assert!(page.contains("<strong>u_admin_without_profile</strong> accepted your answer"));
-    assert!(!page.contains("<strong>alice@holdfast.local</strong> accepted your answer"));
+    assert!(!page.contains("<strong>alice@steadholme.local</strong> accepted your answer"));
     assert!(page.contains(r#"aria-current="page""#));
     assert!(!page.contains("role=\"tablist\""));
     assert!(!page.contains("aria-selected="));

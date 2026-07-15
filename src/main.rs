@@ -60,7 +60,7 @@ async fn main() {
     if require_persistence() && !env_truthy("AUDIT_ENABLED") {
         fatal(
             "audit",
-            "HOLDFAST_PROFILE=prod (or REQUIRE_PERSISTENCE) requires AUDIT_ENABLED=true \
+            "STEADHOLME_PROFILE=prod (or REQUIRE_PERSISTENCE) requires AUDIT_ENABLED=true \
              (+ WATCHTOWER_URL + AUDIT_INGEST_TOKEN) so content mutations are recorded"
                 .to_string(),
         );
@@ -281,10 +281,10 @@ async fn build_drive() -> Result<Router, String> {
     // metadata store is always Postgres here (require_env above), so under the prod profile (or an
     // explicit REQUIRE_PERSISTENCE) a volatile in-memory blob backend would persist every file ROW
     // yet silently drop the bytes on restart — a split brain. Refuse at STARTUP naming the exact
-    // vars to set (never panic mid-request). Dev, with HOLDFAST_PROFILE unset, keeps memory.
+    // vars to set (never panic mid-request). Dev, with STEADHOLME_PROFILE unset, keeps memory.
     if require_persistence() && blobs_kind == "memory" {
         return Err(
-            "HOLDFAST_PROFILE=prod (or REQUIRE_PERSISTENCE) refuses the volatile in-memory blob \
+            "STEADHOLME_PROFILE=prod (or REQUIRE_PERSISTENCE) refuses the volatile in-memory blob \
              store for the drive (aperture) surface (store=postgres + blobs=memory would keep file \
              rows but drop the bytes): set APERTURE_BLOBS=s3 with S3_ENDPOINT / S3_BUCKET / \
              S3_REGION / S3_ACCESS_KEY / S3_SECRET_KEY to persist uploaded bytes in Cairn"
@@ -342,10 +342,10 @@ fn env_truthy(key: &str) -> bool {
 }
 
 /// Whether this boot must refuse a volatile (in-memory) backend. True under the prod profile
-/// (`HOLDFAST_PROFILE=prod`, case-insensitive) or an explicit truthy `REQUIRE_PERSISTENCE`. When
+/// (`STEADHOLME_PROFILE=prod`, case-insensitive) or an explicit truthy `REQUIRE_PERSISTENCE`. When
 /// both are unset the dev memory-friendly path (APERTURE_BLOBS=memory default) is preserved.
 fn require_persistence() -> bool {
-    std::env::var("HOLDFAST_PROFILE")
+    std::env::var("STEADHOLME_PROFILE")
         .map(|p| p.trim().eq_ignore_ascii_case("prod"))
         .unwrap_or(false)
         || env_truthy("REQUIRE_PERSISTENCE")

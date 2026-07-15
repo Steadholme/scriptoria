@@ -62,7 +62,7 @@ async fn pg_store_full_integration() {
         id: "cmt_pg_1".to_string(),
         thread_id: "thr_pg_1".to_string(),
         author_sub: "u_alice".to_string(),
-        author_email: "alice@holdfast.local".to_string(),
+        author_email: "alice@steadholme.local".to_string(),
         body: "root comment".to_string(),
         created_at: now,
         hidden: false,
@@ -73,7 +73,7 @@ async fn pg_store_full_integration() {
         id: "cmt_pg_2".to_string(),
         thread_id: "thr_pg_1".to_string(),
         author_sub: "u_bob".to_string(),
-        author_email: "bob@holdfast.local".to_string(),
+        author_email: "bob@steadholme.local".to_string(),
         body: "a reply".to_string(),
         created_at: now + 1,
         hidden: false,
@@ -234,7 +234,7 @@ async fn pg_store_full_integration() {
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .header(header::COOKIE, "__Host-csrf=tok")
                 .header("x-auth-subject", "u_carol")
-                .header("x-auth-email", "carol@holdfast.local")
+                .header("x-auth-email", "carol@steadholme.local")
                 .body(Body::from(body))
                 .unwrap(),
         )

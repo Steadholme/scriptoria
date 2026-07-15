@@ -138,7 +138,7 @@ async fn pg_bookmarks_are_migrated_linearizable_and_cascading() {
         body_md: "due lifecycle".to_string(),
         quoted_post_id: String::new(),
         author_sub: owner.clone(),
-        author_email: format!("{owner}@holdfast.local"),
+        author_email: format!("{owner}@steadholme.local"),
         created_at: now + 3,
     };
     store.add_reply(&lifecycle).await.unwrap();
@@ -209,7 +209,7 @@ async fn pg_bookmarks_are_migrated_linearizable_and_cascading() {
         body_md: "delete target".to_string(),
         quoted_post_id: String::new(),
         author_sub: owner.clone(),
-        author_email: format!("{owner}@holdfast.local"),
+        author_email: format!("{owner}@steadholme.local"),
         created_at: now + 3,
     };
     store.add_reply(&reply).await.unwrap();
@@ -247,7 +247,7 @@ async fn pg_bookmarks_are_migrated_linearizable_and_cascading() {
         body_md: "ABA target".to_string(),
         quoted_post_id: String::new(),
         author_sub: owner.clone(),
-        author_email: format!("{owner}@holdfast.local"),
+        author_email: format!("{owner}@steadholme.local"),
         created_at: now + 4,
     };
     store.add_reply(&aba_post).await.unwrap();
@@ -328,7 +328,7 @@ async fn pg_bookmarks_are_migrated_linearizable_and_cascading() {
         category_id: "general".to_string(),
         title: "PG bookmark quota".to_string(),
         author_sub: quota_owner.clone(),
-        author_email: format!("{quota_owner}@holdfast.local"),
+        author_email: format!("{quota_owner}@steadholme.local"),
         created_at: now,
         last_at: now,
         locked: false,
@@ -341,7 +341,7 @@ async fn pg_bookmarks_are_migrated_linearizable_and_cascading() {
         body_md: "quota op".to_string(),
         quoted_post_id: String::new(),
         author_sub: quota_owner.clone(),
-        author_email: format!("{quota_owner}@holdfast.local"),
+        author_email: format!("{quota_owner}@steadholme.local"),
         created_at: now,
     };
     store.create_thread(&quota_thread, &quota_op).await.unwrap();
@@ -355,7 +355,7 @@ async fn pg_bookmarks_are_migrated_linearizable_and_cascading() {
     .bind(&prefix)
     .bind(&quota_thread_id)
     .bind(&quota_owner)
-    .bind(format!("{quota_owner}@holdfast.local"))
+    .bind(format!("{quota_owner}@steadholme.local"))
     .bind(now)
     .bind((MAX_BOOKMARKS_PER_USER - 1) as i64)
     .execute(&raw)
@@ -381,7 +381,7 @@ async fn pg_bookmarks_are_migrated_linearizable_and_cascading() {
         body_md: "candidate a".to_string(),
         quoted_post_id: String::new(),
         author_sub: quota_owner.clone(),
-        author_email: format!("{quota_owner}@holdfast.local"),
+        author_email: format!("{quota_owner}@steadholme.local"),
         created_at: now + 20_000,
     };
     let candidate_b = Post {
@@ -480,7 +480,7 @@ async fn pg_legacy_bookmarks_receive_stable_ids_without_losing_post_cascade() {
         "INSERT INTO posts \
              (id, thread_id, body_md, quoted_post_id, author_sub, author_email, created_at) \
          VALUES ('p_legacy_bookmark', 't_legacy_bookmark', 'legacy', '', \
-                 'u_legacy_bookmark', 'legacy@holdfast.local', 1)",
+                 'u_legacy_bookmark', 'legacy@steadholme.local', 1)",
     )
     .execute(&admin)
     .await
@@ -567,7 +567,7 @@ fn fixture_thread(suffix: &str, created_at: i64) -> (Thread, Post) {
             category_id: "general".to_string(),
             title: "PG bookmarks".to_string(),
             author_sub: subject.clone(),
-            author_email: format!("{subject}@holdfast.local"),
+            author_email: format!("{subject}@steadholme.local"),
             created_at,
             last_at: created_at,
             locked: false,
@@ -580,7 +580,7 @@ fn fixture_thread(suffix: &str, created_at: i64) -> (Thread, Post) {
             body_md: "PG bookmark body".to_string(),
             quoted_post_id: String::new(),
             author_sub: subject.clone(),
-            author_email: format!("{subject}@holdfast.local"),
+            author_email: format!("{subject}@steadholme.local"),
             created_at,
         },
     )

@@ -86,7 +86,7 @@ async fn pg_store_full_integration() {
         title: "PG Hello".to_string(),
         body_md: "# Hi\n\nFrom **postgres**.".to_string(),
         author_sub: "u_alice".to_string(),
-        author_email: "alice@holdfast.local".to_string(),
+        author_email: "alice@steadholme.local".to_string(),
         created_at: now - 100,
         updated_at: now - 100,
         edit_version: 1,
@@ -217,7 +217,7 @@ async fn pg_store_full_integration() {
         title: "PG Second".to_string(),
         body_md: "later".to_string(),
         author_sub: "u_alice".to_string(),
-        author_email: "alice@holdfast.local".to_string(),
+        author_email: "alice@steadholme.local".to_string(),
         created_at: now,
         updated_at: now,
         edit_version: 1,
@@ -407,7 +407,7 @@ async fn pg_store_full_integration() {
     bulk_foreign.updated_at = now - 1_098;
     bulk_foreign.published = false;
     bulk_foreign.author_sub = "u_bob".to_string();
-    bulk_foreign.author_email = "bob@holdfast.local".to_string();
+    bulk_foreign.author_email = "bob@steadholme.local".to_string();
     for item in [&bulk_one, &bulk_two, &bulk_foreign] {
         pg.create_post(item)
             .await
@@ -598,7 +598,7 @@ async fn pg_store_full_integration() {
     foreign_library.id = "post_pg_library_foreign".to_string();
     foreign_library.slug = "pg-library-foreign".to_string();
     foreign_library.author_sub = "u_bob".to_string();
-    foreign_library.author_email = "bob@holdfast.local".to_string();
+    foreign_library.author_email = "bob@steadholme.local".to_string();
     foreign_library.updated_at = now - 898;
     pg.create_post(&foreign_library)
         .await
@@ -692,7 +692,7 @@ async fn pg_store_full_integration() {
     let stale_bulk = pg
         .bulk_update_library(LibraryBulkCommand {
             owner_sub: "u_alice".to_string(),
-            editor_email: "alice@holdfast.local".to_string(),
+            editor_email: "alice@steadholme.local".to_string(),
             selections: vec![
                 LibrarySelection {
                     post_id: library_one.id.clone(),
@@ -714,7 +714,7 @@ async fn pg_store_full_integration() {
     let applied_bulk = pg
         .bulk_update_library(LibraryBulkCommand {
             owner_sub: "u_alice".to_string(),
-            editor_email: "alice@holdfast.local".to_string(),
+            editor_email: "alice@steadholme.local".to_string(),
             selections: vec![
                 LibrarySelection {
                     post_id: library_two.id.clone(),
@@ -750,7 +750,7 @@ async fn pg_store_full_integration() {
     );
     let concurrent_a = pg.bulk_update_library(LibraryBulkCommand {
         owner_sub: "u_alice".to_string(),
-        editor_email: "alice@holdfast.local".to_string(),
+        editor_email: "alice@steadholme.local".to_string(),
         selections: vec![
             LibrarySelection {
                 post_id: library_one.id.clone(),
@@ -766,7 +766,7 @@ async fn pg_store_full_integration() {
     });
     let concurrent_b = pg.bulk_update_library(LibraryBulkCommand {
         owner_sub: "u_alice".to_string(),
-        editor_email: "alice@holdfast.local".to_string(),
+        editor_email: "alice@steadholme.local".to_string(),
         selections: vec![
             LibrarySelection {
                 post_id: library_two.id.clone(),
@@ -924,7 +924,7 @@ async fn pg_store_full_integration() {
             post: edited.clone(),
             expected_version: 1,
             editor_sub: "u_alice".to_string(),
-            editor_email: "alice@holdfast.local".to_string(),
+            editor_email: "alice@steadholme.local".to_string(),
             source: "update".to_string(),
             restored_from: None,
             consume_autosave_session: Some(autosave_session.to_string()),
@@ -953,7 +953,7 @@ async fn pg_store_full_integration() {
             post: edited.clone(),
             expected_version: 1,
             editor_sub: "u_alice".to_string(),
-            editor_email: "alice@holdfast.local".to_string(),
+            editor_email: "alice@steadholme.local".to_string(),
             source: "stale".to_string(),
             restored_from: None,
             consume_autosave_session: None,
@@ -1081,7 +1081,7 @@ async fn pg_store_full_integration() {
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .header(header::COOKIE, "__Host-csrf=tok")
                 .header("x-auth-subject", "u_bob")
-                .header("x-auth-email", "bob@holdfast.local")
+                .header("x-auth-email", "bob@steadholme.local")
                 .body(Body::from(body))
                 .unwrap(),
         )
@@ -1115,7 +1115,7 @@ async fn pg_store_full_integration() {
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
             .header(header::COOKIE, "__Host-csrf=tok")
             .header("x-auth-subject", "u_bob")
-            .header("x-auth-email", "bob@holdfast.local")
+            .header("x-auth-email", "bob@steadholme.local")
             .body(Body::from(delete_body))
             .unwrap(),
     )
@@ -1135,7 +1135,7 @@ async fn pg_store_full_integration() {
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .header(header::COOKIE, "__Host-csrf=tok")
                 .header("x-auth-subject", "u_bob")
-                .header("x-auth-email", "bob@holdfast.local")
+                .header("x-auth-email", "bob@steadholme.local")
                 .body(Body::from(stale_edit_body))
                 .unwrap(),
         )

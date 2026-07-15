@@ -9,13 +9,13 @@ use agora::store::{AcceptedAnswerAction, ActivityFilter, ThreadSort, ThreadStatu
 use agora::{app, build_dev_state, new_id, now_secs, AppState};
 
 const ALICE_SUB: &str = "u_v7_alice";
-const ALICE_EMAIL: &str = "alice@holdfast.local";
+const ALICE_EMAIL: &str = "alice@steadholme.local";
 const BOB_SUB: &str = "u_v7_bob";
-const BOB_EMAIL: &str = "bob@holdfast.local";
+const BOB_EMAIL: &str = "bob@steadholme.local";
 const CAROL_SUB: &str = "u_v7_carol";
-const CAROL_EMAIL: &str = "carol@holdfast.local";
+const CAROL_EMAIL: &str = "carol@steadholme.local";
 const DAVE_SUB: &str = "u_v8_dave";
-const DAVE_EMAIL: &str = "dave@holdfast.local";
+const DAVE_EMAIL: &str = "dave@steadholme.local";
 const TOK: &str = "v7forumcsrftoken123";
 
 #[tokio::test]

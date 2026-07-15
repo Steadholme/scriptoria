@@ -88,7 +88,7 @@ pub struct Config {
     /// A per-owner `owner_quotas` row overrides it — see [`effective_quota`].
     pub default_quota_bytes: i64,
     /// Whether owner routes may synthesize the local `dev-user` identity when gateway headers are
-    /// absent. Enabled only by [`Config::dev`]; `HOLDFAST_PROFILE=prod` and
+    /// absent. Enabled only by [`Config::dev`]; `STEADHOLME_PROFILE=prod` and
     /// `REQUIRE_PERSISTENCE` boots always disable it.
     pub allow_dev_identity: bool,
     /// Run the bounded Trash-retention and durable object-delete worker. Disabled for the
@@ -137,7 +137,7 @@ impl Config {
                 config.default_quota_bytes = n;
             }
         }
-        let production = std::env::var("HOLDFAST_PROFILE")
+        let production = std::env::var("STEADHOLME_PROFILE")
             .map(|profile| profile.trim().eq_ignore_ascii_case("prod"))
             .unwrap_or(false)
             || env_truthy("REQUIRE_PERSISTENCE");

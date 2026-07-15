@@ -74,7 +74,7 @@ async fn pg_store_full_integration() {
         &state,
         "/edit/runbook",
         &cookie,
-        "alice@holdfast.local",
+        "alice@steadholme.local",
         &[
             ("csrf_token", &csrf),
             ("title", "Runbook"),
@@ -88,7 +88,7 @@ async fn pg_store_full_integration() {
     // Index + page render straight out of Postgres.
     let (_s, _h, idx) = call(&state, get("/")).await;
     assert!(idx.contains(">Runbook</a>"));
-    assert!(idx.contains("alice@holdfast.local"));
+    assert!(idx.contains("alice@steadholme.local"));
 
     let (status, _h, page) = call(&state, get("/w/runbook")).await;
     assert_eq!(status, StatusCode::OK);
@@ -111,7 +111,7 @@ async fn pg_store_full_integration() {
         &state,
         "/edit/runbook",
         &cookie2,
-        "bob@holdfast.local",
+        "bob@steadholme.local",
         &[
             ("csrf_token", &csrf2),
             ("base_rev", &base2),
@@ -135,7 +135,7 @@ async fn pg_store_full_integration() {
     let created_at: i64 = row.try_get("created_at").unwrap();
     let updated_at: i64 = row.try_get("updated_at").unwrap();
     assert_eq!(title, "Runbook v2");
-    assert_eq!(updated_by, "bob@holdfast.local");
+    assert_eq!(updated_by, "bob@steadholme.local");
     assert!(
         created_at <= updated_at,
         "created_at preserved across the upsert"
@@ -161,15 +161,15 @@ async fn pg_store_full_integration() {
 
     let (status, _h, history) = call(&state, get("/history/runbook")).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(history.contains("alice@holdfast.local"));
-    assert!(history.contains("bob@holdfast.local"));
+    assert!(history.contains("alice@steadholme.local"));
+    assert!(history.contains("bob@steadholme.local"));
 
     // CSRF is enforced against the live DB-backed app too (no write should occur).
     let bad = post_form(
         &state,
         "/edit/runbook",
         "", // no cookie
-        "mallory@holdfast.local",
+        "mallory@steadholme.local",
         &[
             ("csrf_token", "forged"),
             ("title", "Hacked"),

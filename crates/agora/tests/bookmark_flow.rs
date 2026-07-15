@@ -17,9 +17,9 @@ use agora::store::{
 use agora::{app, build_dev_state, new_id, now_secs, AppState};
 
 const ALICE_SUB: &str = "u_bookmark_alice";
-const ALICE_EMAIL: &str = "alice@holdfast.local";
+const ALICE_EMAIL: &str = "alice@steadholme.local";
 const BOB_SUB: &str = "u_bookmark_bob";
-const BOB_EMAIL: &str = "bob@holdfast.local";
+const BOB_EMAIL: &str = "bob@steadholme.local";
 const TOK: &str = "bookmarkcsrftoken123";
 
 #[tokio::test]
@@ -86,7 +86,7 @@ async fn browser_flow_is_owner_only_no_store_and_honest_about_delivery() {
         get_as_groups(
             &format!("/bookmarks/{}/edit", op.id),
             "u_admin",
-            "admin@holdfast.local",
+            "admin@steadholme.local",
             "admins",
         ),
     )

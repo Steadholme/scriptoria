@@ -139,7 +139,7 @@ async fn pg_follow_levels_migrate_and_match_memory_authority() {
         ("pg_level_follow", ThreadFollowLevel::Follow),
         ("pg_level_mute", ThreadFollowLevel::Mute),
     ] {
-        let (thread, op) = fixture_thread(suffix, "u_alice", "alice@holdfast.local", now);
+        let (thread, op) = fixture_thread(suffix, "u_alice", "alice@steadholme.local", now);
         store.create_thread(&thread, &op).await.unwrap();
         store
             .set_thread_follow_level(&thread.id, "u_carol", level, now + 1)
@@ -148,7 +148,7 @@ async fn pg_follow_levels_migrate_and_match_memory_authority() {
         let reply = fixture_reply(
             &thread.id,
             "u_bob",
-            "bob@holdfast.local",
+            "bob@steadholme.local",
             suffix,
             "",
             now + 2,
@@ -264,7 +264,7 @@ async fn pg_follow_levels_migrate_and_match_memory_authority() {
     let (repair_thread, repair_op) = fixture_thread(
         "pg_rollback_repair",
         "u_carol",
-        "carol@holdfast.local",
+        "carol@steadholme.local",
         now + 12,
     );
     store
@@ -283,7 +283,7 @@ async fn pg_follow_levels_migrate_and_match_memory_authority() {
     let repair_reply = fixture_reply(
         &repair_thread.id,
         "u_bob",
-        "bob@holdfast.local",
+        "bob@steadholme.local",
         "rollback repair",
         "",
         now + 14,
@@ -345,7 +345,7 @@ async fn pg_follow_levels_migrate_and_match_memory_authority() {
     let (direct_thread, direct_op) = fixture_thread(
         "pg_level_direct",
         "u_carol",
-        "carol@holdfast.local",
+        "carol@steadholme.local",
         now + 20,
     );
     store
@@ -364,7 +364,7 @@ async fn pg_follow_levels_migrate_and_match_memory_authority() {
     let direct_reply = fixture_reply(
         &direct_thread.id,
         "u_bob",
-        "bob@holdfast.local",
+        "bob@steadholme.local",
         "direct survives mute",
         "",
         now + 22,
@@ -399,7 +399,7 @@ async fn pg_follow_levels_migrate_and_match_memory_authority() {
     let (rollback_deleted, rollback_deleted_op) = fixture_thread(
         "pg_v6_delete_cascade",
         "u_alice",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
         now + 30,
     );
     store
@@ -679,7 +679,7 @@ async fn pg_catch_up_is_complete_exact_keyset_and_mute_safe() {
     let (mut old, old_op) = fixture_thread(
         "pg_catch_old_follow",
         "u_alice",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
         base + 100,
     );
     old.title = "Old PG explicit relationship".to_string();
@@ -700,7 +700,7 @@ async fn pg_catch_up_is_complete_exact_keyset_and_mute_safe() {
     let mut first_unread = fixture_reply(
         &old.id,
         "u_bob",
-        "bob@holdfast.local",
+        "bob@steadholme.local",
         "stale first unread",
         "",
         base + 102,
@@ -709,7 +709,7 @@ async fn pg_catch_up_is_complete_exact_keyset_and_mute_safe() {
     let mut read_hole = fixture_reply(
         &old.id,
         "u_bob",
-        "bob@holdfast.local",
+        "bob@steadholme.local",
         "read middle reply",
         "",
         base + 103,
@@ -718,7 +718,7 @@ async fn pg_catch_up_is_complete_exact_keyset_and_mute_safe() {
     let mut second_unread = fixture_reply(
         &old.id,
         "u_bob",
-        "bob@holdfast.local",
+        "bob@steadholme.local",
         "second unread",
         "",
         base + 104,
@@ -749,7 +749,7 @@ async fn pg_catch_up_is_complete_exact_keyset_and_mute_safe() {
         let (mut noise, op) = fixture_thread(
             &format!("pg_catch_noise_{index:03}"),
             "u_noise",
-            "noise@holdfast.local",
+            "noise@steadholme.local",
             base + 1_000 + index,
         );
         noise.title = format!("PG unrelated noise {index:03}");
@@ -797,7 +797,7 @@ async fn pg_catch_up_is_complete_exact_keyset_and_mute_safe() {
     let (mut waiting, waiting_op) = fixture_thread(
         "pg_catch_waiting",
         "u_carol",
-        "carol@holdfast.local",
+        "carol@steadholme.local",
         base + 300,
     );
     waiting.title = "PG question waiting".to_string();
@@ -805,7 +805,7 @@ async fn pg_catch_up_is_complete_exact_keyset_and_mute_safe() {
     let (mut solved, solved_op) = fixture_thread(
         "pg_catch_solved",
         "u_carol",
-        "carol@holdfast.local",
+        "carol@steadholme.local",
         base + 301,
     );
     solved.title = "PG question solved".to_string();
@@ -813,7 +813,7 @@ async fn pg_catch_up_is_complete_exact_keyset_and_mute_safe() {
     let solved_answer = fixture_reply(
         &solved.id,
         "u_bob",
-        "bob@holdfast.local",
+        "bob@steadholme.local",
         "accepted answer",
         "",
         base + 302,
@@ -831,7 +831,7 @@ async fn pg_catch_up_is_complete_exact_keyset_and_mute_safe() {
     let (mut muted, muted_op) = fixture_thread(
         "pg_catch_muted",
         "u_carol",
-        "carol@holdfast.local",
+        "carol@steadholme.local",
         base + 303,
     );
     muted.title = "PG muted question".to_string();
@@ -843,7 +843,7 @@ async fn pg_catch_up_is_complete_exact_keyset_and_mute_safe() {
     let muted_direct = fixture_reply(
         &muted.id,
         "u_bob",
-        "bob@holdfast.local",
+        "bob@steadholme.local",
         "direct reply survives mute",
         "",
         base + 305,
@@ -900,7 +900,7 @@ async fn pg_catch_up_is_complete_exact_keyset_and_mute_safe() {
         let (mut thread, op) = fixture_thread(
             &format!("pg_catch_tie_{index:02}"),
             "u_alice",
-            "alice@holdfast.local",
+            "alice@steadholme.local",
             tied_at,
         );
         thread.title = format!("PG tied relationship {index:02}");
@@ -918,7 +918,7 @@ async fn pg_catch_up_is_complete_exact_keyset_and_mute_safe() {
     let newest_then_deleted = fixture_reply(
         "t_pg_catch_tie_00",
         "u_bob",
-        "bob@holdfast.local",
+        "bob@steadholme.local",
         "latest reply deleted after page one",
         "",
         base + 500,
@@ -999,7 +999,7 @@ async fn pg_catch_up_is_complete_exact_keyset_and_mute_safe() {
     let future_reply = fixture_reply(
         "t_pg_catch_tie_02",
         "u_bob",
-        "bob@holdfast.local",
+        "bob@steadholme.local",
         "after snapshot",
         "",
         tied_at,
@@ -1076,7 +1076,7 @@ async fn pg_catch_up_is_complete_exact_keyset_and_mute_safe() {
         "INSERT INTO posts \
              (id, thread_id, body_md, quoted_post_id, author_sub, author_email, created_at) \
          SELECT 'p_plan_' || n::TEXT, 't_plan_' || n::TEXT, 'plan', '', \
-                'u_plan_' || n::TEXT, 'plan@holdfast.local', 1 \
+                'u_plan_' || n::TEXT, 'plan@steadholme.local', 1 \
          FROM generate_series(1, 4000) AS n",
     )
     .execute(&pool)
@@ -1180,7 +1180,7 @@ async fn pg_catch_up_clock_orders_commit_before_snapshot() {
         .seed_categories_if_empty(&default_categories())
         .await
         .unwrap();
-    let (thread, op) = fixture_thread("catch_clock", "u_alice", "alice@holdfast.local", 10);
+    let (thread, op) = fixture_thread("catch_clock", "u_alice", "alice@steadholme.local", 10);
     store.create_thread(&thread, &op).await.unwrap();
     assert_eq!(store.catch_up_snapshot_generation().await.unwrap(), 1);
 
@@ -1413,7 +1413,7 @@ async fn pg_activity_is_atomic_bounded_and_authoritative() {
     let (historical_thread, historical_op) = fixture_thread(
         "pg_historical_alias",
         "u_historical",
-        "historical@holdfast.local",
+        "historical@steadholme.local",
         now - 10,
     );
     store
@@ -1439,7 +1439,7 @@ async fn pg_activity_is_atomic_bounded_and_authoritative() {
     assert_eq!(historical_aliases, 1);
     store.delete_thread(&historical_thread.id).await.unwrap();
 
-    let (thread, op) = fixture_thread("pg_activity", "u_alice", "alice@holdfast.local", now);
+    let (thread, op) = fixture_thread("pg_activity", "u_alice", "alice@steadholme.local", now);
     store
         .create_thread_with_activity(&thread, &op, &[], &new_id("a"))
         .await
@@ -1467,7 +1467,7 @@ async fn pg_activity_is_atomic_bounded_and_authoritative() {
     let reply = fixture_reply(
         &thread.id,
         "u_bob",
-        "bob@holdfast.local",
+        "bob@steadholme.local",
         "PG hello @alice @bob",
         &op.id,
         now + 10,
@@ -1499,7 +1499,7 @@ async fn pg_activity_is_atomic_bounded_and_authoritative() {
     let invalid = fixture_reply(
         &thread.id,
         "u_bob",
-        "bob@holdfast.local",
+        "bob@steadholme.local",
         "must roll back @alice",
         "p_missing",
         now + 11,
@@ -1537,7 +1537,7 @@ async fn pg_activity_is_atomic_bounded_and_authoritative() {
         let post = fixture_reply(
             &thread.id,
             "u_bob",
-            "bob@holdfast.local",
+            "bob@steadholme.local",
             &format!("PG batch {index}"),
             "",
             now + 20 + index as i64,
@@ -1587,7 +1587,7 @@ async fn pg_activity_is_atomic_bounded_and_authoritative() {
     let late = fixture_reply(
         &thread.id,
         "u_bob",
-        "bob@holdfast.local",
+        "bob@steadholme.local",
         "PG late event",
         "",
         now + 200,
@@ -1651,7 +1651,7 @@ async fn pg_activity_is_atomic_bounded_and_authoritative() {
     // Alias routing is append-only and subject-addressed. Rename adds an alias, a collision makes
     // future resolution ambiguous, and neither spoofing nor collision transfers old deliveries.
     let (alias_thread, alias_op) =
-        fixture_thread("pg_alias", "u_bob", "bob@holdfast.local", now + 400);
+        fixture_thread("pg_alias", "u_bob", "bob@steadholme.local", now + 400);
     store
         .create_thread_with_activity(&alias_thread, &alias_op, &[], &new_id("a"))
         .await
@@ -1659,7 +1659,7 @@ async fn pg_activity_is_atomic_bounded_and_authoritative() {
     let rename = fixture_reply(
         &alias_thread.id,
         "u_alice",
-        "alice-renamed@holdfast.local",
+        "alice-renamed@steadholme.local",
         "register rename",
         "",
         now + 401,
@@ -1672,7 +1672,7 @@ async fn pg_activity_is_atomic_bounded_and_authoritative() {
     let unique_mention = fixture_reply(
         &alias_thread.id,
         "u_bob",
-        "bob@holdfast.local",
+        "bob@steadholme.local",
         "Unique @alice-renamed",
         "",
         now + 402,
@@ -1707,7 +1707,7 @@ async fn pg_activity_is_atomic_bounded_and_authoritative() {
     let ambiguous = fixture_reply(
         &alias_thread.id,
         "u_bob",
-        "bob@holdfast.local",
+        "bob@steadholme.local",
         "Ambiguous @alice-renamed",
         "",
         now + 404,
@@ -1743,7 +1743,7 @@ async fn pg_activity_is_atomic_bounded_and_authoritative() {
     // Concurrent follows serialize on the thread lock. Exactly one contender fills slot 256;
     // cap+1 is rejected, and a legacy over-cap row makes reply fan-out fail before any write.
     let (cap_thread, cap_op) =
-        fixture_thread("pg_cap", "u_alice", "alice@holdfast.local", now + 500);
+        fixture_thread("pg_cap", "u_alice", "alice@steadholme.local", now + 500);
     store
         .create_thread_with_activity(&cap_thread, &cap_op, &[], &new_id("a"))
         .await
@@ -1795,7 +1795,7 @@ async fn pg_activity_is_atomic_bounded_and_authoritative() {
     let at_cap = fixture_reply(
         &cap_thread.id,
         "u_bob",
-        "bob@holdfast.local",
+        "bob@steadholme.local",
         "fanout at cap",
         "",
         now + 504,
@@ -1822,7 +1822,7 @@ async fn pg_activity_is_atomic_bounded_and_authoritative() {
     let over_cap = fixture_reply(
         &cap_thread.id,
         "u_bob",
-        "bob@holdfast.local",
+        "bob@steadholme.local",
         "must not persist over cap",
         "",
         now + 506,
@@ -1855,7 +1855,7 @@ async fn pg_activity_is_atomic_bounded_and_authoritative() {
     let mention_over_cap = fixture_reply(
         &cap_thread.id,
         "u_bob",
-        "bob@holdfast.local",
+        "bob@steadholme.local",
         "must not persist mention overflow",
         "",
         now + 507,
@@ -1886,7 +1886,7 @@ async fn pg_activity_is_atomic_bounded_and_authoritative() {
     let (post_delete_thread, post_delete_op) = fixture_thread(
         "pg_concurrent_post",
         "u_alice",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
         now + 600,
     );
     store
@@ -1896,7 +1896,7 @@ async fn pg_activity_is_atomic_bounded_and_authoritative() {
     let post_delete_reply = fixture_reply(
         &post_delete_thread.id,
         "u_bob",
-        "bob@holdfast.local",
+        "bob@steadholme.local",
         "concurrent post delete",
         "",
         now + 601,
@@ -1943,7 +1943,7 @@ async fn pg_activity_is_atomic_bounded_and_authoritative() {
     let (thread_delete_thread, thread_delete_op) = fixture_thread(
         "pg_concurrent_thread",
         "u_alice",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
         now + 700,
     );
     store
@@ -1953,7 +1953,7 @@ async fn pg_activity_is_atomic_bounded_and_authoritative() {
     let thread_delete_reply = fixture_reply(
         &thread_delete_thread.id,
         "u_bob",
-        "bob@holdfast.local",
+        "bob@steadholme.local",
         "concurrent thread delete",
         "",
         now + 701,

@@ -9,9 +9,9 @@ use agora::store::{AcceptedAnswerAction, ThreadSort, ThreadStatusFilter};
 use agora::{app, build_dev_state, now_secs, AppState};
 
 const ALICE_SUB: &str = "u_question_alice";
-const ALICE_EMAIL: &str = "alice-question@holdfast.local";
+const ALICE_EMAIL: &str = "alice-question@steadholme.local";
 const BOB_SUB: &str = "u_question_bob";
-const BOB_EMAIL: &str = "bob-question@holdfast.local";
+const BOB_EMAIL: &str = "bob-question@steadholme.local";
 const TOK: &str = "questioncsrftoken123";
 
 #[tokio::test]
@@ -522,7 +522,7 @@ fn post_admin(uri: &str, body: String) -> Request<Body> {
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header(header::COOKIE, format!("__Host-csrf={TOK}"))
         .header("x-auth-subject", "u_question_admin")
-        .header("x-auth-email", "question-admin@holdfast.local")
+        .header("x-auth-email", "question-admin@steadholme.local")
         .header("x-auth-groups", "forum-admins")
         .body(Body::from(body))
         .unwrap()

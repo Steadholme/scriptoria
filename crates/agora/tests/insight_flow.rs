@@ -177,7 +177,7 @@ async fn create_thread(state: &AppState, cat: &str, title: &str, body: &str) -> 
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header(header::COOKIE, format!("__Host-csrf={TOK}"))
         .header("x-auth-subject", "u_1")
-        .header("x-auth-email", "alice@holdfast.local")
+        .header("x-auth-email", "alice@steadholme.local")
         .body(Body::from(payload))
         .unwrap();
     let (status, h, _b) = send(state, req).await;
@@ -193,7 +193,7 @@ async fn reply(state: &AppState, location: &str, body: &str) {
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header(header::COOKIE, format!("__Host-csrf={TOK}"))
         .header("x-auth-subject", "u_2")
-        .header("x-auth-email", "bob@holdfast.local")
+        .header("x-auth-email", "bob@steadholme.local")
         .body(Body::from(payload))
         .unwrap();
     let (status, ..) = send(state, req).await;
@@ -208,7 +208,7 @@ async fn similar_request(state: &AppState, title: &str, body: &str) -> (StatusCo
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header(header::COOKIE, format!("__Host-csrf={TOK}"))
         .header("x-auth-subject", "u_1")
-        .header("x-auth-email", "alice@holdfast.local")
+        .header("x-auth-email", "alice@steadholme.local")
         .body(Body::from(payload))
         .unwrap();
     let (status, _h, body) = send(state, req).await;

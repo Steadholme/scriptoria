@@ -391,7 +391,7 @@ async fn seed_thread(
         category_id: category_id.to_string(),
         title: title.to_string(),
         author_sub: "u_pg_focus_author".to_string(),
-        author_email: "author@holdfast.local".to_string(),
+        author_email: "author@steadholme.local".to_string(),
         created_at,
         last_at: created_at,
         locked: false,

@@ -332,7 +332,7 @@ fn get(uri: &str, subject: Option<&str>) -> Request<Body> {
     if let Some(subject) = subject {
         request = request
             .header("x-auth-subject", subject)
-            .header("x-auth-email", "writer@holdfast.local");
+            .header("x-auth-email", "writer@steadholme.local");
     }
     request.body(Body::empty()).unwrap()
 }
@@ -344,7 +344,7 @@ fn post(uri: &str, body: &str) -> Request<Body> {
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header(header::COOKIE, format!("__Host-csrf={CSRF}"))
         .header("x-auth-subject", "u_writer")
-        .header("x-auth-email", "writer@holdfast.local")
+        .header("x-auth-email", "writer@steadholme.local")
         .body(Body::from(body.to_string()))
         .unwrap()
 }

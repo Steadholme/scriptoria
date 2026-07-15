@@ -81,7 +81,7 @@ async fn pg_store_full_integration() {
         category_id: "support".to_string(),
         title: "Postgres-backed thread".to_string(),
         author_sub: "u_1".to_string(),
-        author_email: "alice@holdfast.local".to_string(),
+        author_email: "alice@steadholme.local".to_string(),
         created_at: now,
         last_at: now,
         locked: false,
@@ -93,7 +93,7 @@ async fn pg_store_full_integration() {
         thread_id: thread.id.clone(),
         body_md: "Original **post**.".to_string(),
         author_sub: "u_1".to_string(),
-        author_email: "alice@holdfast.local".to_string(),
+        author_email: "alice@steadholme.local".to_string(),
         created_at: now,
         quoted_post_id: String::new(),
     };
@@ -107,7 +107,7 @@ async fn pg_store_full_integration() {
         thread_id: thread.id.clone(),
         body_md: "A reply.".to_string(),
         author_sub: "u_2".to_string(),
-        author_email: "bob@holdfast.local".to_string(),
+        author_email: "bob@steadholme.local".to_string(),
         created_at: now + 5,
         quoted_post_id: String::new(),
     };
@@ -160,7 +160,7 @@ async fn pg_store_full_integration() {
     // Thread page renders the persisted posts (markdown rendered).
     let req = Request::builder()
         .uri(format!("/t/{}", thread.id))
-        .header("x-auth-email", "viewer@holdfast.local")
+        .header("x-auth-email", "viewer@steadholme.local")
         .body(Body::empty())
         .unwrap();
     let resp = app(state.clone()).oneshot(req).await.unwrap();
@@ -182,7 +182,7 @@ async fn pg_store_full_integration() {
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header(header::COOKIE, format!("__Host-csrf={tok}"))
         .header("x-auth-subject", "u_9")
-        .header("x-auth-email", "carol@holdfast.local")
+        .header("x-auth-email", "carol@steadholme.local")
         .body(Body::from(body))
         .unwrap();
     let resp = app(state.clone()).oneshot(req).await.unwrap();
@@ -247,7 +247,7 @@ async fn pg_store_full_integration() {
             thread_id: thread.id.clone(),
             body_md: format!("Paged ordinary reply {index}"),
             author_sub: "u_page".to_string(),
-            author_email: "page@holdfast.local".to_string(),
+            author_email: "page@steadholme.local".to_string(),
             created_at: now + 100 + index,
             quoted_post_id: String::new(),
         };

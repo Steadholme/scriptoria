@@ -214,7 +214,7 @@ async fn search_filters_question_status_and_surfaces_accepted_solution_matches()
         body_md: "The durable fix uses a cobalt rendezvous token.".to_string(),
         quoted_post_id: String::new(),
         author_sub: "u_expert".to_string(),
-        author_email: "expert@holdfast.local".to_string(),
+        author_email: "expert@steadholme.local".to_string(),
         created_at: 110,
     };
     state.store.add_reply(&solution).await.unwrap();
@@ -318,7 +318,7 @@ async fn seed_thread(
         category_id: category_id.to_string(),
         title: title.to_string(),
         author_sub: "u_alice".to_string(),
-        author_email: "alice@holdfast.local".to_string(),
+        author_email: "alice@steadholme.local".to_string(),
         created_at,
         last_at: created_at,
         locked: false,
@@ -331,7 +331,7 @@ async fn seed_thread(
         body_md: first_body_md.to_string(),
         quoted_post_id: String::new(),
         author_sub: "u_alice".to_string(),
-        author_email: "alice@holdfast.local".to_string(),
+        author_email: "alice@steadholme.local".to_string(),
         created_at,
     };
     state.store.create_thread(&thread, &post).await.unwrap();
@@ -344,7 +344,7 @@ async fn seed_reply(state: &AppState, thread_id: &str, id: &str, created_at: i64
         body_md: format!("Reply {id}"),
         quoted_post_id: String::new(),
         author_sub: "u_bob".to_string(),
-        author_email: "bob@holdfast.local".to_string(),
+        author_email: "bob@steadholme.local".to_string(),
         created_at,
     };
     state.store.add_reply(&post).await.unwrap();

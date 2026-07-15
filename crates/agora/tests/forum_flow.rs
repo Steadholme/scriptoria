@@ -91,7 +91,7 @@ async fn create_thread_reply_and_render_markdown() {
     assert_eq!(status, StatusCode::OK);
     assert!(page.contains("Hello Agora"));
     assert!(page.contains("<strong>bold</strong>"), "markdown rendered");
-    assert!(page.contains("alice@holdfast.local"), "trusted author shown");
+    assert!(page.contains("alice@steadholme.local"), "trusted author shown");
     assert!(page.contains("Original post"));
     assert!(page.contains("0 replies"));
 
@@ -151,9 +151,9 @@ async fn missing_thread_and_category_are_404() {
 // --- author edit/delete of own threads + replies ---------------------------------------
 
 const ALICE_SUB: &str = "u_sub_1";
-const ALICE_EMAIL: &str = "alice@holdfast.local";
+const ALICE_EMAIL: &str = "alice@steadholme.local";
 const BOB_SUB: &str = "u_sub_bob";
-const BOB_EMAIL: &str = "bob@holdfast.local";
+const BOB_EMAIL: &str = "bob@steadholme.local";
 
 /// Create a thread as alice and return its `/t/{id}` location.
 async fn create_thread(state: &AppState, tok: &str, title: &str, body_md: &str) -> String {
@@ -648,7 +648,7 @@ fn post_form(uri: &str, csrf_cookie: Option<&str>, auth: bool, body: String) -> 
     if auth {
         b = b
             .header("x-auth-subject", "u_sub_1")
-            .header("x-auth-email", "alice@holdfast.local");
+            .header("x-auth-email", "alice@steadholme.local");
     }
     b.body(Body::from(body)).unwrap()
 }
