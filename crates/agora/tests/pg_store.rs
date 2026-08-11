@@ -22,9 +22,9 @@ use axum::http::{header, Request, StatusCode};
 use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
 
-use agora::store::{AcceptedAnswerAction, PgStore, ReplyAnchor, Store};
-use agora::{app, build_dev_state, default_categories, new_id, now_secs, AppState};
 use agora::model::{CategoryFormat, Post, Thread};
+use agora::store::{AcceptedAnswerAction, PgStore, ReplyAnchor, Store, StoreError};
+use agora::{app, build_dev_state, default_categories, new_id, now_secs, AppState};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pg_store_full_integration() {
@@ -37,26 +37,45 @@ async fn pg_store_full_integration() {
     };
 
     // --- connect / migrate (idempotent: run twice) -------------------------
-    let pg = PgStore::connect(&url).await.expect("connect to TEST_DATABASE_URL");
+    let pg = PgStore::connect(&url)
+        .await
+        .expect("connect to TEST_DATABASE_URL");
     pg.migrate().await.expect("migrate");
     pg.migrate().await.expect("migrate is idempotent");
 
     // Clean slate on a shared raw pool, then seed defaults (idempotent).
-    let raw = PgPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
+    let raw = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
     for tbl in ["post_reactions", "posts", "threads", "categories"] {
-        sqlx::query(&format!("DELETE FROM {tbl}")).execute(&raw).await.unwrap();
+        sqlx::query(&format!("DELETE FROM {tbl}"))
+            .execute(&raw)
+            .await
+            .unwrap();
     }
-    pg.seed_categories_if_empty(&default_categories()).await.expect("seed");
-    pg.seed_categories_if_empty(&default_categories()).await.expect("seed is idempotent");
+    pg.seed_categories_if_empty(&default_categories())
+        .await
+        .expect("seed");
+    pg.seed_categories_if_empty(&default_categories())
+        .await
+        .expect("seed is idempotent");
 
     let cats = pg.list_categories().await.expect("list categories");
     assert_eq!(cats.len(), 3, "three default categories seeded");
     assert_eq!(
-        cats.iter().find(|category| category.id == "support").unwrap().format,
+        cats.iter()
+            .find(|category| category.id == "support")
+            .unwrap()
+            .format,
         CategoryFormat::Question
     );
     assert_eq!(
-        cats.iter().find(|category| category.id == "general").unwrap().format,
+        cats.iter()
+            .find(|category| category.id == "general")
+            .unwrap()
+            .format,
         CategoryFormat::Discussion
     );
     // Startup migration classifies only NULL legacy rows; it must never overwrite a later
@@ -97,7 +116,9 @@ async fn pg_store_full_integration() {
         created_at: now,
         quoted_post_id: String::new(),
     };
-    pg.create_thread(&thread, &first).await.expect("create thread");
+    pg.create_thread(&thread, &first)
+        .await
+        .expect("create thread");
 
     assert_eq!(pg.count_threads("support").await.unwrap(), 1);
     assert_eq!(pg.count_posts(&thread.id).await.unwrap(), 1);
@@ -123,28 +144,46 @@ async fn pg_store_full_integration() {
     let reloaded = pg.get_thread(&thread.id).await.unwrap().unwrap();
     assert_eq!(reloaded.last_at, now + 5, "last_at bumped to reply time");
 
-    let initial_reading = pg.thread_reading_state("reader_a", &thread.id).await.unwrap();
+    let initial_reading = pg
+        .thread_reading_state("reader_a", &thread.id)
+        .await
+        .unwrap();
     assert!(!initial_reading.started);
     assert_eq!(initial_reading.unread_count, 2);
     assert_eq!(initial_reading.first_unread.as_ref().unwrap().id, first.id);
-    pg.mark_thread_posts_read("reader_a", &thread.id, std::slice::from_ref(&reply.id), now + 6)
+    pg.mark_thread_posts_read(
+        "reader_a",
+        &thread.id,
+        std::slice::from_ref(&reply.id),
+        now + 6,
+    )
+    .await
+    .unwrap();
+    let hole = pg
+        .thread_reading_state("reader_a", &thread.id)
         .await
         .unwrap();
-    let hole = pg.thread_reading_state("reader_a", &thread.id).await.unwrap();
     assert!(hole.started);
     assert_eq!(hole.unread_count, 1);
     assert_eq!(hole.first_unread.as_ref().unwrap().id, first.id);
-    assert!(
-        pg.thread_reading_state("reader_b", &thread.id)
-            .await
-            .unwrap()
-            .first_unread
-            .is_some()
-    );
-    pg.mark_thread_posts_read("reader_a", &thread.id, std::slice::from_ref(&first.id), now + 7)
+    assert!(pg
+        .thread_reading_state("reader_b", &thread.id)
+        .await
+        .unwrap()
+        .first_unread
+        .is_some());
+    pg.mark_thread_posts_read(
+        "reader_a",
+        &thread.id,
+        std::slice::from_ref(&first.id),
+        now + 7,
+    )
+    .await
+    .unwrap();
+    let caught_up = pg
+        .thread_reading_state("reader_a", &thread.id)
         .await
         .unwrap();
-    let caught_up = pg.thread_reading_state("reader_a", &thread.id).await.unwrap();
     assert_eq!(caught_up.unread_count, 0);
     assert!(caught_up.first_unread.is_none());
 
@@ -166,7 +205,10 @@ async fn pg_store_full_integration() {
     let resp = app(state.clone()).oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let html = String::from_utf8(
-        axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec(),
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
     )
     .unwrap();
     assert!(html.contains("Postgres-backed thread"));
@@ -187,7 +229,11 @@ async fn pg_store_full_integration() {
         .unwrap();
     let resp = app(state.clone()).oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    assert_eq!(pg.count_threads("support").await.unwrap(), 2, "HTTP create persisted to PG");
+    assert_eq!(
+        pg.count_threads("support").await.unwrap(),
+        2,
+        "HTTP create persisted to PG"
+    );
 
     // --- author edit/delete of own thread + reply (portable UPDATE/DELETE) -
     // Edit the thread: title + original-post body update atomically, and the denormalised
@@ -206,22 +252,47 @@ async fn pg_store_full_integration() {
         .into_iter()
         .find(|d| d.id == thread.id)
         .expect("digest for edited thread");
-    assert_eq!(digest.first_body_md, "Edited **op** body.", "first_body_md kept in step");
+    assert_eq!(
+        digest.first_body_md, "Edited **op** body.",
+        "first_body_md kept in step"
+    );
 
     // --- reactions: idempotent toggle + per-viewer aggregate --------------
     // u_1 reacts "up" on the reply → inserted (true), count 1, and it is u_1's own.
-    assert!(pg.toggle_reaction(&reply.id, "u_1", "up", now).await.unwrap(), "first toggle inserts");
+    assert!(
+        pg.toggle_reaction(&reply.id, "u_1", "up", now)
+            .await
+            .unwrap(),
+        "first toggle inserts"
+    );
     // Toggling the same (post,user,kind) again removes it (false) — idempotent, no duplicate row.
-    assert!(!pg.toggle_reaction(&reply.id, "u_1", "up", now).await.unwrap(), "second toggle removes");
+    assert!(
+        !pg.toggle_reaction(&reply.id, "u_1", "up", now)
+            .await
+            .unwrap(),
+        "second toggle removes"
+    );
     // Two different users react "up": count 2, and "mine" reflects the viewer.
-    assert!(pg.toggle_reaction(&reply.id, "u_1", "up", now).await.unwrap());
-    assert!(pg.toggle_reaction(&reply.id, "u_2", "up", now).await.unwrap());
+    assert!(pg
+        .toggle_reaction(&reply.id, "u_1", "up", now)
+        .await
+        .unwrap());
+    assert!(pg
+        .toggle_reaction(&reply.id, "u_2", "up", now)
+        .await
+        .unwrap());
     let counts = pg.reactions_for_post(&reply.id, Some("u_2")).await.unwrap();
     let up = counts.iter().find(|c| c.kind == "up").expect("up count");
     assert_eq!(up.count, 2, "two distinct reactors");
     assert!(up.mine, "u_2 is among the reactors");
-    let counts_other = pg.reactions_for_post(&reply.id, Some("u_stranger")).await.unwrap();
-    assert!(!counts_other.iter().find(|c| c.kind == "up").unwrap().mine, "stranger is not a reactor");
+    let counts_other = pg
+        .reactions_for_post(&reply.id, Some("u_stranger"))
+        .await
+        .unwrap();
+    assert!(
+        !counts_other.iter().find(|c| c.kind == "up").unwrap().mine,
+        "stranger is not a reactor"
+    );
 
     // --- accepted answer: set, read back, and clear-on-delete -------------
     pg.mutate_accepted_answer(
@@ -233,10 +304,58 @@ async fn pg_store_full_integration() {
     .await
     .expect("set accepted");
     assert_eq!(
-        pg.get_thread(&thread.id).await.unwrap().unwrap().accepted_post_id,
+        pg.get_thread(&thread.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .accepted_post_id,
         reply.id,
         "accepted_post_id persisted"
     );
+    assert!(matches!(
+        pg.mutate_accepted_answer(
+            &thread.id,
+            AcceptedAnswerAction::ClearIf {
+                post_id: "p_stale_solution".to_string(),
+            },
+        )
+        .await
+        .unwrap_err(),
+        StoreError::Conflict(_)
+    ));
+    assert_eq!(
+        pg.get_thread(&thread.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .accepted_post_id,
+        reply.id,
+        "stale clear cannot remove the current solution"
+    );
+    pg.mutate_accepted_answer(
+        &thread.id,
+        AcceptedAnswerAction::ClearIf {
+            post_id: reply.id.clone(),
+        },
+    )
+    .await
+    .expect("clear exact accepted target");
+    pg.mutate_accepted_answer(
+        &thread.id,
+        AcceptedAnswerAction::ClearIf {
+            post_id: reply.id.clone(),
+        },
+    )
+    .await
+    .expect("duplicate clear is idempotent");
+    pg.mutate_accepted_answer(
+        &thread.id,
+        AcceptedAnswerAction::Accept {
+            post_id: reply.id.clone(),
+        },
+    )
+    .await
+    .expect("restore accepted target for pagination/deletion coverage");
 
     // The accepted solution is excluded before LIMIT so the fixed solution region can render it
     // exactly once while ordinary reply pages remain full.
@@ -264,7 +383,11 @@ async fn pg_store_full_integration() {
         )
         .await
         .unwrap();
-    assert_eq!(first_page.len(), 20, "accepted exclusion happens before LIMIT");
+    assert_eq!(
+        first_page.len(),
+        20,
+        "accepted exclusion happens before LIMIT"
+    );
     assert!(first_page.iter().all(|post| post.id != reply.id));
     for id in &extra_reply_ids {
         pg.delete_post(id).await.unwrap();
@@ -272,27 +395,40 @@ async fn pg_store_full_integration() {
     assert_eq!(pg.count_posts(&thread.id).await.unwrap(), 2);
 
     // Edit then delete the reply (a single-post UPDATE / DELETE).
-    pg.update_post(&reply.id, "Edited reply.").await.expect("update reply");
+    pg.update_post(&reply.id, "Edited reply.")
+        .await
+        .expect("update reply");
     let posts = pg.posts_in_thread(&thread.id).await.unwrap();
     assert_eq!(posts[1].body_md, "Edited reply.");
     pg.delete_post(&reply.id).await.expect("delete reply");
-    assert_eq!(pg.count_posts(&thread.id).await.unwrap(), 1, "reply deleted");
+    assert_eq!(
+        pg.count_posts(&thread.id).await.unwrap(),
+        1,
+        "reply deleted"
+    );
     // Deleting the reply clears it as the accepted answer AND drops its reactions (no orphans).
     assert!(
-        pg.get_thread(&thread.id).await.unwrap().unwrap().accepted_post_id.is_empty(),
+        pg.get_thread(&thread.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .accepted_post_id
+            .is_empty(),
         "accepted answer cleared when the reply is deleted"
     );
     assert!(
-        pg.reactions_for_post(&reply.id, None).await.unwrap().is_empty(),
+        pg.reactions_for_post(&reply.id, None)
+            .await
+            .unwrap()
+            .is_empty(),
         "reactions removed with the deleted post"
     );
-    let receipt_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM forum_post_read_receipts WHERE post_id = $1",
-    )
-    .bind(&reply.id)
-    .fetch_one(&raw)
-    .await
-    .unwrap();
+    let receipt_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM forum_post_read_receipts WHERE post_id = $1")
+            .bind(&reply.id)
+            .fetch_one(&raw)
+            .await
+            .unwrap();
     assert_eq!(receipt_count, 0, "post deletion cascades reading receipts");
 
     // Delete the whole thread: thread + remaining posts go together.
@@ -302,12 +438,19 @@ async fn pg_store_full_integration() {
         1,
         "only the separately-created HTTP thread remains"
     );
-    assert_eq!(pg.count_posts(&thread.id).await.unwrap(), 0, "thread's posts gone");
+    assert_eq!(
+        pg.count_posts(&thread.id).await.unwrap(),
+        0,
+        "thread's posts gone"
+    );
     assert!(pg.get_thread(&thread.id).await.unwrap().is_none());
 
     // Cleanup the throwaway tables.
     for tbl in ["post_reactions", "posts", "threads", "categories"] {
-        sqlx::query(&format!("DELETE FROM {tbl}")).execute(&raw).await.unwrap();
+        sqlx::query(&format!("DELETE FROM {tbl}"))
+            .execute(&raw)
+            .await
+            .unwrap();
     }
     println!(
         "PG STORE INTEGRATION OK: migrate (idempotent) + seed (idempotent) + create_thread + \

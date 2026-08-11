@@ -24,50 +24,91 @@ async fn reaction_toggle_is_idempotent_and_per_user() {
     let loc = create_thread(&state, "React here", "OP body.").await;
     let tid = loc.strip_prefix("/t/").unwrap().to_string();
     // The OP is the only post; grab its id from the store.
-    let pid = state.store.posts_in_thread(&tid).await.unwrap()[0].id.clone();
+    let pid = state.store.posts_in_thread(&tid).await.unwrap()[0]
+        .id
+        .clone();
     let react_uri = format!("/t/{tid}/p/{pid}/react");
 
     // Alice reacts "up" → count 1, and it renders as HER active reaction.
     let (s, _h, _b) = send(
         &state,
-        post_as(&react_uri, TOK, ALICE_SUB, ALICE_EMAIL, form(&[("csrf", TOK), ("kind", "up")])),
+        post_as(
+            &react_uri,
+            TOK,
+            ALICE_SUB,
+            ALICE_EMAIL,
+            form(&[("csrf", TOK), ("kind", "up")]),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::SEE_OTHER);
 
     let (_s, _h, page) = send(&state, get_as(&loc, ALICE_SUB, ALICE_EMAIL)).await;
-    assert!(page.contains(r##"data-wire-target="#post-"##));
-    assert!(page.contains("odyssey-wire v1"));
-    assert!(page.contains("odyssey-spark v1"));
-    assert!(!page.contains("handleReact"));
-    assert!(page.contains(r#"class="reaction is-mine""#), "alice sees her own reaction highlighted");
-    assert!(page.contains(r#"<span class="reaction__count">1</span>"#), "count is 1");
+    assert!(page.contains(&format!(
+        r#"<form class="inline-form" method="post" action="{react_uri}">"#
+    )));
+    assert!(page.contains(r#"<input type="hidden" name="kind" value="up">"#));
+    assert!(
+        page.contains(r#"class="ag-react is-mine" type="submit" aria-pressed="true""#),
+        "alice sees her own reaction highlighted without relying on Wire"
+    );
+    assert!(
+        page.contains(r#"<span class="ag-react__count">1</span>"#),
+        "count is 1"
+    );
 
     // Bob sees the same count of 1, but NOT highlighted as his.
     let (_s, _h, bpage) = send(&state, get_as(&loc, BOB_SUB, BOB_EMAIL)).await;
-    assert!(bpage.contains(r#"<span class="reaction__count">1</span>"#), "bob sees count 1");
-    assert!(!bpage.contains(r#"class="reaction is-mine""#), "not bob's reaction");
+    assert!(
+        bpage.contains(r#"<span class="ag-react__count">1</span>"#),
+        "bob sees count 1"
+    );
+    assert!(
+        bpage.contains(r#"class="ag-react" type="submit" aria-pressed="false""#),
+        "the same exact POST target is not painted as Bob's reaction"
+    );
 
     // Bob adds his own "up" → count 2. Two distinct users, unique per (post,user,kind).
     let (s, _h, _b) = send(
         &state,
-        post_as(&react_uri, TOK, BOB_SUB, BOB_EMAIL, form(&[("csrf", TOK), ("kind", "up")])),
+        post_as(
+            &react_uri,
+            TOK,
+            BOB_SUB,
+            BOB_EMAIL,
+            form(&[("csrf", TOK), ("kind", "up")]),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::SEE_OTHER);
     let (_s, _h, page) = send(&state, get_as(&loc, ALICE_SUB, ALICE_EMAIL)).await;
-    assert!(page.contains(r#"<span class="reaction__count">2</span>"#), "count is now 2");
+    assert!(
+        page.contains(r#"<span class="ag-react__count">2</span>"#),
+        "count is now 2"
+    );
 
     // Alice toggles "up" again → her reaction is removed (idempotent toggle), count back to 1.
     let (s, _h, _b) = send(
         &state,
-        post_as(&react_uri, TOK, ALICE_SUB, ALICE_EMAIL, form(&[("csrf", TOK), ("kind", "up")])),
+        post_as(
+            &react_uri,
+            TOK,
+            ALICE_SUB,
+            ALICE_EMAIL,
+            form(&[("csrf", TOK), ("kind", "up")]),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::SEE_OTHER);
     let (_s, _h, page) = send(&state, get_as(&loc, ALICE_SUB, ALICE_EMAIL)).await;
-    assert!(page.contains(r#"<span class="reaction__count">1</span>"#), "alice's toggle removed → 1");
-    assert!(!page.contains(r#"class="reaction is-mine""#), "alice no longer highlighted");
+    assert!(
+        page.contains(r#"<span class="ag-react__count">1</span>"#),
+        "alice's toggle removed → 1"
+    );
+    assert!(
+        page.contains(r#"class="ag-react" type="submit" aria-pressed="false""#),
+        "alice no longer owns the aggregate reaction"
+    );
 }
 
 #[tokio::test]
@@ -75,13 +116,20 @@ async fn react_requires_csrf_identity_and_known_kind() {
     let state = build_dev_state().await;
     let loc = create_thread(&state, "Guarded", "OP.").await;
     let tid = loc.strip_prefix("/t/").unwrap().to_string();
-    let pid = state.store.posts_in_thread(&tid).await.unwrap()[0].id.clone();
+    let pid = state.store.posts_in_thread(&tid).await.unwrap()[0]
+        .id
+        .clone();
     let react_uri = format!("/t/{tid}/p/{pid}/react");
 
     // No CSRF cookie → forbidden.
     let (s, _h, _b) = send(
         &state,
-        post_form(&react_uri, None, true, form(&[("csrf", TOK), ("kind", "up")])),
+        post_form(
+            &react_uri,
+            None,
+            true,
+            form(&[("csrf", TOK), ("kind", "up")]),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::FORBIDDEN);
@@ -89,7 +137,12 @@ async fn react_requires_csrf_identity_and_known_kind() {
     // Valid CSRF but no identity → unauthorized.
     let (s, _h, _b) = send(
         &state,
-        post_form(&react_uri, Some(TOK), false, form(&[("csrf", TOK), ("kind", "up")])),
+        post_form(
+            &react_uri,
+            Some(TOK),
+            false,
+            form(&[("csrf", TOK), ("kind", "up")]),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
@@ -97,14 +150,20 @@ async fn react_requires_csrf_identity_and_known_kind() {
     // Unknown reaction kind → bad request.
     let (s, _h, _b) = send(
         &state,
-        post_as(&react_uri, TOK, ALICE_SUB, ALICE_EMAIL, form(&[("csrf", TOK), ("kind", "rocket")])),
+        post_as(
+            &react_uri,
+            TOK,
+            ALICE_SUB,
+            ALICE_EMAIL,
+            form(&[("csrf", TOK), ("kind", "rocket")]),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
-async fn author_marks_accepted_answer_sorts_first_with_badge() {
+async fn author_marks_accepted_answer_renders_dais_first() {
     let state = build_dev_state().await;
     let loc = create_thread(&state, "Question", "How do I do X?").await;
     let tid = loc.strip_prefix("/t/").unwrap().to_string();
@@ -114,24 +173,56 @@ async fn author_marks_accepted_answer_sorts_first_with_badge() {
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     reply_as(&state, &loc, BOB_SUB, BOB_EMAIL, "First reply — not it.").await;
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    reply_as(&state, &loc, BOB_SUB, BOB_EMAIL, "Second reply — THE answer.").await;
+    reply_as(
+        &state,
+        &loc,
+        BOB_SUB,
+        BOB_EMAIL,
+        "Second reply — THE answer.",
+    )
+    .await;
 
     let posts = state.store.posts_in_thread(&tid).await.unwrap();
     assert_eq!(posts.len(), 3, "OP + two replies");
+    let first_reply = posts[1].id.clone();
     let second_reply = posts[2].id.clone();
 
     // A non-author (bob) cannot mark the accepted answer.
     let (s, _h, _b) = send(
         &state,
-        post_as(&format!("/t/{tid}/accept"), TOK, BOB_SUB, BOB_EMAIL, form(&[("csrf", TOK), ("action", "accept"), ("post_id", &second_reply)])),
+        post_as(
+            &format!("/t/{tid}/accept"),
+            TOK,
+            BOB_SUB,
+            BOB_EMAIL,
+            form(&[
+                ("csrf", TOK),
+                ("action", "accept"),
+                ("post_id", &second_reply),
+            ]),
+        ),
     )
     .await;
-    assert_eq!(s, StatusCode::FORBIDDEN, "only the thread author/admin may accept");
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "only the thread author/admin may accept"
+    );
 
     // The thread author (alice) marks the SECOND reply as accepted.
     let (s, _h, _b) = send(
         &state,
-        post_as(&format!("/t/{tid}/accept"), TOK, ALICE_SUB, ALICE_EMAIL, form(&[("csrf", TOK), ("action", "accept"), ("post_id", &second_reply)])),
+        post_as(
+            &format!("/t/{tid}/accept"),
+            TOK,
+            ALICE_SUB,
+            ALICE_EMAIL,
+            form(&[
+                ("csrf", TOK),
+                ("action", "accept"),
+                ("post_id", &second_reply),
+            ]),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::SEE_OTHER);
@@ -140,18 +231,28 @@ async fn author_marks_accepted_answer_sorts_first_with_badge() {
     let reloaded = state.store.get_thread(&tid).await.unwrap().unwrap();
     assert_eq!(reloaded.accepted_post_id, second_reply);
 
-    // Render: the accepted reply owns one labelled Solution region and appears before the first
+    // Render: the accepted reply owns one labelled Answer Dais and appears before the first
     // ordinary reply. Its content is not duplicated in the normal stream.
     let (_s, _h, page) = send(&state, get_as(&loc, ALICE_SUB, ALICE_EMAIL)).await;
     assert!(
-        page.contains("Accepted answer"),
-        "accepted heading rendered"
+        page.contains(r#"id="ag-dais-title">Answer Dais</h2>"#),
+        "accepted heading rendered in the typed dais"
     );
-    assert_eq!(page.matches(r#"class="ag-solution""#).count(), 1);
+    assert_eq!(
+        page.matches(r#"<section class="ag-dais ag-key-shared" aria-labelledby="ag-dais-title">"#)
+            .count(),
+        1
+    );
+    assert!(page.contains(
+        "Accepted by the asker or an authorized moderator. This marks acceptance, not objective correctness."
+    ));
+    assert_eq!(
+        page.matches(&format!(r#"id="post-{second_reply}""#))
+            .count(),
+        1,
+        "the accepted post has one exact typed target"
+    );
     assert_eq!(page.matches("Second reply").count(), 1);
-    assert!(page.contains(".ag-solution .post[id] {"));
-    assert!(page.contains("scroll-margin-top:calc(var(--appbar-h,56px) + 124px);"));
-    assert!(page.contains("scroll-margin-top:calc(var(--appbar-h,56px) + 60px);"));
     let acc = page.find("Second reply").expect("accepted reply present");
     let first = page.find("First reply").expect("first reply present");
     assert!(acc < first, "accepted reply sorts before the earlier reply");
@@ -159,21 +260,120 @@ async fn author_marks_accepted_answer_sorts_first_with_badge() {
     // Accept is idempotent: repeating it leaves the same solution selected.
     let (s, _h, _b) = send(
         &state,
-        post_as(&format!("/t/{tid}/accept"), TOK, ALICE_SUB, ALICE_EMAIL, form(&[("csrf", TOK), ("action", "accept"), ("post_id", &second_reply)])),
+        post_as(
+            &format!("/t/{tid}/accept"),
+            TOK,
+            ALICE_SUB,
+            ALICE_EMAIL,
+            form(&[
+                ("csrf", TOK),
+                ("action", "accept"),
+                ("post_id", &second_reply),
+            ]),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::SEE_OTHER);
     let reloaded = state.store.get_thread(&tid).await.unwrap().unwrap();
     assert_eq!(reloaded.accepted_post_id, second_reply);
 
-    // Clear is its own idempotent command and does not depend on a target field.
+    // A different explicit accept may replace the solution.
     let (s, _h, _b) = send(
         &state,
-        post_as(&format!("/t/{tid}/accept"), TOK, ALICE_SUB, ALICE_EMAIL, form(&[("csrf", TOK), ("action", "clear")])),
+        post_as(
+            &format!("/t/{tid}/accept"),
+            TOK,
+            ALICE_SUB,
+            ALICE_EMAIL,
+            form(&[
+                ("csrf", TOK),
+                ("action", "accept"),
+                ("post_id", &first_reply),
+            ]),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::SEE_OTHER);
-    assert!(state.store.get_thread(&tid).await.unwrap().unwrap().accepted_post_id.is_empty());
+    assert_eq!(
+        state
+            .store
+            .get_thread(&tid)
+            .await
+            .unwrap()
+            .unwrap()
+            .accepted_post_id,
+        first_reply
+    );
+
+    // A stale "Remove solution" form for the old answer cannot clear the newer selection.
+    let (s, _h, _b) = send(
+        &state,
+        post_as(
+            &format!("/t/{tid}/accept"),
+            TOK,
+            ALICE_SUB,
+            ALICE_EMAIL,
+            form(&[
+                ("csrf", TOK),
+                ("action", "clear"),
+                ("post_id", &second_reply),
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert_eq!(
+        state
+            .store
+            .get_thread(&tid)
+            .await
+            .unwrap()
+            .unwrap()
+            .accepted_post_id,
+        first_reply
+    );
+
+    // Clear is idempotent when retried against the same server-issued target.
+    let (s, _h, _b) = send(
+        &state,
+        post_as(
+            &format!("/t/{tid}/accept"),
+            TOK,
+            ALICE_SUB,
+            ALICE_EMAIL,
+            form(&[
+                ("csrf", TOK),
+                ("action", "clear"),
+                ("post_id", &first_reply),
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::SEE_OTHER);
+    assert!(state
+        .store
+        .get_thread(&tid)
+        .await
+        .unwrap()
+        .unwrap()
+        .accepted_post_id
+        .is_empty());
+    let (s, _h, _b) = send(
+        &state,
+        post_as(
+            &format!("/t/{tid}/accept"),
+            TOK,
+            ALICE_SUB,
+            ALICE_EMAIL,
+            form(&[
+                ("csrf", TOK),
+                ("action", "clear"),
+                ("post_id", &first_reply),
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::SEE_OTHER);
 }
 
 #[tokio::test]
@@ -181,14 +381,26 @@ async fn original_post_cannot_be_accepted() {
     let state = build_dev_state().await;
     let loc = create_thread(&state, "No OP accept", "OP body.").await;
     let tid = loc.strip_prefix("/t/").unwrap().to_string();
-    let op_id = state.store.posts_in_thread(&tid).await.unwrap()[0].id.clone();
+    let op_id = state.store.posts_in_thread(&tid).await.unwrap()[0]
+        .id
+        .clone();
 
     let (s, _h, _b) = send(
         &state,
-        post_as(&format!("/t/{tid}/accept"), TOK, ALICE_SUB, ALICE_EMAIL, form(&[("csrf", TOK), ("action", "accept"), ("post_id", &op_id)])),
+        post_as(
+            &format!("/t/{tid}/accept"),
+            TOK,
+            ALICE_SUB,
+            ALICE_EMAIL,
+            form(&[("csrf", TOK), ("action", "accept"), ("post_id", &op_id)]),
+        ),
     )
     .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "the OP can never be the accepted answer");
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "the OP can never be the accepted answer"
+    );
     let reloaded = state.store.get_thread(&tid).await.unwrap().unwrap();
     assert!(reloaded.accepted_post_id.is_empty());
 }
@@ -196,15 +408,28 @@ async fn original_post_cannot_be_accepted() {
 // --- helpers ---------------------------------------------------------------------------
 
 async fn create_thread(state: &AppState, title: &str, body_md: &str) -> String {
-    let body = form(&[("csrf", TOK), ("category", "support"), ("title", title), ("body", body_md)]);
+    let body = form(&[
+        ("csrf", TOK),
+        ("category", "support"),
+        ("title", title),
+        ("body", body_md),
+    ]);
     let (status, h, _b) = send(state, post_as("/new", TOK, ALICE_SUB, ALICE_EMAIL, body)).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    h.get(header::LOCATION).unwrap().to_str().unwrap().to_string()
+    h.get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string()
 }
 
 async fn reply_as(state: &AppState, loc: &str, sub: &str, email: &str, body_md: &str) {
     let body = form(&[("csrf", TOK), ("body", body_md)]);
-    let (s, _h, _b) = send(state, post_as(&format!("{loc}/reply"), TOK, sub, email, body)).await;
+    let (s, _h, _b) = send(
+        state,
+        post_as(&format!("{loc}/reply"), TOK, sub, email, body),
+    )
+    .await;
     assert_eq!(s, StatusCode::SEE_OTHER);
 }
 
@@ -212,7 +437,9 @@ async fn send(state: &AppState, req: Request<Body>) -> (StatusCode, HeaderMap, S
     let resp = app(state.clone()).oneshot(req).await.unwrap();
     let status = resp.status();
     let headers = resp.headers().clone();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     (status, headers, String::from_utf8(bytes.to_vec()).unwrap())
 }
 
@@ -265,7 +492,9 @@ fn enc(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }

@@ -16,11 +16,19 @@ use serde::Deserialize;
 use crate::audit::AuditEvent;
 use crate::auth;
 use crate::error::AppError;
-use crate::handlers::forum::{html_response, redirect_to, render_admin_thread_toolbar};
+use crate::handlers::forum::{html_response, redirect_to};
 use crate::handlers::{
-    email_display, esc, fmt_ts, personal_counts, render_page_with_personal_counts,
+    category_vm, form_action, hidden_field, link_action, page_chrome, personal_counts,
+    thread_row_shared,
 };
 use crate::model::{BannedAuthor, Category, CategoryFormat};
+use crate::view_model::{
+    ActionKind, AddBanFormVM, AdminCategoryVM, AdminShared, AdminThreadToolbarVM, AdminThreadVM,
+    AdminView, AdminViewerState, BannedAuthorVM, CollectionState, ConsequenceVM,
+    CreateCategoryFormVM, DestructiveReviewVM, MoveThreadFormVM as MoveThreadFormViewModel, NavTab,
+    Opaque, RenameCategoryFormVM, Text, ThreadKind,
+};
+use crate::views::{admin, shell};
 use crate::{now_secs, AppState};
 
 /// Recent threads listed on the admin dashboard.
@@ -38,6 +46,58 @@ fn actor(headers: &HeaderMap) -> String {
         .unwrap_or_else(|| "admin".to_string())
 }
 
+fn category_delete_action(id: &str) -> String {
+    format!("admin.category.delete:{id}")
+}
+
+fn thread_delete_action(id: &str) -> String {
+    format!("admin.thread.delete:{id}")
+}
+
+fn post_delete_action(id: &str) -> String {
+    format!("admin.post.delete:{id}")
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn destructive_review_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    actor_sub: &str,
+    page_title: &str,
+    heading: &str,
+    consequence: &str,
+    action_path: &str,
+    action_key: &str,
+    cancel_href: &str,
+) -> Result<Response, AppError> {
+    let (csrf, set_cookie) = auth::ensure_csrf(headers);
+    let confirm = auth::new_destructive_confirmation(
+        state.config.destructive_confirmation_key(),
+        &csrf,
+        action_key,
+        actor_sub,
+    );
+    let review = DestructiveReviewVM {
+        heading: Text(heading.to_string()),
+        consequence: ConsequenceVM {
+            summary: Text(consequence.to_string()),
+            detail: None,
+        },
+        commit: form_action(
+            action_path,
+            ActionKind::DeleteConfirm,
+            csrf,
+            vec![hidden_field("confirm", confirm)],
+        ),
+        cancel_href: Opaque(cancel_href.to_string()),
+    };
+    let content = shell::destructive_review(&review);
+    let counts = personal_counts(state, headers, now_secs()).await?;
+    let chrome = page_chrome(page_title, headers, NavTab::Home, counts);
+    let html = shell::page(&chrome, &content);
+    Ok(html_response(html, set_cookie))
+}
+
 // ===========================================================================
 // GET /admin — dashboard
 // ===========================================================================
@@ -52,163 +112,170 @@ pub async fn dashboard(
     let threads = state.store.recent_threads(ADMIN_THREAD_LIMIT).await?;
     let bans = state.store.list_bans().await?;
 
-    // --- categories: rename / reorder / delete rows + a create form ---------
-    let mut cat_rows = String::new();
-    for c in &categories {
-        let count = state.store.count_threads(&c.id).await?;
-        cat_rows.push_str(&format!(
-            r#"<div class="admin-row ag-admin--cat">
-  <form class="inline-form" method="post" action="/admin/categories/{id}/rename">
-    <input type="hidden" name="csrf" value="{csrf}">
-    <input type="text" name="name" maxlength="{maxn}" value="{name}" required>
-    <button class="btn btn-secondary btn-sm" type="submit">Rename</button>
-  </form>
-  <form class="inline-form" method="post" action="/admin/categories/{id}/format">
-    <input type="hidden" name="csrf" value="{csrf}">
-    <select name="format" aria-label="Category format">
-      <option value="discussion"{discussion_selected}>Discussion</option>
-      <option value="question"{question_selected}>Question</option>
-    </select>
-    <button class="btn btn-secondary btn-sm" type="submit">Set format</button>
-  </form>
-  <span class="muted">{count} {tw} · <code>{id}</code></span>
-  <form class="inline-form" method="post" action="/admin/categories/{id}/reorder">
-    <input type="hidden" name="csrf" value="{csrf}">
-    <button class="btn btn-ghost btn-sm" name="dir" value="up" type="submit">↑</button>
-    <button class="btn btn-ghost btn-sm" name="dir" value="down" type="submit">↓</button>
-  </form>
-  <form class="inline-form" method="post" action="/admin/categories/{id}/delete" onsubmit="return confirm('Delete this category?');">
-    <input type="hidden" name="csrf" value="{csrf}">
-    <button class="btn btn-danger btn-sm" type="submit">Delete</button>
-  </form>
-</div>"#,
-            id = esc(&c.id),
-            csrf = esc(&csrf),
-            maxn = MAX_NAME,
-            name = esc(&c.name),
-            count = count,
-            tw = if count == 1 { "thread" } else { "threads" },
-            discussion_selected = if c.format == CategoryFormat::Discussion {
-                " selected"
-            } else {
-                ""
+    let admin_categories = categories
+        .iter()
+        .enumerate()
+        .map(|(index, category)| {
+            let reorder_action = format!("/admin/categories/{}/reorder", category.id);
+            AdminCategoryVM {
+                category: category_vm(category),
+                rename: RenameCategoryFormVM {
+                    name_max_chars: MAX_NAME,
+                    submit: form_action(
+                        format!("/admin/categories/{}/rename", category.id),
+                        ActionKind::RenameCategory,
+                        csrf.clone(),
+                        Vec::new(),
+                    ),
+                },
+                set_format: form_action(
+                    format!("/admin/categories/{}/format", category.id),
+                    ActionKind::SetCategoryFormat,
+                    csrf.clone(),
+                    Vec::new(),
+                ),
+                move_up: (index > 0).then(|| {
+                    form_action(
+                        reorder_action.clone(),
+                        ActionKind::MoveCategoryUp,
+                        csrf.clone(),
+                        vec![hidden_field("dir", "up")],
+                    )
+                }),
+                move_down: (index + 1 < categories.len()).then(|| {
+                    form_action(
+                        reorder_action,
+                        ActionKind::MoveCategoryDown,
+                        csrf.clone(),
+                        vec![hidden_field("dir", "down")],
+                    )
+                }),
+                delete_review: link_action(
+                    format!("/admin/categories/{}/delete", category.id),
+                    ActionKind::DeleteAdminReview,
+                ),
+            }
+        })
+        .collect();
+
+    let category_choices = categories
+        .iter()
+        .map(|category| category_vm(category).category)
+        .collect::<Vec<_>>();
+    let mut admin_threads = Vec::with_capacity(threads.len());
+    for thread in &threads {
+        let category = categories
+            .iter()
+            .find(|category| category.id == thread.category_id);
+        let accepted = state
+            .store
+            .get_valid_accepted_post(&thread.id)
+            .await?
+            .is_some();
+        admin_threads.push(AdminThreadVM {
+            thread: thread_row_shared(thread, category, None, accepted),
+            toolbar: AdminThreadToolbarVM {
+                move_thread: Some(MoveThreadFormViewModel {
+                    selected_category: Opaque(thread.category_id.clone()),
+                    categories: category_choices.clone(),
+                    submit: form_action(
+                        format!("/admin/threads/{}/move", thread.id),
+                        ActionKind::MoveThread,
+                        csrf.clone(),
+                        Vec::new(),
+                    ),
+                }),
+                lock: Some(form_action(
+                    format!("/admin/threads/{}/lock", thread.id),
+                    if thread.locked {
+                        ActionKind::Unlock
+                    } else {
+                        ActionKind::Lock
+                    },
+                    csrf.clone(),
+                    vec![hidden_field(
+                        "state",
+                        if thread.locked { "unlocked" } else { "locked" },
+                    )],
+                )),
+                pin: Some(form_action(
+                    format!("/admin/threads/{}/pin", thread.id),
+                    if thread.pinned {
+                        ActionKind::Unpin
+                    } else {
+                        ActionKind::Pin
+                    },
+                    csrf.clone(),
+                    vec![hidden_field(
+                        "state",
+                        if thread.pinned { "unpinned" } else { "pinned" },
+                    )],
+                )),
+                delete_review: Some(link_action(
+                    format!("/admin/threads/{}/delete", thread.id),
+                    ActionKind::DeleteAdminReview,
+                )),
             },
-            question_selected = if c.format == CategoryFormat::Question {
-                " selected"
-            } else {
-                ""
-            },
-        ));
+        });
     }
 
-    let create_cat = format!(
-        r#"<div class="ag-admin-new"><form class="form inline-form" method="post" action="/admin/categories">
-  <input type="hidden" name="csrf" value="{csrf}">
-  <input type="text" name="id" maxlength="{maxid}" placeholder="slug-id" required>
-  <input type="text" name="name" maxlength="{maxn}" placeholder="Display name" required>
-  <select name="format" aria-label="Category format">
-    <option value="discussion">Discussion</option>
-    <option value="question">Question</option>
-  </select>
-  <button class="btn btn-primary btn-sm" type="submit">Add category</button>
-</form></div>"#,
-        csrf = esc(&csrf),
-        maxid = MAX_CATEGORY_ID,
-        maxn = MAX_NAME,
-    );
-
-    // --- threads: each with the shared lock/pin/move/delete toolbar ---------
-    let mut thread_rows = String::new();
-    for t in &threads {
-        thread_rows.push_str(&format!(
-            r#"<div class="admin-row ag-admin--thread">
-  <a class="thread-row__title" href="/t/{id}">{title}</a>
-  {toolbar}
-</div>"#,
-            id = esc(&t.id),
-            title = esc(&t.title),
-            toolbar = render_admin_thread_toolbar(t, &categories, &csrf),
-        ));
-    }
-    if thread_rows.is_empty() {
-        thread_rows = r#"<div class="empty">No threads yet.</div>"#.to_string();
-    }
-
-    // --- bans: list + remove, plus an add form ------------------------------
-    let mut ban_rows = String::new();
-    for b in &bans {
-        ban_rows.push_str(&format!(
-            r#"<div class="admin-row ag-admin--ban">
-  <span><code>{sub}</code>{reason} <span class="muted">· by {by} · {when}</span></span>
-  <form class="inline-form" method="post" action="/admin/bans/{sub_enc}/delete">
-    <input type="hidden" name="csrf" value="{csrf}">
-    <button class="btn btn-secondary btn-sm" type="submit">Unban</button>
-  </form>
-</div>"#,
-            sub = esc(&b.author_sub),
-            reason = if b.reason.is_empty() {
-                String::new()
-            } else {
-                format!(" — {}", esc(&b.reason))
-            },
-            by = esc(&b.banned_by),
-            when = esc(&fmt_ts(b.created_at)),
-            sub_enc = esc(&b.author_sub),
-            csrf = esc(&csrf),
-        ));
-    }
-    if ban_rows.is_empty() {
-        ban_rows = r#"<div class="empty">No blocked authors.</div>"#.to_string();
-    }
-    let add_ban = format!(
-        r#"<div class="ag-admin-new"><form class="form inline-form" method="post" action="/admin/bans">
-  <input type="hidden" name="csrf" value="{csrf}">
-  <input type="text" name="author_sub" maxlength="{maxsub}" placeholder="author subject id" required>
-  <input type="text" name="reason" maxlength="{maxr}" placeholder="reason (optional)">
-  <button class="btn btn-danger btn-sm" type="submit">Block author</button>
-</form></div>"#,
-        csrf = esc(&csrf),
-        maxsub = MAX_SUB,
-        maxr = MAX_REASON,
-    );
-
-    let content = format!(
-        r#"<nav class="crumbs"><a href="/">Home</a><span class="crumbs__sep">/</span><span>Admin</span></nav>
-<div class="page-head"><div><h1>Admin</h1><p class="muted">Moderate categories, threads, and authors.</p></div></div>
-<div class="stat-grid ag-admin-stats">
-  <div class="stat"><span class="stat__label">Categories</span><b class="stat__value">{cat_count}</b></div>
-  <div class="stat"><span class="stat__label">Recent threads</span><b class="stat__value">{thread_count}</b></div>
-  <div class="stat"><span class="stat__label">Blocked authors</span><b class="stat__value">{ban_count}</b></div>
-</div>
-<section class="section">
-  <div class="ag-sect__head"><h2 class="section__title">Categories</h2><span class="ag-count">{cat_count}</span></div>
-  <div class="card ag-rows">{cat_rows}{create_cat}</div>
-</section>
-<section class="section">
-  <div class="ag-sect__head"><h2 class="section__title">Threads</h2><span class="ag-count">{thread_count}</span></div>
-  <div class="card ag-rows">{thread_rows}</div>
-</section>
-<section class="section">
-  <div class="ag-sect__head"><h2 class="section__title">Blocked authors</h2><span class="ag-count">{ban_count}</span></div>
-  <div class="card ag-rows">{ban_rows}{add_ban}</div>
-</section>"#,
-        cat_count = categories.len(),
-        thread_count = threads.len(),
-        ban_count = bans.len(),
-        cat_rows = cat_rows,
-        create_cat = create_cat,
-        thread_rows = thread_rows,
-        ban_rows = ban_rows,
-        add_ban = add_ban,
-    );
+    let banned_authors = bans
+        .iter()
+        .map(|ban| BannedAuthorVM {
+            // The handler deliberately approves the stable subject as the display label. The view
+            // cannot recover the unban target from this text; authority remains sealed in `unban`.
+            author_display: Text(ban.author_sub.clone()),
+            reason: Text(ban.reason.clone()),
+            banned_by: Text(ban.banned_by.clone()),
+            created_at: ban.created_at,
+            unban: form_action(
+                "/admin/bans/delete",
+                ActionKind::Unban,
+                csrf.clone(),
+                vec![hidden_field("author_sub", ban.author_sub.clone())],
+            ),
+        })
+        .collect();
 
     let counts = personal_counts(&state, &headers, now).await?;
-    let html = render_page_with_personal_counts(
-        "Admin",
-        &email_display(&headers),
-        &content,
-        counts,
-    );
+    let view = AdminView {
+        chrome: page_chrome("Administration", &headers, NavTab::Home, counts),
+        shared: AdminShared {
+            visible_thread_bound: ADMIN_THREAD_LIMIT,
+            state: if threads.is_empty() {
+                CollectionState::ReadyEmpty
+            } else {
+                CollectionState::Ready
+            },
+            now,
+        },
+        viewer: AdminViewerState {
+            create_category: CreateCategoryFormVM {
+                id: Text(String::new()),
+                name: Text(String::new()),
+                selected_kind: ThreadKind::Discussion,
+                id_max_chars: MAX_CATEGORY_ID,
+                name_max_chars: MAX_NAME,
+                submit: form_action(
+                    "/admin/categories",
+                    ActionKind::CreateCategory,
+                    csrf.clone(),
+                    Vec::new(),
+                ),
+            },
+            add_ban: AddBanFormVM {
+                subject_input: Text(String::new()),
+                reason: Text(String::new()),
+                author_sub_max_chars: MAX_SUB,
+                reason_max_chars: MAX_REASON,
+                submit: form_action("/admin/bans", ActionKind::AddBan, csrf, Vec::new()),
+            },
+            categories: admin_categories,
+            threads: admin_threads,
+            banned_authors,
+        },
+    };
+    let html = admin::admin(&view);
     Ok(html_response(html, set_cookie))
 }
 
@@ -407,13 +474,54 @@ pub struct CsrfForm {
     pub csrf: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct DeleteConfirmForm {
+    #[serde(default)]
+    pub csrf: String,
+    #[serde(default)]
+    pub confirm: String,
+}
+
+pub async fn delete_category_review(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let admin = auth::require_author(&headers)?;
+    let category = state
+        .store
+        .get_category(&id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("category not found".to_string()))?;
+    if state.store.count_threads(&id).await? > 0 {
+        return Err(AppError::InvalidRequest(
+            "category still has threads — move or delete them first".to_string(),
+        ));
+    }
+    destructive_review_response(
+        &state,
+        &headers,
+        &admin.sub,
+        "Review category deletion",
+        "Delete category?",
+        &format!(
+            "The empty category “{}” ({}) will be permanently deleted.",
+            category.name, category.id
+        ),
+        &format!("/admin/categories/{id}/delete"),
+        &category_delete_action(&id),
+        "/admin",
+    )
+    .await
+}
+
 pub async fn delete_category(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Form(form): Form<CsrfForm>,
+    Form(form): Form<DeleteConfirmForm>,
 ) -> Result<Response, AppError> {
-    auth::verify_csrf(&headers, &form.csrf)?;
+    let admin = auth::require_author(&headers)?;
     if state.store.get_category(&id).await?.is_none() {
         return Err(AppError::NotFound("category not found".to_string()));
     }
@@ -423,6 +531,14 @@ pub async fn delete_category(
             "category still has threads — move or delete them first".to_string(),
         ));
     }
+    auth::consume_destructive_confirmation(
+        state.config.destructive_confirmation_key(),
+        &headers,
+        &form.csrf,
+        &form.confirm,
+        &category_delete_action(&id),
+        &admin.sub,
+    )?;
     state.store.delete_category(&id).await?;
     state.audit.emit(AuditEvent::notice(
         "admin.category.delete",
@@ -437,19 +553,35 @@ pub async fn delete_category(
 // Thread moderation
 // ===========================================================================
 
+#[derive(Debug, Deserialize)]
+pub struct ThreadStateForm {
+    #[serde(default)]
+    pub csrf: String,
+    #[serde(default)]
+    pub state: String,
+}
+
 pub async fn lock_thread(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Form(form): Form<CsrfForm>,
+    Form(form): Form<ThreadStateForm>,
 ) -> Result<Response, AppError> {
     auth::verify_csrf(&headers, &form.csrf)?;
-    let thread = state
+    let _thread = state
         .store
         .get_thread(&id)
         .await?
         .ok_or_else(|| AppError::NotFound("thread not found".to_string()))?;
-    let locked = !thread.locked;
+    let locked = match form.state.trim() {
+        "locked" => true,
+        "unlocked" => false,
+        _ => {
+            return Err(AppError::InvalidRequest(
+                "thread lock state must be locked or unlocked".to_string(),
+            ));
+        }
+    };
     state.store.set_thread_locked(&id, locked).await?;
     state.audit.emit(AuditEvent::notice(
         "admin.thread.lock",
@@ -464,15 +596,23 @@ pub async fn pin_thread(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Form(form): Form<CsrfForm>,
+    Form(form): Form<ThreadStateForm>,
 ) -> Result<Response, AppError> {
     auth::verify_csrf(&headers, &form.csrf)?;
-    let thread = state
+    let _thread = state
         .store
         .get_thread(&id)
         .await?
         .ok_or_else(|| AppError::NotFound("thread not found".to_string()))?;
-    let pinned = !thread.pinned;
+    let pinned = match form.state.trim() {
+        "pinned" => true,
+        "unpinned" => false,
+        _ => {
+            return Err(AppError::InvalidRequest(
+                "thread pin state must be pinned or unpinned".to_string(),
+            ));
+        }
+    };
     state.store.set_thread_pinned(&id, pinned).await?;
     state.audit.emit(AuditEvent::notice(
         "admin.thread.pin",
@@ -512,16 +652,55 @@ pub async fn move_thread(
     Ok(redirect_to(&format!("/t/{id}")))
 }
 
+pub async fn delete_thread_review(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let admin = auth::require_author(&headers)?;
+    let thread = state
+        .store
+        .get_thread(&id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("thread not found".to_string()))?;
+    let reply_count = state.store.count_posts(&id).await?.saturating_sub(1);
+    destructive_review_response(
+        &state,
+        &headers,
+        &admin.sub,
+        "Review admin thread deletion",
+        "Delete thread as administrator?",
+        &format!(
+            "The thread “{}” and its {} {} will be permanently deleted.",
+            thread.title,
+            reply_count,
+            if reply_count == 1 { "reply" } else { "replies" }
+        ),
+        &format!("/admin/threads/{id}/delete"),
+        &thread_delete_action(&id),
+        &format!("/t/{id}"),
+    )
+    .await
+}
+
 pub async fn delete_thread(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Form(form): Form<CsrfForm>,
+    Form(form): Form<DeleteConfirmForm>,
 ) -> Result<Response, AppError> {
-    auth::verify_csrf(&headers, &form.csrf)?;
+    let admin = auth::require_author(&headers)?;
     if state.store.get_thread(&id).await?.is_none() {
         return Err(AppError::NotFound("thread not found".to_string()));
     }
+    auth::consume_destructive_confirmation(
+        state.config.destructive_confirmation_key(),
+        &headers,
+        &form.csrf,
+        &form.confirm,
+        &thread_delete_action(&id),
+        &admin.sub,
+    )?;
     state.store.delete_thread(&id).await?;
     state.audit.emit(AuditEvent::notice(
         "admin.thread.delete",
@@ -536,13 +715,12 @@ pub async fn delete_thread(
 // Any-post deletion
 // ===========================================================================
 
-pub async fn delete_post(
+pub async fn delete_post_review(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Form(form): Form<CsrfForm>,
 ) -> Result<Response, AppError> {
-    auth::verify_csrf(&headers, &form.csrf)?;
+    let admin = auth::require_author(&headers)?;
     let post = state
         .store
         .get_post(&id)
@@ -555,6 +733,50 @@ pub async fn delete_post(
             "the original post cannot be deleted separately; delete the thread".to_string(),
         ));
     }
+    destructive_review_response(
+        &state,
+        &headers,
+        &admin.sub,
+        "Review admin post deletion",
+        "Delete reply as administrator?",
+        &format!(
+            "The reply by {} will be permanently removed from this thread.",
+            post.author_email
+        ),
+        &format!("/admin/posts/{id}/delete"),
+        &post_delete_action(&id),
+        &format!("/t/{thread_id}"),
+    )
+    .await
+}
+
+pub async fn delete_post(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<DeleteConfirmForm>,
+) -> Result<Response, AppError> {
+    let admin = auth::require_author(&headers)?;
+    let post = state
+        .store
+        .get_post(&id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("post not found".to_string()))?;
+    let thread_id = post.thread_id.clone();
+    let op = state.store.first_post_in_thread(&thread_id).await?;
+    if op.as_ref().is_some_and(|original| original.id == id) {
+        return Err(AppError::InvalidRequest(
+            "the original post cannot be deleted separately; delete the thread".to_string(),
+        ));
+    }
+    auth::consume_destructive_confirmation(
+        state.config.destructive_confirmation_key(),
+        &headers,
+        &form.csrf,
+        &form.confirm,
+        &post_delete_action(&id),
+        &admin.sub,
+    )?;
     state.store.delete_post(&id).await?;
     state.audit.emit(AuditEvent::notice(
         "admin.post.delete",
@@ -611,18 +833,31 @@ pub async fn add_ban(
     Ok(redirect_to("/admin"))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RemoveBanForm {
+    #[serde(default)]
+    pub csrf: String,
+    #[serde(default)]
+    pub author_sub: String,
+}
+
 pub async fn remove_ban(
     State(state): State<AppState>,
-    Path(sub): Path<String>,
     headers: HeaderMap,
-    Form(form): Form<CsrfForm>,
+    Form(form): Form<RemoveBanForm>,
 ) -> Result<Response, AppError> {
     auth::verify_csrf(&headers, &form.csrf)?;
-    state.store.remove_ban(&sub).await?;
+    let author_sub = form.author_sub.trim();
+    if author_sub.is_empty() || author_sub.len() > MAX_SUB {
+        return Err(AppError::InvalidRequest(
+            "author subject id is required".to_string(),
+        ));
+    }
+    state.store.remove_ban(author_sub).await?;
     state.audit.emit(AuditEvent::notice(
         "admin.author.unban",
         &actor(&headers),
-        &sub,
+        author_sub,
         "unban",
     ));
     Ok(redirect_to("/admin"))

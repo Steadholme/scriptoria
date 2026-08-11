@@ -58,13 +58,19 @@ async fn reply_fanout_deduplicates_paths_and_suppresses_actor() {
         "actor never receives their own @mention/follow delivery"
     );
 
+    let delete_uri = format!("/t/{thread_id}/p/{reply_id}/delete");
+    let (review_status, _, review_body) =
+        send(&state, get_as_with_csrf(&delete_uri, BOB_SUB, BOB_EMAIL)).await;
+    assert_eq!(review_status, StatusCode::OK);
+    let confirm = hidden_input_value(&review_body, "confirm");
+
     let (status, _, _) = send(
         &state,
         post_as(
-            &format!("/t/{thread_id}/p/{reply_id}/delete"),
+            &delete_uri,
             BOB_SUB,
             BOB_EMAIL,
-            form(&[("csrf", TOK)]),
+            form(&[("csrf", TOK), ("confirm", &confirm)]),
         ),
     )
     .await;
@@ -531,12 +537,31 @@ async fn admin_accept_uses_actor_subject_and_activity_filters_are_navigation() {
     assert_eq!(accepted.event.actor_sub, "u_admin_without_profile");
     assert!(accepted.actor_email.is_empty());
 
-    let (_, _, page) = send(&state, get_as("/activity", BOB_SUB, BOB_EMAIL)).await;
-    assert!(page.contains("<strong>u_admin_without_profile</strong> accepted your answer"));
-    assert!(!page.contains("<strong>alice@steadholme.local</strong> accepted your answer"));
-    assert!(page.contains(r#"aria-current="page""#));
-    assert!(!page.contains("role=\"tablist\""));
-    assert!(!page.contains("aria-selected="));
+    let (_, _, page) = send(&state, get_as_with_csrf("/activity", BOB_SUB, BOB_EMAIL)).await;
+    assert!(page.contains("Answer accepted"));
+    assert!(page.contains("Answer activity"));
+    assert!(page.contains(r#"<span class="ag-row__author">u_admin_without_profile</span>"#));
+    assert!(!page.contains(r#"<span class="ag-row__author">alice@steadholme.local</span>"#));
+    assert!(page.contains(&format!(
+        r#"method="post" action="/activity/{}/open""#,
+        accepted.event.id
+    )));
+    assert!(page.contains(&format!(
+        r#"name="next" value="/t/{thread_id}?around={}_{}#post-{}""#,
+        accepted.post_created_at, accepted.event.post_id, accepted.event.post_id
+    )));
+    assert!(page.contains(&format!(r#"name="csrf" value="{TOK}""#)));
+    assert!(page.contains(r#"<nav class="tabs" aria-label="Activity state">"#));
+    assert!(page.contains(r#"<nav class="tabs ag-activity-reasons" aria-label="Activity reason">"#));
+    assert_eq!(
+        page.matches(r#"class="tab is-active" aria-current="page""#)
+            .count(),
+        2,
+        "each query-navigation group identifies its current page"
+    );
+    assert!(!page.contains(r#"role="tablist""#));
+    assert!(!page.contains(r#"role="tab""#));
+    assert!(!page.contains(r#"aria-selected="#));
 }
 
 async fn activity(state: &AppState, subject: &str) -> Vec<agora::model::ActivityItem> {
@@ -662,6 +687,16 @@ fn get_as(uri: &str, subject: &str, email: &str) -> Request<Body> {
         .unwrap()
 }
 
+fn get_as_with_csrf(uri: &str, subject: &str, email: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header(header::COOKIE, format!("__Host-csrf={TOK}"))
+        .header("x-auth-subject", subject)
+        .header("x-auth-email", email)
+        .body(Body::empty())
+        .unwrap()
+}
+
 fn post_as(uri: &str, subject: &str, email: &str, body: String) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -710,6 +745,19 @@ fn form(pairs: &[(&str, &str)]) -> String {
         .map(|(key, value)| format!("{}={}", encode(key), encode(value)))
         .collect::<Vec<_>>()
         .join("&")
+}
+
+fn hidden_input_value(body: &str, name: &str) -> String {
+    let marker = format!(r#"name="{name}" value=""#);
+    let start = body
+        .find(&marker)
+        .map(|index| index + marker.len())
+        .unwrap_or_else(|| panic!("hidden input {name:?} missing"));
+    let end = body[start..]
+        .find('"')
+        .map(|index| start + index)
+        .expect("hidden input value closes");
+    body[start..end].to_string()
 }
 
 fn encode(value: &str) -> String {

@@ -21,7 +21,7 @@ async fn home_lists_seeded_categories() {
     assert!(body.contains("Announcements"));
     assert!(body.contains("General Discussion"));
     assert!(body.contains("Support"));
-    assert!(body.contains("No threads yet"));
+    assert!(body.contains(r#"<p class="muted">No threads here yet. Start the first one.</p>"#));
 }
 
 #[tokio::test]
@@ -40,7 +40,12 @@ async fn new_form_issues_csrf_cookie_and_token() {
 #[tokio::test]
 async fn post_without_csrf_is_forbidden() {
     let state = build_dev_state().await;
-    let body = form(&[("csrf", "x"), ("category", "general"), ("title", "T"), ("body", "B")]);
+    let body = form(&[
+        ("csrf", "x"),
+        ("category", "general"),
+        ("title", "T"),
+        ("body", "B"),
+    ]);
     // No CSRF cookie present -> double-submit fails.
     let (status, _h, _b) = send(&state, post_form("/new", None, true, body)).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -50,7 +55,12 @@ async fn post_without_csrf_is_forbidden() {
 async fn post_without_identity_is_unauthorized() {
     let state = build_dev_state().await;
     let tok = "csrftoken123";
-    let body = form(&[("csrf", tok), ("category", "general"), ("title", "T"), ("body", "B")]);
+    let body = form(&[
+        ("csrf", tok),
+        ("category", "general"),
+        ("title", "T"),
+        ("body", "B"),
+    ]);
     // Valid CSRF (cookie matches field) but NO X-Auth-Subject injected.
     let (status, _h, _b) = send(&state, post_form("/new", Some(tok), false, body)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -60,7 +70,12 @@ async fn post_without_identity_is_unauthorized() {
 async fn unknown_category_is_rejected() {
     let state = build_dev_state().await;
     let tok = "csrftoken123";
-    let body = form(&[("csrf", tok), ("category", "nope"), ("title", "T"), ("body", "B")]);
+    let body = form(&[
+        ("csrf", tok),
+        ("category", "nope"),
+        ("title", "T"),
+        ("body", "B"),
+    ]);
     let (status, _h, _b) = send(&state, post_form("/new", Some(tok), true, body)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
@@ -84,14 +99,20 @@ async fn create_thread_reply_and_render_markdown() {
         .and_then(|v| v.to_str().ok())
         .expect("redirect Location")
         .to_string();
-    assert!(location.starts_with("/t/t_"), "redirects to the new thread: {location}");
+    assert!(
+        location.starts_with("/t/t_"),
+        "redirects to the new thread: {location}"
+    );
 
     // The thread page renders the markdown body + the author + the OP badge.
     let (status, _h, page) = send(&state, get(&location)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(page.contains("Hello Agora"));
     assert!(page.contains("<strong>bold</strong>"), "markdown rendered");
-    assert!(page.contains("alice@steadholme.local"), "trusted author shown");
+    assert!(
+        page.contains("alice@steadholme.local"),
+        "trusted author shown"
+    );
     assert!(page.contains("Original post"));
     assert!(page.contains("0 replies"));
 
@@ -129,14 +150,28 @@ async fn markdown_xss_is_sanitised() {
     ]);
     let (status, h, _b) = send(&state, post_form("/new", Some(tok), true, body)).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    let location = h.get(header::LOCATION).unwrap().to_str().unwrap().to_string();
+    let location = h
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
 
     let (_s, _h, page) = send(&state, get(&location)).await;
     // No executable script tag and no executable javascript: href survive into the page.
-    assert!(!page.contains("<script>alert"), "raw script must be neutralised");
-    assert!(!page.contains("href=\"javascript"), "javascript: href must be defused");
+    assert!(
+        !page.contains("<script>alert"),
+        "raw script must be neutralised"
+    );
+    assert!(
+        !page.contains("href=\"javascript"),
+        "javascript: href must be defused"
+    );
     assert!(page.contains("href=\"#\""), "unsafe link rewritten to #");
-    assert!(page.contains("&lt;script&gt;"), "script shown as escaped text");
+    assert!(
+        page.contains("&lt;script&gt;"),
+        "script shown as escaped text"
+    );
 }
 
 #[tokio::test]
@@ -165,7 +200,11 @@ async fn create_thread(state: &AppState, tok: &str, title: &str, body_md: &str) 
     ]);
     let (status, h, _b) = send(state, post_form("/new", Some(tok), true, body)).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    h.get(header::LOCATION).unwrap().to_str().unwrap().to_string()
+    h.get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string()
 }
 
 #[tokio::test]
@@ -173,13 +212,17 @@ async fn author_can_edit_and_delete_own_thread() {
     let state = build_dev_state().await;
     let tok = "csrftoken123";
     let location = create_thread(&state, tok, "Orig Title", "Orig **body**.").await;
+    let tid = location.strip_prefix("/t/").unwrap().to_string();
     let edit_uri = format!("{location}/edit");
     let delete_uri = format!("{location}/delete");
 
-    // The author sees edit + delete controls on the thread page.
+    // The author sees edit + delete-review controls on the thread page.
     let (_s, _h, page) = send(&state, get_as(&location, ALICE_SUB, ALICE_EMAIL)).await;
     assert!(page.contains(&edit_uri), "author sees the edit link");
-    assert!(page.contains(&delete_uri), "author sees the delete form");
+    assert!(
+        page.contains(&delete_uri),
+        "author sees the delete review link"
+    );
 
     // The edit form is prefilled with the current title + original-post body.
     let (s, _h, form_page) = send(&state, get_as(&edit_uri, ALICE_SUB, ALICE_EMAIL)).await;
@@ -188,19 +231,145 @@ async fn author_can_edit_and_delete_own_thread() {
     assert!(form_page.contains("Orig **body**."), "OP body prefilled");
 
     // Save an edit → the thread renders the new title + body.
-    let ebody = form(&[("csrf", tok), ("title", "New Title"), ("body", "New _body_.")]);
-    let (s, _h, _b) = send(&state, post_form_as(&edit_uri, tok, ALICE_SUB, ALICE_EMAIL, ebody)).await;
+    let ebody = form(&[
+        ("csrf", tok),
+        ("title", "New Title"),
+        ("body", "New _body_."),
+    ]);
+    let (s, _h, _b) = send(
+        &state,
+        post_form_as(&edit_uri, tok, ALICE_SUB, ALICE_EMAIL, ebody),
+    )
+    .await;
     assert_eq!(s, StatusCode::SEE_OTHER);
     let (_s, _h, page) = send(&state, get(&location)).await;
     assert!(page.contains("New Title"), "new title shown");
     assert!(page.contains("<em>body</em>"), "new OP markdown rendered");
     assert!(!page.contains("Orig Title"), "old title gone");
 
-    // Delete → 303 to the category, and the thread is now 404.
-    let (s, dh, _b) =
-        send(&state, post_form_as(&delete_uri, tok, ALICE_SUB, ALICE_EMAIL, form(&[("csrf", tok)]))).await;
+    // A direct POST without a server-rendered confirmation is refused and does not mutate.
+    let (s, _h, _b) = send(
+        &state,
+        post_form_as(
+            &delete_uri,
+            tok,
+            ALICE_SUB,
+            ALICE_EMAIL,
+            form(&[("csrf", tok)]),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert!(state.store.get_thread(&tid).await.unwrap().is_some());
+
+    // GET the review on the same path. Its confirmation is bound to the actor, target action,
+    // and freshly-issued CSRF session.
+    let review = delete_review_as(&state, &delete_uri, ALICE_SUB, ALICE_EMAIL, None).await;
+
+    // A valid confirmation minted for another target is the wrong action.
+    let decoy_location = create_thread(&state, tok, "Keep me", "Decoy body.").await;
+    let decoy_tid = decoy_location.strip_prefix("/t/").unwrap().to_string();
+    let decoy_delete_uri = format!("{decoy_location}/delete");
+    let wrong_action = delete_review_as(
+        &state,
+        &decoy_delete_uri,
+        ALICE_SUB,
+        ALICE_EMAIL,
+        Some(&review.csrf),
+    )
+    .await;
+    let (s, _h, _b) = send(
+        &state,
+        post_form_as(
+            &delete_uri,
+            &review.csrf,
+            ALICE_SUB,
+            ALICE_EMAIL,
+            confirmation_form(&review.csrf, &wrong_action.confirm),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert!(state.store.get_thread(&tid).await.unwrap().is_some());
+    assert!(state.store.get_thread(&decoy_tid).await.unwrap().is_some());
+
+    // The same review cannot be committed by another actor.
+    let (s, _h, _b) = send(
+        &state,
+        post_form_as(
+            &delete_uri,
+            &review.csrf,
+            BOB_SUB,
+            BOB_EMAIL,
+            confirmation_form(&review.csrf, &review.confirm),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert!(state.store.get_thread(&tid).await.unwrap().is_some());
+
+    // Even a matching double-submit pair cannot reuse a confirmation from another CSRF session.
+    let wrong_csrf = "different-csrf-session";
+    let (s, _h, _b) = send(
+        &state,
+        post_form_as(
+            &delete_uri,
+            wrong_csrf,
+            ALICE_SUB,
+            ALICE_EMAIL,
+            confirmation_form(wrong_csrf, &review.confirm),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert!(state.store.get_thread(&tid).await.unwrap().is_some());
+
+    let expired = expired_confirmation(&review.confirm);
+    let (s, _h, _b) = send(
+        &state,
+        post_form_as(
+            &delete_uri,
+            &review.csrf,
+            ALICE_SUB,
+            ALICE_EMAIL,
+            confirmation_form(&review.csrf, &expired),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert!(state.store.get_thread(&tid).await.unwrap().is_some());
+
+    let (s, _h, _b) = send(
+        &state,
+        post_form_as(
+            &delete_uri,
+            &review.csrf,
+            ALICE_SUB,
+            ALICE_EMAIL,
+            confirmation_form(&review.csrf, "malformed-confirmation"),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert!(state.store.get_thread(&tid).await.unwrap().is_some());
+
+    // Only the exact review tuple commits: 303 to the category, then the thread is 404.
+    let (s, dh, _b) = send(
+        &state,
+        post_form_as(
+            &delete_uri,
+            &review.csrf,
+            ALICE_SUB,
+            ALICE_EMAIL,
+            confirmation_form(&review.csrf, &review.confirm),
+        ),
+    )
+    .await;
     assert_eq!(s, StatusCode::SEE_OTHER);
-    assert_eq!(dh.get(header::LOCATION).unwrap().to_str().unwrap(), "/c/general");
+    assert_eq!(
+        dh.get(header::LOCATION).unwrap().to_str().unwrap(),
+        "/c/general"
+    );
     let (s, _h, _b) = send(&state, get(&location)).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
 }
@@ -216,16 +385,28 @@ async fn non_author_cannot_edit_or_delete_thread() {
     // Bob sees NO owner controls on alice's thread.
     let (_s, _h, page) = send(&state, get_as(&location, BOB_SUB, BOB_EMAIL)).await;
     assert!(!page.contains(&edit_uri), "non-author sees no edit link");
-    assert!(!page.contains(&delete_uri), "non-author sees no delete form");
+    assert!(
+        !page.contains(&delete_uri),
+        "non-author sees no delete review link"
+    );
 
-    // Bob is blocked from the edit form, the update, and the delete (CSRF valid — author fails).
+    // Bob is blocked from the edit form, the update, and even opening the delete review.
     let (s, _h, _b) = send(&state, get_as(&edit_uri, BOB_SUB, BOB_EMAIL)).await;
     assert_eq!(s, StatusCode::FORBIDDEN);
     let ebody = form(&[("csrf", tok), ("title", "Hijacked"), ("body", "x")]);
-    let (s, _h, _b) = send(&state, post_form_as(&edit_uri, tok, BOB_SUB, BOB_EMAIL, ebody)).await;
+    let (s, _h, _b) = send(
+        &state,
+        post_form_as(&edit_uri, tok, BOB_SUB, BOB_EMAIL, ebody),
+    )
+    .await;
     assert_eq!(s, StatusCode::FORBIDDEN);
-    let (s, _h, _b) =
-        send(&state, post_form_as(&delete_uri, tok, BOB_SUB, BOB_EMAIL, form(&[("csrf", tok)]))).await;
+    let (s, _h, _b) = send(&state, get_as(&delete_uri, BOB_SUB, BOB_EMAIL)).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _h, _b) = send(
+        &state,
+        post_form_as(&delete_uri, tok, BOB_SUB, BOB_EMAIL, form(&[("csrf", tok)])),
+    )
+    .await;
     assert_eq!(s, StatusCode::FORBIDDEN);
 
     // The thread survives, unchanged.
@@ -241,7 +422,11 @@ async fn thread_edit_requires_csrf() {
     let location = create_thread(&state, tok, "T", "B").await;
     // Valid identity but NO CSRF cookie → double-submit fails before anything mutates.
     let body = form(&[("csrf", tok), ("title", "X"), ("body", "Y")]);
-    let (s, _h, _b) = send(&state, post_form(&format!("{location}/edit"), None, true, body)).await;
+    let (s, _h, _b) = send(
+        &state,
+        post_form(&format!("{location}/edit"), None, true, body),
+    )
+    .await;
     assert_eq!(s, StatusCode::FORBIDDEN);
 }
 
@@ -258,8 +443,11 @@ async fn author_can_edit_and_delete_own_reply() {
 
     // Bob replies.
     let reply = form(&[("csrf", tok), ("body", "Bob original reply.")]);
-    let (s, _h, _b) =
-        send(&state, post_form_as(&format!("{location}/reply"), tok, BOB_SUB, BOB_EMAIL, reply)).await;
+    let (s, _h, _b) = send(
+        &state,
+        post_form_as(&format!("{location}/reply"), tok, BOB_SUB, BOB_EMAIL, reply),
+    )
+    .await;
     assert_eq!(s, StatusCode::SEE_OTHER);
 
     // Locate bob's reply id via the store (ids are not surfaced to non-owners in HTML).
@@ -277,25 +465,119 @@ async fn author_can_edit_and_delete_own_reply() {
     let (_s, _h, bpage) = send(&state, get_as(&location, BOB_SUB, BOB_EMAIL)).await;
     assert!(bpage.contains(&edit_uri), "reply author sees edit link");
     let (_s, _h, apage) = send(&state, get_as(&location, ALICE_SUB, ALICE_EMAIL)).await;
-    assert!(!apage.contains(&edit_uri), "non-author sees no reply controls");
+    assert!(
+        !apage.contains(&edit_uri),
+        "non-author sees no reply controls"
+    );
 
     // Alice cannot edit bob's reply.
     let ebody = form(&[("csrf", tok), ("body", "alice hijack")]);
-    let (s, _h, _b) = send(&state, post_form_as(&edit_uri, tok, ALICE_SUB, ALICE_EMAIL, ebody)).await;
+    let (s, _h, _b) = send(
+        &state,
+        post_form_as(&edit_uri, tok, ALICE_SUB, ALICE_EMAIL, ebody),
+    )
+    .await;
     assert_eq!(s, StatusCode::FORBIDDEN);
 
     // Bob edits his own reply.
     let ebody = form(&[("csrf", tok), ("body", "Bob _edited_ reply.")]);
-    let (s, _h, _b) = send(&state, post_form_as(&edit_uri, tok, BOB_SUB, BOB_EMAIL, ebody)).await;
+    let (s, _h, _b) = send(
+        &state,
+        post_form_as(&edit_uri, tok, BOB_SUB, BOB_EMAIL, ebody),
+    )
+    .await;
     assert_eq!(s, StatusCode::SEE_OTHER);
     let (_s, _h, page) = send(&state, get(&location)).await;
-    assert!(page.contains("<em>edited</em>"), "edited reply markdown rendered");
+    assert!(
+        page.contains("<em>edited</em>"),
+        "edited reply markdown rendered"
+    );
     assert!(!page.contains("Bob original reply"), "old reply body gone");
 
-    // Bob deletes his own reply.
-    let (s, _h, _b) =
-        send(&state, post_form_as(&delete_uri, tok, BOB_SUB, BOB_EMAIL, form(&[("csrf", tok)]))).await;
+    // Direct POST cannot skip the review.
+    let (s, _h, _b) = send(
+        &state,
+        post_form_as(&delete_uri, tok, BOB_SUB, BOB_EMAIL, form(&[("csrf", tok)])),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert!(state.store.get_post(&pid).await.unwrap().is_some());
+
+    let review = delete_review_as(&state, &delete_uri, BOB_SUB, BOB_EMAIL, None).await;
+
+    // The review is actor-bound.
+    let (s, _h, _b) = send(
+        &state,
+        post_form_as(
+            &delete_uri,
+            &review.csrf,
+            ALICE_SUB,
+            ALICE_EMAIL,
+            confirmation_form(&review.csrf, &review.confirm),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert!(state.store.get_post(&pid).await.unwrap().is_some());
+
+    let wrong_csrf = "reply-wrong-csrf";
+    let (s, _h, _b) = send(
+        &state,
+        post_form_as(
+            &delete_uri,
+            wrong_csrf,
+            BOB_SUB,
+            BOB_EMAIL,
+            confirmation_form(wrong_csrf, &review.confirm),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert!(state.store.get_post(&pid).await.unwrap().is_some());
+
+    let expired = expired_confirmation(&review.confirm);
+    let (s, _h, _b) = send(
+        &state,
+        post_form_as(
+            &delete_uri,
+            &review.csrf,
+            BOB_SUB,
+            BOB_EMAIL,
+            confirmation_form(&review.csrf, &expired),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert!(state.store.get_post(&pid).await.unwrap().is_some());
+
+    let (s, _h, _b) = send(
+        &state,
+        post_form_as(
+            &delete_uri,
+            &review.csrf,
+            BOB_SUB,
+            BOB_EMAIL,
+            confirmation_form(&review.csrf, "not.a.valid.confirmation"),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert!(state.store.get_post(&pid).await.unwrap().is_some());
+
+    // Bob's exact review token deletes the reply and keeps the original redirect.
+    let (s, h, _b) = send(
+        &state,
+        post_form_as(
+            &delete_uri,
+            &review.csrf,
+            BOB_SUB,
+            BOB_EMAIL,
+            confirmation_form(&review.csrf, &review.confirm),
+        ),
+    )
+    .await;
     assert_eq!(s, StatusCode::SEE_OTHER);
+    assert_eq!(h.get(header::LOCATION).unwrap().to_str().unwrap(), location);
     let (_s, _h, page) = send(&state, get(&location)).await;
     assert!(!page.contains("edited"), "reply removed");
     assert!(page.contains("0 replies"));
@@ -311,18 +593,35 @@ async fn original_post_cannot_be_edited_or_deleted_via_reply_route() {
     // The original post's id (oldest post). Editing/deleting it via the reply route must be
     // refused even for its own author — that path is the thread controls (which keep the
     // denormalised first_body_md in step).
-    let op_id = state.store.posts_in_thread(&tid).await.unwrap()[0].id.clone();
+    let op_id = state.store.posts_in_thread(&tid).await.unwrap()[0]
+        .id
+        .clone();
 
     let ebody = form(&[("csrf", tok), ("body", "sneaky")]);
     let (s, _h, _b) = send(
         &state,
-        post_form_as(&format!("/t/{tid}/p/{op_id}/edit"), tok, ALICE_SUB, ALICE_EMAIL, ebody),
+        post_form_as(
+            &format!("/t/{tid}/p/{op_id}/edit"),
+            tok,
+            ALICE_SUB,
+            ALICE_EMAIL,
+            ebody,
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::FORBIDDEN);
+    let op_delete_uri = format!("/t/{tid}/p/{op_id}/delete");
+    let (s, _h, _b) = send(&state, get_as(&op_delete_uri, ALICE_SUB, ALICE_EMAIL)).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
     let (s, _h, _b) = send(
         &state,
-        post_form_as(&format!("/t/{tid}/p/{op_id}/delete"), tok, ALICE_SUB, ALICE_EMAIL, form(&[("csrf", tok)])),
+        post_form_as(
+            &op_delete_uri,
+            tok,
+            ALICE_SUB,
+            ALICE_EMAIL,
+            form(&[("csrf", tok)]),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::FORBIDDEN);
@@ -337,7 +636,14 @@ async fn original_post_cannot_be_edited_or_deleted_via_reply_route() {
 /// strictly increase (so the keyset order is deterministic — HTTP replies would collide on the
 /// same epoch SECOND). Inserted straight through the store, past the HTTP layer.
 async fn seed_replies(state: &AppState, tid: &str, count: usize) {
-    let base = state.store.first_post_in_thread(tid).await.unwrap().unwrap().created_at + 10;
+    let base = state
+        .store
+        .first_post_in_thread(tid)
+        .await
+        .unwrap()
+        .unwrap()
+        .created_at
+        + 10;
     for i in 0..count {
         let post = Post {
             id: format!("p_seed_{i:04}"),
@@ -365,16 +671,27 @@ async fn thread_default_page_shows_oldest_replies_with_forward_nav() {
     // page), and the total reply count is shown.
     let (status, _h, page) = send(&state, get(&location)).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(page.contains("reply-body-000"), "oldest reply on the first page");
+    assert!(
+        page.contains("reply-body-000"),
+        "oldest reply on the first page"
+    );
     assert!(
         !page.contains(&format!("reply-body-{:03}", count - 1)),
         "newest reply is NOT on the first page"
     );
-    assert!(page.contains(&format!("{count} replies")), "reply count shown");
+    assert!(
+        page.contains(&format!("{count} replies")),
+        "reply count shown"
+    );
     // Forward-only nav on the first page: newer + jump-to-latest, no older link.
     assert!(page.contains("?after="), "Load newer link present");
-    assert!(page.contains("?latest=1"), "Jump to latest link present");
-    assert!(!page.contains("?before="), "no Load older on the first page");
+    assert!(page.contains(&format!(
+        r#"<a class="btn btn-ghost btn-sm ag-page__jump" href="{location}?latest=1#thread-latest">Jump to latest</a>"#
+    )));
+    assert!(
+        !page.contains("?before="),
+        "no Load older on the first page"
+    );
 }
 
 #[tokio::test]
@@ -392,13 +709,25 @@ async fn thread_jump_to_latest_shows_newest_replies_with_backward_nav() {
         page.contains(&format!("reply-body-{:03}", count - 1)),
         "newest reply on the latest page"
     );
-    assert!(!page.contains("reply-body-000"), "oldest reply is NOT on the latest page");
+    assert!(
+        !page.contains("reply-body-000"),
+        "oldest reply is NOT on the latest page"
+    );
     // The original post is still pinned at the top of every page.
-    assert!(page.contains("Original post"), "OP pinned on the latest page");
+    assert!(
+        page.contains("Original post"),
+        "OP pinned on the latest page"
+    );
     // Backward-only nav on the latest page: older link, no newer / jump-to-latest.
     assert!(page.contains("?before="), "Load older link present");
-    assert!(!page.contains("?after="), "no Load newer on the latest page");
-    assert!(!page.contains("?latest=1"), "no Jump to latest on the latest page");
+    assert!(
+        !page.contains("?after="),
+        "no Load newer on the latest page"
+    );
+    assert!(
+        !page.contains(r#"class="btn btn-ghost btn-sm ag-page__jump""#),
+        "no Jump to latest on the latest page"
+    );
 }
 
 #[tokio::test]
@@ -411,18 +740,39 @@ async fn thread_before_cursor_pages_to_older_replies() {
 
     // Cursor at the 3rd-oldest reply (id `p_seed_0003`, created_at base+3): `?before=` returns the
     // replies strictly OLDER than it — indices 0..=2 only.
-    let base = state.store.first_post_in_thread(&tid).await.unwrap().unwrap().created_at + 10;
+    let base = state
+        .store
+        .first_post_in_thread(&tid)
+        .await
+        .unwrap()
+        .unwrap()
+        .created_at
+        + 10;
     let cursor = format!("{ts}_p_seed_0003", ts = base + 3);
     let (status, _h, page) = send(&state, get(&format!("{location}?before={cursor}"))).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(page.contains("reply-body-000"), "older page includes reply 0");
-    assert!(page.contains("reply-body-002"), "older page includes reply 2");
-    assert!(!page.contains("reply-body-003"), "cursor reply excluded (strictly older)");
+    assert!(
+        page.contains("reply-body-000"),
+        "older page includes reply 0"
+    );
+    assert!(
+        page.contains("reply-body-002"),
+        "older page includes reply 2"
+    );
+    assert!(
+        !page.contains("reply-body-003"),
+        "cursor reply excluded (strictly older)"
+    );
     // Only 3 replies are older than the cursor (< one page), so no further Load older; but newer
     // replies exist, so forward nav + jump-to-latest are offered.
-    assert!(!page.contains("?before="), "no Load older beyond the oldest replies");
+    assert!(
+        !page.contains("?before="),
+        "no Load older beyond the oldest replies"
+    );
     assert!(page.contains("?after="), "Load newer link present");
-    assert!(page.contains("?latest=1"), "Jump to latest link present");
+    assert!(page.contains(&format!(
+        r#"<a class="btn btn-ghost btn-sm ag-page__jump" href="{location}?latest=1#thread-latest">Jump to latest</a>"#
+    )));
 }
 
 #[tokio::test]
@@ -434,13 +784,16 @@ async fn reading_receipts_resume_at_exact_first_unread_without_swallowing_holes(
     let reply_count = REPLIES_PER_PAGE as usize + 5;
     seed_replies(&state, &tid, reply_count).await;
 
-    let (status, _, first_page) =
-        send(&state, get_as(&location, ALICE_SUB, ALICE_EMAIL)).await;
+    let (status, _, first_page) = send(&state, get_as(&location, ALICE_SUB, ALICE_EMAIL)).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(first_page.matches("id=\"thread-resume\"").count(), 1);
-    assert!(first_page.contains("First unread"));
+    let first_unread = r#"<div class="ag-first-unread ag-key-private" id="thread-resume" role="separator" tabindex="-1"><span>First unread</span></div>"#;
+    assert_eq!(first_page.matches(first_unread).count(), 1);
+    assert!(first_page.contains(&format!(
+        r#"<form class="inline-form" method="post" action="/t/{tid}/read" data-thread-read-form>"#
+    )));
+    assert!(first_page.contains(r#"data-thread-read-sentinel"#));
+    assert!(first_page.contains(r#"data-thread-read-status role="status" aria-live="polite""#));
     assert!(first_page.contains("Mark page read &amp; continue"));
-    assert!(first_page.contains("body: new URLSearchParams(new FormData(form))"));
 
     let visible = state.store.posts_in_thread(&tid).await.unwrap();
     let visible_ids = visible
@@ -473,11 +826,18 @@ async fn reading_receipts_resume_at_exact_first_unread_without_swallowing_holes(
         .unwrap();
     assert!(reading.started);
     assert_eq!(reading.unread_count, 5);
-    assert_eq!(reading.first_unread.as_ref().unwrap().body_md, "reply-body-020");
+    assert_eq!(
+        reading.first_unread.as_ref().unwrap().body_md,
+        "reply-body-020"
+    );
 
     let (_, _, home) = send(&state, get_as("/", ALICE_SUB, ALICE_EMAIL)).await;
-    assert!(home.contains("Continue · 5 new"));
-    assert!(home.contains(&format!("/t/{tid}?resume=1#thread-resume")));
+    assert!(
+        home.contains(r#"<span class="ag-mark ag-key-private ag-mark--unread">5 unread</span>"#)
+    );
+    assert!(home.contains(&format!(
+        r#"<a class="ag-mark ag-key-private ag-mark--resume" href="/t/{tid}?resume=1#thread-resume">Resume</a>"#
+    )));
 
     let (_, _, resumed) = send(
         &state,
@@ -485,8 +845,58 @@ async fn reading_receipts_resume_at_exact_first_unread_without_swallowing_holes(
     )
     .await;
     assert!(resumed.contains("reply-body-020"));
-    assert_eq!(resumed.matches("id=\"thread-resume\"").count(), 1);
+    assert_eq!(resumed.matches(first_unread).count(), 1);
     assert!(resumed.find("First unread").unwrap() < resumed.find("reply-body-020").unwrap());
+
+    let remaining_ids = visible
+        .iter()
+        .skip(REPLIES_PER_PAGE as usize + 1)
+        .map(|post| post.id.clone())
+        .collect::<Vec<_>>();
+    state
+        .store
+        .mark_thread_posts_read(ALICE_SUB, &tid, &remaining_ids, 124)
+        .await
+        .unwrap();
+    let caught_up = state
+        .store
+        .thread_reading_state(ALICE_SUB, &tid)
+        .await
+        .unwrap();
+    assert!(caught_up.started);
+    assert_eq!(caught_up.unread_count, 0);
+    assert!(caught_up.first_unread.is_none());
+    let (_, _, caught_up_page) = send(&state, get_as(&location, ALICE_SUB, ALICE_EMAIL)).await;
+    assert!(caught_up_page
+        .contains(r#"<span class="ag-mark ag-key-private ag-mark--caught-up">Caught up</span>"#));
+    assert!(
+        !caught_up_page.contains(&format!("{location}?resume=1#thread-resume")),
+        "caught-up state never links to a missing resume target"
+    );
+    assert!(
+        !caught_up_page.contains(&format!(r#"action="/t/{tid}/read""#)),
+        "caught-up state does not issue a meaningless mark-page-read action"
+    );
+    assert!(!caught_up_page.contains(first_unread));
+
+    // A replay of an old page form remains safe and lands on a real latest-page anchor.
+    let stale_body = form(&[("csrf", tok), ("post_ids", &visible_ids)]);
+    let (status, headers, _) = send(
+        &state,
+        post_form_as(
+            &format!("{location}/read"),
+            tok,
+            ALICE_SUB,
+            ALICE_EMAIL,
+            stale_body,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        headers.get(header::LOCATION).unwrap().to_str().unwrap(),
+        format!("{location}?latest=1#thread-latest")
+    );
 
     let latest = state
         .store
@@ -529,7 +939,12 @@ async fn accepted_solution_can_be_the_exact_first_unread_boundary() {
     assert_eq!(status, StatusCode::SEE_OTHER);
     let location = headers.get(header::LOCATION).unwrap().to_str().unwrap();
     let tid = location.strip_prefix("/t/").unwrap();
-    let op = state.store.first_post_in_thread(tid).await.unwrap().unwrap();
+    let op = state
+        .store
+        .first_post_in_thread(tid)
+        .await
+        .unwrap()
+        .unwrap();
     let solution = Post {
         id: "p_solution_reading".to_string(),
         thread_id: tid.to_string(),
@@ -574,10 +989,27 @@ async fn accepted_solution_can_be_the_exact_first_unread_boundary() {
         get_as(&format!("{location}?resume=1"), ALICE_SUB, ALICE_EMAIL),
     )
     .await;
-    assert_eq!(page.matches("id=\"thread-resume\"").count(), 1);
+    assert_eq!(
+        page.matches(
+            r#"<div class="ag-first-unread ag-key-private" id="thread-resume" role="separator" tabindex="-1"><span>First unread</span></div>"#
+        )
+        .count(),
+        1
+    );
     assert_eq!(page.matches("The accepted solution body.").count(), 1);
     assert!(page.contains("A later ordinary reply."));
-    assert!(page.find("First unread").unwrap() < page.find("Accepted answer").unwrap());
+    assert!(
+        !page.contains("?before="),
+        "the earliest accepted boundary has no phantom older reply page"
+    );
+    assert!(!page.contains("Load older"));
+    let dais = page.find("Answer Dais").unwrap();
+    let boundary = page.find("First unread").unwrap();
+    let accepted = page.find("The accepted solution body.").unwrap();
+    assert!(
+        dais < boundary && boundary < accepted,
+        "the visible unread separator marks the accepted post inside the Answer Dais"
+    );
 }
 
 #[tokio::test]
@@ -588,8 +1020,18 @@ async fn reading_receipt_post_is_csrf_guarded_and_batch_atomic() {
     let second_location = create_thread(&state, tok, "Second receipt thread", "Second OP.").await;
     let first_tid = first_location.strip_prefix("/t/").unwrap();
     let second_tid = second_location.strip_prefix("/t/").unwrap();
-    let first_op = state.store.first_post_in_thread(first_tid).await.unwrap().unwrap();
-    let second_op = state.store.first_post_in_thread(second_tid).await.unwrap().unwrap();
+    let first_op = state
+        .store
+        .first_post_in_thread(first_tid)
+        .await
+        .unwrap()
+        .unwrap();
+    let second_op = state
+        .store
+        .first_post_in_thread(second_tid)
+        .await
+        .unwrap()
+        .unwrap();
 
     let body = form(&[("csrf", tok), ("post_ids", &first_op.id)]);
     let (status, _, _) = send(
@@ -629,7 +1071,9 @@ async fn send(state: &AppState, req: Request<Body>) -> (StatusCode, HeaderMap, S
     let resp = app(state.clone()).oneshot(req).await.unwrap();
     let status = resp.status();
     let headers = resp.headers().clone();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     (status, headers, String::from_utf8(bytes.to_vec()).unwrap())
 }
 
@@ -712,4 +1156,74 @@ fn csrf_value(set_cookie: &str) -> String {
         .and_then(|kv| kv.split_once('='))
         .map(|(_, v)| v.to_string())
         .expect("cookie value")
+}
+
+#[derive(Debug)]
+struct DeleteReview {
+    csrf: String,
+    confirm: String,
+}
+
+/// Open a destructive-action review as `subject`, optionally preserving an existing CSRF
+/// session so a token for one target can be proved unusable for another.
+async fn delete_review_as(
+    state: &AppState,
+    uri: &str,
+    subject: &str,
+    email: &str,
+    existing_csrf: Option<&str>,
+) -> DeleteReview {
+    let mut request = Request::builder()
+        .uri(uri)
+        .header("x-auth-subject", subject)
+        .header("x-auth-email", email);
+    if let Some(csrf) = existing_csrf {
+        request = request.header(header::COOKIE, format!("__Host-csrf={csrf}"));
+    }
+    let (status, headers, body) = send(state, request.body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "delete review must render");
+    assert!(body.contains(r#"method="post""#));
+    assert!(body.contains(&format!(r#"action="{uri}""#)));
+
+    let csrf = hidden_input_value(&body, "csrf");
+    let confirm = hidden_input_value(&body, "confirm");
+    assert!(!csrf.is_empty());
+    assert!(!confirm.is_empty());
+    match existing_csrf {
+        Some(expected) => assert_eq!(csrf, expected, "review preserves the CSRF session"),
+        None => {
+            let cookie = set_cookie(&headers).expect("delete review sets a CSRF cookie");
+            assert_eq!(csrf_value(&cookie), csrf, "hidden CSRF matches its cookie");
+        }
+    }
+    DeleteReview { csrf, confirm }
+}
+
+fn hidden_input_value(html: &str, name: &str) -> String {
+    let name_attr = format!(r#"name="{name}""#);
+    html.split("<input")
+        .skip(1)
+        .filter_map(|rest| rest.split_once('>').map(|(tag, _)| tag))
+        .find(|tag| tag.contains(&name_attr))
+        .and_then(|tag| attribute_value(tag, "value"))
+        .unwrap_or_else(|| panic!("hidden input {name:?} missing from review"))
+        .to_string()
+}
+
+fn attribute_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let marker = format!(r#"{name}=""#);
+    let value = tag.split_once(&marker)?.1;
+    value.split_once('"').map(|(value, _)| value)
+}
+
+fn confirmation_form(csrf: &str, confirm: &str) -> String {
+    form(&[("csrf", csrf), ("confirm", confirm)])
+}
+
+/// Keep the token structurally valid while forcing verification down the expiry branch.
+fn expired_confirmation(confirm: &str) -> String {
+    let (_, rest) = confirm
+        .split_once('.')
+        .expect("confirmation has an expiry prefix");
+    format!("0.{rest}")
 }

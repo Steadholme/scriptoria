@@ -374,7 +374,7 @@ body.page {
   .layout { grid-template-columns:1fr; }
 }
 
-@media (max-width:720px) {
+@media (max-width:768px) {
   .usermenu__name { display:none; }
   .appbar__name > span { display:none; }
   .appbar {
@@ -432,6 +432,13 @@ body.page {
   }
   .card-post:hover .card-post__cover img { transform:none; }
 }
+
+/* Opt Inkwell out of Odyssey's shared cross-document View Transition: motion.css
+   declares `@view-transition{ navigation:auto }`, but service.css is inlined after
+   Odyssey's APP_CSS so this later rule wins the cascade and the Writer/Review/Edit
+   SSR round-trip no longer starts a transition to skip (both JavaScript and no-
+   JavaScript). Reduced-motion continuity above is unchanged: no transition, no motion. */
+@view-transition { navigation:none; }
 
 /* S2 MASTHEAD -------------------------------------------------------------- */
 .reader {
@@ -1098,65 +1105,177 @@ body.page {
   white-space:normal;
 }
 
-/* S8 EDITOR --------------------------------------------------------------- */
+/* S8 EDITOR — PALIMPSEST ATELIER ---------------------------------------------
+   The Writer reads as a palimpsest atelier: a warm limestone drafting table,
+   midnight-violet editorial ink, ultramarine Draft registration on the writing
+   layer, and cold-lilac Proof registration on the preview plane. Every rule is
+   scoped to the Writer root (.ink-editwrap / [data-writer-studio]) so shared
+   Ask, Admin, Library, Review Manage, and Revision Workbench selectors cannot
+   drift. Decorative layers are CSS-only and carry no meaning; state stays in
+   text, and the complete form works without JavaScript. */
+
+/* Product-owned palimpsest tokens. Surface roots carry them unconditionally;
+   the body hooks repeat the same values only so the page ground can use them
+   (kept in a separate rule because a :has() selector list invalidates the
+   whole rule where :has() is unsupported). Dark + forced-colors remaps in S20. */
+.ink-editwrap,
+.ink-preflight {
+  --pal-ground:#ece4cf;
+  --pal-plane:#f8f3e4;
+  --pal-inset:#efe7d1;
+  --pal-ink:#251a44;
+  --pal-ink-2:#4a3f6b;
+  --pal-ink-3:#6f648e;
+  --pal-line:#d9cdb0;
+  --pal-line-strong:#bda982;
+  --pal-draft:#2e44c4;
+  --pal-draft-ink:#2a3aa8;
+  --pal-draft-soft:#e2e6f8;
+  --pal-proof:#8574c9;
+  --pal-proof-ink:#6350ab;
+  --pal-proof-soft:#eae6f7;
+  --pal-ring:rgba(46,68,196,.30);
+}
+
+body.page-console:has(> .ink-editwrap),
+body.page-preflight {
+  --pal-ground:#ece4cf;
+  --pal-plane:#f8f3e4;
+  --pal-inset:#efe7d1;
+  --pal-ink:#251a44;
+  --pal-ink-2:#4a3f6b;
+  --pal-ink-3:#6f648e;
+  --pal-line:#d9cdb0;
+  --pal-line-strong:#bda982;
+  --pal-draft:#2e44c4;
+  --pal-draft-ink:#2a3aa8;
+  --pal-draft-soft:#e2e6f8;
+  --pal-proof:#8574c9;
+  --pal-proof-ink:#6350ab;
+  --pal-proof-soft:#eae6f7;
+  --pal-ring:rgba(46,68,196,.30);
+}
+
+body.page-console:has(> .ink-editwrap) { background:var(--pal-ground); }
+
 .console--narrow.ink-editwrap { max-width:1120px; }
 
-.ink-editwrap .console__head { margin-bottom:var(--sp-4); }
+.ink-editwrap .console__head {
+  margin-bottom:var(--sp-5);
+  padding-bottom:var(--sp-4);
+  border-bottom:1px solid var(--pal-line);
+}
 
-.ink-editwrap .console__head h1 { font-size:18px; }
+.ink-editwrap .console__head h1 {
+  font-family:var(--serif);
+  font-size:24px;
+  font-weight:var(--fw-semibold);
+  letter-spacing:-.01em;
+  color:var(--pal-ink);
+}
+
+.ink-editwrap .console__head .sub { color:var(--pal-ink-2); }
 
 .ink-editor {
   display:grid;
-  grid-template-columns:minmax(0,1fr) 304px;
+  grid-template-columns:minmax(0,1fr) 312px;
   gap:var(--sp-6);
   align-items:start;
 }
 
+/* Drafting sheet on the limestone table. The shadow stack is one flat second
+   sheet peeking from beneath (successive drafting layer); it is decorative and
+   disappears cleanly in forced-colors. */
 .ink-editor__canvas {
   min-width:0;
   display:flex;
   flex-direction:column;
   gap:var(--sp-4);
+  padding:var(--sp-5) var(--sp-6) 0;
+  background:var(--pal-plane);
+  border:1px solid var(--pal-line);
+  border-radius:var(--r-sm);
+  box-shadow:
+    5px 5px 0 -2px var(--pal-plane),
+    6px 6px 0 -2px var(--pal-line);
 }
 
+/* Collated metadata margin: rail sections abandon generic card boxes for one
+   continuous margin separated by hairlines, each titled with a Draft tick. */
 .ink-editor__rail {
   position:sticky;
   top:calc(56px + var(--sp-5));
   min-width:0;
   display:flex;
   flex-direction:column;
-  gap:var(--sp-4);
+  gap:var(--sp-6);
+  padding-left:var(--sp-5);
+  border-left:1px solid var(--pal-line-strong);
 }
 
-.ink-editor__rail .card { margin:0; }
+.ink-editor__rail .card {
+  margin:0;
+  padding:0 0 var(--sp-5);
+  background:transparent;
+  background-image:none;
+  border:0;
+  border-bottom:1px solid var(--pal-line);
+  border-radius:0;
+  box-shadow:none;
+  overflow:visible;
+  transition:none;
+}
+
+.ink-editor__rail .card:last-child {
+  padding-bottom:0;
+  border-bottom:0;
+}
+
+.ink-editor__rail .card:hover {
+  box-shadow:none;
+  border-color:var(--pal-line);
+}
+
+.ink-editor__rail .card__body { padding:0; }
 
 .ink-editor__rail .card__title {
+  padding-left:var(--sp-2);
+  border-left:3px solid var(--pal-draft);
   font-size:var(--fs-micro);
   font-weight:var(--fw-semibold);
   text-transform:uppercase;
   letter-spacing:.07em;
-  color:var(--ink-3);
+  color:var(--pal-ink-3);
 }
 
+.ink-editor__rail .field__hint { color:var(--pal-ink-3); }
+
+/* Title: borderless serif ink with the ultramarine Draft registration rule. */
 .ink-editor__canvas #title,
 .ink-editor__canvas #title:focus {
   border:0;
+  border-bottom:2px solid var(--pal-draft);
   background:transparent;
   border-radius:0;
   box-shadow:none;
 }
 
 .ink-editor__canvas #title {
-  padding:var(--sp-2) 0;
+  padding:var(--sp-2) 0 var(--sp-3);
   font-family:var(--serif);
   font-size:32px;
   font-weight:var(--fw-semibold);
   letter-spacing:-.02em;
   line-height:1.2;
-  color:var(--ink);
+  color:var(--pal-ink);
 }
 
-.ink-editor__canvas #title::placeholder { color:var(--ink-4); }
+.ink-editor__canvas #title::placeholder { color:var(--pal-ink-3); }
+
+.ink-editor__canvas #title:focus {
+  outline:2px solid var(--pal-draft);
+  outline-offset:4px;
+}
 
 .ink-editor__canvas .field__counter {
   opacity:0;
@@ -1179,50 +1298,66 @@ body.page {
   min-height:56vh;
   font-size:15px;
   line-height:1.75;
+  color:var(--pal-ink);
+}
+
+.ink-editor__canvas .editor__body:focus {
+  outline:2px solid var(--pal-draft);
+  outline-offset:6px;
 }
 
 .ink-editor__canvas .editor__bodybar {
-  border-bottom:1px solid var(--hairline);
+  border-bottom:1px solid var(--pal-line);
   padding-bottom:var(--sp-2);
   margin-bottom:0;
 }
 
-.editor__tabs .tab.is-active {
-  color:var(--ink);
+.ink-editor__canvas .editor__tabs .tab { color:var(--pal-ink-3); }
+
+.ink-editor__canvas .editor__tabs .tab.is-active {
+  color:var(--pal-ink);
   font-weight:var(--fw-semibold);
-  border-bottom-color:var(--brand);
+  border-bottom-color:var(--pal-draft);
 }
 
+.ink-editor__canvas .editor__tabs .tab:focus-visible {
+  outline:2px solid var(--pal-draft);
+  outline-offset:2px;
+}
+
+/* Proof plane: the live preview is a cold-lilac registered sheet. In Split it
+   scrolls; its top rule aligns with the write pane's Draft rule. */
 .ink-editor__canvas .editor__preview {
-  border:0;
-  background:transparent;
-  border-radius:0;
-  padding:var(--sp-3) 0;
+  border:1px solid var(--pal-line);
+  border-top:3px solid var(--pal-proof);
+  border-radius:var(--r-sm);
+  background:color-mix(in srgb, var(--pal-proof-soft) 45%, var(--pal-plane));
+  padding:var(--sp-4) var(--sp-5);
   margin-top:0;
+  overflow-wrap:anywhere;
 }
 
-.editor__workspace {
-  min-width:0;
-}
+.ink-editor__canvas .editor__workspace { min-width:0; }
 
-.editor__workspace.is-split {
+.ink-editor__canvas .editor__workspace.is-split {
   display:grid;
   grid-template-columns:minmax(0,1fr) minmax(0,1fr);
   gap:var(--sp-5);
 }
 
-.editor__workspace.is-split #pane-write {
+.ink-editor__canvas .editor__workspace.is-split #pane-write {
   min-width:0;
-  padding-right:var(--sp-5);
-  border-right:1px solid var(--hairline);
+  padding-top:var(--sp-3);
+  border-top:3px solid var(--pal-draft);
 }
 
-.editor__workspace.is-split #pane-preview {
+.ink-editor__canvas .editor__workspace.is-split #pane-preview {
   min-width:0;
   max-height:68vh;
   overflow:auto;
 }
 
+/* Flat colophon strip: opaque limestone and a double hairline rule, no glass. */
 .ink-editor__actionbar {
   position:sticky;
   bottom:0;
@@ -1231,66 +1366,92 @@ body.page {
   flex-wrap:wrap;
   align-items:center;
   gap:var(--sp-3);
-  padding:var(--sp-3) 0;
-  margin-top:var(--sp-2);
-  background:color-mix(in srgb, var(--bg) 92%, transparent);
-  backdrop-filter:blur(6px);
-  border-top:1px solid var(--hairline);
+  margin:var(--sp-3) calc(-1 * var(--sp-6)) 0;
+  padding:var(--sp-3) var(--sp-6) var(--sp-4);
+  background:var(--pal-plane);
+  border-top:3px double var(--pal-line-strong);
+  border-radius:0 0 var(--r-sm) var(--r-sm);
 }
 
-.writer-state {
+.ink-editor__actionbar .writer-state {
   display:inline-flex;
   align-items:center;
   gap:var(--sp-2);
   min-width:112px;
-  color:var(--ink-2);
+  color:var(--pal-ink-2);
   font-size:var(--fs-sm);
   font-weight:var(--fw-semibold);
 }
 
-.writer-state__dot {
-  width:8px;
-  height:8px;
-  border-radius:50%;
-  background:var(--ink-4);
+/* Square registration mark with a one-step offset echo; the text label beside
+   it always carries the state, never the mark alone. */
+.ink-editor__actionbar .writer-state__dot {
+  width:9px;
+  height:9px;
+  border-radius:2px;
+  background:var(--pal-draft);
+  box-shadow:2px 2px 0 var(--pal-draft-soft);
 }
 
-.writer-state--saving .writer-state__dot { background:var(--brand); animation:ink-pulse 900ms ease-in-out infinite alternate; }
-.writer-state--published .writer-state__dot { background:var(--ok); }
-.writer-state--scheduled .writer-state__dot { background:var(--warn); }
-.writer-state--error { color:var(--down-ink); }
-.writer-state--error .writer-state__dot { background:var(--down); }
+.ink-editor__actionbar .writer-state--saving .writer-state__dot { animation:ink-pulse 900ms ease-in-out infinite alternate; }
+
+.ink-editor__actionbar .writer-state--published .writer-state__dot {
+  background:var(--ok);
+  box-shadow:2px 2px 0 var(--ok-soft);
+}
+
+.ink-editor__actionbar .writer-state--scheduled .writer-state__dot {
+  background:var(--warn);
+  box-shadow:2px 2px 0 var(--warn-soft);
+}
+
+.ink-editor__actionbar .writer-state--error { color:var(--down-ink); }
+
+.ink-editor__actionbar .writer-state--error .writer-state__dot {
+  background:var(--down);
+  box-shadow:2px 2px 0 var(--down-soft);
+}
 
 @keyframes ink-pulse { to { opacity:.35; transform:scale(.78); } }
 
-.writer-privacy {
-  margin:calc(var(--sp-2) * -1) 0 0;
+.ink-editor__canvas .writer-privacy {
+  margin:0 0 var(--sp-4);
   font-size:var(--fs-micro);
+  color:var(--pal-ink-3);
 }
 
-.ink-setting {
+/* Recovery bar: ultramarine Draft registration, flat limestone tint. */
+.ink-editor__canvas .draftbar {
+  border:1px solid var(--pal-line-strong);
+  border-left:3px solid var(--pal-draft);
+  border-radius:var(--r-xs);
+  background:var(--pal-draft-soft);
+  color:var(--pal-ink);
+}
+
+.ink-editor__rail .ink-setting {
   display:flex;
   align-items:center;
   padding:var(--sp-2) 0;
 }
 
-.ink-setting + .ink-setting { border-top:1px solid var(--hairline); }
+.ink-editor__rail .ink-setting + .ink-setting { border-top:1px solid var(--pal-line); }
 
-.ink-setting .check {
+.ink-editor__rail .ink-setting .check {
   width:100%;
   flex-direction:row-reverse;
   justify-content:space-between;
   font-weight:var(--fw-medium);
-  color:var(--ink);
+  color:var(--pal-ink);
 }
 
-.ink-cover__thumb {
+.ink-editor__rail .ink-cover__thumb {
   display:block;
   width:100%;
   max-height:140px;
   object-fit:cover;
-  border-radius:var(--r-sm);
-  border:1px solid var(--border);
+  border-radius:var(--r-xs);
+  border:1px solid var(--pal-line);
   margin-top:var(--sp-2);
 }
 
@@ -1299,71 +1460,73 @@ body.page {
   resize:vertical;
 }
 
-.ink-settings-disclosure > summary {
+.ink-editor__rail .ink-settings-disclosure > summary {
   display:grid;
   grid-template-columns:minmax(0,1fr) auto;
   align-items:center;
   gap:2px var(--sp-3);
-  padding:var(--sp-3) var(--sp-4);
+  padding:var(--sp-3) 0;
   list-style:none;
   cursor:pointer;
   user-select:none;
 }
 
-.ink-settings-disclosure > summary::-webkit-details-marker { display:none; }
+.ink-editor__rail .ink-settings-disclosure > summary::-webkit-details-marker { display:none; }
 
-.ink-settings-disclosure > summary span {
+.ink-editor__rail .ink-settings-disclosure > summary span {
   font-size:var(--fs-micro);
   font-weight:var(--fw-semibold);
   letter-spacing:.07em;
   text-transform:uppercase;
-  color:var(--ink-3);
+  color:var(--pal-ink-3);
 }
 
-.ink-settings-disclosure > summary small {
+.ink-editor__rail .ink-settings-disclosure > summary small {
   grid-column:1;
   grid-row:2;
   overflow:hidden;
-  color:var(--ink-4);
+  color:var(--pal-ink-3);
   font-size:var(--fs-micro);
   text-overflow:ellipsis;
   white-space:nowrap;
 }
 
-.ink-settings-disclosure > summary::after {
+.ink-editor__rail .ink-settings-disclosure > summary::after {
   content:"+";
   grid-column:2;
   grid-row:1 / span 2;
-  color:var(--brand-ink);
+  color:var(--pal-draft-ink);
   font-size:18px;
   font-weight:var(--fw-medium);
 }
 
-.ink-settings-disclosure[open] > summary {
-  border-bottom:1px solid var(--hairline);
+.ink-editor__rail .ink-settings-disclosure[open] > summary {
+  border-bottom:1px solid var(--pal-line);
 }
 
-.ink-settings-disclosure[open] > summary::after { content:"−"; }
+.ink-editor__rail .ink-settings-disclosure[open] > summary::after { content:"−"; }
 
-.ink-publish-details .field,
-.ink-social-settings .field { margin-bottom:var(--sp-4); }
+.ink-editor__rail .ink-settings-disclosure .card__body { padding-top:var(--sp-3); }
 
-.ink-social-preview {
+.ink-editor__rail .ink-publish-details .field,
+.ink-editor__rail .ink-social-settings .field { margin-bottom:var(--sp-4); }
+
+.ink-editor__rail .ink-social-preview {
   overflow:hidden;
-  border:1px solid var(--border);
-  border-radius:var(--r-sm);
-  background:var(--surface-2);
+  border:1px solid var(--pal-line);
+  border-radius:var(--r-xs);
+  background:var(--pal-inset);
 }
 
-.ink-social-preview__image {
+.ink-editor__rail .ink-social-preview__image {
   display:block;
   width:100%;
   aspect-ratio:1.91 / 1;
   object-fit:cover;
-  border-bottom:1px solid var(--hairline);
+  border-bottom:1px solid var(--pal-line);
 }
 
-.ink-social-preview__body {
+.ink-editor__rail .ink-social-preview__body {
   display:flex;
   flex-direction:column;
   gap:4px;
@@ -1371,71 +1534,129 @@ body.page {
   min-width:0;
 }
 
-.ink-social-preview__host {
-  color:var(--ink-4);
+.ink-editor__rail .ink-social-preview__host {
+  color:var(--pal-ink-3);
   font-size:var(--fs-micro);
   letter-spacing:.025em;
   text-transform:uppercase;
 }
 
-.ink-social-preview__body strong,
-.ink-social-preview__body > span:last-child {
+.ink-editor__rail .ink-social-preview__body strong,
+.ink-editor__rail .ink-social-preview__body > span:last-child {
   overflow:hidden;
   display:-webkit-box;
   -webkit-box-orient:vertical;
 }
 
-.ink-social-preview__body strong {
+.ink-editor__rail .ink-social-preview__body strong {
   -webkit-line-clamp:2;
-  color:var(--ink);
+  color:var(--pal-ink);
   font-family:var(--serif);
   font-size:var(--fs-body);
   line-height:1.35;
 }
 
-.ink-social-preview__body > span:last-child {
+.ink-editor__rail .ink-social-preview__body > span:last-child {
   -webkit-line-clamp:3;
-  color:var(--ink-3);
+  color:var(--pal-ink-2);
   font-size:var(--fs-sm);
   line-height:1.45;
 }
 
-.tag-suggestions {
+.ink-editor__rail .tag-suggestions {
   display:flex;
   flex-wrap:wrap;
   gap:var(--sp-2);
   margin-top:var(--sp-2);
   padding:var(--sp-2);
-  border:1px solid var(--border);
-  border-radius:var(--r-sm);
-  background:var(--surface);
+  border:1px solid var(--pal-line-strong);
+  border-radius:var(--r-xs);
+  background:var(--pal-plane);
   box-shadow:var(--sh-sm);
 }
 
-.tag-suggestions[hidden] { display:none; }
+.ink-editor__rail .tag-suggestions[hidden] { display:none; }
 
-.tag-suggestions__item {
-  border:1px solid var(--border);
+.ink-editor__rail .tag-suggestions__item {
+  border:1px solid var(--pal-line);
   border-radius:999px;
   padding:5px 9px;
-  background:var(--surface-2);
-  color:var(--ink-2);
+  background:var(--pal-inset);
+  color:var(--pal-ink-2);
   font:inherit;
   font-size:var(--fs-sm);
   cursor:pointer;
 }
 
-.tag-suggestions__item:hover,
-.tag-suggestions__item:focus-visible {
-  border-color:var(--brand);
-  color:var(--brand-ink);
+.ink-editor__rail .tag-suggestions__item:hover,
+.ink-editor__rail .tag-suggestions__item:focus-visible {
+  border-color:var(--pal-draft);
+  color:var(--pal-draft-ink);
   outline:none;
 }
 
-.draftbar {
-  border-color:color-mix(in srgb, var(--brand) 22%, var(--surface));
-  background:var(--brand-soft);
-  color:var(--brand-ink);
+/* Ultramarine focus registration for every Writer field and action. The
+   borderless title/body above keep their own outline variant. */
+.ink-editor input:focus,
+.ink-editor textarea:focus,
+.ink-editor select:focus {
+  border-color:var(--pal-draft);
+  box-shadow:0 0 0 4px var(--pal-ring);
+  outline:none;
+}
+
+.ink-editwrap .ink-editor .btn-primary {
+  background:var(--pal-ink);
+  border-color:transparent;
+  color:var(--pal-plane);
+}
+
+.ink-editwrap .ink-editor .btn-primary:hover {
+  background:color-mix(in srgb, var(--pal-ink) 88%, var(--pal-draft));
+  color:var(--pal-plane);
+}
+
+.ink-editor .btn:focus-visible,
+.ink-editor a:focus-visible,
+.ink-editor summary:focus-visible {
+  outline:2px solid var(--pal-draft);
+  outline-offset:2px;
+}
+
+/* Writer narrow and zoom reflow: the rail margin folds under the sheet, the
+   colophon strip re-pads, and targets keep a 44px floor. */
+@media (max-width:960px) {
+  .ink-editor__rail {
+    padding-left:0;
+    padding-top:var(--sp-5);
+    border-left:0;
+    border-top:1px solid var(--pal-line-strong);
+  }
+}
+
+@media (max-width:720px) {
+  .ink-editor__actionbar .btn { min-height:44px; }
+}
+
+@media (max-width:520px) {
+  .ink-editor__canvas { padding:var(--sp-4) var(--sp-4) 0; }
+  .ink-editor__actionbar {
+    margin-left:calc(-1 * var(--sp-4));
+    margin-right:calc(-1 * var(--sp-4));
+    padding-left:var(--sp-4);
+    padding-right:var(--sp-4);
+  }
+}
+
+@media (pointer:coarse) {
+  .ink-editor__canvas .editor__tabs .tab { min-height:44px; }
+  .ink-editor__canvas .draftbar .btn { min-height:44px; }
+  .ink-editor__actionbar .btn { min-height:44px; }
+  .ink-editor__rail .tag-suggestions__item {
+    min-height:44px;
+    padding-top:9px;
+    padding-bottom:9px;
+  }
 }
 
 /* S9 SEARCH --------------------------------------------------------------- */
@@ -2079,28 +2300,63 @@ body.page {
 
 .draftbar__spacer { margin-left:auto; }
 
-/* S15 REVIEW & PUBLISH ----------------------------------------------------- */
+/* S15 REVIEW & PUBLISH — FINAL PROOF -----------------------------------------
+   Preflight resolves the palimpsest into one clean proof: flat limestone
+   sheets, midnight-violet ink, cold-lilac Proof registration on the decision
+   sheet and body sample. No decorative gradient, no glass. Palimpsest tokens
+   come from the shared block in S8; every rule stays scoped to the Preflight
+   root (.ink-preflight / body.page-preflight). */
+body.page-preflight { background:var(--pal-ground); }
+
 .ink-preflight { max-width:980px; }
 
 .ink-preflight__head { margin-bottom:var(--sp-5); }
 
+.ink-preflight__head h1 { color:var(--pal-ink); }
+
+.ink-preflight__head .sub { color:var(--pal-ink-2); }
+
 .ink-preflight__eyebrow {
   margin:0 0 6px;
-  color:var(--brand-ink);
+  color:var(--pal-proof-ink);
   font-size:12px;
   font-weight:700;
   letter-spacing:.1em;
   text-transform:uppercase;
 }
 
+/* Proof sheets: the generic card frame and its gradient rule are dismantled
+   into one flat plane per section. */
+.ink-preflight .card {
+  background:var(--pal-plane);
+  background-image:none;
+  border:1px solid var(--pal-line);
+  border-radius:var(--r-sm);
+  box-shadow:none;
+  transition:none;
+}
+
+.ink-preflight .card:hover {
+  box-shadow:none;
+  border-color:var(--pal-line);
+}
+
+.ink-preflight .card__title { color:var(--pal-ink); }
+
+.ink-preflight .field__hint { color:var(--pal-ink-3); }
+
+/* Final action: the proof registration strip replaces the old gradient. */
 .ink-preflight__decision {
   margin-bottom:var(--sp-5);
-  border-color:var(--accent-border);
-  background:linear-gradient(135deg,var(--brand-soft),var(--surface) 58%);
+  border-top:3px solid var(--pal-proof);
 }
 
 .ink-preflight__decision h2,
 .ink-preflight__decision p { margin-top:0; }
+
+.ink-preflight__decision h2 { color:var(--pal-ink); }
+
+.ink-preflight__decision p { color:var(--pal-ink-2); }
 
 .ink-preflight__facts,
 .ink-preflight__metadata {
@@ -2115,11 +2371,11 @@ body.page {
   grid-template-columns:minmax(110px,.35fr) minmax(0,1fr);
   gap:var(--sp-4);
   padding:10px 0;
-  border-top:1px solid var(--hairline);
+  border-top:1px solid var(--pal-line);
 }
 
 .ink-preflight dt {
-  color:var(--ink-3);
+  color:var(--pal-ink-3);
   font-size:12.5px;
   font-weight:650;
 }
@@ -2128,7 +2384,7 @@ body.page {
   min-width:0;
   margin:0;
   overflow-wrap:anywhere;
-  color:var(--ink);
+  color:var(--pal-ink);
   font-size:13px;
 }
 
@@ -2139,9 +2395,11 @@ body.page {
   margin-bottom:var(--sp-5);
 }
 
+/* Checks collate into hairline rows; status words stay in text, ok/warn ink
+   only reinforces them. */
 .ink-preflight__checks {
   display:grid;
-  gap:10px;
+  gap:0;
   margin:var(--sp-4) 0 0;
   padding:0;
   list-style:none;
@@ -2152,27 +2410,31 @@ body.page {
   grid-template-columns:70px minmax(0,1fr);
   gap:10px;
   align-items:start;
-  padding:10px 12px;
-  border:1px solid var(--border);
-  border-radius:var(--r-sm);
-  background:var(--surface-2);
+  padding:10px 2px;
+  border-top:1px solid var(--pal-line);
   font-size:12.5px;
 }
 
+.ink-preflight__checks .ink-preflight__check:first-child { border-top:0; }
+
+.ink-preflight__check strong { color:var(--pal-ink); }
 .ink-preflight__check.is-ready strong { color:var(--ok-ink); }
 .ink-preflight__check.is-warning strong { color:var(--warn-ink); }
-.ink-preflight__check span { color:var(--ink-2); line-height:1.45; }
+.ink-preflight__check span { color:var(--pal-ink-2); line-height:1.45; }
 
 .ink-preflight__body {
   max-height:520px;
   overflow:auto;
   margin-top:var(--sp-4);
   padding:var(--sp-5);
-  border:1px solid var(--border);
-  border-radius:var(--r);
-  background:var(--surface-2);
+  border:1px solid var(--pal-line);
+  border-top:3px solid var(--pal-proof);
+  border-radius:var(--r-sm);
+  background:var(--pal-inset);
+  overflow-wrap:anywhere;
 }
 
+/* Confirmation strip: flat opaque colophon, no glass, no lift shadow. */
 .ink-preflight__actions {
   position:sticky;
   bottom:12px;
@@ -2182,11 +2444,42 @@ body.page {
   gap:var(--sp-3);
   margin-top:var(--sp-5);
   padding:12px;
-  border:1px solid var(--accent-border);
-  border-radius:var(--r);
-  background:color-mix(in srgb,var(--surface) 95%,transparent);
-  box-shadow:var(--sh-md);
-  backdrop-filter:blur(10px);
+  border:1px solid var(--pal-line-strong);
+  border-top:3px double var(--pal-line-strong);
+  border-radius:var(--r-sm);
+  background:var(--pal-plane);
+  box-shadow:none;
+}
+
+.ink-preflight .ink-preflight__actions .btn-primary {
+  background:var(--pal-ink);
+  border-color:transparent;
+  color:var(--pal-plane);
+}
+
+.ink-preflight .ink-preflight__actions .btn-primary:hover {
+  background:color-mix(in srgb, var(--pal-ink) 88%, var(--pal-proof));
+  color:var(--pal-plane);
+}
+
+.ink-preflight .btn:focus-visible,
+.ink-preflight a:focus-visible {
+  outline:2px solid var(--pal-draft);
+  outline-offset:2px;
+}
+
+.ink-preflight > .writer-privacy {
+  margin:var(--sp-4) 0 0;
+  font-size:var(--fs-micro);
+  color:var(--pal-ink-3);
+}
+
+@media (max-width:720px) {
+  .ink-preflight__actions .btn { min-height:44px; }
+}
+
+@media (pointer:coarse) {
+  .ink-preflight__actions .btn { min-height:44px; }
 }
 
 /* S16 AUTHOR CONTENT LIBRARY ---------------------------------------------- */
@@ -2694,4 +2987,112 @@ body.page {
   .revision-context { grid-template-columns:1fr; }
   .revision-diff-head { flex-direction:column; }
   .revision-fields { min-width:680px; }
+}
+
+/* S20 PALIMPSEST THEME SUPPORT -----------------------------------------------
+   Dark and forced-colors remaps for the Writer/Preflight palimpsest tokens
+   defined in S8. Values only; the light cascade is untouched and every rule
+   stays scoped to the same two surfaces. Reduced motion is already covered by
+   the global S1 reduce block, which also silences the saving pulse. */
+:root[data-theme="dark"] .ink-editwrap,
+:root[data-theme="dark"] .ink-preflight {
+  --pal-ground:#120d1e;
+  --pal-plane:#1c1629;
+  --pal-inset:#221a33;
+  --pal-ink:#ece5f7;
+  --pal-ink-2:#c6bce0;
+  --pal-ink-3:#9d92c0;
+  --pal-line:#372c50;
+  --pal-line-strong:#4e4073;
+  --pal-draft:#9dadff;
+  --pal-draft-ink:#bcc7ff;
+  --pal-draft-soft:#252e55;
+  --pal-proof:#c3b1ef;
+  --pal-proof-ink:#cfc2f4;
+  --pal-proof-soft:#291f42;
+  --pal-ring:rgba(157,173,255,.40);
+}
+
+:root[data-theme="dark"] body.page-console:has(> .ink-editwrap),
+:root[data-theme="dark"] body.page-preflight {
+  --pal-ground:#120d1e;
+  --pal-plane:#1c1629;
+  --pal-inset:#221a33;
+  --pal-ink:#ece5f7;
+  --pal-ink-2:#c6bce0;
+  --pal-ink-3:#9d92c0;
+  --pal-line:#372c50;
+  --pal-line-strong:#4e4073;
+  --pal-draft:#9dadff;
+  --pal-draft-ink:#bcc7ff;
+  --pal-draft-soft:#252e55;
+  --pal-proof:#c3b1ef;
+  --pal-proof-ink:#cfc2f4;
+  --pal-proof-soft:#291f42;
+  --pal-ring:rgba(157,173,255,.40);
+}
+
+@media (prefers-color-scheme:dark) {
+  :root[data-theme="auto"] .ink-editwrap,
+  :root[data-theme="auto"] .ink-preflight {
+    --pal-ground:#120d1e;
+    --pal-plane:#1c1629;
+    --pal-inset:#221a33;
+    --pal-ink:#ece5f7;
+    --pal-ink-2:#c6bce0;
+    --pal-ink-3:#9d92c0;
+    --pal-line:#372c50;
+    --pal-line-strong:#4e4073;
+    --pal-draft:#9dadff;
+    --pal-draft-ink:#bcc7ff;
+    --pal-draft-soft:#252e55;
+    --pal-proof:#c3b1ef;
+    --pal-proof-ink:#cfc2f4;
+    --pal-proof-soft:#291f42;
+    --pal-ring:rgba(157,173,255,.40);
+  }
+
+  :root[data-theme="auto"] body.page-console:has(> .ink-editwrap),
+  :root[data-theme="auto"] body.page-preflight {
+    --pal-ground:#120d1e;
+    --pal-plane:#1c1629;
+    --pal-inset:#221a33;
+    --pal-ink:#ece5f7;
+    --pal-ink-2:#c6bce0;
+    --pal-ink-3:#9d92c0;
+    --pal-line:#372c50;
+    --pal-line-strong:#4e4073;
+    --pal-draft:#9dadff;
+    --pal-draft-ink:#bcc7ff;
+    --pal-draft-soft:#252e55;
+    --pal-proof:#c3b1ef;
+    --pal-proof-ink:#cfc2f4;
+    --pal-proof-soft:#291f42;
+    --pal-ring:rgba(157,173,255,.40);
+  }
+}
+
+/* Forced colors: decorative layer shadows and color tints drop away; hairline
+   rules become system borders and keep the registration structure. The state
+   mark stays visible as an outlined square beside its text label. */
+@media (forced-colors: active) {
+  body.page-console:has(> .ink-editwrap),
+  body.page-preflight { background:Canvas; }
+
+  .ink-editor__canvas,
+  .ink-editor__canvas .editor__preview,
+  .ink-editor__actionbar,
+  .ink-preflight .card,
+  .ink-preflight__actions {
+    background:Canvas;
+    box-shadow:none;
+  }
+
+  .ink-editor__actionbar .writer-state__dot {
+    background:transparent;
+    border:2px solid CanvasText;
+    box-shadow:none;
+  }
+
+  .ink-editor__actionbar .writer-state--saving .writer-state__dot { animation:none; }
 }

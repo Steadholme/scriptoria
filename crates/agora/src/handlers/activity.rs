@@ -11,11 +11,16 @@ use serde::Deserialize;
 
 use crate::auth;
 use crate::error::AppError;
-use crate::handlers::{
-    email_display, esc, fmt_ts, personal_counts, rel_time, render_page_with_personal_counts,
-};
-use crate::model::{ActivityItem, ActivityReason};
+use crate::handlers::{form_action, hidden_field, page_chrome, personal_counts};
+use crate::model::{ActivityItem, ActivityKind, ActivityReason};
 use crate::store::{ActivityCursor, ActivityFilter};
+use crate::view_model::{
+    ActionKind, ActivityFilterLinkVM, ActivityFilterVM, ActivityItemShared, ActivityItemVM,
+    ActivityItemViewerState, ActivityKindVM, ActivityOpenFormVM, ActivityReadScopeLinkVM,
+    ActivityReadScopeVM, ActivityReasonVM, ActivityShared, ActivityView, ActivityViewerState,
+    CollectionState, NavTab, Opaque, PageLinkVM, PaginationVM, Text,
+};
+use crate::views;
 use crate::{now_secs, AppState};
 
 const ACTIVITY_PAGE_SIZE: i64 = 30;
@@ -74,49 +79,74 @@ pub async fn page(
     let has_more = items.len() as i64 > ACTIVITY_PAGE_SIZE;
     items.truncate(ACTIVITY_PAGE_SIZE as usize);
     let counts = personal_counts(&state, &headers, now).await?;
-    let unread_count = counts.unread_activity.unwrap_or(0);
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
-    let controls = render_controls(&query, &csrf, &items);
-    let rows = render_rows(&items, &csrf, now);
-    let pagination = if has_more {
-        items
+    let filter = query.filter();
+    let unread_only = query.unread_only();
+    let older = has_more.then(|| {
+        let item = items
             .last()
-            .map(|item| {
-                let cursor = format!("{}_{}", item.event.created_at, item.event.id);
-                format!(
-                    r#"<nav class="pagination"><a class="btn btn-secondary btn-sm" href="{href}">Older activity →</a></nav>"#,
-                    href = activity_href(
-                        query.filter_key(),
-                        query.unread_only(),
-                        Some(&cursor),
-                    ),
-                )
-            })
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
-    let content = format!(
-        r#"<nav class="crumbs"><a href="/">Home</a><span class="crumbs__sep">/</span><span>Activity</span></nav>
-<div class="page-head ag-activity-head">
-  <div><h1>Activity</h1><p class="muted">Replies, mentions, followed threads, and accepted answers that bring you back.</p></div>
-  <span class="ag-activity-total">{unread_label}</span>
-</div>
-{controls}
-<section class="ag-activity-list" aria-label="Personal activity">{rows}</section>
-{pagination}"#,
-        unread_label = if unread_count == 1 {
-            "1 unread".to_string()
-        } else {
-            format!("{unread_count} unread")
+            .expect("has_more requires a retained page item");
+        let cursor = format!("{}_{}", item.event.created_at, item.event.id);
+        PageLinkVM {
+            href: Opaque(activity_href(
+                query.filter_key(),
+                unread_only,
+                Some(&cursor),
+            )),
+            label: Text("Older activity".to_string()),
+        }
+    });
+    let mark_page_read = (!items.is_empty()).then(|| {
+        form_action(
+            "/activity/read-page",
+            ActionKind::MarkPageRead,
+            csrf.clone(),
+            vec![
+                hidden_field("filter", query.filter_key()),
+                hidden_field("state", if unread_only { "unread" } else { "all" }),
+                hidden_field(
+                    "ids",
+                    items
+                        .iter()
+                        .map(|item| item.event.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+            ],
+        )
+    });
+    let view = ActivityView {
+        chrome: page_chrome("Activity", &headers, NavTab::Activity, counts),
+        shared: ActivityShared {
+            active_filter: activity_filter_vm(filter),
+            read_scope: if unread_only {
+                ActivityReadScopeVM::Unread
+            } else {
+                ActivityReadScopeVM::All
+            },
+            filter_links: activity_filter_links(unread_only),
+            read_scope_links: activity_read_scope_links(query.filter_key()),
+            visible_bound: ACTIVITY_PAGE_SIZE,
+            state: activity_collection_state(&items, filter, unread_only, before.is_some()),
+            now,
         },
-    );
-    let html = render_page_with_personal_counts(
-        "Activity",
-        &email_display(&headers),
-        &content,
-        counts,
-    );
+        viewer: ActivityViewerState {
+            items: items
+                .iter()
+                .map(|item| activity_item_vm(item, &csrf))
+                .collect(),
+            pagination: PaginationVM {
+                previous: None,
+                next: older,
+                jump: None,
+                at_start: before.is_none(),
+                at_end: !has_more,
+                visible_limit: ACTIVITY_PAGE_SIZE,
+            },
+            mark_page_read,
+        },
+    };
+    let html = views::personal::activity(&view);
     Ok(html_response(html, set_cookie))
 }
 
@@ -209,132 +239,121 @@ pub async fn mark_page_read(
         ActivityFilter::All => "all",
         ActivityFilter::Reason(reason) => reason.as_str(),
     };
-    let location = activity_href(filter_key, form.state == "unread", None).replace("&amp;", "&");
+    let location = activity_href(filter_key, form.state == "unread", None);
     Ok(redirect_to(&location))
 }
 
-fn render_controls(query: &ActivityQuery, csrf: &str, items: &[ActivityItem]) -> String {
-    let filter_key = query.filter_key();
-    let unread = query.unread_only();
-    let filter_tab = |key: &str, label: &str| {
-        format!(
-            r#"<a class="tab{active}"{current} href="{href}">{label}</a>"#,
-            active = if filter_key == key { " is-active" } else { "" },
-            current = if filter_key == key {
-                r#" aria-current="page""#
-            } else {
-                ""
-            },
-            href = activity_href(key, unread, None),
-        )
-    };
-    let state_tab = |only_unread: bool, label: &str| {
-        format!(
-            r#"<a class="tab{active}"{current} href="{href}">{label}</a>"#,
-            active = if unread == only_unread {
-                " is-active"
-            } else {
-                ""
-            },
-            current = if unread == only_unread {
-                r#" aria-current="page""#
-            } else {
-                ""
-            },
-            href = activity_href(filter_key, only_unread, None),
-        )
-    };
-    format!(
-        r#"<div class="ag-activity-controls">
-  <div class="ag-activity-tabs">
-    <nav class="tabs" aria-label="Activity state">{all_state}{unread_state}</nav>
-    <nav class="tabs ag-activity-reasons" aria-label="Activity reason">{all}{mentions}{replies}{following}{answers}</nav>
-  </div>
-  <form method="post" action="/activity/read-page">
-    <input type="hidden" name="csrf" value="{csrf}">
-    <input type="hidden" name="filter" value="{filter}">
-    <input type="hidden" name="state" value="{state}">
-    <input type="hidden" name="ids" value="{ids}">
-    <button class="btn btn-secondary btn-sm" type="submit"{disabled}>Mark this page read</button>
-  </form>
-</div>"#,
-        all_state = state_tab(false, "All"),
-        unread_state = state_tab(true, "Unread"),
-        all = filter_tab("all", "Everything"),
-        mentions = filter_tab("mention", "Mentions"),
-        replies = filter_tab("reply", "Replies"),
-        following = filter_tab("following", "Following"),
-        answers = filter_tab("answer", "Answers"),
-        csrf = esc(csrf),
-        filter = filter_key,
-        state = if unread { "unread" } else { "all" },
-        ids = esc(&items
-            .iter()
-            .map(|item| item.event.id.as_str())
-            .collect::<Vec<_>>()
-            .join(",")),
-        disabled = if items.is_empty() { " disabled" } else { "" },
-    )
+fn activity_filter_vm(filter: ActivityFilter) -> ActivityFilterVM {
+    match filter {
+        ActivityFilter::All => ActivityFilterVM::All,
+        ActivityFilter::Reason(ActivityReason::Mention) => ActivityFilterVM::Mention,
+        ActivityFilter::Reason(ActivityReason::Reply) => ActivityFilterVM::Reply,
+        ActivityFilter::Reason(ActivityReason::Following) => ActivityFilterVM::Following,
+        ActivityFilter::Reason(ActivityReason::Answer) => ActivityFilterVM::Answer,
+    }
 }
 
-fn render_rows(items: &[ActivityItem], csrf: &str, now: i64) -> String {
-    if items.is_empty() {
-        return r#"<div class="empty"><h3>Nothing waiting here.</h3><p>New replies and direct activity will appear here.</p></div>"#.to_string();
-    }
-    let mut html = String::new();
-    for item in items {
-        let target = activity_target(item);
-        let (reason_label, sentence) = activity_copy(item);
-        let actor = if item.actor_email.trim().is_empty() {
-            item.event.actor_sub.as_str()
-        } else {
-            item.actor_email.as_str()
-        };
-        html.push_str(&format!(
-            r#"<article class="ag-activity-row{unread}" id="activity-{id}">
-  <form class="ag-activity-open" method="post" action="/activity/{id}/open">
-    <input type="hidden" name="csrf" value="{csrf}">
-    <input type="hidden" name="next" value="{target}">
-    <button type="submit">
-      <span class="ag-activity-dot" aria-hidden="true"></span>
-      <span class="ag-activity-main">
-        <span class="ag-activity-title">{title}</span>
-        <span class="ag-activity-copy"><strong>{actor}</strong> {sentence}</span>
-        <span class="ag-activity-snippet">{snippet}</span>
-      </span>
-      <span class="ag-activity-meta"><span class="badge">{reason}</span><time title="{absolute}">{relative}</time></span>
-    </button>
-  </form>
-  <form class="ag-activity-state" method="post" action="/activity/{id}/state">
-    <input type="hidden" name="csrf" value="{csrf}">
-    <input type="hidden" name="state" value="{next_state}">
-    <button class="btn btn-ghost btn-sm" type="submit">{state_label}</button>
-  </form>
-</article>"#,
-            unread = if item.read { "" } else { " is-unread" },
-            id = esc(&item.event.id),
-            csrf = esc(csrf),
-            target = esc(&target),
-            title = esc(&item.thread_title),
-            actor = esc(actor),
-            sentence = sentence,
-            snippet = esc(&compact_snippet(&item.post_body_md, 180)),
-            reason = reason_label,
-            absolute = esc(&fmt_ts(item.event.created_at)),
-            relative = esc(&rel_time(item.event.created_at, now)),
-            next_state = if item.read { "unread" } else { "read" },
-            state_label = if item.read { "Mark unread" } else { "Mark read" },
-        ));
-    }
-    html
+fn activity_filter_links(unread: bool) -> Vec<ActivityFilterLinkVM> {
+    [
+        (ActivityFilterVM::All, "all", "Everything"),
+        (ActivityFilterVM::Mention, "mention", "Mentions"),
+        (ActivityFilterVM::Reply, "reply", "Replies"),
+        (ActivityFilterVM::Following, "following", "Following"),
+        (ActivityFilterVM::Answer, "answer", "Answers"),
+    ]
+    .into_iter()
+    .map(|(filter, key, label)| ActivityFilterLinkVM {
+        filter,
+        link: PageLinkVM {
+            href: Opaque(activity_href(key, unread, None)),
+            label: Text(label.to_string()),
+        },
+    })
+    .collect()
 }
 
-fn activity_copy(item: &ActivityItem) -> (&'static str, &'static str) {
-    match item.reason {
-        ActivityReason::Mention => ("Mention", "mentioned you"),
-        ActivityReason::Reply => ("Reply", "replied to you"),
-        ActivityReason::Following => ("Following", "posted in a thread you follow"),
-        ActivityReason::Answer => ("Accepted", "accepted your answer"),
+fn activity_read_scope_links(filter: &str) -> Vec<ActivityReadScopeLinkVM> {
+    [
+        (ActivityReadScopeVM::All, false, "All"),
+        (ActivityReadScopeVM::Unread, true, "Unread"),
+    ]
+    .into_iter()
+    .map(|(scope, unread, label)| ActivityReadScopeLinkVM {
+        scope,
+        link: PageLinkVM {
+            href: Opaque(activity_href(filter, unread, None)),
+            label: Text(label.to_string()),
+        },
+    })
+    .collect()
+}
+
+fn activity_collection_state(
+    items: &[ActivityItem],
+    filter: ActivityFilter,
+    unread_only: bool,
+    has_cursor: bool,
+) -> CollectionState {
+    if !items.is_empty() {
+        CollectionState::Ready
+    } else if has_cursor {
+        CollectionState::End
+    } else if filter != ActivityFilter::All || unread_only {
+        CollectionState::FilteredZero
+    } else {
+        CollectionState::ReadyEmpty
+    }
+}
+
+fn activity_item_vm(item: &ActivityItem, csrf: &str) -> ActivityItemVM {
+    let actor_display = if item.actor_email.trim().is_empty() {
+        item.event.actor_sub.clone()
+    } else {
+        item.actor_email.clone()
+    };
+    let next_state = if item.read { "unread" } else { "read" };
+    ActivityItemVM {
+        shared: ActivityItemShared {
+            id: Opaque(item.event.id.clone()),
+            kind: match item.event.kind {
+                ActivityKind::PostCreated => ActivityKindVM::PostCreated,
+                ActivityKind::AnswerAccepted => ActivityKindVM::AnswerAccepted,
+            },
+            thread_id: Opaque(item.event.thread_id.clone()),
+            post_id: Opaque(item.event.post_id.clone()),
+            thread_title: Text(item.thread_title.clone()),
+            post_excerpt: Text(compact_snippet(&item.post_body_md, 180)),
+            actor_display: Text(actor_display),
+            created_at: item.event.created_at,
+        },
+        viewer: ActivityItemViewerState {
+            reason: match item.reason {
+                ActivityReason::Mention => ActivityReasonVM::Mention,
+                ActivityReason::Reply => ActivityReasonVM::Reply,
+                ActivityReason::Following => ActivityReasonVM::Following,
+                ActivityReason::Answer => ActivityReasonVM::Answer,
+            },
+            read: item.read,
+            open: ActivityOpenFormVM {
+                submit: form_action(
+                    format!("/activity/{}/open", item.event.id),
+                    ActionKind::OpenActivity,
+                    csrf,
+                    Vec::new(),
+                ),
+                exact_target: Opaque(activity_target(item)),
+            },
+            toggle_read: form_action(
+                format!("/activity/{}/state", item.event.id),
+                if item.read {
+                    ActionKind::MarkUnread
+                } else {
+                    ActionKind::MarkRead
+                },
+                csrf,
+                vec![hidden_field("state", next_state)],
+            ),
+        },
     }
 }
 
@@ -346,14 +365,14 @@ fn activity_target(item: &ActivityItem) -> String {
 }
 
 fn activity_href(filter: &str, unread: bool, before: Option<&str>) -> String {
-    let mut params = vec![format!("filter={}", esc(filter))];
+    let mut params = vec![format!("filter={filter}")];
     if unread {
         params.push("state=unread".to_string());
     }
     if let Some(before) = before {
-        params.push(format!("before={}", esc(before)));
+        params.push(format!("before={before}"));
     }
-    format!("/activity?{}", params.join("&amp;"))
+    format!("/activity?{}", params.join("&"))
 }
 
 fn parse_filter(value: &str) -> ActivityFilter {

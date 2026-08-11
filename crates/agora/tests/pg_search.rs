@@ -237,12 +237,7 @@ async fn pg_question_status_and_solution_body_are_one_bounded_read_model() {
     pg.create_thread(&unanswered, &unanswered_op).await.unwrap();
 
     let hits = pg
-        .search_threads(
-            &solution_needle,
-            None,
-            ThreadStatusFilter::Answered,
-            10,
-        )
+        .search_threads(&solution_needle, None, ThreadStatusFilter::Answered, 10)
         .await
         .unwrap();
     assert_eq!(hits.len(), 1);
@@ -262,7 +257,9 @@ async fn pg_question_status_and_solution_body_are_one_bounded_read_model() {
         .await
         .unwrap();
     assert!(answered_list.iter().any(|thread| thread.id == answered.id));
-    assert!(answered_list.iter().all(|thread| thread.id != unanswered.id));
+    assert!(answered_list
+        .iter()
+        .all(|thread| thread.id != unanswered.id));
     let unanswered_list = pg
         .list_threads(
             None,
@@ -274,8 +271,12 @@ async fn pg_question_status_and_solution_body_are_one_bounded_read_model() {
         )
         .await
         .unwrap();
-    assert!(unanswered_list.iter().any(|thread| thread.id == unanswered.id));
-    assert!(unanswered_list.iter().all(|thread| thread.id != answered.id));
+    assert!(unanswered_list
+        .iter()
+        .any(|thread| thread.id == unanswered.id));
+    assert!(unanswered_list
+        .iter()
+        .all(|thread| thread.id != answered.id));
 
     pg.delete_thread(&answered.id).await.unwrap();
     pg.delete_thread(&unanswered.id).await.unwrap();
@@ -428,8 +429,8 @@ async fn pg_migrate_backfills_legacy_original_body_without_overwriting_current_c
         .bind(&legacy_thread_id)
         .bind(&preserved_thread_id)
         .execute(&pool)
-    .await
-    .expect("remove backfill fixture threads");
+        .await
+        .expect("remove backfill fixture threads");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -527,18 +528,8 @@ async fn pg_reply_pages_and_thread_ties_match_memory_ordering() {
         [format!("p_e_{marker}"), format!("p_d_{marker}")]
     );
 
-    let tied_a = fixture_thread(
-        &format!("t_a_{marker}"),
-        &category_id,
-        "Tie A",
-        now + 100,
-    );
-    let tied_b = fixture_thread(
-        &format!("t_b_{marker}"),
-        &category_id,
-        "Tie B",
-        now + 100,
-    );
+    let tied_a = fixture_thread(&format!("t_a_{marker}"), &category_id, "Tie A", now + 100);
+    let tied_b = fixture_thread(&format!("t_b_{marker}"), &category_id, "Tie B", now + 100);
     let tied_a_op = fixture_post(&format!("p_tie_a_{marker}"), &tied_a.id, "A", now + 100);
     let tied_b_op = fixture_post(&format!("p_tie_b_{marker}"), &tied_b.id, "B", now + 100);
     pg.create_thread(&tied_a, &tied_a_op).await.unwrap();
@@ -586,7 +577,12 @@ async fn pg_invalid_answer_migration_and_public_predicate_are_idempotent() {
         "Target",
         now,
     );
-    let target_op = fixture_post(&format!("p_target_op_{marker}"), &target.id, "Target OP", now);
+    let target_op = fixture_post(
+        &format!("p_target_op_{marker}"),
+        &target.id,
+        "Target OP",
+        now,
+    );
     let target_reply = fixture_post(
         &format!("p_target_reply_{marker}"),
         &target.id,
@@ -711,7 +707,9 @@ async fn pg_invalid_answer_migration_and_public_predicate_are_idempotent() {
     );
 
     pg.migrate().await.expect("clean invalid accepted pointers");
-    pg.migrate().await.expect("accepted pointer cleanup is idempotent");
+    pg.migrate()
+        .await
+        .expect("accepted pointer cleanup is idempotent");
     for invalid in [&missing.id, &original.id, &cross.id] {
         assert!(pg
             .get_thread(invalid)
@@ -1003,11 +1001,7 @@ async fn pg_guarded_commands_serialize_conflicting_writes_without_orphans() {
     .expect("reply/delete commands must not deadlock");
     delete_result.unwrap();
     assert!(pg.get_thread(&reply_delete.id).await.unwrap().is_none());
-    assert!(pg
-        .get_post(&reply_delete_race.id)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(pg.get_post(&reply_delete_race.id).await.unwrap().is_none());
 
     let reply_lock = fixture_thread(
         &format!("t_reply_lock_{marker}"),
@@ -1027,9 +1021,7 @@ async fn pg_guarded_commands_serialize_conflicting_writes_without_orphans() {
         "reply",
         now + 41,
     );
-    pg.create_thread(&reply_lock, &reply_lock_op)
-        .await
-        .unwrap();
+    pg.create_thread(&reply_lock, &reply_lock_op).await.unwrap();
     let barrier = Arc::new(Barrier::new(3));
     let reply_task = {
         let pg = Arc::clone(&pg);
@@ -1110,7 +1102,10 @@ async fn pg_guarded_commands_serialize_conflicting_writes_without_orphans() {
     .expect("create/category-delete commands must not deadlock");
     let category_exists = pg.get_category(&categories[6]).await.unwrap().is_some();
     let thread_exists = pg.get_thread(&create_delete.id).await.unwrap().is_some();
-    assert_eq!(category_exists, thread_exists, "thread and category cannot orphan");
+    assert_eq!(
+        category_exists, thread_exists,
+        "thread and category cannot orphan"
+    );
 
     for thread_id in [
         &accept_format.id,

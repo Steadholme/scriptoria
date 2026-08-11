@@ -13,12 +13,14 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
-use crate::handlers::{
-    ag_tone, email_display, esc, fmt_ts, personal_counts, rel_time,
-    render_page_with_personal_counts,
-};
-use crate::model::{Category, CategoryFormat, ThreadSearchHit};
+use crate::handlers::{category_vm, page_chrome, personal_counts, thread_row_shared, thread_scope};
+use crate::model::Category;
 use crate::store::ThreadStatusFilter;
+use crate::view_model::{
+    CollectionState, NavTab, Opaque, SearchMatchSource, SearchQueryState, SearchResultVM,
+    SearchShared, SearchView, SearchViewerState, Text, ThreadOrder,
+};
+use crate::views;
 use crate::{now_secs, AppState};
 
 const SEARCH_PAGE_LIMIT: i64 = 50;
@@ -77,7 +79,6 @@ pub async fn page(
     let category_id = normalize_category(params.category.as_deref());
     let status = normalize_status(params.status.as_deref());
     let categories = state.store.list_categories().await?;
-    let category_names = category_names(&categories);
     let hits = if query.chars().count() < SEARCH_PAGE_QUERY_MIN_CHARS {
         Vec::new()
     } else {
@@ -91,23 +92,72 @@ pub async fn page(
             )
             .await?
     };
-
-    let content = render_search_page(
-        &query,
-        category_id.as_deref(),
-        status.as_deref(),
-        &categories,
-        &category_names,
-        &hits,
-        now,
-    );
     let counts = personal_counts(&state, &headers, now).await?;
-    Ok(Html(render_page_with_personal_counts(
-        "Search",
-        &email_display(&headers),
-        &content,
-        counts,
-    )))
+    let categories_by_id: HashMap<&str, &Category> = categories
+        .iter()
+        .map(|category| (category.id.as_str(), category))
+        .collect();
+    let results: Vec<SearchResultVM> = hits
+        .iter()
+        .map(|hit| {
+            let excerpt = if hit.matched_in_solution {
+                hit.accepted_body_md.as_str()
+            } else {
+                hit.first_body_md.as_str()
+            };
+            SearchResultVM {
+                thread: thread_row_shared(
+                    &hit.thread,
+                    categories_by_id
+                        .get(hit.thread.category_id.as_str())
+                        .copied(),
+                    Some(hit.reply_count.saturating_add(1)),
+                    !hit.thread.accepted_post_id.is_empty(),
+                ),
+                excerpt: Text(compact_excerpt(excerpt, SEARCH_EXCERPT_CHARS)),
+                source: if hit.matched_in_solution {
+                    SearchMatchSource::AcceptedAnswer
+                } else {
+                    SearchMatchSource::Topic
+                },
+            }
+        })
+        .collect();
+    let query_state = if query.is_empty() {
+        SearchQueryState::Empty
+    } else if query.chars().count() < SEARCH_PAGE_QUERY_MIN_CHARS {
+        SearchQueryState::TooShort
+    } else {
+        SearchQueryState::Valid
+    };
+    let collection_state = if !results.is_empty() {
+        CollectionState::Ready
+    } else if query_state == SearchQueryState::TooShort {
+        CollectionState::TooShort
+    } else if query_state == SearchQueryState::Valid && (category_id.is_some() || status.is_some())
+    {
+        CollectionState::FilteredZero
+    } else {
+        CollectionState::ReadyEmpty
+    };
+    let view = SearchView {
+        chrome: page_chrome("Search", &headers, NavTab::Search, counts),
+        shared: SearchShared {
+            categories: categories.iter().map(category_vm).collect(),
+            query_state,
+            results,
+            visible_bound: SEARCH_PAGE_LIMIT,
+            state: collection_state,
+            now,
+        },
+        viewer: SearchViewerState {
+            query: Text(query),
+            selected_category: category_id.map(Opaque),
+            order: ThreadOrder::Latest,
+            scope: thread_scope(status_filter(status.as_deref())),
+        },
+    };
+    Ok(Html(views::search::search(&view)))
 }
 
 /// `GET /api/search/suggest?q=&category=&limit=` — same-origin suggestions for the product-owned
@@ -233,175 +283,6 @@ fn category_names(categories: &[Category]) -> HashMap<&str, &str> {
         .iter()
         .map(|category| (category.id.as_str(), category.name.as_str()))
         .collect()
-}
-
-fn render_search_page(
-    query: &str,
-    selected_category: Option<&str>,
-    selected_status: Option<&str>,
-    categories: &[Category],
-    category_names: &HashMap<&str, &str>,
-    hits: &[ThreadSearchHit],
-    now: i64,
-) -> String {
-    let options = render_category_options(categories, selected_category);
-    let status_options = format!(
-        r#"<option value="">All discussions</option><option value="unanswered"{unanswered}>Unanswered questions</option><option value="answered"{answered}>Answered questions</option>"#,
-        unanswered = if selected_status == Some("unanswered") { " selected" } else { "" },
-        answered = if selected_status == Some("answered") { " selected" } else { "" },
-    );
-    let category_formats: HashMap<&str, CategoryFormat> = categories
-        .iter()
-        .map(|category| (category.id.as_str(), category.format))
-        .collect();
-    let body = if query.is_empty() {
-        r#"<section class="empty ag-search-empty">
-  <div class="empty__ico" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg></div>
-  <h2>Find a discussion</h2>
-  <p>Search titles, original posts, and accepted solutions. Add a category or answer status to narrow the result.</p>
-</section>"#
-            .to_string()
-    } else if query.chars().count() < SEARCH_PAGE_QUERY_MIN_CHARS {
-        r#"<section class="empty ag-search-empty">
-  <h2>Keep typing</h2>
-  <p>Use at least two characters to search the forum.</p>
-</section>"#
-            .to_string()
-    } else if hits.is_empty() {
-        format!(
-            r#"<section class="empty ag-search-empty">
-  <h2>No discussions found</h2>
-  <p>No thread matched <strong>{query}</strong>{scope}. Try fewer words or search every category.</p>
-</section>"#,
-            query = esc(query),
-            scope = selected_category
-                .map(|category| format!(" in <strong>{}</strong>", esc(category)))
-                .unwrap_or_default(),
-        )
-    } else {
-        render_results(hits, category_names, &category_formats, now)
-    };
-    let result_label = if query.is_empty() {
-        "Search across the forum".to_string()
-    } else if query.chars().count() < SEARCH_PAGE_QUERY_MIN_CHARS {
-        "Search queries need at least two characters".to_string()
-    } else {
-        format!(
-            "{} {} for “{}”",
-            hits.len(),
-            if hits.len() == 1 { "result" } else { "results" },
-            esc(query)
-        )
-    };
-
-    format!(
-        r#"<nav class="crumbs"><a href="/">Home</a><span class="crumbs__sep">/</span><span>Search</span></nav>
-<div class="page-head ag-search-head">
-  <div><h1>Search discussions</h1><p class="muted">{result_label}</p></div>
-</div>
-<form class="card ag-search-form" method="get" action="/search" role="search" aria-label="Forum search">
-  <div class="field ag-search-form__query">
-    <label class="label" for="search-page-query">Keywords</label>
-    <input id="search-page-query" class="input" type="search" name="q" value="{query}" maxlength="{max}" placeholder="Search titles and original posts" autofocus>
-  </div>
-  <div class="field ag-search-form__category">
-    <label class="label" for="search-page-category">Category</label>
-    <select id="search-page-category" name="category"><option value="">All categories</option>{options}</select>
-  </div>
-  <div class="field ag-search-form__status">
-    <label class="label" for="search-page-status">Answer status</label>
-    <select id="search-page-status" name="status">{status_options}</select>
-  </div>
-  <button class="btn btn-primary" type="submit">Search</button>
-</form>
-{body}"#,
-        result_label = result_label,
-        query = esc(query),
-        max = SEARCH_QUERY_MAX_CHARS,
-        options = options,
-        status_options = status_options,
-        body = body,
-    )
-}
-
-fn render_category_options(categories: &[Category], selected: Option<&str>) -> String {
-    let mut options = String::new();
-    for category in categories {
-        options.push_str(&format!(
-            r#"<option value="{id}"{selected}>{name}</option>"#,
-            id = esc(&category.id),
-            selected = if selected == Some(category.id.as_str()) {
-                " selected"
-            } else {
-                ""
-            },
-            name = esc(&category.name),
-        ));
-    }
-    options
-}
-
-fn render_results(
-    hits: &[ThreadSearchHit],
-    category_names: &HashMap<&str, &str>,
-    category_formats: &HashMap<&str, CategoryFormat>,
-    now: i64,
-) -> String {
-    let mut items = String::new();
-    for hit in hits {
-        let category_name = category_names
-            .get(hit.thread.category_id.as_str())
-            .copied()
-            .unwrap_or("Unknown category");
-        let is_question = category_formats
-            .get(hit.thread.category_id.as_str())
-            .copied()
-            .unwrap_or_default()
-            .is_question();
-        let answer_state = if !hit.thread.accepted_post_id.is_empty() {
-            r#"<span class="badge badge-accepted">Answered</span>"#.to_string()
-        } else if is_question {
-            r#"<span class="badge ag-answer-state ag-answer-state--open">Needs answer</span>"#
-                .to_string()
-        } else {
-            String::new()
-        };
-        let (excerpt, match_source) = if hit.matched_in_solution {
-            (
-                hit.accepted_body_md.as_str(),
-                r#"<span class="ag-search-hit__source">Matched in accepted answer</span>"#,
-            )
-        } else {
-            (hit.first_body_md.as_str(), "")
-        };
-        items.push_str(&format!(
-            r#"<li><a class="ag-search-hit" href="/t/{id}">
-  <span class="ag-search-hit__main">
-    <span class="ag-search-hit__title">{title}{answer_state}</span>
-    {match_source}<span class="ag-search-hit__excerpt">{excerpt}</span>
-    <span class="ag-search-hit__meta"><span class="ag-chip ag-tone-{tone}">{category}</span><span>{replies}</span><time title="{absolute}">Active {relative}</time></span>
-  </span>
-</a></li>"#,
-            id = esc(&hit.thread.id),
-            title = esc(&hit.thread.title),
-            answer_state = answer_state,
-            match_source = match_source,
-            excerpt = esc(&compact_excerpt(
-                excerpt,
-                SEARCH_EXCERPT_CHARS
-            )),
-            tone = ag_tone(&hit.thread.category_id),
-            category = esc(category_name),
-            replies = if hit.reply_count == 1 {
-                "1 reply".to_string()
-            } else {
-                format!("{} replies", hit.reply_count)
-            },
-            absolute = esc(&fmt_ts(hit.thread.last_at)),
-            relative = esc(&rel_time(hit.thread.last_at, now)),
-        ));
-    }
-    format!(r#"<ol class="ag-search-results">{items}</ol>"#)
 }
 
 fn compact_excerpt(input: &str, max_chars: usize) -> String {

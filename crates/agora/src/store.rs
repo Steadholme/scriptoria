@@ -102,12 +102,32 @@ pub enum ThreadStatusFilter {
 }
 
 /// Explicit, idempotent accepted-answer mutation. `Accept` never toggles: accepting an already
-/// accepted reply is a successful no-op, while `Clear` always clears the pointer and does not
-/// depend on the old target post still existing.
+/// accepted reply is a successful no-op. `ClearIf` binds a rendered remove action to the answer
+/// it described, while `Clear` is reserved for internal unconditional cleanup.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AcceptedAnswerAction {
     Accept { post_id: String },
+    ClearIf { post_id: String },
     Clear,
+}
+
+fn accepted_answer_clear_target(
+    current_post_id: &str,
+    expected_post_id: &str,
+) -> Result<String, StoreError> {
+    let expected_post_id = expected_post_id.trim();
+    if expected_post_id.is_empty() {
+        return Err(StoreError::InvalidOperation(
+            "accepted answer target is required when clearing".to_string(),
+        ));
+    }
+    if current_post_id.is_empty() || current_post_id == expected_post_id {
+        Ok(String::new())
+    } else {
+        Err(StoreError::Conflict(
+            "accepted answer changed; reload before removing it".to_string(),
+        ))
+    }
 }
 
 /// Atomic result returned to the handler after the Store has validated category, thread, original
@@ -2487,6 +2507,10 @@ impl Store for InMemoryStore {
 
         let (accepted_post, next_id) = match action {
             AcceptedAnswerAction::Clear => (None, String::new()),
+            AcceptedAnswerAction::ClearIf { post_id } => (
+                None,
+                accepted_answer_clear_target(&thread.accepted_post_id, &post_id)?,
+            ),
             AcceptedAnswerAction::Accept { post_id } => {
                 if !category.format.is_question() {
                     return Err(StoreError::InvalidOperation(
@@ -2556,6 +2580,10 @@ impl Store for InMemoryStore {
         let posts = self.posts.lock().expect("posts lock poisoned");
         let (accepted_post, next_id) = match action {
             AcceptedAnswerAction::Clear => (None, String::new()),
+            AcceptedAnswerAction::ClearIf { post_id } => (
+                None,
+                accepted_answer_clear_target(&thread.accepted_post_id, &post_id)?,
+            ),
             AcceptedAnswerAction::Accept { post_id } => {
                 if !category.format.is_question() {
                     return Err(StoreError::InvalidOperation(
@@ -6993,6 +7021,10 @@ impl PgStore {
 
             let (accepted_post, next_id) = match &action {
                 AcceptedAnswerAction::Clear => (None, String::new()),
+                AcceptedAnswerAction::ClearIf { post_id } => (
+                    None,
+                    accepted_answer_clear_target(&thread.accepted_post_id, post_id)?,
+                ),
                 AcceptedAnswerAction::Accept { post_id } => {
                     if CategoryFormat::parse(&category_format).unwrap_or_default()
                         != CategoryFormat::Question

@@ -13,6 +13,8 @@ const ALICE_EMAIL: &str = "alice-question@steadholme.local";
 const BOB_SUB: &str = "u_question_bob";
 const BOB_EMAIL: &str = "bob-question@steadholme.local";
 const TOK: &str = "questioncsrftoken123";
+const LATEST_ANCHOR: &str =
+    r#"<span class="ag-thread-latest-anchor" id="thread-latest" tabindex="-1"></span>"#;
 
 #[tokio::test]
 async fn question_lifecycle_filters_and_historical_clear_are_coherent() {
@@ -68,11 +70,10 @@ async fn question_lifecycle_filters_and_historical_clear_are_coherent() {
     assert!(question_page.contains("Needs answer"));
     assert!(question_page.contains("Your answer"));
     assert!(question_page.contains("Post answer"));
-    assert_eq!(question_page.matches(r#"id="thread-latest""#).count(), 1);
+    assert_eq!(question_page.matches(LATEST_ANCHOR).count(), 1);
     assert!(
-        question_page.find(r#"id="thread-latest""#).unwrap()
-            < question_page.find("Original post").unwrap(),
-        "a question without replies anchors Latest at its original post"
+        question_page.find("Original post").unwrap() < question_page.find(LATEST_ANCHOR).unwrap(),
+        "a question without replies anchors Latest after the typed reply boundary"
     );
 
     let answer_id = reply(
@@ -90,24 +91,23 @@ async fn question_lifecycle_filters_and_historical_clear_are_coherent() {
             &format!("/t/{question_id}/accept"),
             ALICE_SUB,
             ALICE_EMAIL,
-            form(&[
-                ("csrf", TOK),
-                ("action", "accept"),
-                ("post_id", &answer_id),
-            ]),
+            form(&[("csrf", TOK), ("action", "accept"), ("post_id", &answer_id)]),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
 
     let (_, _, answered_page) = send(&state, get_as(&question, ALICE_SUB, ALICE_EMAIL)).await;
-    let solution = answered_page.find(r#"class="ag-solution""#).unwrap();
-    let latest = answered_page.find(r#"id="thread-latest""#).unwrap();
-    let heading = answered_page.find("Accepted answer</h2>").unwrap();
+    let dais = answered_page
+        .find(r#"<section class="ag-dais ag-key-shared" aria-labelledby="ag-dais-title">"#)
+        .unwrap();
+    let answer = answered_page.find("Renew before half-life.").unwrap();
+    let latest = answered_page.find(LATEST_ANCHOR).unwrap();
     assert!(
-        solution < latest && latest < heading,
-        "when no ordinary reply remains, Latest anchors the labelled solution"
+        dais < answer && answer < latest,
+        "the accepted answer is rendered once on the Answer Dais before the latest boundary"
     );
+    assert_eq!(answered_page.matches("Renew before half-life.").count(), 1);
 
     let (_, _, answered) = send(&state, get("/questions?status=answered")).await;
     assert!(answered.contains("How should leases be renewed?"));
@@ -186,12 +186,9 @@ async fn question_lifecycle_filters_and_historical_clear_are_coherent() {
         .await
         .unwrap();
     let historical_location = format!("/t/{historical_id}");
-    let (_, _, historical) = send(
-        &state,
-        get_as(&historical_location, ALICE_SUB, ALICE_EMAIL),
-    )
-    .await;
-    assert!(historical.contains("Accepted answer"));
+    let (_, _, historical) =
+        send(&state, get_as(&historical_location, ALICE_SUB, ALICE_EMAIL)).await;
+    assert!(historical.contains("Answer Dais"));
     assert!(historical.contains("Remove solution"));
     assert_eq!(
         historical
@@ -234,12 +231,7 @@ async fn question_lifecycle_filters_and_historical_clear_are_coherent() {
         .all(|thread| thread.id != historical_id));
     assert!(state
         .store
-        .search_threads(
-            "legacy solution only",
-            None,
-            ThreadStatusFilter::Any,
-            100,
-        )
+        .search_threads("legacy solution only", None, ThreadStatusFilter::Any, 100,)
         .await
         .unwrap()
         .iter()
@@ -250,7 +242,11 @@ async fn question_lifecycle_filters_and_historical_clear_are_coherent() {
             &format!("/t/{historical_id}/accept"),
             ALICE_SUB,
             ALICE_EMAIL,
-            form(&[("csrf", TOK), ("action", "clear")]),
+            form(&[
+                ("csrf", TOK),
+                ("action", "clear"),
+                ("post_id", historical_reply_id),
+            ]),
         ),
     )
     .await;
@@ -316,9 +312,8 @@ async fn accepted_solution_is_fixed_above_a_full_reply_page_without_duplication(
     assert!(first_page.contains("ordinary paged reply 0"));
     assert!(first_page.contains("ordinary paged reply 19"));
     assert!(!first_page.contains("ordinary paged reply 20"));
-    assert!(first_page.contains("Jump to latest"));
     assert!(first_page.contains(&format!(
-        r#"href="/t/{thread_id}?latest=1#thread-latest">Latest</a>"#
+        r#"<a class="btn btn-ghost btn-sm ag-page__jump" href="/t/{thread_id}?latest=1#thread-latest">Jump to latest</a>"#
     )));
 
     let (_, _, latest_page) = send(
@@ -329,10 +324,18 @@ async fn accepted_solution_is_fixed_above_a_full_reply_page_without_duplication(
     assert_eq!(latest_page.matches("THE PAGED SOLUTION").count(), 1);
     assert!(latest_page.contains("ordinary paged reply 23"));
     assert!(latest_page.contains("25 replies"));
-    assert_eq!(latest_page.matches(r#"id="thread-latest""#).count(), 1);
-    assert!(latest_page
-        .contains(r#"<article id="post-p_paged_answer_23" class="post"><span id="thread-latest""#));
-    assert!(latest_page.contains(r##"href="#thread-latest">Latest</a>"##));
+    assert_eq!(latest_page.matches(LATEST_ANCHOR).count(), 1);
+    let last_reply = latest_page
+        .find(r#"<article class="ag-post ag-key-shared" id="post-p_paged_answer_23">"#)
+        .unwrap();
+    assert!(
+        last_reply < latest_page.find(LATEST_ANCHOR).unwrap(),
+        "the latest boundary follows the last typed reply"
+    );
+    assert!(
+        !latest_page.contains(r#"class="btn btn-ghost btn-sm ag-page__jump""#),
+        "the latest page does not render a redundant jump"
+    );
 }
 
 #[tokio::test]

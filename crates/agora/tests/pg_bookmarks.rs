@@ -180,21 +180,12 @@ async fn pg_bookmarks_are_migrated_linearizable_and_cascading() {
         .iter()
         .any(|item| item.bookmark.post_id == lifecycle.id));
     let completed = store
-        .complete_due_bookmark(
-            &owner,
-            &lifecycle.id,
-            cas(&snoozed),
-            now + 100,
-        )
+        .complete_due_bookmark(&owner, &lifecycle.id, cas(&snoozed), now + 100)
         .await
         .unwrap();
     assert_eq!(completed.remind_at, None);
     store
-        .remove_bookmark(
-            &owner,
-            &lifecycle.id,
-            cas(&completed),
-        )
+        .remove_bookmark(&owner, &lifecycle.id, cas(&completed))
         .await
         .unwrap();
     assert!(store
@@ -257,23 +248,13 @@ async fn pg_bookmarks_are_migrated_linearizable_and_cascading() {
         .unwrap();
     assert!(matches!(
         store
-            .snooze_bookmark(
-                &owner,
-                &aba_post.id,
-                cas(&original),
-                now + 100,
-                now + 5,
-            )
+            .snooze_bookmark(&owner, &aba_post.id, cas(&original), now + 100, now + 5,)
             .await
             .unwrap_err(),
         StoreError::InvalidOperation(_)
     ));
     store
-        .remove_bookmark(
-            &owner,
-            &aba_post.id,
-            cas(&original),
-        )
+        .remove_bookmark(&owner, &aba_post.id, cas(&original))
         .await
         .unwrap();
     let replacement = store
@@ -298,11 +279,7 @@ async fn pg_bookmarks_are_migrated_linearizable_and_cascading() {
     ));
     assert!(matches!(
         store
-            .remove_bookmark(
-                &owner,
-                &aba_post.id,
-                cas(&original),
-            )
+            .remove_bookmark(&owner, &aba_post.id, cas(&original),)
             .await
             .unwrap_err(),
         StoreError::Conflict(_)
@@ -535,7 +512,10 @@ async fn pg_legacy_bookmarks_receive_stable_ids_without_losing_post_cascade() {
     .fetch_one(&admin)
     .await
     .unwrap();
-    assert_eq!(second_id, first_id, "idempotent migrate must not rewrite identity");
+    assert_eq!(
+        second_id, first_id,
+        "idempotent migrate must not rewrite identity"
+    );
 
     sqlx::query("DELETE FROM posts WHERE id = 'p_legacy_bookmark'")
         .execute(&admin)

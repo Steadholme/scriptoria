@@ -7,12 +7,11 @@ use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use tower::ServiceExt;
 
-use agora::model::{Post, Thread};
 use agora::handlers::personal_counts;
+use agora::model::{Post, Thread};
 use agora::store::{
     BookmarkCas, BookmarkCursor, BookmarkReminderUpdate, BookmarkState, StoreError,
-    MAX_BOOKMARKS_PER_USER,
-    MAX_BOOKMARK_POST_BATCH, MAX_REMINDER_HORIZON_SECS,
+    MAX_BOOKMARKS_PER_USER, MAX_BOOKMARK_POST_BATCH, MAX_REMINDER_HORIZON_SECS,
 };
 use agora::{app, build_dev_state, new_id, now_secs, AppState};
 
@@ -30,7 +29,7 @@ async fn browser_flow_is_owner_only_no_store_and_honest_about_delivery() {
 
     let (status, headers, page) = send(
         &state,
-        get_as(&format!("/t/{}", thread.id), ALICE_SUB, ALICE_EMAIL),
+        get_as_with_csrf(&format!("/t/{}", thread.id), ALICE_SUB, ALICE_EMAIL),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -38,7 +37,12 @@ async fn browser_flow_is_owner_only_no_store_and_honest_about_delivery() {
         headers.get(header::CACHE_CONTROL).unwrap(),
         "private, no-store"
     );
-    assert!(page.contains("Bookmark this post"));
+    assert!(page.contains(&format!(
+        r#"method="post" action="/t/{}/p/{}/bookmark""#,
+        thread.id, op.id
+    )));
+    assert!(page.contains(&format!(r#"name="csrf" value="{TOK}""#)));
+    assert!(page.contains(">Bookmark</button>"));
 
     let (status, headers, _) = send(
         &state,
@@ -64,10 +68,12 @@ async fn browser_flow_is_owner_only_no_store_and_honest_about_delivery() {
 
     let (_, _, alice_thread) = send(
         &state,
-        get_as(&format!("/t/{}", thread.id), ALICE_SUB, ALICE_EMAIL),
+        get_as_with_csrf(&format!("/t/{}", thread.id), ALICE_SUB, ALICE_EMAIL),
     )
     .await;
     assert!(alice_thread.contains("ag-post-bookmark is-saved"));
+    assert!(alice_thread.contains(&format!(r#"href="/bookmarks/{}/edit""#, op.id)));
+    assert!(alice_thread.contains(">Saved</a>"));
     let (_, _, bob_thread) = send(
         &state,
         get_as(&format!("/t/{}", thread.id), BOB_SUB, BOB_EMAIL),
@@ -126,7 +132,45 @@ async fn browser_flow_is_owner_only_no_store_and_honest_about_delivery() {
     );
     assert!(scheduled.contains("&lt;script&gt;alert(1)&lt;/script&gt; private intent"));
     assert!(!scheduled.contains("<script>alert(1)</script>"));
-    assert!(scheduled.contains("does not send email or push"));
+    assert!(scheduled.contains(&format!(r#"href="{target}""#)));
+
+    let scheduled_bookmark = state
+        .store
+        .get_bookmark(ALICE_SUB, &op.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .bookmark;
+    let (status, headers, editor) = send(
+        &state,
+        get_as_with_csrf(
+            &format!("/bookmarks/{}/edit", op.id),
+            ALICE_SUB,
+            ALICE_EMAIL,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get(header::CACHE_CONTROL).unwrap(),
+        "private, no-store"
+    );
+    assert!(editor.contains(&format!(
+        r#"method="post" action="/bookmarks/{}/edit""#,
+        op.id
+    )));
+    assert!(editor.contains(&format!(r#"name="csrf" value="{TOK}""#)));
+    assert!(editor.contains(&format!(
+        r#"name="expected_bookmark_id" value="{}""#,
+        scheduled_bookmark.bookmark_id
+    )));
+    assert!(editor.contains(&format!(
+        r#"name="expected_version" value="{}""#,
+        scheduled_bookmark.version
+    )));
+    assert!(editor.contains("&lt;script&gt;alert(1)&lt;/script&gt; private intent"));
+    assert!(!editor.contains("<script>alert(1)</script>"));
+    assert!(editor.contains("does not send email or push"));
 
     let (status, _, stale) = send(
         &state,
@@ -239,8 +283,32 @@ async fn browser_flow_is_owner_only_no_store_and_honest_about_delivery() {
         get_as("/bookmarks?state=due", ALICE_SUB, ALICE_EMAIL),
     )
     .await;
-    assert!(due.contains("Due ·"));
+    assert!(due.contains("Reminder "));
     assert!(due.contains("Bookmarks, 1 due"));
+    assert!(due.contains(&format!(
+        r#"method="post" action="/bookmarks/{}/complete""#,
+        op.id
+    )));
+    assert_eq!(
+        due.matches(&format!(
+            r#"method="post" action="/bookmarks/{}/snooze""#,
+            op.id
+        ))
+        .count(),
+        2
+    );
+    assert!(due.contains("Snooze 24 hours"));
+    assert!(due.contains("Snooze 7 days"));
+    assert!(due.contains(r#"name="preset" value="tomorrow""#));
+    assert!(due.contains(r#"name="preset" value="week""#));
+    assert!(due.contains(&format!(
+        r#"name="expected_bookmark_id" value="{}""#,
+        due_row.bookmark_id
+    )));
+    assert!(due.contains(&format!(
+        r#"name="expected_version" value="{}""#,
+        due_row.version
+    )));
     assert!(!due.contains("notification sent"));
 
     let (status, _, _) = send(
@@ -461,13 +529,7 @@ async fn csrf_subject_and_cas_fail_closed() {
     assert!(matches!(
         state
             .store
-            .snooze_bookmark(
-                ALICE_SUB,
-                &op.id,
-                cas(&updated),
-                100,
-                12,
-            )
+            .snooze_bookmark(ALICE_SUB, &op.id, cas(&updated), 100, 12,)
             .await
             .unwrap_err(),
         StoreError::InvalidOperation(_)
@@ -475,11 +537,7 @@ async fn csrf_subject_and_cas_fail_closed() {
 
     state
         .store
-        .remove_bookmark(
-            ALICE_SUB,
-            &op.id,
-            cas(&updated),
-        )
+        .remove_bookmark(ALICE_SUB, &op.id, cas(&updated))
         .await
         .unwrap();
     let replacement = state
@@ -527,11 +585,7 @@ async fn csrf_subject_and_cas_fail_closed() {
     assert!(matches!(
         state
             .store
-            .remove_bookmark(
-                ALICE_SUB,
-                &op.id,
-                cas(&first),
-            )
+            .remove_bookmark(ALICE_SUB, &op.id, cas(&first),)
             .await
             .unwrap_err(),
         StoreError::Conflict(_)
@@ -954,6 +1008,16 @@ async fn send(state: &AppState, request: Request<Body>) -> (StatusCode, HeaderMa
 fn get_as(uri: &str, subject: &str, email: &str) -> Request<Body> {
     Request::builder()
         .uri(uri)
+        .header("x-auth-subject", subject)
+        .header("x-auth-email", email)
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn get_as_with_csrf(uri: &str, subject: &str, email: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header(header::COOKIE, format!("__Host-csrf={TOK}"))
         .header("x-auth-subject", subject)
         .header("x-auth-email", email)
         .body(Body::empty())

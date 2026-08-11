@@ -38,43 +38,63 @@ async fn quote_reply_renders_escaped_blockquote_and_deduplicated_activity() {
 
     let (_s, _h, page) = send(&state, get_as(&loc, ALICE_SUB, ALICE_EMAIL)).await;
     assert!(
-        page.contains(r#"<blockquote class="post-quote">"#),
-        "quote block rendered"
+        page.contains(r#"<blockquote class="ag-quote ag-key-shared">"#),
+        "typed shared quote block rendered"
     );
     assert!(
-        page.contains("alice@steadholme.local wrote:"),
+        page.contains(r#"<cite class="ag-quote__cite">alice@steadholme.local · <time "#),
         "quoted author attributed"
     );
     assert!(
         page.contains("Original &lt;unsafe&gt; body."),
         "quoted body is escaped"
     );
-    let quote_pos = page.find(r#"<blockquote class="post-quote">"#).unwrap();
+    let quote_pos = page
+        .find(r#"<blockquote class="ag-quote ag-key-shared">"#)
+        .unwrap();
     let reply_pos = page.find("Thanks @alice").unwrap();
     assert!(quote_pos < reply_pos, "quote renders above reply body");
 
     let (_s, _h, home) = send(&state, get_as("/", ALICE_SUB, ALICE_EMAIL)).await;
-    assert!(home.contains("Activity, 1 unread"));
-    assert!(home.contains(r#"aria-label="For you""#));
-    assert!(home.contains(r#"href="/bookmarks""#));
-    assert!(home.contains(">Saved</span>"));
-    assert!(home.contains(r#"href="/?filter=subscribed""#));
-    assert!(home.contains(r#"<a class="ag-cat is-active" href="/" aria-current="page">"#));
+    assert!(home.contains(r#"aria-label="Activity, 1 unread""#));
     assert!(
-        home.contains(r#"class="ag-cat__count ag-personal-count">1 unread</span>"#),
-        "the home rail reuses the private request-derived Activity count"
+        home.contains(r#"<a class="ag-ledger-link ag-key-private" href="/for-you">For You</a>"#)
+    );
+    assert!(home
+        .contains(r#"<a class="ag-ledger-link ag-key-private" href="/bookmarks">Bookmarks</a>"#));
+    assert!(home.contains(
+        r#"<a class="btn btn-secondary btn-sm ag-key-private" href="/?sort=latest&amp;filter=subscribed">Following</a>"#
+    ));
+    assert!(!home.contains(r#"aria-pressed="false">Following</a>"#));
+    assert!(home.contains(r#"<a class="appnav is-active" href="/" aria-current="location">"#));
+    assert!(
+        home.contains(r#"<span class="ag-count-badge ag-key-private" aria-hidden="true">1</span>"#),
+        "the app bar renders the private request-derived Activity count"
     );
     let (_s, _h, activity) = send(&state, get_as("/activity", ALICE_SUB, ALICE_EMAIL)).await;
     assert!(activity.contains("Quote and mention"));
-    assert!(activity.contains("Mention"));
+    assert!(activity
+        .contains(r#"<span class="ag-mark ag-key-private ag-mark--reason">Mentioned you</span>"#));
     assert_eq!(
-        activity.matches("ag-activity-row is-unread").count(),
+        activity
+            .matches(r#"class="ag-activity-row ag-key-shared""#)
+            .count(),
         1,
         "OP + quote + @mention delivery paths collapse to one event"
     );
+    assert!(
+        activity.contains(r#"<span class="ag-mark ag-key-private ag-mark--unread">Unread</span>"#)
+    );
 
     let (_s, _h, bob_activity) = send(&state, get_as("/activity", BOB_SUB, BOB_EMAIL)).await;
-    assert!(bob_activity.contains("0 unread"), "the actor is never self-notified");
+    assert_eq!(
+        bob_activity
+            .matches(r#"class="ag-activity-row ag-key-shared""#)
+            .count(),
+        0,
+        "the actor is never self-notified"
+    );
+    assert!(bob_activity.contains("No activity in this view yet."));
 }
 
 #[tokio::test]
@@ -98,31 +118,22 @@ async fn thread_follow_preference_form_and_filter() {
     assert_eq!(status, StatusCode::SEE_OTHER);
 
     let (_s, _h, thread_page) = send(&state, get_as(&subscribed_loc, ALICE_SUB, ALICE_EMAIL)).await;
-    assert!(thread_page.contains(r#"name="level""#));
+    assert!(thread_page.contains(&format!(
+        r#"<form class="ag-form ag-subscribe" method="post" action="{subscribe_uri}">"#
+    )));
+    assert!(thread_page.contains(r#"<select id="ag-sub-level" name="level">"#));
     assert!(thread_page.contains(r#"value="watch" selected"#));
-    assert!(thread_page.contains("Watch · replies in Activity"));
-    assert!(thread_page.contains("Follow · personal feeds only"));
-    assert!(thread_page.contains("Mute · hide from personal feeds"));
-    assert!(thread_page
-        .contains("Direct replies, mentions and accepted answers still appear in Activity."));
-    assert!(thread_page.contains("None · reset preference"));
-    assert!(thread_page.contains(r#"data-wire-target=".subscription-form""#));
-    assert!(thread_page.contains(r#"class="ag-thread-toolbar""#));
-    assert!(thread_page.contains(r##"href="#reply">Reply</a>"##));
-    assert!(thread_page.contains(r##"href="#thread-latest">Latest</a>"##));
-    assert!(thread_page.contains(
-        "scroll-margin-top:calc(var(--appbar-h,56px) + 72px)"
-    ));
-    assert!(thread_page.contains(".post[id],"));
+    assert!(thread_page.contains(r#"<option value="none">Not following</option>"#));
+    assert!(thread_page.contains(r#"<option value="watch" selected>Watch</option>"#));
+    assert!(thread_page.contains(r#"<option value="follow">Follow</option>"#));
+    assert!(thread_page.contains(r#"<option value="mute">Mute</option>"#));
+    assert!(thread_page.contains("Private: this shapes your catch-up, not notification delivery."));
     assert_eq!(
         thread_page
-            .matches(&format!(
-                r#"action="/t/{}/subscribe""#,
-                subscribed_loc.trim_start_matches("/t/")
-            ))
+            .matches(&format!(r#"action="{subscribe_uri}""#))
             .count(),
         1,
-        "sticky toolbar reuses one authoritative subscription form"
+        "the typed view renders one authoritative subscription form"
     );
 
     let (_s, _h, filtered) = send(
@@ -133,7 +144,7 @@ async fn thread_follow_preference_form_and_filter() {
     assert!(filtered.contains("Subscribed target"));
     assert!(!filtered.contains("Unsubscribed target"));
     assert!(filtered.contains(
-        r#"<a class="ag-cat is-active" href="/?filter=subscribed" aria-current="page">"#
+        r#"<a class="btn btn-secondary btn-sm ag-key-private is-active" href="/?sort=latest" aria-current="page">Show all</a>"#
     ));
 
     let (status, _h, _b) = send(

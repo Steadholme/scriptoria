@@ -1,30 +1,33 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="auto">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
+  <meta name="color-scheme" content="light dark">
   <meta name="robots" content="noindex">
   <title>{{TITLE}} · Steadholme Agora</title>
   <style>{{STYLE}}</style>
   {{DYNAMIC}}
 </head>
-<body class="page">
+<body class="page ag-page-shell">
+  <a class="ag-skip-link" href="#ag-main">Skip to forum content</a>
   {{APPBAR}}
 
-  <main class="wrap">
+  <main class="wrap ag-main" id="ag-main" tabindex="-1">
     {{CONTENT}}
   </main>
 
-  <footer class="site-foot">Steadholme Agora · discussion forum · identity by Keystone SSO</footer>
+  <footer class="site-foot">
+    <span><strong>Steadholme Agora</strong> · shared discussion, bounded views</span>
+    <span>Identity by Keystone SSO</span>
+  </footer>
 
   <div class="toast-host" id="hf-toasts" data-toast-host aria-live="polite" aria-atomic="false"></div>
 
   <script>
-    // Progressive enhancement. Every control below is a real form/link that works without JS
-    // (POST→303 / GET navigation). Odyssey wire handles reactions and subscriptions; this
-    // local script keeps sort tabs as a lightweight enhancement. Accepted-answer commands use
-    // their real POST→303 forms so the server can rebuild the one authoritative Solution region.
+    // Progressive enhancement. Every mutation remains a real POST form and every navigation a
+    // real link. This local script only swaps bounded thread-list GET results; a failed request
+    // follows the same href as the no-JavaScript path.
     (function () {
       var host = document.getElementById('hf-toasts');
       function toast(msg, kind) {
@@ -44,22 +47,57 @@
       (function () {
         var tabs = document.querySelectorAll('.sort-tabs a[data-sort-tab]');
         if (!tabs.length) { return; }
-        function swap(href, pushed) {
+        var requestId = 0;
+        var requestController = null;
+        function swap(href, pushed, focusSort) {
+          requestId += 1;
+          var thisRequest = requestId;
+          if (requestController) { requestController.abort(); }
+          var thisController = typeof AbortController === 'function' ? new AbortController() : null;
+          requestController = thisController;
           var list = document.querySelector('.thread-list');
-          if (list) { list.classList.add('is-busy'); }
-          fetch(href, { headers: { 'Accept': 'text/html' }, credentials: 'same-origin' })
+          if (list) {
+            list.classList.add('is-busy');
+            list.setAttribute('aria-busy', 'true');
+          }
+          var requestOptions = {
+            headers: { 'Accept': 'text/html' },
+            credentials: 'same-origin'
+          };
+          if (thisController) { requestOptions.signal = thisController.signal; }
+          fetch(href, requestOptions)
             .then(function (r) { if (!r.ok) { throw 0; } return r.text(); })
             .then(function (htmlText) {
+              if (thisRequest !== requestId) { return; }
               var doc = new DOMParser().parseFromString(htmlText, 'text/html');
               var freshList = doc.querySelector('.thread-list');
               var freshControls = doc.querySelector('[data-thread-controls]');
-              if (freshList && list) { list.replaceWith(freshList); }
+              var freshFocus = doc.querySelector('#category-focus-heading');
               var controls = document.querySelector('[data-thread-controls]');
-              if (freshControls && controls) { controls.replaceWith(freshControls); bindTabs(); }
+              var focus = document.querySelector('#category-focus-heading');
+              if (!freshList || !freshControls || !list || !controls ||
+                  Boolean(freshFocus) !== Boolean(focus)) { throw 0; }
+              list.replaceWith(freshList);
+              controls.replaceWith(freshControls);
+              if (freshFocus && focus) { focus.replaceWith(freshFocus); }
+              bindTabs();
+              if (requestController === thisController) { requestController = null; }
               if (pushed) { history.pushState({}, '', href); }
+              if (focusSort) {
+                var active = document.querySelector(
+                  '.sort-tabs a[data-sort-tab="' + focusSort + '"]'
+                );
+                if (active) {
+                  active.focus();
+                  toast('Threads sorted by ' + active.textContent.trim(), 'ok');
+                }
+              }
             })
-            .catch(function () {
+            .catch(function (error) {
+              if (thisRequest !== requestId || (error && error.name === 'AbortError')) { return; }
+              if (requestController === thisController) { requestController = null; }
               if (list) { list.classList.remove('is-busy'); }
+              if (list) { list.removeAttribute('aria-busy'); }
               toast('Could not load that view', 'err');
               window.location.href = href; // hard fallback
             });
@@ -69,12 +107,55 @@
             a.addEventListener('click', function (e) {
               if (e.metaKey || e.ctrlKey || e.shiftKey || e.button) { return; }
               e.preventDefault();
-              swap(a.getAttribute('href'), true);
+              swap(a.getAttribute('href'), true, a.getAttribute('data-sort-tab'));
             });
           });
         }
-        window.addEventListener('popstate', function () { swap(location.pathname + location.search, false); });
+        window.addEventListener('popstate', function () {
+          var sort = new URLSearchParams(location.search).get('sort') || 'latest';
+          swap(location.pathname + location.search, false, sort);
+        });
         bindTabs();
+      })();
+      // ---- Page-bounded reading receipts ----
+      (function () {
+        var form = document.querySelector('[data-thread-read-form]');
+        var sentinel = document.querySelector('[data-thread-read-sentinel]');
+        if (!form || !sentinel || !window.fetch || !window.IntersectionObserver) { return; }
+        var sent = false;
+        var observer = new IntersectionObserver(function (entries) {
+          if (sent || !entries.some(function (entry) { return entry.isIntersecting; })) { return; }
+          sent = true;
+          observer.disconnect();
+          fetch(form.action, {
+            method: 'POST',
+            body: new URLSearchParams(new FormData(form)),
+            credentials: 'same-origin',
+            headers: { 'Accept': 'application/json' }
+          }).then(function (response) {
+            if (!response.ok) { throw new Error('read receipt failed'); }
+            var status = document.querySelector('[data-thread-read-status]');
+            var button = document.querySelector('[data-thread-read-submit]');
+            if (status) {
+              status.textContent =
+                'Page marked read · Continue returns to the earliest unread post.';
+            }
+            if (button) {
+              button.textContent = 'Read through this page';
+              button.disabled = true;
+            }
+            var progress = form.closest('[data-thread-read-progress]');
+            if (progress) { progress.classList.add('is-read'); }
+          }).catch(function () {
+            var status = document.querySelector('[data-thread-read-status]');
+            if (status) {
+              status.textContent =
+                'Automatic progress was not saved · use the button to retry.';
+            }
+            toast('Reading progress was not saved', 'err');
+          });
+        }, { rootMargin: '0px 0px -8% 0px' });
+        observer.observe(sentinel);
       })();
     })();
   </script>
@@ -237,6 +318,100 @@
       document.addEventListener('pointerdown', function (event) {
         if (!form.contains(event.target)) { close(); }
       });
+    })();
+  </script>
+
+  <script>
+    // Compose-time duplicate hints are explicitly heuristic and bounded. The normal /new form
+    // remains complete without this enhancement. Draft content is sent only to Agora's
+    // same-origin, CSRF-protected endpoint and is written only through text DOM nodes.
+    (function () {
+      var box = document.querySelector('[data-ag-similar]');
+      if (!box) { return; }
+      var form = box.closest('form');
+      var list = box.querySelector('[data-ag-similar-list]');
+      var title = document.getElementById('ag-compose-title');
+      var body = document.getElementById('ag-compose-body');
+      if (!form || !list || !title || !body || form.getAttribute('action') !== '/new') { return; }
+      var csrf = form.querySelector('input[name="csrf"]');
+      var timer = null;
+      var requestId = 0;
+      var controller = null;
+
+      function close() {
+        box.hidden = true;
+        list.textContent = '';
+      }
+
+      function invalidate() {
+        if (timer) { clearTimeout(timer); timer = null; }
+        requestId += 1;
+        if (controller) { controller.abort(); controller = null; }
+      }
+
+      function render(data) {
+        list.textContent = '';
+        var results = data && Array.isArray(data.similar) ? data.similar.slice(0, 3) : [];
+        results.forEach(function (result) {
+          var item = document.createElement('li');
+          var link = document.createElement('a');
+          link.href = '/t/' + encodeURIComponent(result.id);
+          link.target = '_blank';
+          link.rel = 'noopener';
+          link.textContent = result.title;
+          item.appendChild(link);
+          list.appendChild(item);
+        });
+        box.hidden = results.length === 0;
+      }
+
+      function load() {
+        timer = null;
+        var draftTitle = (title.value || '').trim();
+        var draftBody = (body.value || '').trim();
+        if (draftTitle.length < 4 && draftBody.length < 12) { close(); return; }
+        invalidate();
+        var thisRequest = requestId;
+        var thisController = typeof AbortController === 'function' ? new AbortController() : null;
+        controller = thisController;
+        var payload = 'csrf=' + encodeURIComponent(csrf ? csrf.value : '') +
+          '&title=' + encodeURIComponent(draftTitle) +
+          '&body=' + encodeURIComponent(draftBody);
+        var options = {
+          method: 'POST',
+          headers: {
+            'Accept': 'application/json',
+            'Content-Type': 'application/x-www-form-urlencoded'
+          },
+          credentials: 'same-origin',
+          body: payload
+        };
+        if (thisController) { options.signal = thisController.signal; }
+        fetch('/api/similar', options)
+          .then(function (response) {
+            if (!response.ok) { throw new Error('similarity unavailable'); }
+            return response.json();
+          })
+          .then(function (data) {
+            if (thisRequest === requestId) { render(data); }
+          })
+          .catch(function (error) {
+            if (error && error.name === 'AbortError') { return; }
+            if (thisRequest === requestId) { close(); }
+          })
+          .then(function () {
+            if (thisRequest === requestId) { controller = null; }
+          });
+      }
+
+      function schedule() {
+        invalidate();
+        close();
+        timer = setTimeout(load, 500);
+      }
+
+      title.addEventListener('input', schedule);
+      body.addEventListener('input', schedule);
     })();
   </script>
 </body>

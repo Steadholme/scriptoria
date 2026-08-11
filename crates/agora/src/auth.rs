@@ -58,12 +58,25 @@ pub fn require_author(headers: &HeaderMap) -> Result<Identity, AppError> {
 }
 
 fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+    unique_header_value(headers, name).ok().flatten()
+}
+
+/// Read one gateway envelope field. Duplicate values — including repeated identical values —
+/// are ambiguous at proxy/application boundaries and therefore invalidate the envelope.
+fn unique_header_value(headers: &HeaderMap, name: &str) -> Result<Option<String>, ()> {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+    let value = value.to_str().map_err(|_| ())?.trim();
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value.to_string()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -142,7 +155,8 @@ pub fn require_admin(headers: &HeaderMap) -> Result<(), AppError> {
 // Gateway identity signature (X-Auth-Sig) verification
 // ---------------------------------------------------------------------------
 
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 /// The shared gateway HMAC key, read once from `GATEWAY_HMAC_KEY`. Empty (unset) disables
 /// verification — the pre-signature behavior, fully backward compatible.
@@ -152,30 +166,52 @@ fn gateway_key() -> &'static str {
         .as_str()
 }
 
-/// Verify the gateway-injected identity is authentic. When `GATEWAY_HMAC_KEY` is set AND an
-/// identity (`X-Auth-Subject`) is present, a valid `X-Auth-Sig` — HMAC-SHA256 over
-/// `subject "\n" groups "\n" minute` for the current OR previous minute — is REQUIRED; a rogue
-/// peer that POSTs `X-Auth-Subject` directly (bypassing Sluice) cannot forge it. Returns:
-/// - `true` when the key is unset (verification off), or no identity header is present
-///   (public/dev path), or the signature is valid;
-/// - `false` when an identity is present but the signature is missing or invalid (=> 401).
+/// Backward-compatible development verifier. Production middleware uses
+/// [`gateway_identity_ok_for`] with an explicit key and `require_subject=true`.
 pub fn gateway_identity_ok(headers: &HeaderMap) -> bool {
-    let key = gateway_key();
-    if key.is_empty() {
-        return true;
-    }
-    let Some(subject) = header_value(headers, HEADER_SUBJECT) else {
-        return true; // no injected identity to verify (public route / local dev)
+    gateway_identity_ok_for(headers, gateway_key(), false)
+}
+
+/// Verify the gateway-injected identity against an explicit runtime policy.
+///
+/// The HMAC message and minute-window behavior remain byte-identical to Sluice. When
+/// `require_subject` is true, both an empty key and a missing subject fail closed. Development
+/// may omit both; once a key and identity are present the signature is always mandatory.
+pub fn gateway_identity_ok_for(headers: &HeaderMap, key: &str, require_subject: bool) -> bool {
+    let subject = match unique_header_value(headers, HEADER_SUBJECT) {
+        Ok(value) => value,
+        Err(()) => return false,
     };
-    let groups = header_value(headers, HEADER_GROUPS).unwrap_or_default();
-    let Some(sig) = header_value(headers, HEADER_SIG) else {
+    let email = match unique_header_value(headers, HEADER_EMAIL) {
+        Ok(value) => value,
+        Err(()) => return false,
+    };
+    let groups = match unique_header_value(headers, HEADER_GROUPS) {
+        Ok(value) => value,
+        Err(()) => return false,
+    };
+    let sig = match unique_header_value(headers, HEADER_SIG) {
+        Ok(value) => value,
+        Err(()) => return false,
+    };
+    if key.is_empty() {
+        return !require_subject;
+    }
+    let Some(subject) = subject else {
+        return !require_subject && email.is_none() && groups.is_none() && sig.is_none();
+    };
+    let groups = groups.unwrap_or_default();
+    let Some(sig) = sig else {
         return false; // identity present but unsigned — reject
     };
     let win = now_unix() / 60;
     // Accept the current and previous minute (clock skew + minute-boundary tolerance).
-    [win, win - 1]
-        .iter()
-        .any(|&w| ct_eq(sig.as_bytes(), sign_identity(key, &subject, &groups, w).as_bytes()))
+    [win, win - 1].iter().any(|&w| {
+        ct_eq(
+            sig.as_bytes(),
+            sign_identity(key, &subject, &groups, w).as_bytes(),
+        )
+    })
 }
 
 /// Recompute the gateway signature — byte-identical to Sluice's `auth.SignIdentity` (Go).
@@ -270,6 +306,124 @@ pub fn verify_csrf(headers: &HeaderMap, submitted: &str) -> Result<(), AppError>
     }
 }
 
+/// Lifetime of a server-rendered destructive-action review.
+const DESTRUCTIVE_CONFIRM_TTL: i64 = 600;
+const DESTRUCTIVE_CONFIRM_DOMAIN: &[u8] = b"steadholme.agora.destructive.v1";
+
+/// Mint a short-lived confirmation token bound to one CSRF session, actor and action.
+///
+/// The random nonce makes each rendered review unique. Verification is stateless; a successful
+/// delete naturally makes a replay a 404, while the expiry bounds an abandoned review.
+pub fn new_destructive_confirmation(
+    signing_key: &[u8],
+    csrf: &str,
+    action: &str,
+    actor_sub: &str,
+) -> String {
+    let expires = now_unix().saturating_add(DESTRUCTIVE_CONFIRM_TTL);
+    let mut nonce = [0u8; 16];
+    OsRng.fill_bytes(&mut nonce);
+    let nonce = hex::encode(nonce);
+    let mac = destructive_confirmation_mac(signing_key, csrf, action, actor_sub, expires, &nonce);
+    format!("{expires}.{nonce}.{mac}")
+}
+
+/// Verify CSRF and atomically consume the short-lived destructive review token.
+///
+/// The bounded process-local replay set is sufficient for Agora's single active service
+/// instance. A valid token is consumed before Store mutation, so a failed mutation requires a
+/// fresh review instead of making the bearer capability reusable.
+pub fn consume_destructive_confirmation(
+    signing_key: &[u8],
+    headers: &HeaderMap,
+    submitted_csrf: &str,
+    submitted_confirm: &str,
+    action: &str,
+    actor_sub: &str,
+) -> Result<(), AppError> {
+    verify_csrf(headers, submitted_csrf)?;
+
+    let mut parts = submitted_confirm.split('.');
+    let expires = parts
+        .next()
+        .and_then(|value| value.parse::<i64>().ok())
+        .ok_or_else(invalid_destructive_confirmation)?;
+    let nonce = parts.next().filter(|value| value.len() == 32);
+    let submitted_mac = parts.next().filter(|value| value.len() == 64);
+    if parts.next().is_some() {
+        return Err(invalid_destructive_confirmation());
+    }
+    let (Some(nonce), Some(submitted_mac)) = (nonce, submitted_mac) else {
+        return Err(invalid_destructive_confirmation());
+    };
+
+    let now = now_unix();
+    if expires < now || expires > now.saturating_add(DESTRUCTIVE_CONFIRM_TTL) {
+        return Err(invalid_destructive_confirmation());
+    }
+    let expected = destructive_confirmation_mac(
+        signing_key,
+        submitted_csrf,
+        action,
+        actor_sub,
+        expires,
+        nonce,
+    );
+    if !ct_eq(expected.as_bytes(), submitted_mac.as_bytes()) {
+        return Err(invalid_destructive_confirmation());
+    }
+    consume_confirmation_once(submitted_confirm, expires, now)?;
+    Ok(())
+}
+
+fn consume_confirmation_once(token: &str, expires: i64, now: i64) -> Result<(), AppError> {
+    static USED: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+
+    let mut used = USED
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| {
+            AppError::Internal(
+                "The action review service is temporarily unavailable. Please retry.".to_string(),
+            )
+        })?;
+    used.retain(|_, stored_expiry| *stored_expiry >= now);
+    if used.insert(token.to_string(), expires).is_some() {
+        return Err(invalid_destructive_confirmation());
+    }
+    Ok(())
+}
+
+fn destructive_confirmation_mac(
+    signing_key: &[u8],
+    csrf: &str,
+    action: &str,
+    actor_sub: &str,
+    expires: i64,
+    nonce: &str,
+) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(signing_key).expect("HMAC accepts any key len");
+    mac.update(DESTRUCTIVE_CONFIRM_DOMAIN);
+    mac.update(b"\n");
+    mac.update(csrf.as_bytes());
+    mac.update(b"\n");
+    mac.update(action.as_bytes());
+    mac.update(b"\n");
+    mac.update(actor_sub.as_bytes());
+    mac.update(b"\n");
+    mac.update(expires.to_string().as_bytes());
+    mac.update(b"\n");
+    mac.update(nonce.as_bytes());
+    to_hex(&mac.finalize().into_bytes())
+}
+
+fn invalid_destructive_confirmation() -> AppError {
+    AppError::Forbidden("destructive action review is missing, expired, or mismatched".to_string())
+}
+
 /// Length-checked constant-time byte comparison.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -321,6 +475,129 @@ mod tests {
     }
 
     #[test]
+    fn production_gateway_policy_requires_key_subject_and_signature() {
+        let empty = HeaderMap::new();
+        assert!(!gateway_identity_ok_for(&empty, "", true));
+        assert!(!gateway_identity_ok_for(&empty, "production-key", true));
+        assert!(gateway_identity_ok_for(&empty, "", false));
+
+        let mut unsigned = HeaderMap::new();
+        unsigned.insert(HEADER_SUBJECT, HeaderValue::from_static("user-42"));
+        assert!(!gateway_identity_ok_for(&unsigned, "production-key", true));
+    }
+
+    #[test]
+    fn duplicate_gateway_envelope_fields_fail_closed() {
+        let window = now_unix() / 60;
+        let sig = sign_identity("production-key", "user-42", "admins", window);
+        let mut valid = HeaderMap::new();
+        valid.append(HEADER_SUBJECT, HeaderValue::from_static("user-42"));
+        valid.append(HEADER_GROUPS, HeaderValue::from_static("admins"));
+        valid.append(HEADER_SIG, HeaderValue::from_str(&sig).unwrap());
+        assert!(gateway_identity_ok_for(&valid, "production-key", true));
+
+        for (name, duplicate) in [
+            (HEADER_SUBJECT, "user-42"),
+            (HEADER_SUBJECT, "user-99"),
+            (HEADER_GROUPS, "admins"),
+            (HEADER_GROUPS, "forum-admins"),
+            (HEADER_SIG, sig.as_str()),
+            (HEADER_SIG, "00"),
+        ] {
+            let mut headers = valid.clone();
+            headers.append(name, HeaderValue::from_str(duplicate).unwrap());
+            assert!(
+                !gateway_identity_ok_for(&headers, "production-key", true),
+                "duplicate {name} must invalidate the envelope"
+            );
+        }
+
+        let mut duplicate_email = valid;
+        duplicate_email.append(HEADER_EMAIL, HeaderValue::from_static("one@example.test"));
+        duplicate_email.append(HEADER_EMAIL, HeaderValue::from_static("two@example.test"));
+        assert!(!gateway_identity_ok_for(
+            &duplicate_email,
+            "production-key",
+            true
+        ));
+        assert!(identity_email(&duplicate_email).is_none());
+    }
+
+    #[test]
+    fn destructive_confirmation_is_bound_to_session_actor_and_action() {
+        let signing_key = b"server-only-test-key";
+        let csrf = new_csrf_token();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("{CSRF_COOKIE}={csrf}")).unwrap(),
+        );
+        let token = new_destructive_confirmation(signing_key, &csrf, "thread:t_1", "user-42");
+
+        assert!(consume_destructive_confirmation(
+            signing_key,
+            &headers,
+            &csrf,
+            &token,
+            "thread:t_1",
+            "user-42"
+        )
+        .is_ok());
+        assert!(consume_destructive_confirmation(
+            signing_key,
+            &headers,
+            &csrf,
+            &token,
+            "thread:t_2",
+            "user-42"
+        )
+        .is_err());
+        assert!(consume_destructive_confirmation(
+            signing_key,
+            &headers,
+            &csrf,
+            &token,
+            "thread:t_1",
+            "user-99"
+        )
+        .is_err());
+
+        let other_csrf = new_csrf_token();
+        let mut other_headers = HeaderMap::new();
+        other_headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("{CSRF_COOKIE}={other_csrf}")).unwrap(),
+        );
+        assert!(consume_destructive_confirmation(
+            signing_key,
+            &other_headers,
+            &other_csrf,
+            &token,
+            "thread:t_1",
+            "user-42"
+        )
+        .is_err());
+        assert!(consume_destructive_confirmation(
+            b"different-server-key",
+            &headers,
+            &csrf,
+            &token,
+            "thread:t_1",
+            "user-42"
+        )
+        .is_err());
+        assert!(consume_destructive_confirmation(
+            signing_key,
+            &headers,
+            &csrf,
+            &token,
+            "thread:t_1",
+            "user-42"
+        )
+        .is_err());
+    }
+
+    #[test]
     fn csrf_absent_is_rejected() {
         let headers = HeaderMap::new();
         assert!(verify_csrf(&headers, "anything").is_err());
@@ -338,7 +615,10 @@ mod tests {
 
         // comma-separated groups, with whitespace, parse and match by exact name.
         let mut admins = HeaderMap::new();
-        admins.insert(HEADER_GROUPS, HeaderValue::from_static("dev, infra-admins ,x"));
+        admins.insert(
+            HEADER_GROUPS,
+            HeaderValue::from_static("dev, infra-admins ,x"),
+        );
         assert!(has_group(&admins, "infra-admins"));
         assert!(has_group(&admins, "dev"));
         assert!(!has_group(&admins, "admins"));
@@ -362,7 +642,10 @@ mod tests {
         delegated.insert(HEADER_GROUPS, HeaderValue::from_static("forum-admins"));
         assert!(!has_group(&delegated, "admins"));
         assert!(!has_group(&delegated, "infra-admins"));
-        assert!(is_admin(&delegated), "the product admin group authorizes the panel");
+        assert!(
+            is_admin(&delegated),
+            "the product admin group authorizes the panel"
+        );
         assert!(require_admin(&delegated).is_ok());
 
         // a random, unrelated group is still rejected (403).

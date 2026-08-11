@@ -36,9 +36,10 @@ async fn search_page_matches_title_and_original_body_with_result_context() {
     let (status, _, title_html) = send(&state, get("/search?q=ownership")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(title_html.contains("Rust ownership patterns"));
-    assert!(title_html.contains("General Discussion"));
-    assert!(title_html.contains("2 replies"));
-    assert!(title_html.contains("Active"));
+    assert!(title_html.contains(r#"href="/t/t_rust""#));
+    assert!(title_html.contains("Discussion"));
+    assert!(title_html.contains("Matched in the topic"));
+    assert!(title_html.contains("Showing 1 · up to 50 results (a bounded set, not a total count)"));
 
     let (status, _, body_html) = send(&state, get("/search?q=lifetimes&category=general")).await;
     assert_eq!(status, StatusCode::OK);
@@ -82,7 +83,10 @@ async fn empty_query_is_a_prompt_and_category_filter_is_real() {
 
     let (status, _, empty) = send(&state, get("/search")).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(empty.contains("Find a discussion"));
+    assert!(empty.contains("Search the amphitheatre"));
+    assert!(empty.contains(
+        "Enter 2 to 160 characters to search thread titles, original posts, and accepted answers."
+    ));
     assert!(!empty.contains("Shared needle general"));
 
     let (_, _, support) = send(&state, get("/search?q=needle&category=support")).await;
@@ -90,7 +94,8 @@ async fn empty_query_is_a_prompt_and_category_filter_is_real() {
     assert!(!support.contains("Shared needle general"));
 
     let (_, _, missing) = send(&state, get("/search?q=does-not-exist")).await;
-    assert!(missing.contains("No discussions found"));
+    assert!(missing.contains("Nothing here yet"));
+    assert!(missing.contains("No threads matched this search."));
 }
 
 #[tokio::test]
@@ -174,7 +179,8 @@ async fn suggest_clamps_query_and_limit_and_filters_category() {
     );
 
     let (_, _, short_page) = send(&state, get("/search?q=n")).await;
-    assert!(short_page.contains("Use at least two characters"));
+    assert!(short_page.contains("Keep typing"));
+    assert!(short_page.contains("Search needs at least 2 characters."));
     assert!(!short_page.contains("Clamp needle"));
 
     let (_, _, support) = send(
@@ -247,14 +253,11 @@ async fn search_filters_question_status_and_surfaces_accepted_solution_matches()
     )
     .await;
 
-    let (status, _, solution_html) = send(
-        &state,
-        get("/search?q=rendezvous&status=answered"),
-    )
-    .await;
+    let (status, _, solution_html) =
+        send(&state, get("/search?q=rendezvous&status=answered")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(solution_html.contains("Status matrix answered"));
-    assert!(solution_html.contains("Matched in accepted answer"));
+    assert!(solution_html.contains("Matched in the accepted answer"));
     assert!(solution_html.contains("cobalt rendezvous token"));
     assert!(solution_html.contains(r#"value="answered" selected"#));
 

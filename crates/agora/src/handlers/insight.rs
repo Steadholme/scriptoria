@@ -5,21 +5,23 @@
 //! - `POST /api/similar` (SSO + CSRF): given a draft `{title, body}`, returns the top-3 existing
 //!   threads most similar to it, so a user can spot a duplicate before posting. Same
 //!   double-submit CSRF + gateway-identity guard as the other POSTs.
-//! - `GET  /api/thread/{id}/summary`: the extractive summary (top sentences across the thread's
-//!   posts) for a thread. Read-only, like the other GETs.
+//! - `GET  /api/thread/{id}/summary`: the extractive summary for the same bounded reply page as
+//!   the HTML thread view. Read-only, like the other GETs.
 //!
 //! Errors reuse [`AppError`] (the same branded surface as the rest of the app); the empty/no-op
 //! cases return `200` with an empty list rather than an error, so the UI never has to special-
 //! case a failure and the endpoints never 500 on ordinary input.
 
-use axum::extract::{Form, Path, State};
+use axum::extract::{Form, Path, Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::auth;
 use crate::error::AppError;
+use crate::handlers::forum::{summary_state, thread_page_boundary, ThreadQuery};
 use crate::model::Post;
+use crate::view_model::{SummaryStateVM, SummaryUnavailableReason};
 use crate::{textsim, AppState};
 
 /// How many recent threads to score a draft against.
@@ -71,7 +73,9 @@ pub async fn similar(
 
     let query = format!("{}\n{}", form.title.trim(), form.body.trim());
     if query.trim().is_empty() {
-        return Ok(Json(SimilarResponse { similar: Vec::new() }));
+        return Ok(Json(SimilarResponse {
+            similar: Vec::new(),
+        }));
     }
 
     let digests = state.store.thread_digests(DIGEST_LIMIT).await?;
@@ -104,30 +108,66 @@ pub async fn similar(
 #[derive(Debug, Serialize)]
 pub struct SummaryResponse {
     pub thread_id: String,
+    /// Posts in this explicit HTML/JSON page boundary, not the whole thread.
     pub post_count: i64,
+    pub word_count: i64,
+    pub sentence_bound: i64,
+    pub scope: &'static str,
+    pub state: &'static str,
     pub summary: Vec<String>,
 }
 
 pub async fn summary(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<ThreadQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<SummaryResponse>, AppError> {
-    let thread = state
-        .store
-        .get_thread(&id)
-        .await?
-        .ok_or_else(|| AppError::NotFound("thread not found".to_string()))?;
-    let posts = state.store.posts_in_thread(&id).await?;
+    let viewer = auth::identity_subject(&headers);
+    let boundary = thread_page_boundary(&state, &id, &q, viewer.as_deref()).await?;
+    let thread_id = boundary.thread_id().to_string();
+    let posts = boundary.visible_posts();
+    let (state_name, word_count, sentence_bound, summary) = match summary_state(&posts) {
+        SummaryStateVM::Available(summary) => (
+            "available",
+            summary.source_word_count,
+            summary.sentence_bound,
+            summary
+                .sentences
+                .into_iter()
+                .map(|sentence| sentence.0)
+                .collect(),
+        ),
+        SummaryStateVM::Unavailable(reason) => {
+            let state = match reason {
+                SummaryUnavailableReason::TooFewPosts => "too_few_posts",
+                SummaryUnavailableReason::TooFewWords => "too_few_words",
+                SummaryUnavailableReason::Unavailable => "unavailable",
+            };
+            (
+                state,
+                posts
+                    .iter()
+                    .map(|post| post.body_md.split_whitespace().count() as i64)
+                    .sum(),
+                SUMMARY_SENTENCES as i64,
+                Vec::new(),
+            )
+        }
+    };
 
     Ok(Json(SummaryResponse {
-        thread_id: thread.id,
+        thread_id,
         post_count: posts.len() as i64,
-        summary: thread_summary(&posts, SUMMARY_SENTENCES),
+        word_count,
+        sentence_bound,
+        scope: "visible_page",
+        state: state_name,
+        summary,
     }))
 }
 
-/// Extractive summary of a thread's posts: the most salient sentences across all post bodies,
-/// in reading order. Shared by the JSON endpoint and the server-rendered thread-page card.
+/// Extractive summary of a bounded page's posts, in reading order.
 pub fn thread_summary(posts: &[Post], max_sentences: usize) -> Vec<String> {
     let combined = posts
         .iter()

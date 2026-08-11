@@ -247,7 +247,12 @@ mod tests {
     fn disabled_sink_is_noop_and_never_drops() {
         let sink = AuditSink::disabled();
         for _ in 0..1000 {
-            sink.emit(AuditEvent::info("echo.comment.post", "a@b", "thread/x", "ok"));
+            sink.emit(AuditEvent::info(
+                "echo.comment.post",
+                "a@b",
+                "thread/x",
+                "ok",
+            ));
         }
         assert_eq!(sink.dropped(), 0);
     }

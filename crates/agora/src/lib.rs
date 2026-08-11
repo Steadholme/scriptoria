@@ -22,9 +22,9 @@
 //! - `POST /t/{id}/reply`    post a reply
 //! - `POST /t/{id}/read`     mark only the currently rendered posts read, then continue
 //! - `GET/POST /t/{id}/edit` edit one's OWN thread (title + original-post body)
-//! - `POST /t/{id}/delete`   delete one's OWN thread (and all its posts)
+//! - `GET/POST /t/{id}/delete`   review, then delete one's OWN thread (and all its posts)
 //! - `GET/POST /t/{tid}/p/{pid}/edit`   edit one's OWN reply
-//! - `POST /t/{tid}/p/{pid}/delete`     delete one's OWN reply
+//! - `GET/POST /t/{tid}/p/{pid}/delete` review, then delete one's OWN reply
 //! - `POST /t/{tid}/p/{pid}/react`      toggle a reaction (up/heart) on a post
 //! - `POST /t/{id}/accept`   thread author/admin explicitly accept or clear an accepted answer
 //! - `POST /t/{id}/subscribe` toggle the current user's thread subscription
@@ -45,6 +45,8 @@ pub mod model;
 pub mod notify;
 pub mod store;
 pub mod textsim;
+pub mod view_model;
+pub mod views;
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -111,14 +113,17 @@ pub fn app(state: AppState) -> Router {
             "/t/{id}/edit",
             get(handlers::forum::edit_thread_form).post(handlers::forum::update_thread),
         )
-        .route("/t/{id}/delete", post(handlers::forum::delete_thread))
+        .route(
+            "/t/{id}/delete",
+            get(handlers::forum::delete_thread_review).post(handlers::forum::delete_thread),
+        )
         .route(
             "/t/{tid}/p/{pid}/edit",
             get(handlers::forum::edit_reply_form).post(handlers::forum::update_reply),
         )
         .route(
             "/t/{tid}/p/{pid}/delete",
-            post(handlers::forum::delete_reply),
+            get(handlers::forum::delete_reply_review).post(handlers::forum::delete_reply),
         )
         .route("/t/{tid}/p/{pid}/react", post(handlers::forum::react))
         .route(
@@ -140,33 +145,64 @@ pub fn app(state: AppState) -> Router {
         .route("/api/thread/{id}/summary", get(handlers::insight::summary))
         .merge(admin_router())
         .fallback(get(handlers::forum::home))
-        // Every HTML surface contains subject-owned navigation state (Activity + Due counts and,
-        // on thread pages, bookmark controls). Never let a shared cache replay one user's view.
-        .layer(axum::middleware::from_fn(private_html_no_store))
         // Reject a forged gateway identity (spoofed X-Auth-* from a rogue in-network peer):
-        // when GATEWAY_HMAC_KEY is set, an injected identity MUST carry a valid X-Auth-Sig.
-        // No-op when the key is unset or no identity is present (health/public/dev).
-        .layer(axum::middleware::from_fn(require_gateway_sig))
+        // production requires a signed subject on every product route; health remains independent.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_gateway_sig,
+        ))
+        // Outermost response policy: every dynamic response is no-store/nosniff, including a
+        // gateway rejection. API and enhanced JSON errors receive the stable safe envelope.
+        .layer(axum::middleware::from_fn(private_dynamic_no_store))
         .with_state(state)
 }
 
-async fn private_html_no_store(
+async fn private_dynamic_no_store(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let wants_json = req.uri().path().starts_with("/api/")
+        || req
+            .headers()
+            .get(axum::http::header::ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("application/json"));
     let mut response = next.run(req).await;
-    let is_html = response
-        .headers()
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.starts_with("text/html"));
-    if is_html {
-        response.headers_mut().insert(
-            axum::http::header::CACHE_CONTROL,
-            axum::http::HeaderValue::from_static("private, no-store"),
-        );
+    let status = response.status();
+    if wants_json && (status.is_client_error() || status.is_server_error()) {
+        response = (
+            status,
+            axum::Json(serde_json::json!({
+                "error": {
+                    "code": stable_error_code(status),
+                    "correlation_id": serde_json::Value::Null,
+                }
+            })),
+        )
+            .into_response();
     }
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("private, no-store"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
     response
+}
+
+fn stable_error_code(status: axum::http::StatusCode) -> &'static str {
+    match status {
+        axum::http::StatusCode::BAD_REQUEST => "invalid_request",
+        axum::http::StatusCode::UNAUTHORIZED => "unauthorized",
+        axum::http::StatusCode::FORBIDDEN => "forbidden",
+        axum::http::StatusCode::NOT_FOUND => "not_found",
+        axum::http::StatusCode::CONFLICT => "conflict",
+        _ => "server_error",
+    }
 }
 
 /// The `/admin` subtree, gated as one unit by [`require_admin_mw`]: category CRUD, thread
@@ -190,7 +226,7 @@ fn admin_router() -> Router<AppState> {
         )
         .route(
             "/admin/categories/{id}/delete",
-            post(handlers::admin::delete_category),
+            get(handlers::admin::delete_category_review).post(handlers::admin::delete_category),
         )
         .route(
             "/admin/threads/{id}/lock",
@@ -203,17 +239,14 @@ fn admin_router() -> Router<AppState> {
         )
         .route(
             "/admin/threads/{id}/delete",
-            post(handlers::admin::delete_thread),
+            get(handlers::admin::delete_thread_review).post(handlers::admin::delete_thread),
         )
         .route(
             "/admin/posts/{id}/delete",
-            post(handlers::admin::delete_post),
+            get(handlers::admin::delete_post_review).post(handlers::admin::delete_post),
         )
         .route("/admin/bans", post(handlers::admin::add_ban))
-        .route(
-            "/admin/bans/{sub}/delete",
-            post(handlers::admin::remove_ban),
-        )
+        .route("/admin/bans/delete", post(handlers::admin::remove_ban))
         .layer(axum::middleware::from_fn(require_admin_mw))
 }
 
@@ -232,18 +265,23 @@ async fn require_admin_mw(
 
 /// Middleware enforcing [`auth::gateway_identity_ok`] — 401 on a missing/invalid signature.
 async fn require_gateway_sig(
+    axum::extract::State(state): axum::extract::State<AppState>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    if auth::gateway_identity_ok(req.headers()) {
+    let require_subject = state.config.is_production() && req.uri().path() != "/healthz";
+    if auth::gateway_identity_ok_for(
+        req.headers(),
+        state.config.gateway_hmac_key(),
+        require_subject,
+    ) {
         next.run(req).await
     } else {
-        (
-            axum::http::StatusCode::UNAUTHORIZED,
-            "invalid or missing gateway identity signature",
+        crate::error::AppError::Unauthorized(
+            "invalid or missing signed gateway identity".to_string(),
         )
-            .into_response()
+        .into_response()
     }
 }
 
@@ -297,7 +335,7 @@ pub async fn build_dev_state() -> AppState {
 /// In both cases the categories table is seeded with the defaults ONLY when empty, so later
 /// operator-created categories survive restarts. Returns an error string on misconfiguration.
 pub async fn build_state_from_env() -> Result<AppState, String> {
-    let config = Config::from_env();
+    let config = Config::from_env()?;
 
     let store_kind = std::env::var("AGORA_STORE").unwrap_or_else(|_| "memory".to_string());
     let store: Arc<dyn Store> = match store_kind.as_str() {
@@ -363,4 +401,43 @@ pub fn new_id(prefix: &str) -> String {
     let mut bytes = [0u8; 9];
     OsRng.fill_bytes(&mut bytes);
     format!("{prefix}_{}", hex::encode(bytes))
+}
+
+#[cfg(test)]
+mod runtime_policy_tests {
+    use axum::body::Body;
+    use axum::http::{header, Request, StatusCode};
+    use tower::ServiceExt;
+
+    use super::Config;
+    use crate::config::RuntimeProfile;
+
+    #[tokio::test]
+    async fn production_router_requires_a_signed_subject_but_keeps_health_independent() {
+        let mut state = super::build_dev_state().await;
+        let mut config = Config::dev();
+        config.profile = RuntimeProfile::Production;
+        state.config = std::sync::Arc::new(config);
+
+        let response = super::app(state.clone())
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "private, no-store"
+        );
+
+        let response = super::app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }

@@ -19,18 +19,31 @@ use crate::auth;
 use crate::error::AppError;
 use crate::handlers::insight::thread_summary;
 use crate::handlers::{
-    ag_initial, ag_tone, email_display, esc, fmt_ts, personal_counts, rel_time,
-    render_page_with_personal_counts, replies_label,
+    category_vm, follow_level, form_action, hidden_field, link_action, page_chrome,
+    personal_counts, thread_kind, thread_order, thread_row_shared, thread_scope,
 };
 use crate::model::{
     Bookmark, Category, CategoryFocusLevel, Post, ReactionCount, Thread, ThreadFollowLevel,
     ThreadReadingState,
 };
 use crate::store::{
-    AcceptedAnswerAction, CatchUpCursor, CatchUpItem, CatchUpQuestionState, CatchUpReason,
-    CatchUpView, CategoryFocusItem, CategoryFocusReason, CategoryFocusRuleItem, ReplyAnchor,
-    ThreadSort, ThreadStatusFilter, MAX_CATCH_UP_PAGE, MAX_CATEGORY_FOCUS_PAGE,
-    MAX_KLAXON_RECIPIENTS_PER_REPLY,
+    AcceptedAnswerAction, CatchUpCursor, CatchUpQuestionState, CatchUpReason, CatchUpView,
+    CategoryFocusReason, ReplyAnchor, ThreadSort, ThreadStatusFilter, MAX_CATCH_UP_PAGE,
+    MAX_CATEGORY_FOCUS_PAGE, MAX_CATEGORY_FOCUS_RULES, MAX_KLAXON_RECIPIENTS_PER_REPLY,
+};
+use crate::view_model::{
+    AcceptanceMeaning, ActionKind, AdminThreadToolbarVM, AnswerDaisVM, AnswerState,
+    CatchUpFeedShared, CatchUpFeedVM, CatchUpFeedViewerState, CatchUpItemVM,
+    CatchUpItemViewerState, CatchUpQuestionStateVM, CatchUpReasonVM, CatchUpTab,
+    CategoryFocusFormVM, CategoryFocusLevelVM, CategoryFocusReasonVM, CategoryPageShared,
+    CategoryPageViewerState, CategoryView, CollectionState, ComposeMode, ComposeShared,
+    ComposeView, ComposeViewerState, ConsequenceVM, DestructiveReviewVM, FocusItemVM, FocusRuleVM,
+    FocusShared, FocusView, FocusViewerState, HomeShared, HomeView, MoveThreadFormVM, NavTab,
+    Opaque, PageLinkVM, PaginationVM, PostActionsVM, PostBookmarkActionVM, PostVM, PostViewerState,
+    QuoteVM, ReactionVM, ReadingProgressVM, ReplyFormVM, SafeHtml, SavedBookmarkStateVM,
+    SubscriptionFormVM, SummaryStateVM, SummaryUnavailableReason, SummaryVM, Text,
+    ThreadListControlsVM, ThreadOrder, ThreadOrderLinkVM, ThreadRowVM, ThreadRowViewerState,
+    ThreadScope, ThreadScopeLinkVM, ThreadShared, ThreadView, ThreadViewerState,
 };
 use crate::{markdown, new_id, now_secs, AppState};
 
@@ -54,58 +67,6 @@ pub const REACTION_KINDS: &[(&str, &str)] = &[("up", "\u{1F44D}"), ("heart", "\u
 fn is_reaction_kind(kind: &str) -> bool {
     REACTION_KINDS.iter().any(|(k, _)| *k == kind)
 }
-
-/// Inline progressive-enhancement script for the new-thread form: as the user types, it asks
-/// `POST /api/similar` for the top existing threads similar to the draft and lists them. It
-/// reads the draft's own double-submit CSRF token from the form's hidden input, builds result
-/// links with `textContent` (never `innerHTML`), and silently hides on any error — so a user
-/// with JS disabled, or an API hiccup, just sees the normal form.
-const SIMILAR_SCRIPT: &str = r#"<script>
-(function () {
-  var form = document.querySelector('form[action="/new"]');
-  if (!form) return;
-  var title = document.getElementById('nt-title');
-  var body = document.getElementById('nt-body');
-  var box = document.getElementById('similar-box');
-  var list = document.getElementById('similar-list');
-  if (!title || !body || !box || !list) return;
-  var csrfInput = form.querySelector('input[name="csrf"]');
-  var csrf = csrfInput ? csrfInput.value : '';
-  var timer = null;
-  function run() {
-    var t = (title.value || '').trim();
-    var b = (body.value || '').trim();
-    if (t.length < 4 && b.length < 12) { box.hidden = true; return; }
-    var payload = 'csrf=' + encodeURIComponent(csrf) +
-      '&title=' + encodeURIComponent(t) + '&body=' + encodeURIComponent(b);
-    fetch('/api/similar', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: payload,
-      credentials: 'same-origin'
-    }).then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (data) {
-        list.textContent = '';
-        var items = (data && data.similar) || [];
-        if (!items.length) { box.hidden = true; return; }
-        items.forEach(function (it) {
-          var li = document.createElement('li');
-          var a = document.createElement('a');
-          a.href = '/t/' + it.id;
-          a.target = '_blank';
-          a.rel = 'noopener';
-          a.textContent = it.title;
-          li.appendChild(a);
-          list.appendChild(li);
-        });
-        box.hidden = false;
-      }).catch(function () { box.hidden = true; });
-  }
-  function schedule() { if (timer) clearTimeout(timer); timer = setTimeout(run, 500); }
-  title.addEventListener('input', schedule);
-  body.addEventListener('input', schedule);
-})();
-</script>"#;
 
 /// Sentences in the per-thread extractive summary card.
 const SUMMARY_SENTENCES: usize = 3;
@@ -163,24 +124,143 @@ impl ThreadListQuery {
     }
 }
 
-/// Compact owner-scoped count used only inside the home rail. `None` means there is no trusted
-/// gateway subject, while zero deliberately renders no badge. The count is request-derived from
-/// the same authoritative reads as the app bar and never implies background delivery.
-fn render_personal_rail_count(count: Option<i64>, noun: &str) -> String {
-    let count = count.unwrap_or(0).max(0);
-    if count == 0 {
-        return String::new();
-    }
-    let display = if count > 99 {
-        "99+".to_string()
-    } else {
-        count.to_string()
+fn thread_list_controls_vm(
+    action: &str,
+    query: &ThreadListQuery,
+    show_subscribed: bool,
+    show_answer_filters: bool,
+    effective_status: ThreadStatusFilter,
+    show_questions_cta: bool,
+) -> ThreadListControlsVM {
+    let active_order = thread_order(query.sort());
+    let active_scope = thread_scope(effective_status);
+    let subscribed_only = query.subscribed_only();
+    let status_key = match effective_status {
+        ThreadStatusFilter::Questions => Some("questions"),
+        ThreadStatusFilter::Answered => Some("answered"),
+        ThreadStatusFilter::Unanswered => Some("unanswered"),
+        ThreadStatusFilter::Any => None,
     };
-    format!(
-        r#"<span class="ag-cat__count ag-personal-count">{display} {noun}</span>"#,
-        display = display,
-        noun = esc(noun),
-    )
+    let order_links = [
+        (ThreadOrder::Latest, "latest"),
+        (ThreadOrder::Top, "top"),
+        (ThreadOrder::Hot, "hot"),
+    ]
+    .into_iter()
+    .map(|(order, key)| ThreadOrderLinkVM {
+        order,
+        href: Opaque(list_href_raw(action, key, status_key, subscribed_only)),
+    })
+    .collect();
+    let scope_links = if show_answer_filters {
+        let all_scope = if effective_status == ThreadStatusFilter::Questions {
+            ThreadScope::Questions
+        } else {
+            ThreadScope::Any
+        };
+        [
+            (all_scope, None),
+            (ThreadScope::Unanswered, Some("unanswered")),
+            (ThreadScope::Answered, Some("answered")),
+        ]
+        .into_iter()
+        .map(|(scope, key)| ThreadScopeLinkVM {
+            scope,
+            href: Opaque(list_href_raw(
+                action,
+                query.sort_key(),
+                key,
+                subscribed_only,
+            )),
+        })
+        .collect()
+    } else {
+        Vec::new()
+    };
+    let subscribed_toggle = show_subscribed.then(|| {
+        let enabling = !subscribed_only;
+        PageLinkVM {
+            href: Opaque(list_href_raw(
+                action,
+                query.sort_key(),
+                status_key,
+                enabling,
+            )),
+            label: Text(if enabling { "Following" } else { "Show all" }.to_string()),
+        }
+    });
+    let questions = show_questions_cta.then(|| PageLinkVM {
+        href: Opaque("/questions".to_string()),
+        label: Text("Questions".to_string()),
+    });
+    ThreadListControlsVM {
+        active_order,
+        active_scope,
+        subscribed_only,
+        order_links,
+        scope_links,
+        subscribed_toggle,
+        questions,
+    }
+}
+
+fn thread_row_viewer(
+    thread_id: &str,
+    reading: Option<&ThreadReadingState>,
+    follow: Option<ThreadFollowLevel>,
+) -> ThreadRowViewerState {
+    ThreadRowViewerState {
+        follow_level: follow.map(follow_level),
+        bookmarked: None,
+        unread_count: reading.map(|state| state.unread_count.max(0)),
+        resume_href: reading
+            .filter(|state| state.started && state.unread_count > 0)
+            .map(|_| Opaque(format!("/t/{thread_id}?resume=1#thread-resume"))),
+    }
+}
+
+const fn category_focus_level_vm(level: CategoryFocusLevel) -> CategoryFocusLevelVM {
+    match level {
+        CategoryFocusLevel::None => CategoryFocusLevelVM::None,
+        CategoryFocusLevel::Priority => CategoryFocusLevelVM::Priority,
+        CategoryFocusLevel::Follow => CategoryFocusLevelVM::Follow,
+        CategoryFocusLevel::Mute => CategoryFocusLevelVM::Mute,
+    }
+}
+
+const fn category_focus_reason_vm(reason: CategoryFocusReason) -> CategoryFocusReasonVM {
+    match reason {
+        CategoryFocusReason::CategoryPriority => CategoryFocusReasonVM::CategoryPriority,
+        CategoryFocusReason::CategoryFollow => CategoryFocusReasonVM::CategoryFollow,
+        CategoryFocusReason::ThreadWatchOverride => CategoryFocusReasonVM::ThreadWatchOverride,
+        CategoryFocusReason::ThreadFollowOverride => CategoryFocusReasonVM::ThreadFollowOverride,
+    }
+}
+
+const fn catch_up_tab(view: CatchUpView) -> CatchUpTab {
+    match view {
+        CatchUpView::Updates => CatchUpTab::Updates,
+        CatchUpView::Following => CatchUpTab::Following,
+        CatchUpView::Questions => CatchUpTab::Questions,
+    }
+}
+
+const fn catch_up_reason(reason: CatchUpReason) -> CatchUpReasonVM {
+    match reason {
+        CatchUpReason::Watch => CatchUpReasonVM::Watch,
+        CatchUpReason::Follow => CatchUpReasonVM::Follow,
+        CatchUpReason::Authored => CatchUpReasonVM::Authored,
+        CatchUpReason::Bookmarked => CatchUpReasonVM::Bookmarked,
+        CatchUpReason::Participated => CatchUpReasonVM::Participated,
+        CatchUpReason::ContinueReading => CatchUpReasonVM::ContinueReading,
+    }
+}
+
+const fn catch_up_question_state(state: CatchUpQuestionState) -> CatchUpQuestionStateVM {
+    match state {
+        CatchUpQuestionState::Waiting => CatchUpQuestionStateVM::Waiting,
+        CatchUpQuestionState::Solved => CatchUpQuestionStateVM::Solved,
+    }
 }
 
 pub async fn home(
@@ -207,131 +287,70 @@ pub async fn home(
             .await?
     };
 
-    // id -> name map so recent rows can name their category.
-    let cat_names: HashMap<&str, &str> = categories
+    let categories_by_id: HashMap<&str, &Category> = categories
         .iter()
-        .map(|c| (c.id.as_str(), c.name.as_str()))
+        .map(|category| (category.id.as_str(), category))
         .collect();
-    let question_categories: HashSet<&str> = categories
-        .iter()
-        .filter(|category| category.format.is_question())
-        .map(|category| category.id.as_str())
-        .collect();
-    let mut reply_counts = HashMap::new();
+    let mut post_counts = HashMap::new();
     for t in &recent {
-        reply_counts.insert(t.id.clone(), state.store.count_posts(&t.id).await?);
+        post_counts.insert(t.id.clone(), state.store.count_posts(&t.id).await?);
     }
     let reading_states = load_reading_states(&state, viewer_sub.as_deref(), &recent).await?;
-
-    let mut cats_html = String::new();
-    for c in &categories {
-        let count = state.store.count_threads(&c.id).await?;
-        cats_html.push_str(&format!(
-            r#"<a class="ag-cat" href="/c/{id}">
-  <span class="ag-cat__dot ag-tone-{tone}" aria-hidden="true"></span>
-  <span class="ag-cat__name">{name}</span>
-  <span class="ag-cat__count">{count}</span>
-</a>"#,
-            id = esc(&c.id),
-            tone = ag_tone(&c.id),
-            name = esc(&c.name),
-            count = count,
-        ));
+    let mut rows = Vec::with_capacity(recent.len());
+    for thread in &recent {
+        let category = categories_by_id.get(thread.category_id.as_str()).copied();
+        let accepted = if category.is_some_and(|category| category.format.is_question()) {
+            state
+                .store
+                .get_valid_accepted_post(&thread.id)
+                .await?
+                .is_some()
+        } else {
+            false
+        };
+        let follow = match viewer_sub.as_deref() {
+            Some(subject) => Some(state.store.thread_follow_level(&thread.id, subject).await?),
+            None => None,
+        };
+        rows.push(ThreadRowVM {
+            shared: thread_row_shared(
+                thread,
+                category,
+                post_counts.get(&thread.id).copied(),
+                accepted,
+            ),
+            viewer: thread_row_viewer(&thread.id, reading_states.get(&thread.id), follow),
+        });
     }
-    if cats_html.is_empty() {
-        cats_html = r#"<div class="empty">No categories yet.</div>"#.to_string();
-    }
-
-    let recent_html = render_thread_rows(
-        &recent,
-        now,
-        Some(&cat_names),
-        Some(&reply_counts),
-        &question_categories,
-        &reading_states,
-    );
-    let thread_controls =
-        render_thread_list_controls("/", &q, viewer_sub.is_some(), true, q.status());
     let counts = personal_counts(&state, &headers, now).await?;
-    let activity_count = render_personal_rail_count(counts.unread_activity, "unread");
-    let bookmark_count = render_personal_rail_count(counts.due_bookmarks, "due");
-
-    let content = format!(
-        r#"<div class="page-head">
-  <div>
-    <h1>Forum</h1>
-    <p class="muted">Discussions across the keep — sign-in is handled by Keystone SSO.</p>
-  </div>
-</div>
-<div class="ag-home">
-  <aside class="ag-rail">
-    <a class="btn btn-primary ag-cta" href="/new">New thread</a>
-    <div class="ag-rail__group">
-      <p class="ag-rail__label">Discover</p>
-      <nav class="ag-rail__nav" aria-label="Discover discussions">
-      <a class="ag-cat{all_active}" href="/"{all_current}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span class="ag-cat__name">All threads</span></a>
-      <a class="ag-cat" href="/questions"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M9.1 9a3 3 0 1 1 5.8 1c0 2-3 2-3 4"/><path d="M12 18h.01"/></svg><span class="ag-cat__name">Questions</span></a>
-      </nav>
-    </div>
-    <div class="ag-rail__group ag-rail__group--personal">
-      <p class="ag-rail__label">For you</p>
-      <nav class="ag-rail__nav" aria-label="For you">
-      <a class="ag-cat" href="/for-you"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 1.7 5.3L19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7L12 3z"/><path d="M19 15v4"/><path d="M21 17h-4"/></svg><span class="ag-cat__name">For You</span></a>
-      <a class="ag-cat" href="/focus"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2"/></svg><span class="ag-cat__name">Focus</span></a>
-      <a class="ag-cat" href="/activity"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg><span class="ag-cat__name">Activity</span>{activity_count}</a>
-      <a class="ag-cat" href="/bookmarks"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h12a1 1 0 0 1 1 1v17l-7-4-7 4V4a1 1 0 0 1 1-1z"/></svg><span class="ag-cat__name">Saved</span>{bookmark_count}</a>
-      <a class="ag-cat{following_active}" href="/?filter=subscribed"{following_current}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 5h8"/><path d="M6 9h12"/><path d="M4 13h16"/><path d="m9 17 3 3 3-3"/></svg><span class="ag-cat__name">Following</span></a>
-      </nav>
-    </div>
-    <div class="ag-rail__group">
-      <p class="ag-rail__label">Spaces</p>
-      <nav class="ag-rail__nav" aria-label="Categories">
-      {cats}
-      </nav>
-    </div>
-  </aside>
-  <div class="ag-feed">
-    <section class="section">
-      <h2 class="section__title">{thread_title}</h2>
-      {controls}
-      <div class="thread-list">{recent}</div>
-    </section>
-  </div>
-</div>"#,
-        cats = cats_html,
-        all_active = if q.subscribed_only() {
-            ""
+    let state_kind = if rows.is_empty() {
+        if q.subscribed_only() || q.status() != ThreadStatusFilter::Any {
+            CollectionState::FilteredZero
         } else {
-            " is-active"
+            CollectionState::ReadyEmpty
+        }
+    } else {
+        CollectionState::Ready
+    };
+    let view = HomeView {
+        chrome: page_chrome("Forum", &headers, NavTab::Home, counts),
+        shared: HomeShared {
+            categories: categories.iter().map(category_vm).collect(),
+            controls: thread_list_controls_vm(
+                "/",
+                &q,
+                viewer_sub.is_some(),
+                true,
+                q.status(),
+                true,
+            ),
+            state: state_kind,
+            visible_bound: RECENT_LIMIT,
+            now,
         },
-        all_current = if q.subscribed_only() {
-            ""
-        } else {
-            r#" aria-current="page""#
-        },
-        following_active = if q.subscribed_only() {
-            " is-active"
-        } else {
-            ""
-        },
-        following_current = if q.subscribed_only() {
-            r#" aria-current="page""#
-        } else {
-            ""
-        },
-        activity_count = activity_count,
-        bookmark_count = bookmark_count,
-        thread_title = thread_list_title(&q, "Recent activity"),
-        controls = thread_controls,
-        recent = recent_html,
-    );
-
-    Ok(Html(render_page_with_personal_counts(
-        "Forum",
-        &email_display(&headers),
-        &content,
-        counts,
-    )))
+        rows,
+    };
+    Ok(Html(crate::views::forum::home(&view)))
 }
 
 // ===========================================================================
@@ -431,38 +450,20 @@ fn parse_catch_up_cursor(raw: &str) -> Option<CatchUpCursor> {
     })
 }
 
-fn catch_up_href(view: CatchUpView, as_of: Option<i64>, before: Option<&CatchUpCursor>) -> String {
+fn catch_up_href_raw(
+    view: CatchUpView,
+    as_of: Option<i64>,
+    before: Option<&CatchUpCursor>,
+) -> String {
     let mut href = format!("/for-you?view={}", view.as_str());
     if let Some(as_of) = as_of {
-        href.push_str(&format!("&amp;as_of={as_of}"));
+        href.push_str(&format!("&as_of={as_of}"));
     }
     if let Some(cursor) = before {
-        href.push_str("&amp;before=");
+        href.push_str("&before=");
         href.push_str(&encode_catch_up_cursor(cursor));
     }
     href
-}
-
-fn render_catch_up_tabs(active: CatchUpView) -> String {
-    let tab = |view: CatchUpView, label: &str| {
-        format!(
-            r#"<a class="tab{active}" href="{href}"{current}>{label}</a>"#,
-            active = if view == active { " is-active" } else { "" },
-            href = catch_up_href(view, None, None),
-            current = if view == active {
-                r#" aria-current="page""#
-            } else {
-                ""
-            },
-            label = esc(label),
-        )
-    };
-    format!(
-        r#"<nav class="tabs ag-catch-up-tabs" aria-label="Catch-up views">{}{}{}</nav>"#,
-        tab(CatchUpView::Updates, "Updates"),
-        tab(CatchUpView::Following, "Following"),
-        tab(CatchUpView::Questions, "Your questions"),
-    )
 }
 
 pub async fn for_you(
@@ -491,69 +492,83 @@ pub async fn for_you(
         .await?;
     let has_more = items.len() as i64 > MAX_CATCH_UP_PAGE;
     items.truncate(MAX_CATCH_UP_PAGE as usize);
-    let rows = render_for_you_rows(&items, now, view);
-    let pagination = if has_more {
-        items
-            .last()
-            .map(|item| CatchUpCursor {
-                view,
-                as_of,
-                snapshot_generation,
-                activity_at: item.activity_at,
-                thread_id: item.thread.id.clone(),
-            })
-            .map(|cursor| {
-                format!(
-                    r#"<nav class="pagination ag-catch-up-pagination"><a class="btn btn-secondary btn-sm" href="{}">More threads →</a></nav>"#,
-                    catch_up_href(view, Some(as_of), Some(&cursor)),
-                )
-            })
-            .unwrap_or_default()
+    let next_cursor = if has_more {
+        items.last().map(|item| CatchUpCursor {
+            view,
+            as_of,
+            snapshot_generation,
+            activity_at: item.activity_at,
+            thread_id: item.thread.id.clone(),
+        })
     } else {
-        String::new()
+        None
     };
-    let (heading, description) = match view {
-        CatchUpView::Updates => (
-            "Updates",
-            "Only related threads with posts you have not read yet.",
-        ),
-        CatchUpView::Following => (
-            "Following",
-            "Every Watch and Follow relationship, including older conversations.",
-        ),
-        CatchUpView::Questions => (
-            "Your questions",
-            "Questions you started, separated by waiting and solved outcomes.",
-        ),
-    };
-    let content = format!(
-        r#"<nav class="crumbs"><a href="/">Home</a><span class="crumbs__sep">/</span><span>For You</span></nav>
-<div class="page-head ag-for-you-head">
-  <div><p class="ag-for-you-eyebrow">Private · exact · explainable</p><h1>Catch up</h1><p class="muted">{description}</p></div>
-  <a class="btn btn-secondary" href="/activity">Open Activity</a>
-</div>
-{tabs}
-<aside class="ag-for-you-note" role="note"><strong>{heading}</strong><span>Catch up lists threads to return to; Activity lists delivered events. Every row has one reason, and Mute always wins without suppressing a direct reply, mention, or accepted answer.</span><time>Snapshot {snapshot}</time></aside>
-<section class="section ag-for-you-feed" aria-labelledby="for-you-heading">
-  <h2 id="for-you-heading" class="section__title">{heading}</h2>
-  <div class="ag-catch-up-list" data-catch-up-view="{view}">{rows}</div>
-</section>
-{pagination}"#,
-        description = esc(description),
-        tabs = render_catch_up_tabs(view),
-        heading = esc(heading),
-        snapshot = esc(&fmt_ts(as_of)),
-        view = view.as_str(),
-        rows = rows,
-        pagination = pagination,
-    );
+    let categories = state.store.list_categories().await?;
+    let categories_by_id: HashMap<&str, &Category> = categories
+        .iter()
+        .map(|category| (category.id.as_str(), category))
+        .collect();
+    let rows = items
+        .iter()
+        .map(|item| {
+            let category = categories_by_id
+                .get(item.thread.category_id.as_str())
+                .copied();
+            let solved = item.question_state == Some(CatchUpQuestionState::Solved);
+            CatchUpItemVM {
+                shared: thread_row_shared(
+                    &item.thread,
+                    category,
+                    Some(item.reply_count.saturating_add(1)),
+                    solved,
+                ),
+                viewer: CatchUpItemViewerState {
+                    reason: catch_up_reason(item.reason),
+                    follow_level: follow_level(item.follow_level),
+                    unread_count: item.unread_count.max(0),
+                    first_unread_href: item.first_unread.as_ref().map(|post| {
+                        Opaque(format!("/t/{}?resume=1#post-{}", item.thread.id, post.id))
+                    }),
+                    question_state: item.question_state.map(catch_up_question_state),
+                },
+            }
+        })
+        .collect::<Vec<_>>();
     let counts = personal_counts(&state, &headers, now).await?;
-    Ok(Html(render_page_with_personal_counts(
-        "Catch up",
-        &email_display(&headers),
-        &content,
-        counts,
-    )))
+    let collection_state = if rows.is_empty() {
+        if before.is_some() {
+            CollectionState::End
+        } else {
+            CollectionState::ReadyEmpty
+        }
+    } else {
+        CollectionState::Ready
+    };
+    let view_model = CatchUpFeedVM {
+        chrome: page_chrome("Catch up", &headers, NavTab::Home, counts),
+        shared: CatchUpFeedShared {
+            active: catch_up_tab(view),
+            snapshot_as_of: as_of,
+            visible_bound: MAX_CATCH_UP_PAGE,
+            state: collection_state,
+            now,
+        },
+        viewer: CatchUpFeedViewerState {
+            items: rows,
+            pagination: PaginationVM {
+                previous: None,
+                next: next_cursor.as_ref().map(|cursor| PageLinkVM {
+                    href: Opaque(catch_up_href_raw(view, Some(as_of), Some(cursor))),
+                    label: Text("More threads".to_string()),
+                }),
+                jump: None,
+                at_start: before.is_none(),
+                at_end: !has_more,
+                visible_limit: MAX_CATCH_UP_PAGE,
+            },
+        },
+    };
+    Ok(Html(crate::views::personal::catch_up(&view_model)))
 }
 
 // ===========================================================================
@@ -563,7 +578,7 @@ pub async fn for_you(
 pub async fn focus(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Html<String>, AppError> {
+) -> Result<Response, AppError> {
     let identity = auth::require_author(&headers)?;
     let now = now_secs();
     let items = state
@@ -571,37 +586,80 @@ pub async fn focus(
         .category_focus_page(&identity.sub, MAX_CATEGORY_FOCUS_PAGE, now)
         .await?;
     let rules = state.store.category_focus_rules(&identity.sub).await?;
-    let threads: Vec<Thread> = items.iter().map(|item| item.thread.clone()).collect();
-    let reading_states = load_reading_states(&state, Some(&identity.sub), &threads).await?;
-    let rows = render_category_focus_rows(&items, !rules.is_empty(), now, &reading_states);
-    let rule_rows = render_category_focus_rule_rows(&rules);
-    let content = format!(
-        r#"<nav class="crumbs"><a href="/">Home</a><span class="crumbs__sep">/</span><span>Focus</span></nav>
-<div class="page-head ag-focus-head">
-  <div><p class="ag-for-you-eyebrow">Private · category intent · explainable</p><h1>Focus</h1><p class="muted">Priority categories come first, followed categories stay in view, and muted categories stay out unless you explicitly Watch or Follow a thread.</p></div>
-  <a class="btn btn-secondary" href="/for-you">Open Catch up</a>
-</div>
-<aside class="ag-for-you-note" role="note"><strong>Bounded desk</strong><span>Showing at most {limit} live threads. Category Focus changes only this private view and never creates Activity.</span></aside>
-<section class="section ag-focus-rules" aria-labelledby="focus-rules-heading">
-  <div class="section__head"><h2 id="focus-rules-heading" class="section__title">Category rules</h2><span class="muted">{rule_count} / 64</span></div>
-  <div class="ag-focus-rule-list">{rule_rows}</div>
-</section>
-<section class="section ag-focus-feed" aria-labelledby="focus-heading">
-  <h2 id="focus-heading" class="section__title">Focused threads</h2>
-  <div class="thread-list ag-focus-list">{rows}</div>
-</section>"#,
-        limit = MAX_CATEGORY_FOCUS_PAGE,
-        rule_count = rules.len(),
-        rule_rows = rule_rows,
-        rows = rows,
-    );
+    let focus_threads = items
+        .iter()
+        .map(|item| item.thread.clone())
+        .collect::<Vec<_>>();
+    let reading_states =
+        load_reading_states(&state, Some(identity.sub.as_str()), &focus_threads).await?;
+    let (csrf, set_cookie) = auth::ensure_csrf(&headers);
+    let rule_models = rules
+        .iter()
+        .map(|rule| FocusRuleVM {
+            category: category_vm(&rule.category),
+            level: category_focus_level_vm(rule.level),
+            submit: form_action(
+                format!("/c/{}/focus", rule.category.id),
+                ActionKind::SaveFocusRule,
+                csrf.clone(),
+                vec![
+                    hidden_field("sort", "latest"),
+                    hidden_field("filter", ""),
+                    hidden_field("status", ""),
+                ],
+            ),
+        })
+        .collect::<Vec<_>>();
+    let mut item_models = Vec::with_capacity(items.len());
+    for item in &items {
+        let accepted = if item.category.format.is_question() {
+            state
+                .store
+                .get_valid_accepted_post(&item.thread.id)
+                .await?
+                .is_some()
+        } else {
+            false
+        };
+        item_models.push(FocusItemVM {
+            shared: thread_row_shared(&item.thread, Some(&item.category), None, accepted),
+            category_level: category_focus_level_vm(item.category_level),
+            thread_level: follow_level(item.thread_level),
+            reason: category_focus_reason_vm(item.reason),
+            viewer: thread_row_viewer(
+                &item.thread.id,
+                reading_states.get(&item.thread.id),
+                Some(item.thread_level),
+            ),
+        });
+    }
     let counts = personal_counts(&state, &headers, now).await?;
-    Ok(Html(render_page_with_personal_counts(
-        "Focus",
-        &email_display(&headers),
-        &content,
-        counts,
-    )))
+    let collection_state = if item_models.is_empty() {
+        if rule_models.is_empty() {
+            CollectionState::ReadyEmpty
+        } else {
+            CollectionState::FilteredZero
+        }
+    } else {
+        CollectionState::Ready
+    };
+    let view = FocusView {
+        chrome: page_chrome("Focus", &headers, NavTab::Home, counts),
+        shared: FocusShared {
+            visible_thread_bound: MAX_CATEGORY_FOCUS_PAGE,
+            rule_bound: MAX_CATEGORY_FOCUS_RULES as i64,
+            state: collection_state,
+            now,
+        },
+        viewer: FocusViewerState {
+            rules: rule_models,
+            items: item_models,
+        },
+    };
+    Ok(html_response(
+        crate::views::personal::focus(&view),
+        set_cookie,
+    ))
 }
 
 // ===========================================================================
@@ -635,58 +693,62 @@ pub async fn questions(
             )
             .await?
     };
-    let category_names: HashMap<&str, &str> = categories
-        .iter()
-        .map(|category| (category.id.as_str(), category.name.as_str()))
-        .collect();
-    let question_categories: HashSet<&str> = categories
+    let question_categories = categories
         .iter()
         .filter(|category| category.format.is_question())
-        .map(|category| category.id.as_str())
-        .collect();
-    let ask_href = categories
+        .collect::<Vec<_>>();
+    let categories_by_id: HashMap<&str, &Category> = question_categories
         .iter()
-        .find(|category| category.format.is_question())
-        .map(|category| format!("/new?cat={}", esc(&category.id)))
-        .unwrap_or_else(|| "/new".to_string());
+        .map(|category| (category.id.as_str(), *category))
+        .collect();
     let reading_states = load_reading_states(&state, viewer_sub.as_deref(), &threads).await?;
-    let list = render_thread_rows(
-        &threads,
-        now,
-        Some(&category_names),
-        None,
-        &question_categories,
-        &reading_states,
-    );
-    let controls =
-        render_thread_list_controls("/questions", &q, viewer_sub.is_some(), true, status);
-    let heading = match status {
-        ThreadStatusFilter::Answered => "Answered questions",
-        ThreadStatusFilter::Unanswered => "Questions that need an answer",
-        ThreadStatusFilter::Any | ThreadStatusFilter::Questions => "All questions",
-    };
-    let content = format!(
-        r#"<nav class="crumbs"><a href="/">Home</a><span class="crumbs__sep">/</span><span>Questions</span></nav>
-<div class="page-head ag-question-head">
-  <div><h1>{heading}</h1><p class="muted">A focused answer desk across every question category.</p></div>
-  <a class="btn btn-primary" href="{ask_href}">Ask question</a>
-</div>
-<section class="section">
-  {controls}
-  <div class="thread-list">{list}</div>
-</section>"#,
-        heading = heading,
-        ask_href = ask_href,
-        controls = controls,
-        list = list,
-    );
+    let mut rows = Vec::with_capacity(threads.len());
+    for thread in &threads {
+        let category = categories_by_id.get(thread.category_id.as_str()).copied();
+        let accepted = state
+            .store
+            .get_valid_accepted_post(&thread.id)
+            .await?
+            .is_some();
+        let post_count = state.store.count_posts(&thread.id).await?;
+        let follow = match viewer_sub.as_deref() {
+            Some(subject) => Some(state.store.thread_follow_level(&thread.id, subject).await?),
+            None => None,
+        };
+        rows.push(ThreadRowVM {
+            shared: thread_row_shared(thread, category, Some(post_count), accepted),
+            viewer: thread_row_viewer(&thread.id, reading_states.get(&thread.id), follow),
+        });
+    }
     let counts = personal_counts(&state, &headers, now).await?;
-    Ok(Html(render_page_with_personal_counts(
-        "Questions",
-        &email_display(&headers),
-        &content,
-        counts,
-    )))
+    let collection_state = if rows.is_empty() {
+        if q.subscribed_only() || status != ThreadStatusFilter::Questions {
+            CollectionState::FilteredZero
+        } else {
+            CollectionState::ReadyEmpty
+        }
+    } else {
+        CollectionState::Ready
+    };
+    let view = HomeView {
+        chrome: page_chrome("Questions", &headers, NavTab::Home, counts),
+        shared: HomeShared {
+            categories: question_categories.into_iter().map(category_vm).collect(),
+            controls: thread_list_controls_vm(
+                "/questions",
+                &q,
+                viewer_sub.is_some(),
+                true,
+                status,
+                false,
+            ),
+            state: collection_state,
+            visible_bound: CATEGORY_LIMIT,
+            now,
+        },
+        rows,
+    };
+    Ok(Html(crate::views::forum::home(&view)))
 }
 
 // ===========================================================================
@@ -727,99 +789,97 @@ pub async fn category(
             .await?
     };
 
-    let crumbs = format!(
-        r#"<nav class="crumbs"><a href="/">Home</a><span class="crumbs__sep">/</span><span>{name}</span></nav>"#,
-        name = esc(&category.name),
-    );
-    let question_categories: HashSet<&str> = if category.format.is_question() {
-        std::iter::once(category.id.as_str()).collect()
-    } else {
-        HashSet::new()
-    };
     let reading_states = load_reading_states(&state, viewer_sub.as_deref(), &threads).await?;
-    let list = render_thread_rows(
-        &threads,
-        now,
-        None,
-        None,
-        &question_categories,
-        &reading_states,
-    );
-    let controls = render_thread_list_controls(
-        &format!("/c/{}", esc(&category.id)),
-        &q,
-        viewer_sub.is_some(),
-        category.format.is_question(),
-        status,
-    );
-    let (focus_form, set_cookie) = if let Some(viewer_sub) = viewer_sub.as_deref() {
+    let mut rows = Vec::with_capacity(threads.len());
+    for thread in &threads {
+        let accepted = if category.format.is_question() {
+            state
+                .store
+                .get_valid_accepted_post(&thread.id)
+                .await?
+                .is_some()
+        } else {
+            false
+        };
+        let post_count = state.store.count_posts(&thread.id).await?;
+        let follow = match viewer_sub.as_deref() {
+            Some(subject) => Some(state.store.thread_follow_level(&thread.id, subject).await?),
+            None => None,
+        };
+        rows.push(ThreadRowVM {
+            shared: thread_row_shared(thread, Some(&category), Some(post_count), accepted),
+            viewer: thread_row_viewer(&thread.id, reading_states.get(&thread.id), follow),
+        });
+    }
+    let (focus, set_cookie) = if let Some(viewer_sub) = viewer_sub.as_deref() {
         let current = state
             .store
             .category_focus_level(viewer_sub, &category.id)
             .await?;
         let (csrf, set_cookie) = auth::ensure_csrf(&headers);
+        let return_status = match q.status() {
+            ThreadStatusFilter::Answered => "answered",
+            ThreadStatusFilter::Unanswered => "unanswered",
+            ThreadStatusFilter::Any | ThreadStatusFilter::Questions => "",
+        };
         (
-            render_category_focus_form(&category, &csrf, current, &q),
+            Some(CategoryFocusFormVM {
+                selected: category_focus_level_vm(current),
+                saved: q.focus_saved.as_deref() == Some(current.as_str()),
+                submit: form_action(
+                    format!("/c/{}/focus", category.id),
+                    ActionKind::ApplyFocus,
+                    csrf,
+                    vec![
+                        hidden_field("sort", q.sort_key()),
+                        hidden_field(
+                            "filter",
+                            if q.subscribed_only() {
+                                "subscribed"
+                            } else {
+                                ""
+                            },
+                        ),
+                        hidden_field("status", return_status),
+                    ],
+                ),
+            }),
             set_cookie,
         )
     } else {
-        (String::new(), None)
+        (None, None)
     };
-
-    let content = format!(
-        r#"{crumbs}
-<div class="page-head">
-  <div>
-    <h1>{name}</h1>
-    <p class="muted">{count} {tw} in this {format_label} category.</p>
-  </div>
-  <a class="btn btn-primary" href="/new?cat={id}">{new_label}</a>
-</div>
-{focus_form}
-<section class="section">
-  {controls}
-  <div class="thread-list">{list}</div>
-</section>"#,
-        crumbs = crumbs,
-        name = esc(&category.name),
-        count = threads.len(),
-        tw = if threads.len() == 1 {
-            if category.format.is_question() {
-                "question"
-            } else {
-                "thread"
-            }
-        } else {
-            if category.format.is_question() {
-                "questions"
-            } else {
-                "threads"
-            }
-        },
-        format_label = if category.format.is_question() {
-            "question"
-        } else {
-            "discussion"
-        },
-        new_label = if category.format.is_question() {
-            "Ask question"
-        } else {
-            "New thread"
-        },
-        id = esc(&category.id),
-        focus_form = focus_form,
-        controls = controls,
-        list = list,
-    );
-
     let counts = personal_counts(&state, &headers, now).await?;
+    let collection_state = if rows.is_empty() {
+        if q.subscribed_only() || status != ThreadStatusFilter::Any {
+            CollectionState::FilteredZero
+        } else {
+            CollectionState::ReadyEmpty
+        }
+    } else {
+        CollectionState::Ready
+    };
+    let view = CategoryView {
+        chrome: page_chrome(category.name.clone(), &headers, NavTab::Home, counts),
+        shared: CategoryPageShared {
+            category: category_vm(&category),
+            controls: thread_list_controls_vm(
+                &format!("/c/{}", category.id),
+                &q,
+                viewer_sub.is_some(),
+                category.format.is_question(),
+                status,
+                false,
+            ),
+            state: collection_state,
+            visible_bound: CATEGORY_LIMIT,
+            now,
+        },
+        rows,
+        viewer: CategoryPageViewerState { focus },
+    };
     Ok(html_response(
-        render_page_with_personal_counts(
-            &category.name,
-            &email_display(&headers),
-            &content,
-            counts,
-        ),
+        crate::views::forum::category(&view),
         set_cookie,
     ))
 }
@@ -878,7 +938,7 @@ pub async fn set_category_focus(
     }
     Ok(redirect_to(&format!(
         "/c/{}?{}#category-focus-heading",
-        esc(&id),
+        id,
         query.join("&")
     )))
 }
@@ -909,45 +969,224 @@ pub struct ThreadQuery {
     pub resume: Option<String>,
 }
 
-pub async fn thread(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Query(q): Query<ThreadQuery>,
-    headers: HeaderMap,
-) -> Result<Response, AppError> {
-    let now = now_secs();
+struct ThreadPostProjection<'a> {
+    viewer: Option<&'a str>,
+    is_admin: bool,
+    thread_id: &'a str,
+    csrf: &'a str,
+    accepted_post_id: &'a str,
+    can_manage_answer: bool,
+    is_question: bool,
+    can_reply: bool,
+    can_post: bool,
+    first_unread_post_id: Option<&'a str>,
+    reactions: &'a HashMap<String, Vec<ReactionCount>>,
+    bookmarks: &'a HashMap<String, Bookmark>,
+    quoted_posts: &'a HashMap<String, Post>,
+    now: i64,
+}
+
+fn project_post(post: &Post, is_op: bool, ctx: &ThreadPostProjection<'_>) -> PostVM {
+    let is_accepted = !is_op && !ctx.accepted_post_id.is_empty() && post.id == ctx.accepted_post_id;
+    let owner = ctx.viewer == Some(post.author_sub.as_str());
+    let mut delete_reviews = Vec::new();
+    if !is_op && owner {
+        delete_reviews.push(link_action(
+            format!("/t/{}/p/{}/delete", ctx.thread_id, post.id),
+            ActionKind::DeleteReplyReview,
+        ));
+    }
+    if !is_op && ctx.is_admin {
+        delete_reviews.push(link_action(
+            format!("/admin/posts/{}/delete", post.id),
+            ActionKind::DeleteAdminReview,
+        ));
+    }
+    let accept = (!is_op && ctx.can_manage_answer && ctx.is_question && !is_accepted).then(|| {
+        form_action(
+            format!("/t/{}/accept", ctx.thread_id),
+            ActionKind::AcceptAnswer,
+            ctx.csrf,
+            vec![
+                hidden_field("action", "accept"),
+                hidden_field("post_id", post.id.clone()),
+            ],
+        )
+    });
+    let remove_solution = (!is_op && ctx.can_manage_answer && is_accepted).then(|| {
+        form_action(
+            format!("/t/{}/accept", ctx.thread_id),
+            ActionKind::RemoveSolution,
+            ctx.csrf,
+            vec![
+                hidden_field("action", "clear"),
+                hidden_field("post_id", post.id.clone()),
+            ],
+        )
+    });
+    let bookmark = ctx.viewer.map(|_| match ctx.bookmarks.get(&post.id) {
+        Some(bookmark) => {
+            let state = match bookmark.remind_at {
+                Some(at) if at <= ctx.now => SavedBookmarkStateVM::Due,
+                Some(_) => SavedBookmarkStateVM::Scheduled,
+                None => SavedBookmarkStateVM::Saved,
+            };
+            PostBookmarkActionVM::Saved {
+                edit: link_action(
+                    format!("/bookmarks/{}/edit", post.id),
+                    ActionKind::BookmarkEdit,
+                ),
+                state,
+            }
+        }
+        None => PostBookmarkActionVM::Save(form_action(
+            format!("/t/{}/p/{}/bookmark", ctx.thread_id, post.id),
+            ActionKind::BookmarkSave,
+            ctx.csrf,
+            Vec::new(),
+        )),
+    });
+    let counts = ctx
+        .reactions
+        .get(&post.id)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let reaction_models = REACTION_KINDS
+        .iter()
+        .map(|(kind, _glyph)| {
+            let aggregate = counts.iter().find(|count| count.kind == *kind);
+            ReactionVM {
+                kind: Text((*kind).to_string()),
+                count: aggregate.map(|count| count.count).unwrap_or(0),
+                mine: ctx
+                    .viewer
+                    .map(|_| aggregate.is_some_and(|count| count.mine)),
+                toggle: (ctx.viewer.is_some() && ctx.can_post).then(|| {
+                    form_action(
+                        format!("/t/{}/p/{}/react", ctx.thread_id, post.id),
+                        ActionKind::ToggleReaction,
+                        ctx.csrf,
+                        vec![hidden_field("kind", *kind)],
+                    )
+                }),
+            }
+        })
+        .collect();
+    let first_unread = ctx.first_unread_post_id == Some(post.id.as_str());
+    PostVM {
+        id: Opaque(post.id.clone()),
+        author_display: Text(post.author_email.clone()),
+        created_at: post.created_at,
+        body: SafeHtml(markdown::render(&post.body_md)),
+        is_op,
+        quote: ctx
+            .quoted_posts
+            .get(&post.quoted_post_id)
+            .map(|quoted| QuoteVM {
+                post_id: Opaque(quoted.id.clone()),
+                author_display: Text(quoted.author_email.clone()),
+                created_at: quoted.created_at,
+                body: SafeHtml(markdown::render(&quoted.body_md)),
+            }),
+        reactions: reaction_models,
+        viewer: PostViewerState {
+            bookmarked: ctx.viewer.map(|_| ctx.bookmarks.contains_key(&post.id)),
+            unread: first_unread.then_some(true),
+            resume_anchor: first_unread.then(|| Opaque("thread-resume".to_string())),
+        },
+        actions: PostActionsVM {
+            edit: (!is_op && owner).then(|| {
+                link_action(
+                    format!("/t/{}/p/{}/edit", ctx.thread_id, post.id),
+                    ActionKind::EditReply,
+                )
+            }),
+            delete_reviews,
+            quote: ctx.can_reply.then(|| {
+                link_action(
+                    format!("/t/{}?quote={}#reply", ctx.thread_id, post.id),
+                    ActionKind::Quote,
+                )
+            }),
+            bookmark,
+            accept,
+            remove_solution,
+        },
+    }
+}
+
+pub(crate) fn summary_state(posts: &[Post]) -> SummaryStateVM {
+    if posts.len() < SUMMARY_MIN_POSTS {
+        return SummaryStateVM::Unavailable(SummaryUnavailableReason::TooFewPosts);
+    }
+    let word_count = posts
+        .iter()
+        .map(|post| post.body_md.split_whitespace().count())
+        .sum::<usize>();
+    if word_count < SUMMARY_MIN_WORDS {
+        return SummaryStateVM::Unavailable(SummaryUnavailableReason::TooFewWords);
+    }
+    let sentences = thread_summary(posts, SUMMARY_SENTENCES);
+    if sentences.len() < 2 {
+        return SummaryStateVM::Unavailable(SummaryUnavailableReason::Unavailable);
+    }
+    SummaryStateVM::Available(SummaryVM {
+        sentences: sentences.into_iter().map(Text).collect(),
+        source_post_count: posts.len() as i64,
+        source_word_count: word_count as i64,
+        sentence_bound: SUMMARY_SENTENCES as i64,
+    })
+}
+
+/// One authoritative reply-page boundary shared by the HTML thread view and its JSON summary.
+/// The accepted answer is extracted before the ordinary-reply limit, exactly as it is rendered.
+pub(crate) struct ThreadPageBoundary {
+    thread: Thread,
+    reading_state: Option<ThreadReadingState>,
+    op: Option<Post>,
+    accepted_post: Option<Post>,
+    replies: Vec<Post>,
+    has_older: bool,
+    has_newer: bool,
+}
+
+impl ThreadPageBoundary {
+    pub(crate) fn thread_id(&self) -> &str {
+        &self.thread.id
+    }
+
+    pub(crate) fn visible_posts(&self) -> Vec<Post> {
+        let mut posts = Vec::with_capacity(self.replies.len() + 2);
+        if let Some(op) = &self.op {
+            posts.push(op.clone());
+        }
+        if let Some(accepted) = &self.accepted_post {
+            posts.push(accepted.clone());
+        }
+        posts.extend(self.replies.iter().cloned());
+        posts
+    }
+}
+
+pub(crate) async fn thread_page_boundary(
+    state: &AppState,
+    id: &str,
+    q: &ThreadQuery,
+    viewer: Option<&str>,
+) -> Result<ThreadPageBoundary, AppError> {
     let thread = state
         .store
-        .get_thread(&id)
+        .get_thread(id)
         .await?
         .ok_or_else(|| AppError::NotFound("thread not found".to_string()))?;
-    let category = state.store.get_category(&thread.category_id).await?;
-    let is_question = category
-        .as_ref()
-        .map(|category| category.format.is_question())
-        .unwrap_or(false);
-    let viewer = auth::identity_subject(&headers);
-    let reading_state = match viewer.as_deref() {
-        Some(subject) => Some(state.store.thread_reading_state(subject, &id).await?),
+    let reading_state = match viewer {
+        Some(subject) => Some(state.store.thread_reading_state(subject, id).await?),
         None => None,
     };
-
-    // Reply count (every post minus the original) — shown in the head + as the reply-list total.
-    let post_count = state.store.count_posts(&id).await?;
-
-    // Keyset-paginated reply list. The original post is pinned at the top on its own; the replies
-    // below it are ONE page under the shared `(created_at, id)` idiom, so a huge thread renders —
-    // and reaction-queries — only a page of replies at a time. We fetch one extra row to learn
-    // whether more replies exist in the fetch direction, then normalise every page to ascending
-    // (oldest→newest) display order.
-    let op = state.store.first_post_in_thread(&id).await?;
-    let op_id = op.as_ref().map(|p| p.id.clone()).unwrap_or_default();
-    let accepted_post = state.store.get_valid_accepted_post(&id).await?;
-    let valid_accepted_id = accepted_post
-        .as_ref()
-        .map(|post| post.id.clone())
-        .unwrap_or_default();
-    let accepted_id = (!valid_accepted_id.is_empty()).then_some(valid_accepted_id.as_str());
+    let op = state.store.first_post_in_thread(id).await?;
+    let op_id = op.as_ref().map(|post| post.id.clone()).unwrap_or_default();
+    let accepted_post = state.store.get_valid_accepted_post(id).await?;
+    let accepted_id = accepted_post.as_ref().map(|post| post.id.as_str());
     let resume_requested = q
         .resume
         .as_deref()
@@ -958,24 +1197,21 @@ pub async fn thread(
     let anchor = if resume_requested {
         match first_unread {
             Some(post) if post.id == op_id => ReplyAnchor::First,
-            Some(post) if Some(post.id.as_str()) == accepted_id => {
-                ReplyAnchor::After(post.created_at, post.id.clone())
-            }
             Some(post) => ReplyAnchor::From(post.created_at, post.id.clone()),
             None => ReplyAnchor::Latest,
         }
     } else {
-        resolve_anchor(&q)
+        resolve_anchor(q)
     };
     let mut fetched = state
         .store
-        .replies_page(&id, &op_id, accepted_id, &anchor, REPLIES_PER_PAGE + 1)
+        .replies_page(id, &op_id, accepted_id, &anchor, REPLIES_PER_PAGE + 1)
         .await?;
     let around_has_newer = if let ReplyAnchor::Around(ts, post_id) = &anchor {
         !state
             .store
             .replies_page(
-                &id,
+                id,
                 &op_id,
                 accepted_id,
                 &ReplyAnchor::After(*ts, post_id.clone()),
@@ -990,7 +1226,7 @@ pub async fn thread(
         !state
             .store
             .replies_page(
-                &id,
+                id,
                 &op_id,
                 accepted_id,
                 &ReplyAnchor::Before(*ts, post_id.clone()),
@@ -1004,13 +1240,9 @@ pub async fn thread(
     let has_more = fetched.len() as i64 > REPLIES_PER_PAGE;
     fetched.truncate(REPLIES_PER_PAGE as usize);
     let (replies, has_older, has_newer) = match anchor {
-        // Ascending fetches: already oldest→newest. First has nothing older (OP is the floor);
-        // After was reached from an older page, so older replies exist.
         ReplyAnchor::First => (fetched, false, has_more),
         ReplyAnchor::From(..) => (fetched, from_has_older, has_more),
         ReplyAnchor::After(..) => (fetched, true, has_more),
-        // Descending fetches: reverse to oldest→newest. Before/Latest were walked newest-first, so
-        // `has_more` means more OLDER replies; Before was reached from a newer page.
         ReplyAnchor::Before(..) => {
             fetched.reverse();
             (fetched, has_more, true)
@@ -1024,6 +1256,50 @@ pub async fn thread(
             (fetched, has_more, around_has_newer)
         }
     };
+    Ok(ThreadPageBoundary {
+        thread,
+        reading_state,
+        op,
+        accepted_post,
+        replies,
+        has_older,
+        has_newer,
+    })
+}
+
+pub async fn thread(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<ThreadQuery>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let now = now_secs();
+    let viewer = auth::identity_subject(&headers);
+    let boundary = thread_page_boundary(&state, &id, &q, viewer.as_deref()).await?;
+    let ThreadPageBoundary {
+        thread,
+        reading_state,
+        op,
+        accepted_post,
+        replies,
+        has_older,
+        has_newer,
+    } = boundary;
+    let category = state.store.get_category(&thread.category_id).await?;
+    let is_question = category
+        .as_ref()
+        .map(|category| category.format.is_question())
+        .unwrap_or(false);
+    let viewer_banned = match viewer.as_deref() {
+        Some(subject) => state.store.is_banned(subject).await?,
+        None => false,
+    };
+    // Reply count (every post minus the original) — shown in the head + as the reply-list total.
+    let post_count = state.store.count_posts(&id).await?;
+    let valid_accepted_id = accepted_post
+        .as_ref()
+        .map(|post| post.id.clone())
+        .unwrap_or_default();
     // Cursors come from the visible page bounds (ascending: first = oldest, last = newest).
     let older_cursor = if has_older {
         replies.first().map(|p| (p.created_at, p.id.clone()))
@@ -1035,22 +1311,23 @@ pub async fn thread(
     } else {
         None
     };
-    let pagination = render_reply_pagination(
-        &thread.id,
-        older_cursor.as_ref(),
-        newer_cursor.as_ref(),
-        has_newer,
-    );
-
-    // The stable Latest anchor targets the final ordinary reply on this page. On the newest page
-    // that is the newest ordinary reply; if the solution is the only reply, it falls back to that
-    // solution, and an otherwise empty discussion falls back to its original post.
-    let latest_post_id = replies
-        .last()
-        .map(|post| post.id.clone())
-        .or_else(|| accepted_post.as_ref().map(|post| post.id.clone()))
-        .or_else(|| op.as_ref().map(|post| post.id.clone()))
-        .unwrap_or_default();
+    let pagination = PaginationVM {
+        previous: older_cursor.as_ref().map(|(ts, cursor_id)| PageLinkVM {
+            href: Opaque(format!("/t/{}?before={ts}_{cursor_id}", thread.id)),
+            label: Text("Load older".to_string()),
+        }),
+        next: newer_cursor.as_ref().map(|(ts, cursor_id)| PageLinkVM {
+            href: Opaque(format!("/t/{}?after={ts}_{cursor_id}", thread.id)),
+            label: Text("Load newer".to_string()),
+        }),
+        jump: has_newer.then(|| PageLinkVM {
+            href: Opaque(format!("/t/{}?latest=1#thread-latest", thread.id)),
+            label: Text("Jump to latest".to_string()),
+        }),
+        at_start: !has_older,
+        at_end: !has_newer,
+        visible_limit: REPLIES_PER_PAGE,
+    };
 
     // Display list: original post, then the accepted solution fixed directly below it, then one
     // full page of ordinary replies. The store excluded the solution before LIMIT, so it neither
@@ -1067,11 +1344,19 @@ pub async fn thread(
     // The authenticated subject (if any) decides which edit/delete controls render.
     let is_admin = auth::is_admin(&headers);
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
-    let subscription_action = if let Some(sub) = viewer.as_deref() {
-        let follow_level = state.store.thread_follow_level(&thread.id, sub).await?;
-        render_subscription_form(&thread.id, &csrf, follow_level)
+    let subscription = if let Some(sub) = viewer.as_deref() {
+        let current_follow = state.store.thread_follow_level(&thread.id, sub).await?;
+        Some(SubscriptionFormVM {
+            selected: follow_level(current_follow),
+            submit: form_action(
+                format!("/t/{}/subscribe", thread.id),
+                ActionKind::UpdateSubscription,
+                csrf.clone(),
+                Vec::new(),
+            ),
+        })
     } else {
-        String::new()
+        None
     };
     let quote_target = match q.quote.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(pid) => state
@@ -1084,62 +1369,58 @@ pub async fn thread(
 
     // Admin moderation toolbar (lock/pin/move/delete) — only for admins. The move dropdown
     // needs the full category list, fetched only on the admin path.
-    let admin_actions = if is_admin {
+    let admin = if is_admin {
         let categories = state.store.list_categories().await?;
-        render_admin_thread_toolbar(&thread, &categories, &csrf)
+        Some(AdminThreadToolbarVM {
+            move_thread: Some(MoveThreadFormVM {
+                selected_category: Opaque(thread.category_id.clone()),
+                categories: categories
+                    .iter()
+                    .map(crate::handlers::category_ref)
+                    .collect(),
+                submit: form_action(
+                    format!("/admin/threads/{}/move", thread.id),
+                    ActionKind::MoveThread,
+                    csrf.clone(),
+                    Vec::new(),
+                ),
+            }),
+            lock: Some(form_action(
+                format!("/admin/threads/{}/lock", thread.id),
+                if thread.locked {
+                    ActionKind::Unlock
+                } else {
+                    ActionKind::Lock
+                },
+                csrf.clone(),
+                vec![hidden_field(
+                    "state",
+                    if thread.locked { "unlocked" } else { "locked" },
+                )],
+            )),
+            pin: Some(form_action(
+                format!("/admin/threads/{}/pin", thread.id),
+                if thread.pinned {
+                    ActionKind::Unpin
+                } else {
+                    ActionKind::Pin
+                },
+                csrf.clone(),
+                vec![hidden_field(
+                    "state",
+                    if thread.pinned { "unpinned" } else { "pinned" },
+                )],
+            )),
+            delete_review: Some(link_action(
+                format!("/admin/threads/{}/delete", thread.id),
+                ActionKind::DeleteAdminReview,
+            )),
+        })
     } else {
-        String::new()
+        None
     };
-
-    // Breadcrumb: Home / Category / Thread.
-    let cat_crumb = match &category {
-        Some(c) => format!(
-            r#"<a href="/c/{cid}">{cname}</a><span class="crumbs__sep">/</span>"#,
-            cid = esc(&c.id),
-            cname = esc(&c.name),
-        ),
-        None => String::new(),
-    };
-    let crumbs = format!(
-        r#"<nav class="crumbs"><a href="/">Home</a><span class="crumbs__sep">/</span>{cat}<span>{title}</span></nav>"#,
-        cat = cat_crumb,
-        title = esc(&thread.title),
-    );
 
     let can_manage_answer = viewer.as_deref() == Some(thread.author_sub.as_str()) || is_admin;
-    // Thread-level controls (edit title + original post, delete whole thread) — author only.
-    let mut thread_actions = if viewer.as_deref() == Some(thread.author_sub.as_str()) {
-        format!(
-            r#"<div class="owner-actions">
-  <a class="btn btn-secondary btn-sm" href="/t/{tid}/edit">Edit thread</a>
-  <form class="inline-form" method="post" action="/t/{tid}/delete" onsubmit="return confirm('Delete this thread and all its replies? This cannot be undone.');">
-    <input type="hidden" name="csrf" value="{csrf}">
-    <button class="btn btn-danger btn-sm" type="submit">Delete thread</button>
-  </form>
-</div>"#,
-            tid = esc(&thread.id),
-            csrf = esc(&csrf),
-        )
-    } else {
-        String::new()
-    };
-    if can_manage_answer
-        && !thread.accepted_post_id.trim().is_empty()
-        && valid_accepted_id.is_empty()
-    {
-        thread_actions.push_str(&format!(
-            r#"<form class="inline-form" method="post" action="/t/{tid}/accept">
-  <input type="hidden" name="csrf" value="{csrf}">
-  <input type="hidden" name="action" value="clear">
-  <button class="btn btn-secondary btn-sm" type="submit">Clear invalid solution</button>
-</form>"#,
-            tid = esc(&thread.id),
-            csrf = esc(&csrf),
-        ));
-    }
-
-    let summary_html = render_summary(&posts);
-
     // Display order: the original post stays first, then the accepted reply (if any), then the
     // rest in their natural oldest-first order. Reordering a clone never touches storage.
     let ordered = order_posts_accepted_first(&posts, &valid_accepted_id);
@@ -1147,8 +1428,6 @@ pub async fn thread(
         .as_ref()
         .and_then(|reading| reading.first_unread.as_ref())
         .map(|post| post.id.as_str());
-    let resume_marker_in_posts =
-        first_unread_id.is_some_and(|post_id| ordered.iter().any(|post| post.id == post_id));
     let quoted_posts = load_quoted_posts(&state, &thread.id, &ordered).await?;
 
     // Per-post reaction aggregates (counts + whether THIS viewer reacted), keyed by post id.
@@ -1175,164 +1454,168 @@ pub async fn thread(
         HashMap::new()
     };
 
-    let posts_html = render_posts(
-        &ordered,
-        now,
-        viewer.as_deref(),
+    let projection = ThreadPostProjection {
+        viewer: viewer.as_deref(),
         is_admin,
-        &thread.id,
-        &csrf,
-        &valid_accepted_id,
+        thread_id: &thread.id,
+        csrf: &csrf,
+        accepted_post_id: &valid_accepted_id,
         can_manage_answer,
         is_question,
-        !thread.locked,
-        &latest_post_id,
-        first_unread_id,
-        &reactions,
-        &bookmarks,
-        &quoted_posts,
-    );
-    let read_progress = render_thread_read_progress(
-        &thread.id,
-        &csrf,
-        viewer.as_deref(),
-        reading_state.as_ref(),
-        &ordered,
-    );
-
-    // A locked thread shows a notice instead of the reply form (admins still moderate above).
-    let reply_form = if thread.locked {
-        r#"<section class="card pad"><p class="muted ag-locked"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="11" x="3" y="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>This thread is locked — no new replies.</p></section>"#
-            .to_string()
-    } else {
-        let quote_fields = render_reply_quote_fields(quote_target.as_ref());
-        let composer_head = render_composer_head(
-            &headers,
-            &format!(
-                r#"<b>{verb}</b><span>{context} &quot;{}&quot;</span>"#,
-                esc(&thread.title),
-                verb = if is_question { "Answer" } else { "Reply" },
-                context = if is_question {
-                    "answering"
-                } else {
-                    "replying to"
-                },
-            ),
-        );
-        format!(
-            r#"<section id="reply" class="card ag-composer ag-composer--reply">
-  <form class="ag-form" method="post" action="/t/{tid}/reply">
-    <input type="hidden" name="csrf" value="{csrf}">
-    {head}
-    <div class="ag-composer__fields">
-      {quote}
-      <div class="field">
-        <label class="label" for="reply-body">Your {reply_noun} <span class="muted">(Markdown supported)</span></label>
-        <textarea id="reply-body" name="body" rows="6" placeholder="Write {reply_article} {reply_noun}…" required></textarea>
-      </div>
-    </div>
-    <div class="ag-composer__bar">
-      {hint}
-      <div class="ag-composer__actions"><button class="btn btn-primary" type="submit">Post {reply_noun}</button></div>
-    </div>
-  </form>
-</section>"#,
-            tid = esc(&thread.id),
-            csrf = esc(&csrf),
-            head = composer_head,
-            quote = quote_fields,
-            hint = markdown_hint(),
-            reply_noun = if is_question { "answer" } else { "reply" },
-            reply_article = if is_question { "an" } else { "a" },
-        )
+        can_reply: !thread.locked && !viewer_banned,
+        can_post: !viewer_banned,
+        first_unread_post_id: first_unread_id,
+        reactions: &reactions,
+        bookmarks: &bookmarks,
+        quoted_posts: &quoted_posts,
+        now,
     };
-
-    // Status badges in the thread head (pinned / locked) so the state is visible to everyone.
-    let mut badges = String::new();
-    if thread.pinned {
-        badges.push_str(r#" <span class="badge badge-op">Pinned</span>"#);
-    }
-    if thread.locked {
-        badges.push_str(r#" <span class="badge badge-op">Locked</span>"#);
-    }
-    if is_question {
-        if valid_accepted_id.is_empty() {
-            badges.push_str(
-                r#" <span class="badge ag-answer-state ag-answer-state--open">Needs answer</span>"#,
-            );
-        } else {
-            badges
-                .push_str(r#" <span class="badge badge-accepted ag-answer-state">Answered</span>"#);
-        }
-    }
-    let category_chip = category
-        .as_ref()
-        .map(|c| {
-            format!(
-                r#"<a class="ag-chip ag-tone-{tone}" href="/c/{cid}">{name}</a>"#,
-                tone = ag_tone(&c.id),
-                cid = esc(&c.id),
-                name = esc(&c.name),
+    let projected = ordered
+        .iter()
+        .enumerate()
+        .map(|(index, post)| project_post(post, index == 0, &projection))
+        .collect::<Vec<_>>();
+    let op = projected
+        .first()
+        .cloned()
+        .ok_or_else(|| AppError::Internal("thread is missing its original post".to_string()))?;
+    let dais = projected
+        .iter()
+        .find(|post| post.id.0 == valid_accepted_id)
+        .cloned()
+        .map(|post| AnswerDaisVM {
+            post,
+            acceptance: AcceptanceMeaning::AcceptedByAskerOrAuthorizedModerator,
+        });
+    let replies = projected
+        .into_iter()
+        .filter(|post| !post.is_op && post.id.0 != valid_accepted_id)
+        .collect::<Vec<_>>();
+    let owner = viewer.as_deref() == Some(thread.author_sub.as_str());
+    let viewer_state = ThreadViewerState {
+        subscription,
+        edit: owner.then(|| link_action(format!("/t/{}/edit", thread.id), ActionKind::EditThread)),
+        delete_review: owner.then(|| {
+            link_action(
+                format!("/t/{}/delete", thread.id),
+                ActionKind::DeleteThreadReview,
             )
-        })
-        .unwrap_or_default();
-    let head_tools = if thread_actions.is_empty() {
-        String::new()
-    } else {
-        format!(r#"<div class="ag-head-tools">{thread_actions}</div>"#)
+        }),
+        clear_invalid_solution: (can_manage_answer
+            && !thread.accepted_post_id.trim().is_empty()
+            && valid_accepted_id.is_empty())
+        .then(|| {
+            form_action(
+                format!("/t/{}/accept", thread.id),
+                ActionKind::ClearInvalidSolution,
+                csrf.clone(),
+                vec![
+                    hidden_field("action", "clear"),
+                    hidden_field("post_id", thread.accepted_post_id.clone()),
+                ],
+            )
+        }),
     };
-    // Product-native reading controls share the existing reply anchor, keyset route and the one
-    // authoritative subscription form. No duplicate form/id/state is introduced for the sticky
-    // desktop rail or its mobile bottom-dock presentation.
-    let reading_toolbar = render_thread_reading_toolbar(ThreadToolbarView {
-        thread_id: &thread.id,
-        post_count,
-        subscription_form: &subscription_action,
-        can_reply: !thread.locked,
-        is_question,
-        has_newer,
-        reading_state: reading_state.as_ref(),
-        resume_marker_in_posts,
-    });
-
-    let content = format!(
-        r#"{crumbs}
-<div class="thread-head ag-thread-head">
-  <div>
-    <h1>{title}{badges}</h1>
-    <div class="ag-thread-meta">{category_chip}<span>Started by <strong>{author}</strong></span><time title="{created_abs}">{created_rel}</time><span>{replies}</span></div>
-    {actions}
-  </div>
-  {admin_actions}
-</div>
-{reading_toolbar}
-{summary}
-<section id="thread-replies" class="posts" aria-label="Thread posts">{posts}</section>
-{read_progress}
-{pagination}
-{reply}"#,
-        crumbs = crumbs,
-        title = esc(&thread.title),
-        badges = badges,
-        category_chip = category_chip,
-        author = esc(&thread.author_email),
-        created_abs = esc(&fmt_ts(thread.created_at)),
-        created_rel = esc(&rel_time(thread.created_at, now)),
-        replies = esc(&replies_label(post_count)),
-        actions = head_tools,
-        admin_actions = admin_actions,
-        reading_toolbar = reading_toolbar,
-        summary = summary_html,
-        posts = posts_html,
-        read_progress = read_progress,
-        pagination = pagination,
-        reply = reply_form,
-    );
-
+    let visible_post_ids = ordered
+        .iter()
+        .map(|post| post.id.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let reading = ReadingProgressVM {
+        started: reading_state.as_ref().is_some_and(|state| state.started),
+        unread_count: reading_state
+            .as_ref()
+            .map(|state| state.unread_count.max(0)),
+        first_unread_href: reading_state
+            .as_ref()
+            .and_then(|state| state.first_unread.as_ref())
+            .map(|_| Opaque(format!("/t/{}?resume=1#thread-resume", thread.id))),
+        resume_href: reading_state
+            .as_ref()
+            .filter(|state| state.started && state.unread_count > 0 && state.first_unread.is_some())
+            .map(|_| Opaque(format!("/t/{}?resume=1#thread-resume", thread.id))),
+        mark_page_read: (viewer.is_some()
+            && reading_state
+                .as_ref()
+                .is_some_and(|state| state.unread_count > 0)
+            && !visible_post_ids.is_empty())
+        .then(|| {
+            form_action(
+                format!("/t/{}/read", thread.id),
+                ActionKind::MarkThreadPageRead,
+                csrf.clone(),
+                vec![hidden_field("post_ids", visible_post_ids)],
+            )
+        }),
+    };
+    let reply_form = if viewer_banned {
+        ReplyFormVM::UnavailableNotice {
+            heading: Text("Posting unavailable".to_string()),
+            message: Text(
+                "Your account is blocked from creating replies or reactions.".to_string(),
+            ),
+        }
+    } else if thread.locked {
+        ReplyFormVM::LockedNotice {
+            message: Text("No new replies can be posted while this thread is locked.".to_string()),
+        }
+    } else {
+        ReplyFormVM::Available {
+            submit: form_action(
+                format!("/t/{}/reply", thread.id),
+                if is_question {
+                    ActionKind::PostAnswer
+                } else {
+                    ActionKind::PostReply
+                },
+                csrf.clone(),
+                Vec::new(),
+            ),
+            body: Text(String::new()),
+            quoted_post_id: quote_target.map(|post| Opaque(post.id)),
+        }
+    };
     let counts = personal_counts(&state, &headers, now).await?;
-    let html =
-        render_page_with_personal_counts(&thread.title, &email_display(&headers), &content, counts);
-    Ok(html_response(html, set_cookie))
+    let view = ThreadView {
+        chrome: page_chrome(thread.title.clone(), &headers, NavTab::Home, counts),
+        shared: ThreadShared {
+            id: Opaque(thread.id.clone()),
+            title: Text(thread.title.clone()),
+            category: category.as_ref().map(crate::handlers::category_ref),
+            kind: category
+                .as_ref()
+                .map(|category| thread_kind(category.format))
+                .unwrap_or(crate::view_model::ThreadKind::Discussion),
+            answer_state: if is_question {
+                if valid_accepted_id.is_empty() {
+                    AnswerState::NeedsAnswer
+                } else {
+                    AnswerState::Answered
+                }
+            } else {
+                AnswerState::NotApplicable
+            },
+            author_display: Text(thread.author_email.clone()),
+            created_at: thread.created_at,
+            post_count: Some(post_count),
+            pinned: thread.pinned,
+            locked: thread.locked,
+        },
+        viewer: viewer_state,
+        op,
+        dais,
+        replies,
+        pagination,
+        reply_form,
+        summary: summary_state(&posts),
+        reading,
+        admin,
+        now,
+    };
+    Ok(html_response(
+        crate::views::forum::thread(&view),
+        set_cookie,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1369,7 +1652,12 @@ pub async fn mark_thread_read(
     if wants_json(&headers) {
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
-    Ok(redirect_to(&format!("/t/{}?resume=1#thread-resume", id)))
+    let reading = state.store.thread_reading_state(&identity.sub, &id).await?;
+    if reading.unread_count > 0 && reading.first_unread.is_some() {
+        Ok(redirect_to(&format!("/t/{}?resume=1#thread-resume", id)))
+    } else {
+        Ok(redirect_to(&format!("/t/{}?latest=1#thread-latest", id)))
+    }
 }
 
 // ===========================================================================
@@ -1388,6 +1676,13 @@ pub async fn new_form(
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let now = now_secs();
+    if let Some(subject) = auth::identity_subject(&headers) {
+        if state.store.is_banned(&subject).await? {
+            return Err(AppError::Forbidden(
+                "your account is blocked from posting".to_string(),
+            ));
+        }
+    }
     let categories = state.store.list_categories().await?;
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
     let requested = q.cat.unwrap_or_default();
@@ -1401,95 +1696,33 @@ pub async fn new_form(
     let is_question = selected_category
         .map(|category| category.format.is_question())
         .unwrap_or(false);
-    let (_, _, viewer_email) = composer_identity(&headers);
-
-    let mut options = String::new();
-    for c in &categories {
-        let sel = if c.id == selected { " selected" } else { "" };
-        options.push_str(&format!(
-            r#"<option value="{id}"{sel}>{name}</option>"#,
-            id = esc(&c.id),
-            sel = sel,
-            name = esc(&c.name),
-        ));
-    }
-
-    let content = format!(
-        r#"<nav class="crumbs"><a href="/">Home</a><span class="crumbs__sep">/</span><span>{page_title}</span></nav>
-<div class="page-head"><div><h1>{page_title}</h1><p class="muted">{page_note}</p></div></div>
-<section class="card ag-composer ag-composer--new">
-  <form class="ag-form" method="post" action="/new">
-    <input type="hidden" name="csrf" value="{csrf}">
-    {head}
-    <div class="ag-composer__fields">
-      <div class="field">
-        <label class="label" for="nt-title">Title</label>
-        <input id="nt-title" class="input ag-title-input" type="text" name="title" maxlength="{maxt}" placeholder="A short, descriptive title" required>
-        <p class="hint">Up to 200 characters — make it easy to find</p>
-        <div id="similar-box" class="similar ag-similar" hidden>
-          <div class="similar__head">Similar existing threads — is one of these your topic?</div>
-          <ul id="similar-list" class="similar__list"></ul>
-        </div>
-      </div>
-      <div class="ag-meta-row">
-        <div class="field">
-          <label class="label" for="nt-cat">Category</label>
-          <select id="nt-cat" name="category" required>{options}</select>
-        </div>
-      </div>
-      <div class="field">
-        <label class="label" for="nt-body">Body <span class="muted">(Markdown supported)</span></label>
-        <textarea id="nt-body" name="body" rows="12" placeholder="Write the first post…" required></textarea>
-      </div>
-    </div>
-    <div class="ag-composer__bar">
-      {hint}
-      <div class="ag-composer__actions">
-      <a class="btn btn-secondary" href="/">Cancel</a>
-      <button class="btn btn-primary" type="submit">{submit_label}</button>
-      </div>
-    </div>
-  </form>
-</section>
-{script}"#,
-        csrf = esc(&csrf),
-        page_title = if is_question {
-            "Ask a question"
-        } else {
-            "New thread"
-        },
-        page_note = if is_question {
-            "Describe the problem clearly so the community can propose a reusable answer."
-        } else {
-            "Start an open discussion with the community."
-        },
-        head = render_composer_head(
-            &headers,
-            &format!(r#"<b>{viewer_email}</b><span>posting a new thread</span>"#),
-        ),
-        options = options,
-        maxt = MAX_TITLE,
-        hint = markdown_hint(),
-        submit_label = if is_question {
-            "Ask question"
-        } else {
-            "Create thread"
-        },
-        script = SIMILAR_SCRIPT,
-    );
-
+    let heading = if is_question {
+        "Ask a question"
+    } else {
+        "New thread"
+    };
     let counts = personal_counts(&state, &headers, now).await?;
-    let html = render_page_with_personal_counts(
-        if is_question {
-            "Ask a question"
-        } else {
-            "New thread"
+    let view = ComposeView {
+        chrome: page_chrome(heading, &headers, NavTab::New, counts),
+        shared: ComposeShared {
+            mode: ComposeMode::NewThread,
+            heading: Text(heading.to_string()),
+            categories: categories.iter().map(category_vm).collect(),
+            selected_category: (!selected.is_empty()).then(|| Opaque(selected.to_string())),
+            thread_kind: selected_category.map(|category| thread_kind(category.format)),
         },
-        &email_display(&headers),
-        &content,
-        counts,
-    );
-    Ok(html_response(html, set_cookie))
+        viewer: ComposeViewerState {
+            title: Text(String::new()),
+            body: Text(String::new()),
+            quoted_post_id: None,
+            submit: form_action("/new", ActionKind::PublishThread, csrf, Vec::new()),
+            cancel_href: Opaque("/".to_string()),
+        },
+    };
+    Ok(html_response(
+        crate::views::forum::compose(&view),
+        set_cookie,
+    ))
 }
 
 // ===========================================================================
@@ -1710,11 +1943,48 @@ pub struct EditThreadForm {
     pub body: String,
 }
 
-/// Minimal form body for a delete: just the CSRF token (identity comes from the gateway).
+/// Commit body for a destructive action. The server-issued confirmation proves that the same
+/// actor and CSRF session visited the consequence review before this POST.
 #[derive(Debug, Deserialize)]
 pub struct DeleteForm {
     #[serde(default)]
     pub csrf: String,
+    #[serde(default)]
+    pub confirm: String,
+}
+
+fn thread_delete_action(id: &str) -> String {
+    format!("thread.delete:{id}")
+}
+
+fn reply_delete_action(thread_id: &str, post_id: &str) -> String {
+    format!("reply.delete:{thread_id}:{post_id}")
+}
+
+/// Build the shared no-JS destructive-action review through the typed presentation seam.
+/// Authorization, consequence selection, CSRF minting and confirmation minting stay here.
+pub(crate) fn render_destructive_review(
+    heading: &str,
+    consequence: &str,
+    action: &str,
+    csrf: &str,
+    confirm: &str,
+    cancel_href: &str,
+) -> String {
+    crate::views::shell::destructive_review(&DestructiveReviewVM {
+        heading: Text(heading.to_string()),
+        consequence: ConsequenceVM {
+            summary: Text(consequence.to_string()),
+            detail: None,
+        },
+        commit: form_action(
+            action,
+            ActionKind::DeleteConfirm,
+            csrf,
+            vec![hidden_field("confirm", confirm)],
+        ),
+        cancel_href: Opaque(cancel_href.to_string()),
+    })
 }
 
 pub async fn edit_thread_form(
@@ -1738,19 +2008,33 @@ pub async fn edit_thread_form(
     let op_body = posts.first().map(|p| p.body_md.as_str()).unwrap_or("");
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
 
-    let content = render_edit_form(
-        "Edit thread",
-        &format!("/t/{}/edit", esc(&thread.id)),
-        &csrf,
-        Some(&thread.title),
-        op_body,
-        &format!("/t/{}", esc(&thread.id)),
-        &headers,
-    );
     let counts = personal_counts(&state, &headers, now).await?;
-    let html =
-        render_page_with_personal_counts("Edit thread", &email_display(&headers), &content, counts);
-    Ok(html_response(html, set_cookie))
+    let view = ComposeView {
+        chrome: page_chrome("Edit thread", &headers, NavTab::Home, counts),
+        shared: ComposeShared {
+            mode: ComposeMode::EditThread,
+            heading: Text("Edit thread".to_string()),
+            categories: Vec::new(),
+            selected_category: Some(Opaque(thread.category_id.clone())),
+            thread_kind: None,
+        },
+        viewer: ComposeViewerState {
+            title: Text(thread.title.clone()),
+            body: Text(op_body.to_string()),
+            quoted_post_id: None,
+            submit: form_action(
+                format!("/t/{}/edit", thread.id),
+                ActionKind::SaveThread,
+                csrf,
+                Vec::new(),
+            ),
+            cancel_href: Opaque(format!("/t/{}", thread.id)),
+        },
+    };
+    Ok(html_response(
+        crate::views::forum::compose(&view),
+        set_cookie,
+    ))
 }
 
 pub async fn update_thread(
@@ -1826,13 +2110,57 @@ pub async fn update_thread(
     Ok(redirect_to(&format!("/t/{id}")))
 }
 
+pub async fn delete_thread_review(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let author = auth::require_author(&headers)?;
+    let thread = state
+        .store
+        .get_thread(&id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("thread not found".to_string()))?;
+    if thread.author_sub != author.sub {
+        return Err(AppError::Forbidden(
+            "you can only delete your own threads".to_string(),
+        ));
+    }
+    let reply_count = state.store.count_posts(&id).await?.saturating_sub(1);
+
+    let (csrf, set_cookie) = auth::ensure_csrf(&headers);
+    let action_key = thread_delete_action(&id);
+    let confirm = auth::new_destructive_confirmation(
+        state.config.destructive_confirmation_key(),
+        &csrf,
+        &action_key,
+        &author.sub,
+    );
+    let content = render_destructive_review(
+        "Delete thread?",
+        &format!(
+            "The thread “{}” and its {} {} will be permanently deleted.",
+            thread.title,
+            reply_count,
+            if reply_count == 1 { "reply" } else { "replies" }
+        ),
+        &format!("/t/{id}/delete"),
+        &csrf,
+        &confirm,
+        &format!("/t/{id}"),
+    );
+    let counts = personal_counts(&state, &headers, now_secs()).await?;
+    let chrome = page_chrome("Review thread deletion", &headers, NavTab::Home, counts);
+    let html = crate::views::shell::page(&chrome, &content);
+    Ok(html_response(html, set_cookie))
+}
+
 pub async fn delete_thread(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
     Form(form): Form<DeleteForm>,
 ) -> Result<Response, AppError> {
-    auth::verify_csrf(&headers, &form.csrf)?;
     let author = auth::require_author(&headers)?;
 
     let thread = state
@@ -1845,6 +2173,14 @@ pub async fn delete_thread(
             "you can only delete your own threads".to_string(),
         ));
     }
+    auth::consume_destructive_confirmation(
+        state.config.destructive_confirmation_key(),
+        &headers,
+        &form.csrf,
+        &form.confirm,
+        &thread_delete_action(&id),
+        &author.sub,
+    )?;
 
     state.store.delete_thread(&id).await?;
     tracing::info!(thread = id, author = thread.author_email, "thread deleted");
@@ -1911,19 +2247,33 @@ pub async fn edit_reply_form(
     let post = locate_own_reply(&posts, &pid, &author.sub)?;
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
 
-    let content = render_edit_form(
-        "Edit reply",
-        &format!("/t/{}/p/{}/edit", esc(&tid), esc(&pid)),
-        &csrf,
-        None,
-        &post.body_md,
-        &format!("/t/{}", esc(&tid)),
-        &headers,
-    );
     let counts = personal_counts(&state, &headers, now).await?;
-    let html =
-        render_page_with_personal_counts("Edit reply", &email_display(&headers), &content, counts);
-    Ok(html_response(html, set_cookie))
+    let view = ComposeView {
+        chrome: page_chrome("Edit reply", &headers, NavTab::Home, counts),
+        shared: ComposeShared {
+            mode: ComposeMode::EditReply,
+            heading: Text("Edit reply".to_string()),
+            categories: Vec::new(),
+            selected_category: None,
+            thread_kind: None,
+        },
+        viewer: ComposeViewerState {
+            title: Text(String::new()),
+            body: Text(post.body_md),
+            quoted_post_id: None,
+            submit: form_action(
+                format!("/t/{tid}/p/{pid}/edit"),
+                ActionKind::SaveReply,
+                csrf,
+                Vec::new(),
+            ),
+            cancel_href: Opaque(format!("/t/{tid}")),
+        },
+    };
+    Ok(html_response(
+        crate::views::forum::compose(&view),
+        set_cookie,
+    ))
 }
 
 pub async fn update_reply(
@@ -1969,17 +2319,58 @@ pub async fn update_reply(
     Ok(redirect_to(&format!("/t/{tid}")))
 }
 
+pub async fn delete_reply_review(
+    State(state): State<AppState>,
+    Path((tid, pid)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let author = auth::require_author(&headers)?;
+    let posts = state.store.posts_in_thread(&tid).await?;
+    let post = locate_own_reply(&posts, &pid, &author.sub)?;
+
+    let (csrf, set_cookie) = auth::ensure_csrf(&headers);
+    let action_key = reply_delete_action(&tid, &pid);
+    let confirm = auth::new_destructive_confirmation(
+        state.config.destructive_confirmation_key(),
+        &csrf,
+        &action_key,
+        &author.sub,
+    );
+    let content = render_destructive_review(
+        "Delete reply?",
+        &format!(
+            "Your reply by {} will be permanently removed from this thread.",
+            post.author_email
+        ),
+        &format!("/t/{tid}/p/{pid}/delete"),
+        &csrf,
+        &confirm,
+        &format!("/t/{tid}"),
+    );
+    let counts = personal_counts(&state, &headers, now_secs()).await?;
+    let chrome = page_chrome("Review reply deletion", &headers, NavTab::Home, counts);
+    let html = crate::views::shell::page(&chrome, &content);
+    Ok(html_response(html, set_cookie))
+}
+
 pub async fn delete_reply(
     State(state): State<AppState>,
     Path((tid, pid)): Path<(String, String)>,
     headers: HeaderMap,
     Form(form): Form<DeleteForm>,
 ) -> Result<Response, AppError> {
-    auth::verify_csrf(&headers, &form.csrf)?;
     let author = auth::require_author(&headers)?;
 
     let posts = state.store.posts_in_thread(&tid).await?;
     let post = locate_own_reply(&posts, &pid, &author.sub)?;
+    auth::consume_destructive_confirmation(
+        state.config.destructive_confirmation_key(),
+        &headers,
+        &form.csrf,
+        &form.confirm,
+        &reply_delete_action(&tid, &pid),
+        &author.sub,
+    )?;
 
     state.store.delete_post(&pid).await?;
     tracing::info!(thread = tid, post = pid, "reply deleted");
@@ -2083,8 +2474,8 @@ pub async fn react(
 // POST /t/{tid}/accept — explicitly accept or clear the accepted answer
 // ===========================================================================
 
-/// Explicit accepted-answer command. `accept` requires `post_id`; `clear` ignores it and is
-/// idempotent even when a legacy pointer references a post that no longer exists.
+/// Explicit accepted-answer command. Both actions bind to `post_id`; a stale clear can never
+/// remove a newer accepted answer selected after the form was rendered.
 #[derive(Debug, Deserialize)]
 pub struct AcceptForm {
     #[serde(default)]
@@ -2121,7 +2512,9 @@ pub async fn accept_answer(
         "accept" => AcceptedAnswerAction::Accept {
             post_id: form.post_id.trim().to_string(),
         },
-        "clear" => AcceptedAnswerAction::Clear,
+        "clear" => AcceptedAnswerAction::ClearIf {
+            post_id: form.post_id.trim().to_string(),
+        },
         _ => {
             return Err(AppError::InvalidRequest(
                 "answer action must be accept or clear".to_string(),
@@ -2266,95 +2659,7 @@ fn subscribed_subject<'a>(q: &ThreadListQuery, viewer_sub: Option<&'a str>) -> O
     }
 }
 
-fn render_thread_list_controls(
-    action: &str,
-    q: &ThreadListQuery,
-    show_subscribed: bool,
-    show_answer_filters: bool,
-    effective_status: ThreadStatusFilter,
-) -> String {
-    let sort = q.sort_key();
-    let sub = q.subscribed_only();
-    let status_key = match effective_status {
-        ThreadStatusFilter::Answered => Some("answered"),
-        ThreadStatusFilter::Unanswered => Some("unanswered"),
-        ThreadStatusFilter::Any | ThreadStatusFilter::Questions => None,
-    };
-    // Sort as tabs: real links (no-JS navigates + keeps the `?sort=` contract); the enhancement
-    // script intercepts a click, fetches the same URL and swaps the `.thread-list` in place.
-    let tab = |key: &str, label: &str| {
-        let active = sort == key;
-        format!(
-            r#"<a class="tab{cls}" role="tab" aria-selected="{sel}" data-sort-tab="{key}" href="{href}">{label}</a>"#,
-            cls = if active { " is-active" } else { "" },
-            sel = if active { "true" } else { "false" },
-            key = key,
-            href = list_href(action, key, status_key, sub),
-            label = label,
-        )
-    };
-    // Following filter as a toggle link that preserves the current sort. Storage keeps the
-    // existing subscription name, but the UI does not promise notification delivery.
-    let filter = if show_subscribed {
-        let (href, label, cls) = if sub {
-            (
-                list_href(action, sort, status_key, false),
-                "Show all",
-                "btn btn-secondary btn-sm",
-            )
-        } else {
-            (
-                list_href(action, sort, status_key, true),
-                "Following",
-                "btn btn-ghost btn-sm",
-            )
-        };
-        format!(
-            r#"<a class="{cls} thread-filter" href="{href}">{label}</a>"#,
-            cls = cls,
-            href = href,
-            label = label,
-        )
-    } else {
-        String::new()
-    };
-    let answer_filters = if show_answer_filters {
-        let status_tab = |key: Option<&str>, label: &str| {
-            let active = status_key == key;
-            format!(
-                r#"<a class="tab{cls}" role="tab" aria-selected="{selected}" href="{href}">{label}</a>"#,
-                cls = if active { " is-active" } else { "" },
-                selected = if active { "true" } else { "false" },
-                href = list_href(action, sort, key, sub),
-                label = label,
-            )
-        };
-        format!(
-            r#"<nav class="tabs answer-tabs" role="tablist" aria-label="Filter by answer status">{all}{unanswered}{answered}</nav>"#,
-            all = status_tab(None, "All"),
-            unanswered = status_tab(Some("unanswered"), "Unanswered"),
-            answered = status_tab(Some("answered"), "Answered"),
-        )
-    } else {
-        String::new()
-    };
-    format!(
-        r#"<div class="thread-controls" data-thread-controls>
-  <div class="thread-controls__tabs">
-    <nav class="tabs sort-tabs" role="tablist" aria-label="Sort threads">{latest}{top}{hot}</nav>
-    {answer_filters}
-  </div>
-  {following}
-</div>"#,
-        latest = tab("latest", "Latest"),
-        top = tab("top", "Top"),
-        hot = tab("hot", "Hot"),
-        answer_filters = answer_filters,
-        following = filter,
-    )
-}
-
-fn list_href(action: &str, sort: &str, status: Option<&str>, subscribed: bool) -> String {
+fn list_href_raw(action: &str, sort: &str, status: Option<&str>, subscribed: bool) -> String {
     let mut params = vec![format!("sort={sort}")];
     if let Some(status) = status {
         params.push(format!("status={status}"));
@@ -2362,249 +2667,7 @@ fn list_href(action: &str, sort: &str, status: Option<&str>, subscribed: bool) -
     if subscribed {
         params.push("filter=subscribed".to_string());
     }
-    format!("{}?{}", esc(action), params.join("&amp;"))
-}
-
-fn thread_list_title(q: &ThreadListQuery, fallback: &'static str) -> &'static str {
-    match q.status() {
-        ThreadStatusFilter::Answered => "Answered questions",
-        ThreadStatusFilter::Unanswered => "Questions that need an answer",
-        ThreadStatusFilter::Any | ThreadStatusFilter::Questions if q.subscribed_only() => {
-            "Following"
-        }
-        ThreadStatusFilter::Any | ThreadStatusFilter::Questions => fallback,
-    }
-}
-
-struct ThreadToolbarView<'a> {
-    thread_id: &'a str,
-    post_count: i64,
-    subscription_form: &'a str,
-    can_reply: bool,
-    is_question: bool,
-    has_newer: bool,
-    reading_state: Option<&'a ThreadReadingState>,
-    resume_marker_in_posts: bool,
-}
-
-fn render_thread_reading_toolbar(view: ThreadToolbarView<'_>) -> String {
-    let latest_href = if view.has_newer {
-        format!("/t/{}?latest=1#thread-latest", esc(view.thread_id))
-    } else {
-        "#thread-latest".to_string()
-    };
-    let reply_action = if view.can_reply {
-        format!(
-            r##"<a class="btn btn-primary btn-sm ag-thread-toolbar__reply" href="#reply">{label}</a>"##,
-            label = if view.is_question { "Answer" } else { "Reply" },
-        )
-    } else {
-        r#"<span class="btn btn-secondary btn-sm ag-thread-toolbar__locked" aria-disabled="true">Locked</span>"#
-            .to_string()
-    };
-    let continuity = match view.reading_state {
-        Some(reading) if reading.first_unread.is_some() => {
-            let marker = if view.resume_marker_in_posts {
-                ""
-            } else {
-                r#" id="thread-resume""#
-            };
-            let label = if reading.started {
-                "Continue reading"
-            } else {
-                "Start reading"
-            };
-            format!(
-                r##"<a{marker} class="btn btn-secondary btn-sm ag-thread-toolbar__continue" href="/t/{tid}?resume=1#thread-resume">{label}<span>{count} unread</span></a>"##,
-                marker = marker,
-                tid = esc(view.thread_id),
-                label = label,
-                count = reading.unread_count,
-            )
-        }
-        Some(_) => {
-            let marker = if view.resume_marker_in_posts {
-                ""
-            } else {
-                r#" id="thread-resume""#
-            };
-            format!(
-                r#"<span{marker} class="ag-thread-toolbar__caught"><span class="ag-thread-toolbar__caught-dot" aria-hidden="true"></span>Caught up</span>"#,
-                marker = marker,
-            )
-        }
-        None => String::new(),
-    };
-    format!(
-        r#"<nav class="ag-thread-toolbar" aria-label="Thread reading actions">
-  <div class="ag-thread-toolbar__context"><span class="ag-thread-toolbar__eyebrow">In this thread</span><strong>{replies}</strong></div>
-  <div class="ag-thread-toolbar__actions">
-    {continuity}
-    <a class="btn btn-ghost btn-sm" href="{latest_href}">Latest</a>
-    {subscription_form}
-    {reply_action}
-  </div>
-</nav>"#,
-        replies = esc(&replies_label(view.post_count)),
-        latest_href = latest_href,
-        continuity = continuity,
-        subscription_form = view.subscription_form,
-        reply_action = reply_action,
-    )
-}
-
-fn render_thread_read_progress(
-    thread_id: &str,
-    csrf: &str,
-    viewer_sub: Option<&str>,
-    reading_state: Option<&ThreadReadingState>,
-    visible_posts: &[Post],
-) -> String {
-    if viewer_sub.is_none()
-        || visible_posts.is_empty()
-        || reading_state.is_some_and(|reading| reading.unread_count == 0)
-    {
-        return String::new();
-    }
-    let post_ids = visible_posts
-        .iter()
-        .map(|post| post.id.as_str())
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        r#"<section class="ag-read-progress" data-thread-read-progress>
-  <span class="ag-read-progress__sentinel" data-thread-read-sentinel aria-hidden="true"></span>
-  <div class="ag-read-progress__copy"><span>Reading progress</span><strong data-thread-read-status>Only posts shown on this page will be marked read.</strong></div>
-  <form class="inline-form" method="post" action="/t/{tid}/read" data-thread-read-form>
-    <input type="hidden" name="csrf" value="{csrf}">
-    <input type="hidden" name="post_ids" value="{post_ids}">
-    <button class="btn btn-secondary btn-sm" type="submit" data-thread-read-submit>Mark page read &amp; continue</button>
-  </form>
-</section>
-<script>
-(function () {{
-  var form = document.querySelector('[data-thread-read-form]');
-  var sentinel = document.querySelector('[data-thread-read-sentinel]');
-  if (!form || !sentinel || !window.fetch || !window.IntersectionObserver) return;
-  var sent = false;
-  var observer = new IntersectionObserver(function (entries) {{
-    if (sent || !entries.some(function (entry) {{ return entry.isIntersecting; }})) return;
-    sent = true;
-    observer.disconnect();
-    fetch(form.action, {{
-      method: 'POST', body: new URLSearchParams(new FormData(form)), credentials: 'same-origin',
-      headers: {{ 'Accept': 'application/json' }}
-    }}).then(function (response) {{
-      if (!response.ok) throw new Error('read receipt failed');
-      var status = document.querySelector('[data-thread-read-status]');
-      var button = document.querySelector('[data-thread-read-submit]');
-      if (status) status.textContent = 'Page marked read · Continue returns to the earliest unread post.';
-      if (button) {{ button.textContent = 'Read through this page'; button.disabled = true; }}
-      form.closest('[data-thread-read-progress]').classList.add('is-read');
-    }}).catch(function () {{
-      var status = document.querySelector('[data-thread-read-status]');
-      if (status) status.textContent = 'Automatic progress was not saved · use the button to retry.';
-    }});
-  }}, {{ rootMargin: '0px 0px -8% 0px' }});
-  observer.observe(sentinel);
-}})();
-</script>"#,
-        tid = esc(thread_id),
-        csrf = esc(csrf),
-        post_ids = esc(&post_ids),
-    )
-}
-
-fn render_subscription_form(
-    thread_id: &str,
-    csrf: &str,
-    follow_level: ThreadFollowLevel,
-) -> String {
-    let option = |level: ThreadFollowLevel, label: &str| {
-        format!(
-            r#"<option value="{value}"{selected}>{label}</option>"#,
-            value = level.as_str(),
-            selected = if follow_level == level {
-                " selected"
-            } else {
-                ""
-            },
-            label = esc(label),
-        )
-    };
-    format!(
-        r#"<form class="inline-form subscription-form" method="post" action="/t/{tid}/subscribe" data-wire data-wire-target=".subscription-form" data-wire-ok="Thread preference saved" data-wire-err="Could not update your thread preference">
-  <input type="hidden" name="csrf" value="{csrf}">
-  <span class="subscription-form__field">
-    <label class="subscription-form__label" for="thread-follow-{tid}">Thread updates</label>
-    <select id="thread-follow-{tid}" name="level" aria-describedby="thread-follow-help-{tid}">
-      {watch}
-      {follow}
-      {mute}
-      {none}
-    </select>
-    <span class="subscription-form__help" id="thread-follow-help-{tid}">Direct replies, mentions and accepted answers still appear in Activity.</span>
-  </span>
-  <button class="btn btn-secondary btn-sm" type="submit">Apply</button>
-</form>"#,
-        tid = esc(thread_id),
-        csrf = esc(csrf),
-        watch = option(ThreadFollowLevel::Watch, "Watch · replies in Activity"),
-        follow = option(ThreadFollowLevel::Follow, "Follow · personal feeds only"),
-        mute = option(ThreadFollowLevel::Mute, "Mute · hide from personal feeds"),
-        none = option(ThreadFollowLevel::None, "None · reset preference"),
-    )
-}
-
-fn composer_identity(headers: &HeaderMap) -> (usize, String, String) {
-    let email = auth::identity_email(headers).unwrap_or_default();
-    let subject = auth::identity_subject(headers);
-    let tone_key = subject
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or(email.as_str());
-    let tone = if tone_key.trim().is_empty() {
-        1
-    } else {
-        ag_tone(tone_key)
-    };
-    let label = if email.trim().is_empty() {
-        "Not signed in".to_string()
-    } else {
-        email.clone()
-    };
-    (tone, esc(&ag_initial(&email)), esc(&label))
-}
-
-fn render_composer_head(headers: &HeaderMap, who_html: &str) -> String {
-    let (tone, initial, _) = composer_identity(headers);
-    format!(
-        r#"<div class="ag-composer__head"><span class="avatar ag-avatar ag-tone-{tone}" aria-hidden="true">{initial}</span><div class="ag-composer__who">{who}</div><span class="pill pill-neutral ag-composer__badge">Markdown</span></div>"#,
-        tone = tone,
-        initial = initial,
-        who = who_html,
-    )
-}
-
-fn markdown_hint() -> &'static str {
-    r#"<div class="ag-md-hint"><code>**bold**</code><code>_italic_</code><code>`code`</code><code>&gt; quote</code><span>@name to mention</span></div>"#
-}
-
-fn render_reply_quote_fields(quote: Option<&Post>) -> String {
-    let Some(quote) = quote else {
-        return String::new();
-    };
-    format!(
-        r##"<input type="hidden" name="quote_post_id" value="{pid}">
-      <blockquote class="ag-composer__quote">
-        <p class="ag-composer__quote-by">Quoting {author}<a href="/t/{tid}#reply">Remove</a></p>
-        <p class="ag-composer__quote-body">{body}</p>
-      </blockquote>"##,
-        pid = esc(&quote.id),
-        tid = esc(&quote.thread_id),
-        author = esc(&quote.author_email),
-        body = esc(&quote.body_md),
-    )
+    format!("{action}?{}", params.join("&"))
 }
 
 async fn load_quoted_posts(
@@ -2628,23 +2691,6 @@ async fn load_quoted_posts(
         }
     }
     Ok(out)
-}
-
-fn render_quote_block(post: &Post, quoted_posts: &HashMap<String, Post>) -> String {
-    if post.quoted_post_id.is_empty() {
-        return String::new();
-    }
-    let Some(quoted) = quoted_posts.get(&post.quoted_post_id) else {
-        return String::new();
-    };
-    format!(
-        r#"<blockquote class="post-quote">
-  <p class="post-quote__by">{author} wrote:</p>
-  <p>{body}</p>
-</blockquote>"#,
-        author = esc(&quoted.author_email),
-        body = esc(&quoted.body_md),
-    )
 }
 
 fn extract_mentions(body: &str) -> Vec<String> {
@@ -2753,115 +2799,6 @@ fn is_mention_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')
 }
 
-/// Render the admin moderation toolbar for a thread: toggle lock, toggle pin, move to another
-/// category, and delete the whole thread. Every action is a CSRF-guarded POST into the
-/// group-gated `/admin` subtree. Category options are HTML-escaped.
-pub(crate) fn render_admin_thread_toolbar(
-    thread: &Thread,
-    categories: &[crate::model::Category],
-    csrf: &str,
-) -> String {
-    let lock_label = if thread.locked { "Unlock" } else { "Lock" };
-    let pin_label = if thread.pinned { "Unpin" } else { "Pin" };
-    let mut options = String::new();
-    for c in categories {
-        let sel = if c.id == thread.category_id {
-            " selected"
-        } else {
-            ""
-        };
-        options.push_str(&format!(
-            r#"<option value="{id}"{sel}>{name}</option>"#,
-            id = esc(&c.id),
-            sel = sel,
-            name = esc(&c.name),
-        ));
-    }
-    format!(
-        r#"<div class="owner-actions admin-toolbar ag-modbar">
-  <form class="inline-form" method="post" action="/admin/threads/{tid}/lock">
-    <input type="hidden" name="csrf" value="{csrf}">
-    <button class="btn btn-secondary btn-sm" type="submit">{lock_label}</button>
-  </form>
-  <form class="inline-form" method="post" action="/admin/threads/{tid}/pin">
-    <input type="hidden" name="csrf" value="{csrf}">
-    <button class="btn btn-secondary btn-sm" type="submit">{pin_label}</button>
-  </form>
-  <form class="inline-form" method="post" action="/admin/threads/{tid}/move">
-    <input type="hidden" name="csrf" value="{csrf}">
-    <select name="category" aria-label="Move to category">{options}</select>
-    <button class="btn btn-secondary btn-sm" type="submit">Move</button>
-  </form>
-  <form class="inline-form" method="post" action="/admin/threads/{tid}/delete" onsubmit="return confirm('Delete this thread and all replies as admin? This cannot be undone.');">
-    <input type="hidden" name="csrf" value="{csrf}">
-    <button class="btn btn-danger btn-sm" type="submit">Delete (admin)</button>
-  </form>
-</div>"#,
-        tid = esc(&thread.id),
-        csrf = esc(csrf),
-        lock_label = lock_label,
-        pin_label = pin_label,
-        options = options,
-    )
-}
-
-/// Render the shared edit-form card (thread or reply). `title_value` is `Some` for a thread
-/// (renders a Title input) and `None` for a reply (body only). Every interpolated value is
-/// HTML-escaped.
-fn render_edit_form(
-    heading: &str,
-    action: &str,
-    csrf: &str,
-    title_value: Option<&str>,
-    body_value: &str,
-    cancel_href: &str,
-    headers: &HeaderMap,
-) -> String {
-    let title_input = match title_value {
-        Some(v) => format!(
-            r#"<div class="field">
-      <label class="label" for="ed-title">Title</label>
-      <input id="ed-title" class="input ag-title-input" type="text" name="title" maxlength="{maxt}" required value="{value}">
-    </div>"#,
-            maxt = MAX_TITLE,
-            value = esc(v),
-        ),
-        None => String::new(),
-    };
-    format!(
-        r#"<nav class="crumbs"><a href="/">Home</a><span class="crumbs__sep">/</span><span>{heading}</span></nav>
-<div class="page-head"><div><h1>{heading}</h1></div></div>
-<section class="card ag-composer ag-composer--edit">
-  <form class="ag-form" method="post" action="{action}">
-    <input type="hidden" name="csrf" value="{csrf}">
-    {head}
-    <div class="ag-composer__fields">
-      {title_input}
-      <div class="field">
-        <label class="label" for="ed-body">Body <span class="muted">(Markdown supported)</span></label>
-        <textarea id="ed-body" name="body" rows="10" required>{body}</textarea>
-      </div>
-    </div>
-    <div class="ag-composer__bar">
-      {hint}
-      <div class="ag-composer__actions">
-      <a class="btn btn-secondary" href="{cancel}">Cancel</a>
-      <button class="btn btn-primary" type="submit">Save changes</button>
-      </div>
-    </div>
-  </form>
-</section>"#,
-        heading = esc(heading),
-        action = action,
-        csrf = esc(csrf),
-        head = render_composer_head(headers, &format!(r#"<b>{}</b>"#, esc(heading))),
-        title_input = title_input,
-        body = esc(body_value),
-        hint = markdown_hint(),
-        cancel = cancel_href,
-    )
-}
-
 async fn load_reading_states(
     state: &AppState,
     viewer_sub: Option<&str>,
@@ -2876,457 +2813,6 @@ async fn load_reading_states(
         .thread_reading_states(viewer_sub, &thread_ids)
         .await
         .map_err(Into::into)
-}
-
-/// Render a list of threads as rows. When `cat_names` is provided (home page) each row also
-/// names its category; otherwise (category page) it is omitted.
-fn render_thread_rows(
-    threads: &[Thread],
-    now: i64,
-    cat_names: Option<&HashMap<&str, &str>>,
-    counts: Option<&HashMap<String, i64>>,
-    question_categories: &HashSet<&str>,
-    reading_states: &HashMap<String, ThreadReadingState>,
-) -> String {
-    render_thread_rows_impl(
-        threads,
-        now,
-        cat_names,
-        counts,
-        question_categories,
-        reading_states,
-        None,
-    )
-}
-
-#[derive(Clone, Debug)]
-struct CategoryFocusSignal {
-    reason: CategoryFocusReason,
-    label: String,
-}
-
-fn render_category_focus_form(
-    category: &Category,
-    csrf: &str,
-    current: CategoryFocusLevel,
-    query: &ThreadListQuery,
-) -> String {
-    let option = |level: CategoryFocusLevel, label: &str| {
-        let selected = if level == current { " selected" } else { "" };
-        format!(
-            r#"<option value="{value}"{selected}>{label}</option>"#,
-            value = level.as_str(),
-            selected = selected,
-            label = esc(label),
-        )
-    };
-    let options = [
-        (CategoryFocusLevel::None, "No category rule"),
-        (CategoryFocusLevel::Priority, "Priority — show first"),
-        (CategoryFocusLevel::Follow, "Follow — keep in Focus"),
-        (CategoryFocusLevel::Mute, "Mute — keep out of Focus"),
-    ]
-    .into_iter()
-    .map(|(level, label)| option(level, label))
-    .collect::<String>();
-    let saved = if query.focus_saved.as_deref() == Some(current.as_str()) {
-        format!(
-            "<p class=\"ag-focus-rule__status\" role=\"status\">Saved as {}.</p>",
-            esc(current.as_str())
-        )
-    } else {
-        String::new()
-    };
-    let return_state = format!(
-        "<input type=\"hidden\" name=\"sort\" value=\"{}\"><input type=\"hidden\" name=\"filter\" value=\"{}\"><input type=\"hidden\" name=\"status\" value=\"{}\">",
-        query.sort_key(),
-        if query.subscribed_only() { "subscribed" } else { "" },
-        match query.status() {
-            ThreadStatusFilter::Answered => "answered",
-            ThreadStatusFilter::Unanswered => "unanswered",
-            ThreadStatusFilter::Any | ThreadStatusFilter::Questions => "",
-        },
-    );
-    format!(
-        r#"<section class="card ag-focus-rule" aria-labelledby="category-focus-heading">
-  <div class="ag-focus-rule__copy">
-    <p class="ag-for-you-eyebrow">Private category rule</p>
-    <h2 id="category-focus-heading">Place {category} in Focus</h2>
-    <p>Priority appears before Follow. Mute excludes this category unless a thread has an explicit Watch or Follow; thread Mute always excludes it. This does not create Activity.</p>
-  </div>
-  <form class="ag-focus-rule__form" method="post" action="/c/{id}/focus">
-    <input type="hidden" name="csrf" value="{csrf}">
-    {return_state}
-    <label class="label" for="category-focus-level">Category intent</label>
-    <div class="ag-focus-rule__controls">
-      <select id="category-focus-level" name="level">{options}</select>
-      <button class="btn btn-primary" type="submit">Save rule</button>
-    </div>
-    {saved}
-    <a class="ag-focus-rule__link" href="/focus">Open your private Focus →</a>
-  </form>
-</section>"#,
-        category = esc(&category.name),
-        id = esc(&category.id),
-        csrf = esc(csrf),
-        return_state = return_state,
-        saved = saved,
-        options = options,
-    )
-}
-
-fn render_category_focus_rows(
-    items: &[CategoryFocusItem],
-    has_rules: bool,
-    now: i64,
-    reading_states: &HashMap<String, ThreadReadingState>,
-) -> String {
-    if items.is_empty() {
-        let copy = if has_rules {
-            "Your rules are active, but no live thread currently matches. Muted categories remain listed above so you can review or change them."
-        } else {
-            "Choose Priority, Follow, or Mute on a category page to shape this private desk."
-        };
-        return format!(
-            r#"<div class="empty ag-for-you-empty"><div class="empty__ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M3 12h6"/><path d="M15 12h6"/><path d="m5.6 5.6 4.2 4.2"/><path d="m14.2 14.2 4.2 4.2"/></svg></div><h3>Your Focus is clear.</h3><p>{copy}</p><a class="btn btn-primary btn-sm" href="/">Browse categories</a></div>"#
-        );
-    }
-
-    let threads: Vec<Thread> = items.iter().map(|item| item.thread.clone()).collect();
-    let category_names: HashMap<&str, &str> = items
-        .iter()
-        .map(|item| (item.category.id.as_str(), item.category.name.as_str()))
-        .collect();
-    let question_categories: HashSet<&str> = items
-        .iter()
-        .filter(|item| item.category.format.is_question())
-        .map(|item| item.category.id.as_str())
-        .collect();
-    let signals: HashMap<String, CategoryFocusSignal> = items
-        .iter()
-        .map(|item| {
-            let label = match item.reason {
-                CategoryFocusReason::CategoryPriority => {
-                    format!("Priority · {}", item.category.name)
-                }
-                CategoryFocusReason::CategoryFollow => {
-                    format!("Follow · {}", item.category.name)
-                }
-                CategoryFocusReason::ThreadWatchOverride => {
-                    format!("Watch thread · overrides muted {}", item.category.name)
-                }
-                CategoryFocusReason::ThreadFollowOverride => {
-                    format!("Follow thread · overrides muted {}", item.category.name)
-                }
-            };
-            (
-                item.thread.id.clone(),
-                CategoryFocusSignal {
-                    reason: item.reason,
-                    label,
-                },
-            )
-        })
-        .collect();
-
-    render_thread_rows_impl(
-        &threads,
-        now,
-        Some(&category_names),
-        None,
-        &question_categories,
-        reading_states,
-        Some(&signals),
-    )
-}
-
-fn render_category_focus_rule_rows(rules: &[CategoryFocusRuleItem]) -> String {
-    if rules.is_empty() {
-        return "<p class=\"muted ag-focus-rules-empty\">No category rules yet. Open a category to add Priority, Follow, or Mute.</p>".to_string();
-    }
-    rules
-        .iter()
-        .map(|rule| {
-            format!(
-                "<a class=\"ag-focus-rule-row ag-focus-rule-row--{level}\" href=\"/c/{id}#category-focus-heading\"><span><strong>{name}</strong><small>{detail}</small></span><b>{label}</b></a>",
-                level = rule.level.as_str(),
-                id = esc(&rule.category.id),
-                name = esc(&rule.category.name),
-                detail = match rule.level {
-                    CategoryFocusLevel::Priority => "Shown before followed categories",
-                    CategoryFocusLevel::Follow => "Kept on the private Focus desk",
-                    CategoryFocusLevel::Mute => "Excluded unless a thread overrides it",
-                    CategoryFocusLevel::None => "No category rule",
-                },
-                label = match rule.level {
-                    CategoryFocusLevel::Priority => "Priority",
-                    CategoryFocusLevel::Follow => "Follow",
-                    CategoryFocusLevel::Mute => "Mute",
-                    CategoryFocusLevel::None => "None",
-                },
-            )
-        })
-        .collect()
-}
-
-fn render_for_you_rows(items: &[CatchUpItem], now: i64, view: CatchUpView) -> String {
-    if items.is_empty() {
-        let (heading, detail, href, action) = match view {
-            CatchUpView::Updates => (
-                "You are caught up.",
-                "No related thread has an unread post in this snapshot.",
-                "/",
-                "Explore Latest",
-            ),
-            CatchUpView::Following => (
-                "No followed threads yet.",
-                "Choose Watch or Follow on a thread to keep it here, however old it becomes.",
-                "/",
-                "Find a thread",
-            ),
-            CatchUpView::Questions => (
-                "You have not asked a question yet.",
-                "Question categories keep waiting and solved outcomes separate.",
-                "/questions",
-                "Open the answer desk",
-            ),
-        };
-        return format!(
-            r#"<div class="empty ag-for-you-empty"><div class="empty__ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 1.7 5.3L19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7L12 3z"/><path d="M19 15v4"/><path d="M21 17h-4"/></svg></div><h3>{heading}</h3><p>{detail}</p><a class="btn btn-primary btn-sm" href="{href}">{action}</a></div>"#,
-            heading = esc(heading),
-            detail = esc(detail),
-            href = href,
-            action = esc(action),
-        );
-    }
-    let mut out = String::new();
-    for item in items {
-        let reason_label = match item.reason {
-            CatchUpReason::Watch => "Watching · replies also enter Activity",
-            CatchUpReason::Follow => "Following · personal feed only",
-            CatchUpReason::Authored => "You started this thread",
-            CatchUpReason::Bookmarked => "You bookmarked a post here",
-            CatchUpReason::Participated => "You joined this conversation",
-            CatchUpReason::ContinueReading => "You started reading this thread",
-        };
-        let follow_label = match item.follow_level {
-            ThreadFollowLevel::None => "No preference",
-            ThreadFollowLevel::Watch => "Watch",
-            ThreadFollowLevel::Follow => "Follow",
-            ThreadFollowLevel::Mute => "Mute",
-        };
-        let question_state = match item.question_state {
-            Some(CatchUpQuestionState::Waiting) => format!(
-                r#"<span class="ag-catch-up-question ag-catch-up-question--waiting" data-question-state="{}">Waiting for a solution</span>"#,
-                CatchUpQuestionState::Waiting.as_str(),
-            ),
-            Some(CatchUpQuestionState::Solved) => format!(
-                r#"<span class="ag-catch-up-question ag-catch-up-question--solved" data-question-state="{}">Solved for the asker</span>"#,
-                CatchUpQuestionState::Solved.as_str(),
-            ),
-            None => String::new(),
-        };
-        let canonical_href = format!("/t/{}", esc(&item.thread.id));
-        let unread = if let Some(post) = item.first_unread.as_ref() {
-            let target = format!(
-                "/t/{}?resume=1#post-{}",
-                esc(&item.thread.id),
-                esc(&post.id),
-            );
-            format!(
-                r#"<a class="ag-catch-up-unread" href="{target}" data-first-unread-id="{post_id}" data-unread-count="{count}">
-  <span class="ag-catch-up-unread__label">First unread · {count} {noun}</span>
-  <span class="ag-catch-up-unread__excerpt">{excerpt}</span>
-  <span class="ag-catch-up-unread__action">Continue from here →</span>
-</a>"#,
-                target = target,
-                post_id = esc(&post.id),
-                count = item.unread_count,
-                noun = if item.unread_count == 1 {
-                    "post"
-                } else {
-                    "posts"
-                },
-                excerpt = esc(&compact_snippet(&post.body_md, 180)),
-            )
-        } else {
-            r#"<div class="ag-catch-up-caught" data-unread-count="0"><span aria-hidden="true"></span>0 unread · Caught up</div>"#.to_string()
-        };
-        out.push_str(&format!(
-            r#"<article class="ag-catch-up-card" data-thread-id="{thread_id}" data-catch-up-reason="{reason}" data-for-you-reason="{reason}" data-follow-level="{follow_level}">
-  <div class="ag-catch-up-card__signals">
-    <span class="ag-for-you-reason">{reason_label}</span>
-    <span class="ag-catch-up-level ag-catch-up-level--{follow_level}">{follow_label}</span>
-    {question_state}
-  </div>
-  <div class="ag-catch-up-card__body">
-    <div class="ag-catch-up-card__identity">
-      <span class="avatar ag-avatar ag-tone-{tone}" aria-hidden="true">{initial}</span>
-      <div><h3><a href="{canonical_href}">{title}</a></h3><p><span class="ag-chip ag-tone-{cat_tone}">{category}</span><span>{replies}</span><span>started by {author}</span></p></div>
-    </div>
-    {unread}
-  </div>
-  <footer><time title="{absolute}">{relative}</time><span>Snapshot activity</span></footer>
-</article>"#,
-            thread_id = esc(&item.thread.id),
-            reason = item.reason.as_str(),
-            follow_level = item.follow_level.as_str(),
-            reason_label = esc(reason_label),
-            follow_label = esc(follow_label),
-            question_state = question_state,
-            tone = ag_tone(&item.thread.author_sub),
-            initial = esc(&ag_initial(&item.thread.author_email)),
-            canonical_href = canonical_href,
-            title = esc(&item.thread.title),
-            cat_tone = ag_tone(&item.thread.category_id),
-            category = esc(&item.category_name),
-            replies = esc(&replies_label(item.reply_count + 1)),
-            author = esc(&item.thread.author_email),
-            unread = unread,
-            absolute = esc(&fmt_ts(item.activity_at)),
-            relative = esc(&rel_time(item.activity_at, now)),
-        ));
-    }
-    out
-}
-
-fn render_thread_rows_impl(
-    threads: &[Thread],
-    now: i64,
-    cat_names: Option<&HashMap<&str, &str>>,
-    counts: Option<&HashMap<String, i64>>,
-    question_categories: &HashSet<&str>,
-    reading_states: &HashMap<String, ThreadReadingState>,
-    focus_signals: Option<&HashMap<String, CategoryFocusSignal>>,
-) -> String {
-    if threads.is_empty() {
-        return r#"<div class="empty"><div class="empty__ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div><h3>No threads yet — start the conversation.</h3><p>Every thread supports Markdown, reactions and @mentions.</p><a class="btn btn-primary btn-sm" href="/new">New thread</a></div>"#.to_string();
-    }
-    let mut out = String::new();
-    for t in threads {
-        let reading = reading_states.get(&t.id);
-        let (href, reading_badge) = match reading {
-            Some(state) if state.started && state.unread_count > 0 => (
-                format!("/t/{}?resume=1#thread-resume", esc(&t.id)),
-                format!(
-                    r#"<span class="ag-row__continue">Continue · {count} new</span>"#,
-                    count = state.unread_count,
-                ),
-            ),
-            _ => (format!("/t/{}", esc(&t.id)), String::new()),
-        };
-        let is_question = question_categories.contains(t.category_id.as_str());
-        let cat_part = match cat_names {
-            Some(map) => {
-                let name = map.get(t.category_id.as_str()).copied().unwrap_or("—");
-                format!(
-                    r#"<span class="ag-chip ag-tone-{tone} thread-row__cat">{name}</span>"#,
-                    tone = ag_tone(&t.category_id),
-                    name = esc(name),
-                )
-            }
-            None => String::new(),
-        };
-        let mut glyphs = String::new();
-        if t.pinned {
-            glyphs.push_str(r#"<svg class="ag-glyph ag-glyph--pin" role="img" aria-label="Pinned" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M5 17h14"/><path d="m7 9 5-5 5 5"/><path d="M8 14h8"/></svg>"#);
-        }
-        if t.locked {
-            glyphs.push_str(r#"<svg class="ag-glyph ag-glyph--lock" role="img" aria-label="Locked" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="11" x="3" y="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>"#);
-        }
-        if !t.accepted_post_id.is_empty() {
-            glyphs.push_str(r#"<svg class="ag-glyph ag-glyph--answered" role="img" aria-label="Answered" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="m9 11 3 3L22 4"/></svg>"#);
-        }
-        let answer_state = if is_question {
-            if t.accepted_post_id.is_empty() {
-                r#"<span class="ag-chip ag-answer-state ag-answer-state--open">Needs answer</span>"#
-                    .to_string()
-            } else {
-                r#"<span class="ag-chip ag-answer-state ag-answer-state--done">Answered</span>"#
-                    .to_string()
-            }
-        } else {
-            String::new()
-        };
-        let focus_signal = focus_signals
-            .and_then(|signals| signals.get(&t.id))
-            .map(|signal| {
-                format!(
-                    r#"<span class="ag-focus-signal ag-focus-signal--{reason}" data-focus-reason="{reason}">{label}</span>"#,
-                    reason = signal.reason.as_str(),
-                    label = esc(&signal.label),
-                )
-            })
-            .unwrap_or_default();
-        let replies = counts
-            .and_then(|map| map.get(&t.id))
-            .map(|count| {
-                format!(
-                    r#"<span class="ag-row__replies" title="{label}">{replies}</span>"#,
-                    label = esc(&replies_label(*count)),
-                    replies = (*count - 1).max(0),
-                )
-            })
-            .unwrap_or_default();
-        let pinned_class = if t.pinned { " ag-row--pinned" } else { "" };
-        out.push_str(&format!(
-            r#"<a class="thread-row ag-row{pinned}" href="{href}">
-  <span class="avatar ag-avatar ag-tone-{tone}" aria-hidden="true">{initial}</span>
-  <span class="thread-row__main">
-    <span class="thread-row__title">{glyphs}<span class="ag-title">{title}</span></span>
-    <span class="thread-row__sub">{focus_signal}{cat}{answer_state}{reading_badge}<span class="ag-row__by">started by {author}</span></span>
-  </span>
-  <span class="ag-row__side">{replies}<span class="thread-row__time" title="{abs}">{when}</span></span>
-</a>"#,
-            href = href,
-            pinned = pinned_class,
-            tone = ag_tone(&t.author_sub),
-            initial = esc(&ag_initial(&t.author_email)),
-            glyphs = glyphs,
-            title = esc(&t.title),
-            cat = cat_part,
-            focus_signal = focus_signal,
-            answer_state = answer_state,
-            reading_badge = reading_badge,
-            author = esc(&t.author_email),
-            replies = replies,
-            abs = esc(&fmt_ts(t.last_at)),
-            when = esc(&rel_time(t.last_at, now)),
-        ));
-    }
-    out
-}
-
-/// Render the per-thread extractive summary card, or an empty string when the thread is too
-/// small/short to be worth summarising. Sentences come from [`thread_summary`] (local,
-/// deterministic, no LLM) and are HTML-escaped before display.
-fn render_summary(posts: &[Post]) -> String {
-    if posts.len() < SUMMARY_MIN_POSTS {
-        return String::new();
-    }
-    let words: usize = posts
-        .iter()
-        .map(|p| p.body_md.split_whitespace().count())
-        .sum();
-    if words < SUMMARY_MIN_WORDS {
-        return String::new();
-    }
-    let sentences = thread_summary(posts, SUMMARY_SENTENCES);
-    if sentences.len() < 2 {
-        return String::new();
-    }
-    let items: String = sentences
-        .iter()
-        .map(|s| format!("<li>{}</li>", esc(s)))
-        .collect();
-    format!(
-        r#"<section class="card pad summary ag-insight">
-  <h2 class="section__title"><svg class="ag-insight__glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 1.7 5.3L19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7L12 3z"/><path d="M19 15v4"/><path d="M21 17h-4"/></svg>Thread summary <span class="badge badge-op">Auto</span></h2>
-  <p class="muted summary__note">Top sentences from posts visible on this page — generated locally, no AI service.</p>
-  <ul class="summary__list">{items}</ul>
-</section>"#,
-        items = items,
-    )
 }
 
 /// Reorder a thread's posts for display: keep the original post (oldest, index 0) first, then
@@ -3382,287 +2868,6 @@ fn parse_cursor(cursor: Option<&str>) -> Option<(i64, String)> {
         return None;
     }
     Some((ts, id.to_string()))
-}
-
-/// Render the reply-list pagination nav: "Load older" (`?before=`) when older replies exist,
-/// "Load newer" (`?after=`) when newer replies exist, and a "Jump to latest" (`?latest=1`) link
-/// whenever the newest page is not already shown. Returns an empty string when the whole reply
-/// list fits on one page (so small threads render exactly as before). Every value is HTML-escaped.
-fn render_reply_pagination(
-    thread_id: &str,
-    older: Option<&(i64, String)>,
-    newer: Option<&(i64, String)>,
-    show_latest: bool,
-) -> String {
-    let mut links = String::new();
-    if let Some((ts, id)) = older {
-        links.push_str(&format!(
-            r#"<a class="btn btn-secondary btn-sm" href="/t/{tid}?before={ts}_{cid}">← Load older</a>"#,
-            tid = esc(thread_id),
-            ts = ts,
-            cid = esc(id),
-        ));
-    }
-    if let Some((ts, id)) = newer {
-        links.push_str(&format!(
-            r#"<a class="btn btn-secondary btn-sm" href="/t/{tid}?after={ts}_{cid}">Load newer →</a>"#,
-            tid = esc(thread_id),
-            ts = ts,
-            cid = esc(id),
-        ));
-    }
-    if show_latest {
-        links.push_str(&format!(
-            r#"<a class="btn btn-ghost btn-sm" href="/t/{tid}?latest=1">Jump to latest</a>"#,
-            tid = esc(thread_id),
-        ));
-    }
-    if links.is_empty() {
-        String::new()
-    } else {
-        format!(r#"<nav class="pagination">{links}</nav>"#)
-    }
-}
-
-/// Render the reaction button row for a post: one CSRF-guarded toggle form per allowed kind (in
-/// [`REACTION_KINDS`] order), each showing the glyph and its live count. The viewer's own active
-/// reactions carry `is-mine`. Every value is HTML-escaped.
-fn render_reactions(
-    thread_id: &str,
-    post_id: &str,
-    csrf: &str,
-    counts: &[ReactionCount],
-) -> String {
-    let mut buttons = String::new();
-    for (kind, glyph) in REACTION_KINDS {
-        let hit = counts.iter().find(|c| c.kind == *kind);
-        let count = hit.map(|c| c.count).unwrap_or(0);
-        let mine = hit.map(|c| c.mine).unwrap_or(false);
-        let mine_class = if mine { " is-mine" } else { "" };
-        buttons.push_str(&format!(
-            r##"<form class="inline-form" method="post" action="/t/{tid}/p/{pid}/react" data-wire data-wire-target="#post-{pid}" data-wire-err="Could not save your reaction">
-    <input type="hidden" name="csrf" value="{csrf}">
-    <input type="hidden" name="kind" value="{kind}">
-    <button class="reaction{mine}" type="submit" aria-pressed="{pressed}" title="{kind} reaction">
-      <span class="reaction__glyph" aria-hidden="true">{glyph}</span>
-      <span class="reaction__count">{count}</span>
-    </button>
-  </form>"##,
-            tid = esc(thread_id),
-            pid = esc(post_id),
-            csrf = esc(csrf),
-            kind = esc(kind),
-            mine = mine_class,
-            pressed = if mine { "true" } else { "false" },
-            glyph = esc(glyph),
-            count = count,
-        ));
-    }
-    format!(r#"<div class="reactions">{buttons}</div>"#)
-}
-
-/// Render the posts of a thread. The first post is flagged as the original post (`is-op`);
-/// each body is rendered through the markdown sanitiser. A REPLY (never the original post —
-/// that is edited/deleted via the thread controls) gets inline Edit/Delete controls when
-/// `viewer` is its author. Every post shows the reaction row; the reply marked as the accepted
-/// answer is wrapped once in a labelled Solution region, and when `can_accept` (thread author or
-/// admin) each reply gets a mark/unmark-accepted control. A post with `quoted_post_id` renders an
-/// escaped quote block above its own markdown body when the referenced post still exists here.
-#[allow(clippy::too_many_arguments)]
-fn render_posts(
-    posts: &[Post],
-    now: i64,
-    viewer: Option<&str>,
-    is_admin: bool,
-    thread_id: &str,
-    csrf: &str,
-    accepted_post_id: &str,
-    can_manage_answer: bool,
-    is_question: bool,
-    can_reply: bool,
-    latest_post_id: &str,
-    first_unread_post_id: Option<&str>,
-    reactions: &HashMap<String, Vec<ReactionCount>>,
-    bookmarks: &HashMap<String, Bookmark>,
-    quoted_posts: &HashMap<String, Post>,
-) -> String {
-    if posts.is_empty() {
-        return r#"<span id="thread-latest" class="ag-thread-latest-anchor" aria-hidden="true"></span><div class="empty">This thread has no posts.</div>"#.to_string();
-    }
-    let empty_counts: Vec<ReactionCount> = Vec::new();
-    let mut out = String::new();
-    for (i, p) in posts.iter().enumerate() {
-        if first_unread_post_id == Some(p.id.as_str()) {
-            out.push_str(
-                r#"<div id="thread-resume" class="ag-first-unread" role="separator"><span>First unread</span></div>"#,
-            );
-        }
-        let is_accepted = i > 0 && !accepted_post_id.is_empty() && p.id == accepted_post_id;
-        let latest_anchor = if p.id == latest_post_id {
-            r#"<span id="thread-latest" class="ag-thread-latest-anchor" aria-hidden="true"></span>"#
-        } else {
-            ""
-        };
-        let op = if i == 0 {
-            " is-op"
-        } else if is_accepted {
-            " is-accepted"
-        } else {
-            ""
-        };
-        let tag = if i == 0 {
-            r#"<span class="badge badge-op">Original post</span>"#.to_string()
-        } else {
-            String::new()
-        };
-        // Own-reply controls: not on the original post (i == 0), only for the author.
-        let owner_controls = if i > 0 && viewer == Some(p.author_sub.as_str()) {
-            format!(
-                r#"<a class="btn btn-ghost btn-sm" href="/t/{tid}/p/{pid}/edit">Edit</a>
-  <form class="inline-form" method="post" action="/t/{tid}/p/{pid}/delete" onsubmit="return confirm('Delete this reply? This cannot be undone.');">
-    <input type="hidden" name="csrf" value="{csrf}">
-    <button class="btn btn-danger btn-sm" type="submit">Delete</button>
-  </form>"#,
-                tid = esc(thread_id),
-                pid = esc(&p.id),
-                csrf = esc(csrf),
-            )
-        } else {
-            String::new()
-        };
-        // Mark/unmark accepted: replies only (i > 0), gated to the thread author + admin.
-        // Question categories can accept any reply. A historical accepted answer in a discussion
-        // remains readable and removable, but the discussion cannot select a new one.
-        let accept_control = if i > 0 && can_manage_answer && (is_question || is_accepted) {
-            let label = if is_accepted {
-                "Remove solution"
-            } else {
-                "Accept answer"
-            };
-            let action = if is_accepted { "clear" } else { "accept" };
-            format!(
-                r#"<form class="inline-form" method="post" action="/t/{tid}/accept">
-    <input type="hidden" name="csrf" value="{csrf}">
-    <input type="hidden" name="action" value="{action}">
-    <input type="hidden" name="post_id" value="{pid}">
-    <button class="btn btn-secondary btn-sm" type="submit">{label}</button>
-  </form>"#,
-                tid = esc(thread_id),
-                pid = esc(&p.id),
-                csrf = esc(csrf),
-                action = action,
-                label = label,
-            )
-        } else {
-            String::new()
-        };
-        let quote_control = if can_reply {
-            format!(
-                r##"<a class="btn btn-ghost btn-sm" href="/t/{tid}?quote={pid}#reply">Quote</a>"##,
-                tid = esc(thread_id),
-                pid = esc(&p.id),
-            )
-        } else {
-            String::new()
-        };
-        let bookmark_control = if viewer.is_none() {
-            String::new()
-        } else if let Some(bookmark) = bookmarks.get(&p.id) {
-            let state = if bookmark.remind_at.is_some_and(|at| at <= now) {
-                " · Due"
-            } else if bookmark.remind_at.is_some() {
-                " · Scheduled"
-            } else {
-                ""
-            };
-            format!(
-                r#"<a class="btn btn-ghost btn-sm ag-post-bookmark is-saved" href="/bookmarks/{pid}/edit" aria-label="Edit saved bookmark{state}">Saved{state}</a>"#,
-                pid = esc(&p.id),
-                state = state,
-            )
-        } else {
-            format!(
-                r#"<form class="inline-form" method="post" action="/t/{tid}/p/{pid}/bookmark"><input type="hidden" name="csrf" value="{csrf}"><button class="btn btn-ghost btn-sm ag-post-bookmark" type="submit" aria-label="Bookmark this post">Bookmark</button></form>"#,
-                tid = esc(thread_id),
-                pid = esc(&p.id),
-                csrf = esc(csrf),
-            )
-        };
-        // Admins can remove any reply. The OP owns the thread identity and must be removed through
-        // Delete thread, so a reply by another author is never silently promoted into editable OP.
-        let admin_controls = if is_admin && i > 0 {
-            format!(
-                r#"<form class="inline-form" method="post" action="/admin/posts/{pid}/delete" onsubmit="return confirm('Delete this post as admin? This cannot be undone.');">
-    <input type="hidden" name="csrf" value="{csrf}">
-    <button class="btn btn-danger btn-sm" type="submit">Delete (admin)</button>
-  </form>"#,
-                pid = esc(&p.id),
-                csrf = esc(csrf),
-            )
-        } else {
-            String::new()
-        };
-        let controls = if quote_control.is_empty()
-            && bookmark_control.is_empty()
-            && owner_controls.is_empty()
-            && accept_control.is_empty()
-            && admin_controls.is_empty()
-        {
-            String::new()
-        } else {
-            format!(
-                r#"<div class="owner-actions post__actions">{quote_control}{bookmark_control}{owner_controls}{accept_control}{admin_controls}</div>"#,
-            )
-        };
-        let counts = reactions.get(&p.id).unwrap_or(&empty_counts);
-        let reactions_html = render_reactions(thread_id, &p.id, csrf, counts);
-        let quote_html = render_quote_block(p, quoted_posts);
-        let post_html = format!(
-            r##"<article id="post-{pid}" class="post{op}">{latest_anchor}
-  <div class="ag-post-rail"><span class="avatar ag-avatar ag-tone-{tone}" aria-hidden="true">{initial}</span></div>
-  <div class="ag-post-main">
-    <header class="post__meta">
-      <span class="post__author">{author}</span>
-      <span class="post__dot">·</span>
-      <a class="ag-permalink" href="#post-{pid}"><time class="post__time" title="{abs}">{ago}</time></a>
-      {tag}
-    </header>
-    <div class="markdown">{quote}{body}</div>
-    <footer class="ag-post-foot">{reactions}{controls}</footer>
-  </div>
-</article>"##,
-            pid = esc(&p.id),
-            op = op,
-            latest_anchor = if is_accepted { "" } else { latest_anchor },
-            tone = ag_tone(&p.author_sub),
-            initial = esc(&ag_initial(&p.author_email)),
-            author = esc(&p.author_email),
-            abs = esc(&fmt_ts(p.created_at)),
-            ago = esc(&rel_time(p.created_at, now)),
-            tag = tag,
-            quote = quote_html,
-            body = markdown::render(&p.body_md),
-            reactions = reactions_html,
-            controls = controls,
-        );
-        if is_accepted {
-            out.push_str(&format!(
-                r#"<section class="ag-solution" aria-labelledby="solution-heading-{pid}">{latest_anchor}
-  <header class="ag-solution__head">
-    <span class="ag-solution__eyebrow">Solution</span>
-    <h2 id="solution-heading-{pid}">Accepted answer</h2>
-  </header>
-  {post}
-</section>"#,
-                pid = esc(&p.id),
-                latest_anchor = latest_anchor,
-                post = post_html,
-            ));
-        } else {
-            out.push_str(&post_html);
-        }
-    }
-    out
 }
 
 /// Build an `Html` response, attaching a `Set-Cookie` header when a fresh CSRF cookie is due.

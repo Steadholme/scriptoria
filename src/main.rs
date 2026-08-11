@@ -30,8 +30,8 @@ use axum::routing::get;
 use axum::Router;
 use tower::ServiceExt;
 
-/// Default listen address — internal-only; Sluice fronts the three subdomains at this upstream.
-const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8700";
+/// Safe development listener. Production containers set their routable address explicitly.
+const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8700";
 
 /// The six composed per-surface routers, dispatched by Host. Cheap to clone (each `Router` is
 /// `Arc`-backed internally).
@@ -66,16 +66,29 @@ async fn main() {
         );
     }
 
-    let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_string());
+    let addr = listener_addr(std::env::var("BIND_ADDR").ok().as_deref())
+        .unwrap_or_else(|error| fatal("listener", error));
 
     // Each surface connects to its OWN database and migrates idempotently — exactly what the
     // standalone service did. A failure here is fatal (the surface cannot serve without its DB).
-    let blog = build_blog().await.unwrap_or_else(|e| fatal("blog (inkwell)", e));
-    let forum = build_forum().await.unwrap_or_else(|e| fatal("forum (agora)", e));
-    let wiki = build_wiki().await.unwrap_or_else(|e| fatal("wiki (lattice)", e));
-    let comments = build_comments().await.unwrap_or_else(|e| fatal("comments (echo)", e));
-    let paste = build_paste().await.unwrap_or_else(|e| fatal("paste (pastefire)", e));
-    let drive = build_drive().await.unwrap_or_else(|e| fatal("drive (aperture)", e));
+    let blog = build_blog()
+        .await
+        .unwrap_or_else(|e| fatal("blog (inkwell)", e));
+    let forum = build_forum()
+        .await
+        .unwrap_or_else(|e| fatal("forum (agora)", e));
+    let wiki = build_wiki()
+        .await
+        .unwrap_or_else(|e| fatal("wiki (lattice)", e));
+    let comments = build_comments()
+        .await
+        .unwrap_or_else(|e| fatal("comments (echo)", e));
+    let paste = build_paste()
+        .await
+        .unwrap_or_else(|e| fatal("paste (pastefire)", e));
+    let drive = build_drive()
+        .await
+        .unwrap_or_else(|e| fatal("drive (aperture)", e));
 
     let app = Router::new()
         // Host-agnostic liveness for the container HEALTHCHECK + estate probes.
@@ -90,7 +103,6 @@ async fn main() {
             drive,
         });
 
-    let addr: SocketAddr = bind_addr.parse().expect("invalid BIND_ADDR");
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
@@ -173,7 +185,7 @@ async fn build_forum() -> Result<Router, String> {
         agora::config::env_nonempty("AUDIT_INGEST_TOKEN").as_deref(),
     );
     let state = agora::AppState {
-        config: Arc::new(agora::config::Config::from_env()),
+        config: Arc::new(agora::config::Config::from_env()?),
         store,
         audit,
         klaxon: agora::KlaxonNotifier::from_env().map(Arc::new),
@@ -341,14 +353,20 @@ fn env_truthy(key: &str) -> bool {
     )
 }
 
-/// Whether this boot must refuse a volatile (in-memory) backend. True under the prod profile
-/// (`STEADHOLME_PROFILE=prod`, case-insensitive) or an explicit truthy `REQUIRE_PERSISTENCE`. When
-/// both are unset the dev memory-friendly path (APERTURE_BLOBS=memory default) is preserved.
+/// Whether this boot must refuse a volatile (in-memory) backend. Both production aliases accepted
+/// by Agora activate the same aggregate audit/durability policy.
 fn require_persistence() -> bool {
-    std::env::var("STEADHOLME_PROFILE")
-        .map(|p| p.trim().eq_ignore_ascii_case("prod"))
-        .unwrap_or(false)
+    profile_requires_persistence(std::env::var("STEADHOLME_PROFILE").ok().as_deref())
         || env_truthy("REQUIRE_PERSISTENCE")
+}
+
+fn profile_requires_persistence(profile: Option<&str>) -> bool {
+    profile.is_some_and(|profile| {
+        matches!(
+            profile.trim().to_ascii_lowercase().as_str(),
+            "prod" | "production"
+        )
+    })
 }
 
 /// Read a required env var, returning a descriptive error when unset/empty.
@@ -359,6 +377,12 @@ fn require_env(key: &str) -> Result<String, String> {
     }
 }
 
+fn listener_addr(raw: Option<&str>) -> Result<SocketAddr, String> {
+    raw.unwrap_or(DEFAULT_BIND_ADDR)
+        .parse()
+        .map_err(|error| format!("invalid BIND_ADDR: {error}"))
+}
+
 /// Log a fatal startup error for one surface and exit.
 fn fatal(surface: &str, err: String) -> ! {
     tracing::error!(surface, error = %err, "failed to build content surface");
@@ -367,8 +391,10 @@ fn fatal(surface: &str, err: String) -> ! {
 
 /// GET `/healthz` over a raw TCP socket on the loopback. Returns the process exit code.
 fn run_healthcheck() -> i32 {
-    let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_string());
-    let port = bind_addr.rsplit(':').next().unwrap_or("8700");
+    let bind_addr = std::env::var("BIND_ADDR").ok();
+    let port = listener_addr(bind_addr.as_deref())
+        .map(|addr| addr.port())
+        .unwrap_or(8700);
     let target = format!("127.0.0.1:{port}");
     match healthcheck_once(&target) {
         Ok(true) => 0,
@@ -394,4 +420,24 @@ fn healthcheck_once(target: &str) -> std::io::Result<bool> {
     let mut buf = String::new();
     stream.read_to_string(&mut buf)?;
     Ok(buf.lines().next().unwrap_or("").contains("200"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{listener_addr, profile_requires_persistence};
+
+    #[test]
+    fn missing_bind_addr_is_loopback_for_explicit_development_boots() {
+        let addr = listener_addr(None).unwrap();
+        assert!(addr.ip().is_loopback());
+        assert_eq!(addr.port(), 8700);
+    }
+
+    #[test]
+    fn every_production_profile_alias_requires_aggregate_durability() {
+        assert!(profile_requires_persistence(Some("prod")));
+        assert!(profile_requires_persistence(Some("PRODUCTION")));
+        assert!(!profile_requires_persistence(Some("development")));
+        assert!(!profile_requires_persistence(None));
+    }
 }

@@ -240,6 +240,29 @@ async fn focus_handlers_use_native_csrf_form_and_explain_each_row() {
         false,
     )
     .await;
+    state
+        .store
+        .mark_thread_posts_read(
+            ALICE_SUB,
+            "t_focus_http",
+            &["p_t_focus_http_op".to_string()],
+            101,
+        )
+        .await
+        .unwrap();
+    state
+        .store
+        .add_reply(&Post {
+            id: "p_t_focus_http_new".to_string(),
+            thread_id: "t_focus_http".to_string(),
+            body_md: "Unread focused reply".to_string(),
+            quoted_post_id: String::new(),
+            author_sub: BOB_SUB.to_string(),
+            author_email: BOB_EMAIL.to_string(),
+            created_at: 102,
+        })
+        .await
+        .unwrap();
 
     let (status, _, _) = send(&state, get("/focus")).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -249,8 +272,22 @@ async fn focus_handlers_use_native_csrf_form_and_explain_each_row() {
     assert_eq!(status, StatusCode::OK);
     assert!(headers.contains_key(header::SET_COOKIE));
     assert!(category_page.contains(r#"method="post" action="/c/general/focus""#));
+    let csrf = headers
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split_once("__Host-csrf=")
+        .unwrap()
+        .1
+        .split(';')
+        .next()
+        .unwrap();
+    assert!(category_page.contains(&format!(r#"name="csrf" value="{csrf}""#)));
     assert!(category_page.contains(r#"name="level""#));
-    assert!(category_page.contains("This does not create Activity"));
+    assert!(category_page
+        .contains("Focus is private. It changes only what you see — never the shared category."));
+    assert!(!category_page.contains(r#"action="/focus""#));
 
     let (status, _, _) = send(
         &state,
@@ -298,17 +335,23 @@ async fn focus_handlers_use_native_csrf_form_and_explain_each_row() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(saved_page.contains("role=\"status\""));
-    assert!(saved_page.contains("Saved as priority"));
+    assert!(saved_page.contains(r#"value="priority" selected"#));
+    assert!(saved_page.contains(r#"method="post" action="/c/general/focus""#));
+    assert!(saved_page
+        .contains("Focus is private. It changes only what you see — never the shared category."));
 
     let (status, _, focus_page) = send(&state, get_as("/focus", ALICE_SUB, ALICE_EMAIL)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(focus_page.contains("Native Focus row"));
-    assert!(focus_page.contains(r#"data-focus-reason="category_priority""#));
-    assert!(focus_page.contains("Priority · General"));
-    assert!(focus_page.contains("Category rules"));
-    assert!(focus_page.contains("href=\"/c/general#category-focus-heading\""));
-    assert!(focus_page.contains("Showing at most 30 live threads"));
+    assert!(focus_page.contains("Shown by category priority"));
+    assert!(focus_page.contains("Priority"));
+    assert!(focus_page.contains("Your rules"));
+    assert!(focus_page.contains("What your focus surfaces"));
+    assert!(focus_page.contains("Up to 64 rules · up to 30 threads shown · private to you"));
+    assert!(focus_page.contains(r#"method="post" action="/c/general/focus""#));
+    assert!(focus_page.contains(r#"href="/t/t_focus_http?resume=1#thread-resume""#));
+    assert!(focus_page.contains("Continue · 1 new"));
+    assert!(!focus_page.contains(r#"action="/focus""#));
     assert!(!focus_page.contains("no notifications"));
     assert!(!focus_page.contains("notification was sent"));
 
@@ -331,8 +374,10 @@ async fn focus_handlers_use_native_csrf_form_and_explain_each_row() {
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     let (_, _, muted_page) = send(&state, get_as("/focus", ALICE_SUB, ALICE_EMAIL)).await;
-    assert!(muted_page.contains("Muted categories remain listed above"));
-    assert!(muted_page.contains("ag-focus-rule-row--mute"));
+    assert!(muted_page.contains("Your rules"));
+    assert!(muted_page.contains("Mute"));
+    assert!(muted_page.contains(r#"method="post" action="/c/general/focus""#));
+    assert!(!muted_page.contains("Native Focus row"));
 }
 
 async fn create_category(state: &AppState, id: &str, name: &str) {

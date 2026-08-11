@@ -394,17 +394,20 @@ async fn catch_up_views_are_private_native_complete_and_mute_first() {
         headers.get(header::CACHE_CONTROL).unwrap(),
         "private, no-store"
     );
-    assert!(updates.contains(r#"data-catch-up-view="updates""#));
+    assert!(updates.contains(r#"<nav class="tabs ag-ledger-tabs" aria-label="Catch-up view">"#));
+    assert!(updates.contains(
+        r#"<a class="tab is-active" aria-current="page" href="?view=updates">Updates</a>"#
+    ));
+    assert!(!updates.contains(r#"role="tablist""#));
+    assert!(!updates.contains(r#"role="tab""#));
+    assert!(!updates.contains(r#"aria-selected="#));
     assert!(updates.contains("Old explicit relationship"));
-    assert!(updates.contains(r#"data-for-you-reason="follow""#));
-    assert!(updates.contains(r#"data-follow-level="follow""#));
+    assert!(updates.contains("You follow this thread"));
+    assert!(updates.contains("Following"));
+    assert!(updates.contains("Only you can see this. It explains why each thread appears."));
     assert!(!updates.contains("Unrelated noise"));
     assert!(!updates.contains("Muted question must stay hidden"));
-    for href in [
-        "/for-you?view=updates",
-        "/for-you?view=following",
-        "/for-you?view=questions",
-    ] {
+    for href in ["?view=updates", "?view=following", "?view=questions"] {
         assert!(updates.contains(href), "missing native GET tab {href}");
     }
 
@@ -415,6 +418,9 @@ async fn catch_up_views_are_private_native_complete_and_mute_first() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(following.contains("Old explicit relationship"));
+    assert!(following.contains(
+        r#"<a class="tab is-active" aria-current="page" href="?view=following">Following</a>"#
+    ));
     assert!(!following.contains("Unrelated noise"));
     assert!(!following.contains("Muted question must stay hidden"));
 
@@ -426,8 +432,11 @@ async fn catch_up_views_are_private_native_complete_and_mute_first() {
     assert_eq!(status, StatusCode::OK);
     assert!(questions.contains("Question waiting for a solution"));
     assert!(questions.contains("Question solved for the asker"));
-    assert!(questions.contains(r#"data-question-state="waiting""#));
-    assert!(questions.contains(r#"data-question-state="solved""#));
+    assert!(questions.contains("Waiting for an answer"));
+    assert!(questions.contains("Accepted answer recorded"));
+    assert!(questions.contains(
+        r#"<a class="tab is-active" aria-current="page" href="?view=questions">Questions</a>"#
+    ));
     assert!(!questions.contains("Old explicit relationship"));
     assert!(!questions.contains("Muted question must stay hidden"));
 
@@ -451,7 +460,7 @@ async fn catch_up_views_are_private_native_complete_and_mute_first() {
 }
 
 #[tokio::test]
-async fn catch_up_updates_keep_unread_holes_live_excerpt_and_read_only_get() {
+async fn catch_up_updates_keep_unread_holes_private_and_read_only_get() {
     let state = build_dev_state().await;
     let now = now_secs();
     seed_thread(
@@ -515,13 +524,16 @@ async fn catch_up_updates_keep_unread_holes_live_excerpt_and_read_only_get() {
     let uri = format!("/for-you?view=updates&as_of={now}");
     let (status, _, body) = send(&state, get_as(&uri, CAROL_SUB, CAROL_EMAIL)).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains(r#"data-first-unread-id="p_fy_hole_one""#));
-    assert!(body.contains(r#"data-unread-count="2""#));
-    assert!(body.contains("Current live first unread &lt;script&gt;must stay text&lt;/script&gt;"));
+    assert!(body.contains("Exact unread holes"));
+    assert!(body.contains("2 unread"));
+    assert!(body.contains("You are watching this thread"));
+    assert!(body.contains("Watching"));
+    assert!(body
+        .contains(r#"href="/t/t_fy_holes?resume=1#post-p_fy_hole_one">Jump to first unread</a>"#));
     assert!(!body.contains("First unread old copy"));
+    assert!(!body.contains("Current live first unread"));
     assert!(!body.contains("<script>must stay text</script>"));
-    assert!(body.contains("/t/t_fy_holes?resume=1#post-p_fy_hole_one"));
-    assert_eq!(body.matches(r#"data-catch-up-reason="watch""#).count(), 1);
+    assert_eq!(body.matches("You are watching this thread").count(), 1);
 
     let after = state
         .store
@@ -576,7 +588,7 @@ async fn catch_up_cursor_is_view_snapshot_and_tie_bound() {
     let first_uri = format!("/for-you?view=following&as_of={now}");
     let (status, _, first) = send(&state, get_as(&first_uri, CAROL_SUB, CAROL_EMAIL)).await;
     assert_eq!(status, StatusCode::OK);
-    let first_ids = data_values(&first, "data-thread-id");
+    let first_ids = thread_ids(&first);
     assert_eq!(first_ids.len(), 30);
     assert_eq!(first_ids[0], "t_fy_tie_00");
     assert_eq!(first_ids[29], "t_fy_tie_03");
@@ -614,17 +626,19 @@ async fn catch_up_cursor_is_view_snapshot_and_tie_bound() {
         .unwrap();
     let (status, _, second) = send(&state, get_as(&next, CAROL_SUB, CAROL_EMAIL)).await;
     assert_eq!(status, StatusCode::OK);
-    let second_ids = data_values(&second, "data-thread-id");
+    let second_ids = thread_ids(&second);
     assert_eq!(second_ids, vec!["t_fy_tie_02", "t_fy_tie_01"]);
     let frozen_t02 = second
-        .split_once(r#"data-thread-id="t_fy_tie_02""#)
+        .split_once(r#"<a class="ag-row__title" href="/t/t_fy_tie_02">Tie relationship 02</a>"#)
         .unwrap()
         .1
-        .split_once("</article>")
+        .split_once("</li>")
         .unwrap()
         .0;
-    assert!(frozen_t02.contains(r#"data-first-unread-id="p_t_fy_tie_02_op""#));
-    assert!(frozen_t02.contains("<span>0 replies</span>"));
+    assert!(frozen_t02.contains("1 unread"));
+    assert!(frozen_t02.contains(
+        r#"href="/t/t_fy_tie_02?resume=1#post-p_t_fy_tie_02_op">Jump to first unread</a>"#
+    ));
     let mut all = first_ids;
     all.extend(second_ids);
     all.sort();
@@ -696,10 +710,21 @@ async fn preference_form_is_csrf_guarded_no_js_and_json_compatible() {
     assert!(json.contains(r#""follow_level":"follow""#));
     assert!(json.contains(r#""subscribed":true"#));
 
-    let (_, _, page) = send(&state, get_as("/t/t_v7_form", CAROL_SUB, CAROL_EMAIL)).await;
+    let (_, _, page) = send(
+        &state,
+        get_as_with_csrf("/t/t_v7_form", CAROL_SUB, CAROL_EMAIL),
+    )
+    .await;
+    assert!(page.contains(r#"method="post" action="/t/t_v7_form/subscribe""#));
+    assert_eq!(
+        page.matches(r#"action="/t/t_v7_form/subscribe""#).count(),
+        1
+    );
+    assert!(page.contains(&format!(r#"name="csrf" value="{TOK}""#)));
+    assert!(page.contains(r#"name="level""#));
     assert!(page.contains(r#"value="follow" selected"#));
-    assert!(page.contains("data-wire"));
-    assert!(page.contains(r#"data-wire-target=".subscription-form""#));
+    assert!(page.contains("Private: this shapes your catch-up, not notification delivery."));
+    assert!(!page.contains(r#"data-wire-target=".subscription-form""#));
 
     let (status, headers, _) = send(
         &state,
@@ -877,6 +902,16 @@ fn get_as(uri: &str, subject: &str, email: &str) -> Request<Body> {
         .unwrap()
 }
 
+fn get_as_with_csrf(uri: &str, subject: &str, email: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header(header::COOKIE, format!("__Host-csrf={TOK}"))
+        .header("x-auth-subject", subject)
+        .header("x-auth-email", email)
+        .body(Body::empty())
+        .unwrap()
+}
+
 fn post_as(
     uri: &str,
     subject: &str,
@@ -930,11 +965,11 @@ fn encode(value: &str) -> String {
     out
 }
 
-fn data_values<'a>(body: &'a str, attribute: &str) -> Vec<&'a str> {
-    let marker = format!(r#"{attribute}=""#);
+fn thread_ids(body: &str) -> Vec<&str> {
+    let marker = r#"<a class="ag-row__title" href="/t/"#;
     let mut values = Vec::new();
     let mut rest = body;
-    while let Some(index) = rest.find(&marker) {
+    while let Some(index) = rest.find(marker) {
         rest = &rest[index + marker.len()..];
         let Some(end) = rest.find('"') else {
             break;
@@ -946,7 +981,7 @@ fn data_values<'a>(body: &'a str, attribute: &str) -> Vec<&'a str> {
 }
 
 fn pagination_href(body: &str) -> String {
-    let marker = r#"<nav class="pagination ag-catch-up-pagination"><a class="btn btn-secondary btn-sm" href=""#;
+    let marker = r#"<a class="btn btn-secondary btn-sm ag-page__link" rel="next" href=""#;
     let rest = body
         .split_once(marker)
         .expect("catch-up page has a pagination link")

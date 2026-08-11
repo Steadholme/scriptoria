@@ -12,14 +12,19 @@ use time::{Date, Month, PrimitiveDateTime, Time};
 use crate::audit::AuditEvent;
 use crate::auth;
 use crate::error::AppError;
-use crate::handlers::{
-    email_display, esc, fmt_ts, personal_counts, render_page_with_personal_counts,
-};
-use crate::model::BookmarkItem;
+use crate::handlers::{form_action, hidden_field, link_action, page_chrome, personal_counts};
+use crate::model::{Bookmark, BookmarkItem};
 use crate::store::{
     BookmarkCas, BookmarkCursor, BookmarkReminderUpdate, BookmarkState, MAX_BOOKMARK_NOTE_CHARS,
     MAX_BOOKMARK_PAGE,
 };
+use crate::view_model::{
+    ActionKind, BookmarkEditShared, BookmarkEditView, BookmarkEditViewerState, BookmarkItemShared,
+    BookmarkItemVM, BookmarkItemViewerState, BookmarkReminderChoiceVM, BookmarkStateVM,
+    BookmarksShared, BookmarksView, BookmarksViewerState, CollectionState, HiddenField, NavTab,
+    Opaque, PageLinkVM, PaginationVM, Text,
+};
+use crate::views;
 use crate::{now_secs, AppState};
 
 const ONE_DAY: i64 = 24 * 60 * 60;
@@ -68,51 +73,48 @@ pub async fn page(
     let has_more = items.len() as i64 > MAX_BOOKMARK_PAGE;
     items.truncate(MAX_BOOKMARK_PAGE as usize);
     let counts = personal_counts(&state, &headers, now).await?;
-    let due = counts.due_bookmarks.unwrap_or(0).max(0);
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
-    let controls = render_tabs(query.state(), due);
-    let rows = render_rows(&items, &csrf, now);
-    let pagination = if has_more {
-        items
+    let active_state = query.state();
+    let older = has_more.then(|| {
+        let item = items
             .last()
-            .map(|item| {
-                let sort_at = match query.state() {
-                    BookmarkState::All => item.bookmark.created_at,
-                    BookmarkState::Due | BookmarkState::Scheduled => {
-                        item.bookmark.remind_at.unwrap_or_default()
-                    }
-                };
-                let cursor = format!("{}_{}", sort_at, item.bookmark.post_id);
-                format!(
-                    r#"<nav class="pagination"><a class="btn btn-secondary btn-sm" href="{}">More bookmarks →</a></nav>"#,
-                    bookmark_href(query.state_key(), Some(&cursor)),
-                )
-            })
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
-    let content = format!(
-        r#"<nav class="crumbs"><a href="/">Home</a><span class="crumbs__sep">/</span><span>Bookmarks</span></nav>
-<div class="page-head ag-bookmark-head">
-  <div><h1>Bookmarks</h1><p class="muted">Save a post, add a private note, or bring it back to your Forum Due queue.</p></div>
-  <span class="ag-bookmark-total">{due_label}</span>
-</div>
-<aside class="ag-bookmark-notice" role="note"><strong>Forum reminder</strong><span>Due reminders appear here and in the Forum header when you visit. Forum does not send email or push reminders yet.</span></aside>
-{controls}
-<section class="ag-bookmark-list" aria-label="Personal bookmarks">{rows}</section>
-{pagination}"#,
-        due_label = if due == 1 {
-            "1 due".to_string()
-        } else {
-            format!("{due} due")
+            .expect("has_more requires a retained page item");
+        let sort_at = match active_state {
+            BookmarkState::All => item.bookmark.created_at,
+            BookmarkState::Due | BookmarkState::Scheduled => {
+                item.bookmark.remind_at.unwrap_or_default()
+            }
+        };
+        let cursor = format!("{}_{}", sort_at, item.bookmark.post_id);
+        PageLinkVM {
+            href: Opaque(bookmark_href(query.state_key(), Some(&cursor))),
+            label: Text("More bookmarks".to_string()),
+        }
+    });
+    let view = BookmarksView {
+        chrome: page_chrome("Bookmarks", &headers, NavTab::Bookmarks, counts),
+        shared: BookmarksShared {
+            active_state: bookmark_state_vm(active_state),
+            visible_bound: MAX_BOOKMARK_PAGE,
+            state: bookmark_collection_state(&items, active_state, cursor.is_some()),
+            now,
         },
-        controls = controls,
-        rows = rows,
-        pagination = pagination,
-    );
-    let html =
-        render_page_with_personal_counts("Bookmarks", &email_display(&headers), &content, counts);
+        viewer: BookmarksViewerState {
+            items: items
+                .iter()
+                .map(|item| bookmark_item_vm(item, &csrf, now))
+                .collect(),
+            pagination: PaginationVM {
+                previous: None,
+                next: older,
+                jump: None,
+                at_start: cursor.is_none(),
+                at_end: !has_more,
+                visible_limit: MAX_BOOKMARK_PAGE,
+            },
+        },
+    };
+    let html = views::personal::bookmarks(&view);
     Ok(html_response(html, set_cookie))
 }
 
@@ -167,47 +169,32 @@ pub async fn edit_form(
         .ok_or_else(|| AppError::NotFound("bookmark not found".to_string()))?;
     let counts = personal_counts(&state, &headers, now).await?;
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
-    let reminder = item
-        .bookmark
-        .remind_at
-        .map(fmt_ts)
-        .unwrap_or_else(|| "No reminder set".to_string());
     let target = post_target(
         &item.thread_id,
         item.post_created_at,
         &item.bookmark.post_id,
     );
-    let content = format!(
-        r#"<nav class="crumbs"><a href="/">Home</a><span class="crumbs__sep">/</span><a href="/bookmarks">Bookmarks</a><span class="crumbs__sep">/</span><span>Edit</span></nav>
-<div class="page-head"><div><h1>Edit bookmark</h1><p class="muted">{title}</p></div></div>
-<section class="card ag-bookmark-editor">
-  <form class="ag-form" method="post" action="/bookmarks/{post_id}/edit">
-    <input type="hidden" name="csrf" value="{csrf}">
-    <input type="hidden" name="expected_bookmark_id" value="{bookmark_id}">
-    <input type="hidden" name="expected_version" value="{version}">
-    <div class="field"><label class="label" for="bookmark-note">Private note</label><textarea id="bookmark-note" name="note" rows="4" maxlength="{max_note}" placeholder="Why did you save this?">{note}</textarea><p class="hint">Plain text, visible only to you. Up to {max_note} characters.</p></div>
-    <div class="field"><label class="label" for="bookmark-reminder">Reminder</label><select id="bookmark-reminder" name="reminder_action"><option value="keep">Keep current — {reminder}</option><option value="none">No reminder</option><option value="tomorrow">24 hours from now</option><option value="week">7 days from now</option><option value="custom">Custom UTC time</option></select></div>
-    <div class="field"><label class="label" for="bookmark-custom">Custom time <span class="muted">(UTC)</span></label><input id="bookmark-custom" class="input" type="datetime-local" name="custom_time"><p class="hint">Used only when “Custom UTC time” is selected. It must be in the future and within 10 years.</p></div>
-    <aside class="ag-bookmark-notice" role="note">This reminder appears in your Forum Due queue. It does not send email or push.</aside>
-    <div class="ag-composer__actions"><a class="btn btn-secondary" href="{target}">Cancel</a><button class="btn btn-primary" type="submit">Save bookmark</button></div>
-  </form>
-</section>"#,
-        title = esc(&item.thread_title),
-        post_id = esc(&item.bookmark.post_id),
-        csrf = esc(&csrf),
-        bookmark_id = esc(&item.bookmark.bookmark_id),
-        version = item.bookmark.version,
-        max_note = MAX_BOOKMARK_NOTE_CHARS,
-        note = esc(&item.bookmark.note),
-        reminder = esc(&reminder),
-        target = esc(&target),
-    );
-    let html = render_page_with_personal_counts(
-        "Edit bookmark",
-        &email_display(&headers),
-        &content,
-        counts,
-    );
+    let view = BookmarkEditView {
+        chrome: page_chrome("Edit bookmark", &headers, NavTab::Bookmarks, counts),
+        shared: BookmarkEditShared {
+            thread_title: Text(item.thread_title),
+            exact_post_href: Opaque(target),
+            current_reminder_at: item.bookmark.remind_at,
+            note_max_chars: MAX_BOOKMARK_NOTE_CHARS,
+        },
+        viewer: BookmarkEditViewerState {
+            note: Text(item.bookmark.note.clone()),
+            selected_reminder: BookmarkReminderChoiceVM::Keep,
+            custom_time: Text(String::new()),
+            save: form_action(
+                format!("/bookmarks/{post_id}/edit"),
+                ActionKind::SaveBookmarkChanges,
+                csrf,
+                bookmark_cas_fields(&item.bookmark),
+            ),
+        },
+    };
+    let html = views::personal::bookmark_edit(&view);
     Ok(html_response(html, set_cookie))
 }
 
@@ -401,84 +388,88 @@ pub async fn remove(
     Ok(redirect_to("/bookmarks"))
 }
 
-fn render_tabs(state: BookmarkState, due: i64) -> String {
-    let tab = |candidate: BookmarkState, label: &str| {
-        let active = state == candidate;
-        format!(
-            r#"<a class="tab{active}"{current} href="{href}">{label}</a>"#,
-            active = if active { " is-active" } else { "" },
-            current = if active {
-                r#" aria-current="page""#
-            } else {
-                ""
-            },
-            href = bookmark_href(bookmark_state_key(candidate), None),
-            label = label,
-        )
-    };
-    format!(
-        r#"<nav class="tabs ag-bookmark-tabs" aria-label="Bookmark state">{}{}{}</nav>"#,
-        tab(BookmarkState::All, "All"),
-        tab(BookmarkState::Due, &format!("Due ({due})")),
-        tab(BookmarkState::Scheduled, "Scheduled"),
-    )
+fn bookmark_state_vm(state: BookmarkState) -> BookmarkStateVM {
+    match state {
+        BookmarkState::All => BookmarkStateVM::All,
+        BookmarkState::Due => BookmarkStateVM::Due,
+        BookmarkState::Scheduled => BookmarkStateVM::Scheduled,
+    }
 }
 
-fn render_rows(items: &[BookmarkItem], csrf: &str, now: i64) -> String {
-    if items.is_empty() {
-        return r#"<div class="empty"><h3>Nothing in this view.</h3><p>Use Bookmark on any post to save it here.</p></div>"#.to_string();
+fn bookmark_collection_state(
+    items: &[BookmarkItem],
+    state: BookmarkState,
+    has_cursor: bool,
+) -> CollectionState {
+    if !items.is_empty() {
+        CollectionState::Ready
+    } else if has_cursor {
+        CollectionState::End
+    } else if state == BookmarkState::All {
+        CollectionState::ReadyEmpty
+    } else {
+        CollectionState::FilteredZero
     }
-    let mut out = String::new();
-    for item in items {
-        let bookmark = &item.bookmark;
-        let target = post_target(&item.thread_id, item.post_created_at, &bookmark.post_id);
-        let note = if bookmark.note.is_empty() {
-            String::new()
-        } else {
-            format!(r#"<p class="ag-bookmark-note">{}</p>"#, esc(&bookmark.note))
-        };
-        let reminder = match bookmark.remind_at {
-            Some(at) if at <= now => format!(
-                r#"<span class="badge ag-bookmark-due">Due · {}</span>"#,
-                esc(&fmt_ts(at))
+}
+
+fn bookmark_cas_fields(bookmark: &Bookmark) -> Vec<HiddenField> {
+    vec![
+        hidden_field("expected_bookmark_id", bookmark.bookmark_id.clone()),
+        hidden_field("expected_version", bookmark.version.to_string()),
+    ]
+}
+
+fn bookmark_item_vm(item: &BookmarkItem, csrf: &str, now: i64) -> BookmarkItemVM {
+    let bookmark = &item.bookmark;
+    let post_id = bookmark.post_id.as_str();
+    let due = bookmark.remind_at.is_some_and(|at| at <= now);
+    let version_action = |suffix: &str, label_kind: ActionKind| {
+        form_action(
+            format!("/bookmarks/{post_id}/{suffix}"),
+            label_kind,
+            csrf,
+            bookmark_cas_fields(bookmark),
+        )
+    };
+    let snooze_action = |preset: &str, label_kind: ActionKind| {
+        let mut fields = bookmark_cas_fields(bookmark);
+        fields.push(hidden_field("preset", preset));
+        form_action(
+            format!("/bookmarks/{post_id}/snooze"),
+            label_kind,
+            csrf,
+            fields,
+        )
+    };
+    BookmarkItemVM {
+        shared: BookmarkItemShared {
+            post_id: Opaque(bookmark.post_id.clone()),
+            thread_id: Opaque(item.thread_id.clone()),
+            thread_title: Text(item.thread_title.clone()),
+            post_author_display: Text(item.post_author_email.clone()),
+            exact_post_href: Opaque(post_target(
+                &item.thread_id,
+                item.post_created_at,
+                &bookmark.post_id,
+            )),
+            post_excerpt: Text(compact_snippet(&item.post_body_md, 180)),
+            post_created_at: item.post_created_at,
+        },
+        viewer: BookmarkItemViewerState {
+            note: Text(bookmark.note.clone()),
+            remind_at: bookmark.remind_at,
+            created_at: bookmark.created_at,
+            updated_at: bookmark.updated_at,
+            edit: link_action(
+                format!("/bookmarks/{post_id}/edit"),
+                ActionKind::BookmarkEdit,
             ),
-            Some(at) => format!(
-                r#"<span class="badge ag-bookmark-scheduled">Scheduled · {}</span>"#,
-                esc(&fmt_ts(at))
-            ),
-            None => r#"<span class="badge">Saved</span>"#.to_string(),
-        };
-        let due_actions = if bookmark.remind_at.is_some_and(|at| at <= now) {
-            format!(
-                r#"<form class="inline-form" method="post" action="/bookmarks/{pid}/complete"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="expected_bookmark_id" value="{bookmark_id}"><input type="hidden" name="expected_version" value="{version}"><button class="btn btn-primary btn-sm" type="submit">Done</button></form>
-<form class="inline-form ag-bookmark-snooze" method="post" action="/bookmarks/{pid}/snooze"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="expected_bookmark_id" value="{bookmark_id}"><input type="hidden" name="expected_version" value="{version}"><label class="sr-only" for="snooze-{pid}">Snooze duration</label><select id="snooze-{pid}" name="preset"><option value="tomorrow">24 hours</option><option value="week">7 days</option></select><button class="btn btn-secondary btn-sm" type="submit">Snooze</button></form>"#,
-                pid = esc(&bookmark.post_id),
-                csrf = esc(csrf),
-                bookmark_id = esc(&bookmark.bookmark_id),
-                version = bookmark.version,
-            )
-        } else {
-            String::new()
-        };
-        out.push_str(&format!(
-            r#"<article class="card ag-bookmark-row">
-  <div class="ag-bookmark-row__main"><div class="ag-bookmark-row__meta">{reminder}<span>Post by {author}</span></div><h2><a href="{target}">{title}</a></h2>{note}<p class="ag-bookmark-snippet">{snippet}</p></div>
-  <div class="ag-bookmark-row__actions"><a class="btn btn-secondary btn-sm" href="{target}">Open</a>{due_actions}<a class="btn btn-ghost btn-sm" href="/bookmarks/{pid}/edit">Edit</a><form class="inline-form" method="post" action="/bookmarks/{pid}/remove" onsubmit="return confirm('Remove this bookmark?');"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="expected_bookmark_id" value="{bookmark_id}"><input type="hidden" name="expected_version" value="{version}"><button class="btn btn-ghost btn-sm" type="submit">Remove</button></form></div>
-</article>"#,
-            reminder = reminder,
-            author = esc(&item.post_author_email),
-            target = esc(&target),
-            title = esc(&item.thread_title),
-            note = note,
-            snippet = esc(&compact_snippet(&item.post_body_md, 180)),
-            due_actions = due_actions,
-            pid = esc(&bookmark.post_id),
-            csrf = esc(csrf),
-            bookmark_id = esc(&bookmark.bookmark_id),
-            version = bookmark.version,
-        ));
+            remove: version_action("remove", ActionKind::RemoveBookmark),
+            done: due.then(|| version_action("complete", ActionKind::CompleteBookmark)),
+            snooze_tomorrow: due.then(|| snooze_action("tomorrow", ActionKind::SnoozeTomorrow)),
+            snooze_week: due.then(|| snooze_action("week", ActionKind::SnoozeWeek)),
+        },
     }
-    out
 }
 
 fn bookmark_state_key(state: BookmarkState) -> &'static str {
@@ -490,10 +481,10 @@ fn bookmark_state_key(state: BookmarkState) -> &'static str {
 }
 
 fn bookmark_href(state: &str, before: Option<&str>) -> String {
-    let mut href = format!("/bookmarks?state={}", esc(state));
+    let mut href = format!("/bookmarks?state={state}");
     if let Some(cursor) = before {
-        href.push_str("&amp;before=");
-        href.push_str(&esc(cursor));
+        href.push_str("&before=");
+        href.push_str(cursor);
     }
     href
 }

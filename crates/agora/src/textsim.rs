@@ -10,19 +10,19 @@
 //! 2. [`summarize`] — an extractive summary: rank a body's sentences by the summed salience of
 //!    their terms and return the top few in original reading order.
 
-use std::collections::{HashMap, HashSet};
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 
 /// Common English stopwords dropped from the bag of words (kept small + obvious — this is a
 /// heuristic, not a linguistics engine).
 const STOPWORDS: &[&str] = &[
     "the", "a", "an", "and", "or", "but", "if", "then", "else", "for", "of", "to", "in", "on",
     "at", "by", "is", "are", "was", "were", "be", "been", "being", "it", "its", "this", "that",
-    "these", "those", "with", "as", "from", "into", "about", "i", "you", "he", "she", "we",
-    "they", "them", "his", "her", "our", "your", "my", "me", "us", "do", "does", "did", "so",
-    "not", "no", "yes", "can", "could", "would", "should", "will", "shall", "may", "might",
-    "have", "has", "had", "there", "here", "what", "which", "who", "whom", "how", "when", "where",
-    "why", "all", "any", "some", "such", "than", "too", "very", "just", "also", "up", "out",
+    "these", "those", "with", "as", "from", "into", "about", "i", "you", "he", "she", "we", "they",
+    "them", "his", "her", "our", "your", "my", "me", "us", "do", "does", "did", "so", "not", "no",
+    "yes", "can", "could", "would", "should", "will", "shall", "may", "might", "have", "has",
+    "had", "there", "here", "what", "which", "who", "whom", "how", "when", "where", "why", "all",
+    "any", "some", "such", "than", "too", "very", "just", "also", "up", "out",
 ];
 
 /// A scored candidate: its index into the input slice and the cosine score in `0.0..=1.0`.
@@ -164,7 +164,10 @@ pub fn summarize(text: &str, max_sentences: usize) -> Vec<String> {
     });
     scored.truncate(max_sentences);
     scored.sort_by_key(|(i, _)| *i);
-    scored.into_iter().map(|(i, _)| sentences[i].clone()).collect()
+    scored
+        .into_iter()
+        .map(|(i, _)| sentences[i].clone())
+        .collect()
 }
 
 /// Strip the common markdown / inline-HTML markup so sentence extraction sees readable prose.
@@ -239,7 +242,10 @@ mod tests {
 
     #[test]
     fn identical_text_is_maximally_similar() {
-        let s = similarity("database connection pool tuning", "database connection pool tuning");
+        let s = similarity(
+            "database connection pool tuning",
+            "database connection pool tuning",
+        );
         assert!(s > 0.99, "identical token sets score ~1.0, got {s}");
     }
 
@@ -255,7 +261,10 @@ mod tests {
     #[test]
     fn stopwords_do_not_create_false_matches() {
         // Two sentences sharing only stopwords must not look similar.
-        let s = similarity("the cat is on the mat", "we are in the house and it is warm");
+        let s = similarity(
+            "the cat is on the mat",
+            "we are in the house and it is warm",
+        );
         assert!(s < 0.05, "stopword-only overlap scored {s}");
     }
 
@@ -272,7 +281,10 @@ mod tests {
         // The two postgres docs (idx 0 and 2) must rank above the off-topic ones.
         assert!(ranked.iter().any(|s| s.index == 0));
         assert!(ranked.iter().any(|s| s.index == 2));
-        assert!(!ranked.iter().any(|s| s.index == 1), "pizza must not surface");
+        assert!(
+            !ranked.iter().any(|s| s.index == 1),
+            "pizza must not surface"
+        );
         // Scores are non-increasing.
         for w in ranked.windows(2) {
             assert!(w[0].score >= w[1].score);
@@ -282,8 +294,14 @@ mod tests {
     #[test]
     fn rank_respects_min_score_and_empty_query() {
         let docs = vec!["totally unrelated content here".to_string()];
-        assert!(rank("xyz qrs", &docs, 3, 0.5).is_empty(), "below threshold -> none");
-        assert!(rank("the and of", &docs, 3, 0.0).is_empty(), "all-stopword query -> none");
+        assert!(
+            rank("xyz qrs", &docs, 3, 0.5).is_empty(),
+            "below threshold -> none"
+        );
+        assert!(
+            rank("the and of", &docs, 3, 0.0).is_empty(),
+            "all-stopword query -> none"
+        );
     }
 
     #[test]
@@ -296,7 +314,9 @@ mod tests {
         let summary = summarize(text, 2);
         assert_eq!(summary.len(), 2);
         // The two migration/database sentences are the most salient.
-        assert!(summary.iter().all(|s| s.to_lowercase().contains("migration")));
+        assert!(summary
+            .iter()
+            .all(|s| s.to_lowercase().contains("migration")));
         // Returned in original reading order.
         assert!(summary[0].contains("failed"));
     }
