@@ -177,6 +177,15 @@ fn shell_and_css_preserve_accessible_progressive_enhancement() {
     assert!(css.contains("border-style: dashed;"));
     assert!(css.contains("min-height: 44px"));
     assert!(css.contains(".ag-row__cat a"));
+
+    // Orphan CSS rules must be removed
+    assert!(!css.contains(".ag-read-progress {"));
+
+    // Print rules must hide spine and controls
+    let print_section = &css[css.find("@media print").unwrap()..];
+    assert!(print_section.contains(".ag-reading-spine"));
+    assert!(print_section.contains(".ag-reading-controls"));
+
     assert!(css.contains("min-height: 24px"));
     assert!(css.contains(".ag-appbar .usermenu:focus-within .usermenu__pop"));
     assert!(css.contains("overflow-wrap: anywhere"));
@@ -398,6 +407,385 @@ fn thread_renders_one_answer_dais_and_truthful_page_bounds() {
         floor < dais && dais < steps,
         "civic reading order is structural"
     );
+}
+
+#[test]
+fn question_thread_renders_reading_spine_with_structural_markers() {
+    let view = ThreadView {
+        chrome: chrome("Question with spine"),
+        shared: ThreadShared {
+            id: opaque("thread-spine"),
+            title: text("Question with reading spine"),
+            category: Some(category().category),
+            kind: ThreadKind::Question,
+            answer_state: AnswerState::Answered,
+            author_display: text("Alice"),
+            created_at: 1_700_000_000,
+            post_count: Some(5),
+            pinned: false,
+            locked: false,
+        },
+        viewer: ThreadViewerState {
+            subscription: None,
+            edit: None,
+            delete_review: None,
+            clear_invalid_solution: None,
+        },
+        op: post("op", "<p>question body</p>", true),
+        dais: Some(AnswerDaisVM {
+            post: post("accepted", "<p>accepted answer</p>", false),
+            acceptance: AcceptanceMeaning::AcceptedByAskerOrAuthorizedModerator,
+        }),
+        replies: vec![
+            post("r1", "<p>reply 1</p>", false),
+            post("r2", "<p>reply 2</p>", false),
+        ],
+        pagination: PaginationVM {
+            previous: None,
+            next: Some(page_link("/t/thread-spine?page=2", "Next")),
+            jump: None,
+            at_start: true,
+            at_end: false,
+            visible_limit: 20,
+        },
+        reply_form: ReplyFormVM::Available {
+            submit: form_action("/t/thread-spine/reply", ActionKind::PostAnswer),
+            body: text(""),
+            quoted_post_id: None,
+        },
+        summary: SummaryStateVM::Unavailable(SummaryUnavailableReason::TooFewPosts),
+        reading: ReadingProgressVM {
+            started: true,
+            unread_count: Some(2),
+            first_unread_href: Some(opaque("#first-unread")),
+            resume_href: Some(opaque("/t/thread-spine?resume=1#resume-post")),
+            mark_page_read: None,
+        },
+        admin: None,
+        now: 1_700_001_000,
+    };
+
+    let html = forum::thread(&view);
+
+    assert!(html.contains(r##"class="ag-reading-spine ag-key-shared""##));
+    assert!(html.contains(r##"href="#ag-floor-title">Question</a>"##));
+    assert!(html.contains(r##"href="#ag-dais-title">Accepted Answer</a>"##));
+    assert!(html.contains("ag-spine__section--dais"));
+    assert!(html.contains("ag-spine__section--private"));
+    assert!(html.contains(r##"href="/t/thread-spine?resume=1#resume-post">Continue reading</a>"##));
+    assert!(html.contains("2 unread"));
+}
+
+#[test]
+fn discussion_thread_has_no_reading_spine() {
+    let view = ThreadView {
+        chrome: chrome("Discussion"),
+        shared: ThreadShared {
+            id: opaque("disc-1"),
+            title: text("Discussion thread"),
+            category: Some(category().category),
+            kind: ThreadKind::Discussion,
+            answer_state: AnswerState::NotApplicable,
+            author_display: text("Bob"),
+            created_at: 1_700_000_000,
+            post_count: Some(3),
+            pinned: false,
+            locked: false,
+        },
+        viewer: ThreadViewerState {
+            subscription: None,
+            edit: None,
+            delete_review: None,
+            clear_invalid_solution: None,
+        },
+        op: post("op", "<p>discussion</p>", true),
+        dais: None,
+        replies: vec![post("r1", "<p>reply</p>", false)],
+        pagination: PaginationVM {
+            previous: None,
+            next: None,
+            jump: None,
+            at_start: true,
+            at_end: true,
+            visible_limit: 20,
+        },
+        reply_form: ReplyFormVM::Available {
+            submit: form_action("/t/disc-1/reply", ActionKind::PostReply),
+            body: text(""),
+            quoted_post_id: None,
+        },
+        summary: SummaryStateVM::Unavailable(SummaryUnavailableReason::TooFewPosts),
+        reading: ReadingProgressVM {
+            started: false,
+            unread_count: None,
+            first_unread_href: None,
+            resume_href: None,
+            mark_page_read: None,
+        },
+        admin: None,
+        now: 1_700_001_000,
+    };
+
+    let html = forum::thread(&view);
+
+    assert!(
+        !html.contains(r##"<aside class="ag-reading-spine"##),
+        "Discussion threads have no spine element"
+    );
+    assert!(
+        !html.contains(r#"<article class="ag-thread ag-thread--spined"#),
+        "Discussion threads do not have the spined modifier on article element"
+    );
+    assert!(
+        html.contains(r#"<article class="ag-thread">"#),
+        "Discussion threads have plain ag-thread class without spined modifier"
+    );
+}
+
+#[test]
+fn steps_spine_marks_pagination_bounds_and_resume_anchor() {
+    let mut resume_post = post("resume", "<p>resume here</p>", false);
+    resume_post.viewer.resume_anchor = Some(opaque("first-unread"));
+
+    let view = ThreadView {
+        chrome: chrome("Paginated"),
+        shared: ThreadShared {
+            id: opaque("pag-1"),
+            title: text("Paginated thread"),
+            category: Some(category().category),
+            kind: ThreadKind::Question,
+            answer_state: AnswerState::NeedsAnswer,
+            author_display: text("Alice"),
+            created_at: 1_700_000_000,
+            post_count: Some(50),
+            pinned: false,
+            locked: false,
+        },
+        viewer: ThreadViewerState {
+            subscription: None,
+            edit: None,
+            delete_review: None,
+            clear_invalid_solution: None,
+        },
+        op: post("op", "<p>question</p>", true),
+        dais: None,
+        replies: vec![
+            post("r1", "<p>reply 1</p>", false),
+            resume_post,
+            post("r3", "<p>reply 3</p>", false),
+        ],
+        pagination: PaginationVM {
+            previous: Some(page_link("/t/pag-1?page=1", "Previous")),
+            next: Some(page_link("/t/pag-1?page=3", "Next")),
+            jump: None,
+            at_start: false,
+            at_end: false,
+            visible_limit: 20,
+        },
+        reply_form: ReplyFormVM::Available {
+            submit: form_action("/t/pag-1/reply", ActionKind::PostAnswer),
+            body: text(""),
+            quoted_post_id: None,
+        },
+        summary: SummaryStateVM::Unavailable(SummaryUnavailableReason::TooFewPosts),
+        reading: ReadingProgressVM {
+            started: true,
+            unread_count: Some(5),
+            first_unread_href: Some(opaque("#first-unread")),
+            resume_href: None,
+            mark_page_read: None,
+        },
+        admin: None,
+        now: 1_700_001_000,
+    };
+
+    let html = forum::thread(&view);
+
+    assert!(html.contains(r#"class="ag-steps__bound ag-steps__bound--start""#));
+    assert!(html.contains("Earlier replies on previous page"));
+    assert!(html.contains(r#"class="ag-steps__bound ag-steps__bound--end""#));
+    assert!(html.contains("More replies on next page"));
+    assert!(html.contains("ag-first-unread"));
+
+    // Count actual bound elements (not CSS occurrences)
+    let bound_elements = html.matches(r#"<div class="ag-steps__bound"#).count();
+    assert_eq!(bound_elements, 2, "both start and end bounds present");
+}
+
+#[test]
+fn reading_controls_consolidate_resume_pagination_and_jump() {
+    let view = ThreadView {
+        chrome: chrome("Controls"),
+        shared: ThreadShared {
+            id: opaque("ctrl-1"),
+            title: text("Thread with controls"),
+            category: Some(category().category),
+            kind: ThreadKind::Question,
+            answer_state: AnswerState::NeedsAnswer,
+            author_display: text("Alice"),
+            created_at: 1_700_000_000,
+            post_count: Some(100),
+            pinned: false,
+            locked: false,
+        },
+        viewer: ThreadViewerState {
+            subscription: None,
+            edit: None,
+            delete_review: None,
+            clear_invalid_solution: None,
+        },
+        op: post("op", "<p>question</p>", true),
+        dais: None,
+        replies: vec![post("r1", "<p>reply 1</p>", false)],
+        pagination: PaginationVM {
+            previous: Some(page_link("/t/ctrl-1?page=1", "Previous")),
+            next: Some(page_link("/t/ctrl-1?page=3", "Next")),
+            jump: Some(page_link(
+                "/t/ctrl-1?latest=1#thread-latest",
+                "Jump to latest",
+            )),
+            at_start: false,
+            at_end: false,
+            visible_limit: 20,
+        },
+        reply_form: ReplyFormVM::Available {
+            submit: form_action("/t/ctrl-1/reply", ActionKind::PostAnswer),
+            body: text(""),
+            quoted_post_id: None,
+        },
+        summary: SummaryStateVM::Unavailable(SummaryUnavailableReason::TooFewPosts),
+        reading: ReadingProgressVM {
+            started: true,
+            unread_count: Some(8),
+            first_unread_href: Some(opaque("#first-unread")),
+            resume_href: None,
+            mark_page_read: Some(form_action("/t/ctrl-1/mark-read", ActionKind::MarkPageRead)),
+        },
+        admin: None,
+        now: 1_700_001_000,
+    };
+
+    let html = forum::thread(&view);
+    assert!(html.contains(r#"class="ag-reading-controls ag-key-private""#));
+    assert!(html.contains(r#"data-thread-read-form"#));
+    assert!(html.contains(r#"data-thread-read-progress"#));
+    assert!(html.contains(r#"class="ag-page""#));
+
+    // Jump control is provided by pagination() helper, not separately
+    assert!(html.contains(r#"class="btn btn-ghost btn-sm ag-page__jump""#));
+    assert!(!html.contains("ag-jump-latest"));
+
+    // Jump link appears exactly once
+    assert_eq!(
+        html.matches(r#"href="/t/ctrl-1?latest=1#thread-latest""#)
+            .count(),
+        1,
+        "Jump to latest link must appear exactly once"
+    );
+    assert_eq!(
+        html.matches(">Jump to latest<").count(),
+        1,
+        "Jump to latest label must appear exactly once"
+    );
+
+    assert!(html.contains("8 unread posts"));
+}
+
+#[test]
+fn spine_layout_uses_grid_not_float() {
+    let css = shell::SERVICE_CSS;
+
+    // Float must not be used anywhere in the stylesheet
+    assert!(
+        !css.contains("float:"),
+        "Float layout is forbidden; use grid for two-column spine layout"
+    );
+
+    // Desktop layout must use grid
+    assert!(css.contains(".ag-thread--spined"));
+    assert!(css.contains("grid-template-columns: 200px minmax(0, 1fr)"));
+}
+
+#[test]
+fn spine_dom_order_places_head_before_body() {
+    let view = ThreadView {
+        chrome: chrome("Layout"),
+        shared: ThreadShared {
+            id: opaque("layout-1"),
+            title: text("Question with spine"),
+            category: Some(category().category),
+            kind: ThreadKind::Question,
+            answer_state: AnswerState::NeedsAnswer,
+            author_display: text("Alice"),
+            created_at: 1_700_000_000,
+            post_count: Some(5),
+            pinned: false,
+            locked: false,
+        },
+        viewer: ThreadViewerState {
+            subscription: None,
+            edit: None,
+            delete_review: None,
+            clear_invalid_solution: None,
+        },
+        op: post("op", "<p>question</p>", true),
+        dais: None,
+        replies: vec![],
+        pagination: PaginationVM {
+            previous: None,
+            next: None,
+            jump: None,
+            at_start: true,
+            at_end: true,
+            visible_limit: 20,
+        },
+        reply_form: ReplyFormVM::Available {
+            submit: form_action("/t/layout-1/reply", ActionKind::PostAnswer),
+            body: text(""),
+            quoted_post_id: None,
+        },
+        summary: SummaryStateVM::Unavailable(SummaryUnavailableReason::TooFewPosts),
+        reading: ReadingProgressVM {
+            started: false,
+            unread_count: None,
+            first_unread_href: None,
+            resume_href: None,
+            mark_page_read: None,
+        },
+        admin: None,
+        now: 1_700_001_000,
+    };
+
+    let html = forum::thread(&view);
+
+    // Find positions of key elements
+    let head_pos = html
+        .find(r#"class="ag-thread__head"#)
+        .expect("head must exist");
+    let body_pos = html
+        .find(r#"class="ag-thread__body"#)
+        .expect("body must exist");
+    let spine_pos = html
+        .find(r#"class="ag-reading-spine"#)
+        .expect("spine must exist");
+    let col_pos = html
+        .find(r#"class="ag-thread__col"#)
+        .expect("col must exist");
+
+    // Head comes before body wrapper
+    assert!(
+        head_pos < body_pos,
+        "Thread head must come before body wrapper for proper mobile order"
+    );
+
+    // Within body: spine comes before content column
+    assert!(
+        spine_pos < col_pos,
+        "Spine must come before content column in DOM order"
+    );
+
+    // Body wrapper comes after head
+    assert!(body_pos > head_pos, "Body wrapper must come after head");
 }
 
 #[test]

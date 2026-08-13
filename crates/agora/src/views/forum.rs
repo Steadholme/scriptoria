@@ -8,7 +8,7 @@
 use crate::view_model::{
     CategoryFocusFormVM, CategoryFocusLevelVM, CategoryPageShared, CategoryPageViewerState,
     CategoryVM, CategoryView, ComposeMode, ComposeShared, ComposeView, ComposeViewerState,
-    HomeShared, HomeView, ReadingProgressVM, ReplyFormVM, SubscriptionFormVM, SummaryStateVM,
+    HomeShared, HomeView, ReplyFormVM, SubscriptionFormVM, SummaryStateVM,
     SummaryUnavailableReason, ThreadFollowLevelVM, ThreadKind, ThreadListControlsVM, ThreadOrder,
     ThreadRowVM, ThreadScope, ThreadShared, ThreadView, ThreadViewerState,
 };
@@ -366,6 +366,13 @@ fn thread_main(v: &ThreadView) -> String {
     segs.push((s.title.0.as_str(), None));
     let crumb = crumbs(&segs);
 
+    let spine = reading_spine(v);
+    let spined = if spine.is_empty() {
+        ""
+    } else {
+        " ag-thread--spined"
+    };
+
     let floor = format!(
         r#"<section class="ag-floor" aria-labelledby="ag-floor-title"><h2 class="eyebrow ag-eyebrow" id="ag-floor-title">Speaker Floor</h2>{post}</section>"#,
         post = post(&v.op, now),
@@ -382,6 +389,18 @@ fn thread_main(v: &ThreadView) -> String {
         .iter()
         .filter(|reply| accepted_id != Some(&reply.id))
         .collect();
+
+    let bounds_start = if !v.pagination.at_start {
+        r#"<div class="ag-steps__bound ag-steps__bound--start" role="separator"><span>Earlier replies on previous page</span></div>"#
+    } else {
+        ""
+    };
+    let bounds_end = if !v.pagination.at_end {
+        r#"<div class="ag-steps__bound ag-steps__bound--end" role="separator"><span>More replies on next page</span></div>"#
+    } else {
+        ""
+    };
+
     let replies = if chronological.is_empty() {
         collection_note(
             crate::view_model::CollectionState::ReadyEmpty,
@@ -400,9 +419,10 @@ fn thread_main(v: &ThreadView) -> String {
         ""
     };
     let steps = format!(
-        r#"<section class="ag-steps" aria-labelledby="ag-steps-title"><h2 class="eyebrow ag-eyebrow" id="ag-steps-title">Reply Steps</h2>{replies}{pagination}{read_sentinel}<span class="ag-thread-latest-anchor" id="thread-latest" tabindex="-1"></span></section>"#,
+        r#"<section class="ag-steps" aria-labelledby="ag-steps-title"><h2 class="eyebrow ag-eyebrow" id="ag-steps-title">Reply Steps</h2>{bounds_start}{replies}{bounds_end}{read_sentinel}<span class="ag-thread-latest-anchor" id="thread-latest" tabindex="-1"></span></section>"#,
+        bounds_start = bounds_start,
         replies = replies,
-        pagination = pagination(&v.pagination),
+        bounds_end = bounds_end,
         read_sentinel = read_sentinel,
     );
 
@@ -412,26 +432,35 @@ fn thread_main(v: &ThreadView) -> String {
         .map(admin_thread_toolbar)
         .unwrap_or_default();
 
+    let controls = reading_controls(v);
+
     format!(
-        r#"<article class="ag-thread">
+        r#"<article class="ag-thread{spined}">
   {crumb}
   {head}
-  {admin}
-  {reading}
-  {summary}
-  {floor}
-  {dais}
-  {steps}
-  {reply}
+  <div class="ag-thread__body">
+    {spine}
+    <div class="ag-thread__col">
+      {admin}
+      {summary}
+      {floor}
+      {dais}
+      {steps}
+      {controls}
+      {reply}
+    </div>
+  </div>
 </article>"#,
+        spined = spined,
         crumb = crumb,
         head = thread_head(s, &v.viewer, now),
+        spine = spine,
         admin = admin,
-        reading = reading_progress(&v.reading),
         summary = summary_block(&v.summary),
         floor = floor,
         dais = dais,
         steps = steps,
+        controls = controls,
         reply = reply_form_block(&v.reply_form, s.kind == ThreadKind::Question),
     )
 }
@@ -534,22 +563,93 @@ fn subscription_form(s: &SubscriptionFormVM) -> String {
     )
 }
 
-/// The private reading strip: continue/start reading, unread count, mark-page-read. Absent
-/// private facts render nothing; a `None` unread count is never a painted "0".
-fn reading_progress(r: &ReadingProgressVM) -> String {
+/// The vertical reading spine for Question threads. Desktop: sticky aside. Mobile: inline.
+/// Marks Question, accepted answer dais, resume/unread state using civic geometry.
+fn reading_spine(v: &ThreadView) -> String {
+    if v.shared.kind != ThreadKind::Question {
+        return String::new();
+    }
+
+    let dais_section = if v.dais.is_some() {
+        r##"<div class="ag-spine__section ag-spine__section--dais"><span class="ag-spine__mark">◆</span><a class="ag-spine__link" href="#ag-dais-title">Accepted Answer</a></div>"##
+    } else {
+        ""
+    };
+
+    let resume_section = if v.reading.resume_href.is_some() || v.reading.first_unread_href.is_some()
+    {
+        let href = v
+            .reading
+            .resume_href
+            .as_ref()
+            .or(v.reading.first_unread_href.as_ref());
+        let label = if v.reading.resume_href.is_some() {
+            "Continue reading"
+        } else {
+            "Start reading"
+        };
+        format!(
+            r##"<div class="ag-spine__section ag-spine__section--private"><span class="ag-spine__mark">→</span><a class="ag-spine__link" href="{href}">{label}</a></div>"##,
+            href = o(href.unwrap()),
+            label = label,
+        )
+    } else {
+        String::new()
+    };
+
+    let unread_indicator = if let Some(n) = v.reading.unread_count {
+        if n > 0 {
+            let label = if n == 1 {
+                "1 unread".to_string()
+            } else {
+                format!("{n} unread")
+            };
+            format!(
+                r##"<div class="ag-spine__section ag-spine__section--private"><span class="ag-spine__mark">•</span><span class="ag-spine__text">{label}</span></div>"##,
+                label = escape(&label),
+            )
+        } else if v.reading.started {
+            r##"<div class="ag-spine__section ag-spine__section--private"><span class="ag-spine__mark">✓</span><span class="ag-spine__text">Caught up</span></div>"##.to_string()
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    format!(
+        r##"<aside class="ag-reading-spine ag-key-shared" aria-label="Reading guide">
+  <div class="ag-spine__section"><span class="ag-spine__mark">○</span><a class="ag-spine__link" href="#ag-floor-title">Question</a></div>
+  {dais_section}
+  {resume_section}
+  {unread_indicator}
+</aside>"##,
+        dais_section = dais_section,
+        resume_section = resume_section,
+        unread_indicator = unread_indicator,
+    )
+}
+
+/// Consolidated reading controls: resume links, unread status, mark-page-read, pagination.
+/// Jump control is provided by the pagination() helper. Placed after steps, before reply form.
+fn reading_controls(v: &ThreadView) -> String {
     let mut parts = String::new();
-    if let Some(h) = &r.resume_href {
+
+    // Resume/start reading link
+    if let Some(h) = &v.reading.resume_href {
         parts.push_str(&format!(
-            r#"<a class="ag-mark ag-key-private ag-mark--resume" href="{}">Continue reading</a>"#,
+            r#"<a class="ag-mark ag-mark--resume" href="{}">Continue reading</a>"#,
             o(h),
         ));
-    } else if let Some(h) = &r.first_unread_href {
+    } else if let Some(h) = &v.reading.first_unread_href {
         parts.push_str(&format!(
-            r#"<a class="ag-mark ag-key-private ag-mark--resume" href="{}">Start reading</a>"#,
+            r#"<a class="ag-mark ag-mark--resume" href="{}">Start reading</a>"#,
             o(h),
         ));
     }
-    if let Some(n) = r.unread_count {
+
+    // Unread count or caught-up status
+    if let Some(n) = v.reading.unread_count {
         if n > 0 {
             let label = if n == 1 {
                 "1 unread post".to_string()
@@ -557,11 +657,13 @@ fn reading_progress(r: &ReadingProgressVM) -> String {
                 format!("{n} unread posts")
             };
             parts.push_str(&super::private_marker("unread", &label));
-        } else if r.started {
+        } else if v.reading.started {
             parts.push_str(&super::private_marker("caught-up", "Caught up"));
         }
     }
-    if let Some(action) = &r.mark_page_read {
+
+    // Mark page read form
+    if let Some(action) = &v.reading.mark_page_read {
         parts.push_str(
             r#"<span class="ag-read-progress__status muted" data-thread-read-status role="status" aria-live="polite">Only posts shown on this page will be marked read.</span>"#,
         );
@@ -571,11 +673,21 @@ fn reading_progress(r: &ReadingProgressVM) -> String {
             hidden = hidden_inputs(&action.csrf.0, &action.fields),
         ));
     }
-    if parts.is_empty() {
+
+    // Pagination (includes built-in jump control)
+    let pagination_html = pagination(&v.pagination);
+
+    if parts.is_empty() && pagination_html.is_empty() {
         return String::new();
     }
+
     format!(
-        r#"<div class="ag-read-progress ag-key-private" role="group" aria-label="Your reading progress" data-thread-read-progress>{parts}</div>"#,
+        r#"<div class="ag-reading-controls ag-key-private" role="region" aria-label="Reading controls" data-thread-read-progress>
+  {parts}
+  {pagination}
+</div>"#,
+        parts = parts,
+        pagination = pagination_html,
     )
 }
 

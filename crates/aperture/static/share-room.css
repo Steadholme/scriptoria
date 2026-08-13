@@ -43,7 +43,7 @@
 [data-ap-share-room] [hidden] { display: none !important; }
 
 [data-ap-share-room] :focus-visible {
-  outline: 3px solid rgba(56, 89, 217, .34);
+  outline: 3px solid rgb(56, 89, 217);
   outline-offset: 3px;
 }
 
@@ -382,4 +382,34 @@
   [data-ap-share-room] *,
   [data-ap-share-room] *::before,
   [data-ap-share-room] *::after { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
+}
+
+/* ============================================================================
+   S13 forced-colors (Windows High Contrast / forced-colors: active)
+   状态语义全部改由 border/outline/系统色表达；不改任何常规模式规则。
+   ============================================================================ */
+@media (forced-colors: active) {
+  [data-ap-share-room] :focus-visible { outline: 3px solid CanvasText; }
+
+  /* 主按钮 vs 次级按钮：粗边框区分，不靠颜色 */
+  [data-ap-share-room] .sr-button { border: 1px solid ButtonText; }
+  [data-ap-share-room] .sr-button--primary { border-width: 3px; }
+
+  /* 上传队列：进度长度保留，成败改由 border-style + 既有状态文本表达 */
+  [data-ap-share-room] .sr-queue__progress { border: 1px solid CanvasText; forced-color-adjust: none; }
+  [data-ap-share-room] .sr-queue__progress::-webkit-progress-value,
+  [data-ap-share-room] .sr-queue__progress::-moz-progress-bar { background: Highlight; }
+  [data-ap-share-room] .sr-queue__item.is-error { border-inline-start: 4px solid CanvasText; }
+  [data-ap-share-room] .sr-retry { text-decoration: underline; }
+
+  /* 拖拽悬停：dashed → solid */
+  [data-ap-share-room] .sr-dropzone { border: 1.5px dashed CanvasText; }
+  [data-ap-share-room] .sr-dropzone.is-over { border-style: solid; border-width: 3px; }
+
+  /* 灯箱 dialog：弹层实边 + 关闭键实边 */
+  [data-ap-share-room] .sr-dialog__panel { border: 3px solid CanvasText; }
+  [data-ap-share-room] .sr-dialog__close { border: 1px solid ButtonText; }
+
+  /* 状态点：圆点消失可接受（有文字），补一个可存活的 border */
+  [data-ap-share-room] .sr-topbar__state::before { border: 1px solid CanvasText; }
 }

@@ -992,15 +992,110 @@ h2.eyebrow.ag-eyebrow {
   width: 100%;
 }
 
-.ag-read-progress {
-  margin-bottom: 24px;
-  padding: 10px;
+/* Reading guide sidebar for Question threads */
+
+.ag-reading-spine {
+  width: 100%;
+  max-width: var(--ag-reading);
+  margin: 0 auto 24px;
+  padding: 12px;
+  display: grid;
+  gap: 8px;
+  background: var(--ag-paper-raised);
+  border: 1px solid var(--ag-rule);
+  border-radius: var(--r-xs);
+}
+
+.ag-spine__section {
+  min-height: 44px;
+  padding: 8px 10px;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
+  border-left: 3px solid var(--ag-rule);
+  border-radius: var(--r-xs);
+}
+
+.ag-spine__section--dais {
+  border-left-width: 5px;
+  border-color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 8%, var(--surface));
+}
+
+.ag-spine__section--private {
+  border-left-style: dashed;
+  border-color: var(--ag-private-rule);
+  background: var(--ag-private-tint);
+}
+
+.ag-spine__mark {
+  flex: 0 0 24px;
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  color: var(--ink-2);
+  font-size: 16px;
+  line-height: 1;
+  user-select: none;
+}
+
+.ag-spine__link,
+.ag-spine__text {
+  min-height: 32px;
+  display: flex;
+  align-items: center;
+  color: var(--ink);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+}
+
+.ag-spine__text {
+  color: var(--ink-2);
+}
+
+/* Steps enhancements for pagination bounds */
+
+.ag-steps__bound {
+  position: relative;
+  min-height: 44px;
+  margin: 14px 0 14px -18px;
+  padding-left: 28px;
+  display: flex;
+  align-items: center;
+  color: var(--ink-3);
+  font-size: var(--fs-sm);
+  border-top: 1px dashed var(--border);
+}
+
+.ag-steps__bound::before {
+  content: "";
+  width: 16px;
+  height: 1px;
+  position: absolute;
+  left: -18px;
+  top: 50%;
+  background: var(--ag-rule);
+}
+
+/* Consolidated reading controls */
+
+.ag-reading-controls {
+  margin: 24px 0;
+  padding: 12px 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
   flex-wrap: wrap;
   background: var(--ag-private-tint);
   border-width: 1px;
+}
+
+.ag-reading-controls .ag-page {
+  width: 100%;
+  margin: 12px 0 0;
+  padding: 12px 0 0;
+  border-top: 1px dashed var(--ag-private-rule);
 }
 
 .ag-floor,
@@ -1193,12 +1288,24 @@ h2.eyebrow.ag-eyebrow {
 }
 
 .ag-first-unread {
+  position: relative;
   min-height: 44px;
-  margin: 8px 0;
+  margin: 8px 0 8px -18px;
+  padding-left: 28px;
   display: flex;
   align-items: center;
   border: 0;
   border-top: 2px dashed var(--ag-private-rule);
+}
+
+.ag-first-unread::before {
+  content: "";
+  width: 16px;
+  height: 2px;
+  position: absolute;
+  left: -18px;
+  top: 50%;
+  background: var(--ag-private-rule);
 }
 
 .ag-first-unread > span {
@@ -1570,6 +1677,48 @@ h2.eyebrow.ag-eyebrow {
 
 .ag-correlation {
   overflow-wrap: anywhere;
+}
+
+/* Responsive adjustments for reading guide and controls */
+
+@media (max-width: 760px) {
+  .ag-reading-controls {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
+
+@media (max-width: 520px) {
+  .ag-steps__bound,
+  .ag-first-unread {
+    margin-left: -10px;
+    padding-left: 20px;
+  }
+
+  .ag-steps__bound::before,
+  .ag-first-unread::before {
+    left: -10px;
+    width: 10px;
+  }
+}
+
+@media (min-width: 1240px) {
+  .ag-thread--spined {
+    width: min(100%, calc(var(--ag-reading) + 224px));
+  }
+
+  .ag-thread--spined .ag-thread__body {
+    display: grid;
+    grid-template-columns: 200px minmax(0, 1fr);
+    column-gap: 24px;
+    align-items: start;
+  }
+
+  .ag-thread--spined .ag-reading-spine {
+    margin: 0;
+    position: sticky;
+    top: calc(var(--appbar-h) + 24px);
+  }
 }
 
 /* Legacy handler compatibility while typed view wiring lands ------------ */
@@ -1977,7 +2126,7 @@ h2.eyebrow.ag-eyebrow {
   .ag-ledger-head,
   .ag-focus-rules,
   .ag-thread__viewer,
-  .ag-read-progress,
+  .ag-reading-controls,
   .ag-activity-controls,
   .ag-bookmark-private {
     border-color: CanvasText;
@@ -2003,7 +2152,8 @@ h2.eyebrow.ag-eyebrow {
   .site-foot,
   .ag-quick-search,
   .ag-thread__viewer,
-  .ag-read-progress,
+  .ag-reading-spine,
+  .ag-reading-controls,
   .ag-post__actions,
   .ag-reactions,
   .ag-reply-form,

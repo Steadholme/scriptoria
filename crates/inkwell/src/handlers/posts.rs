@@ -6,12 +6,13 @@
 //! (never a client field), and every state-changing POST is double-submit CSRF protected.
 //! A post may be edited or deleted only by its own author.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::{Form, Json};
+use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
 
 use crate::audit::AuditEvent;
@@ -653,14 +654,7 @@ pub async fn view(
         (String::new(), None)
     };
 
-    let meta = format!(
-        r#"<div class="ink-byline"><span class="ink-avatar ink-avatar--lg">{initial}</span><div class="ink-byline__col"><span class="ink-byline__author">{author}</span><span class="ink-byline__meta">{date} · {mins} min read{state}</span></div></div>"#,
-        initial = esc(&author_initial(&post.author_email)),
-        author = esc(&post.author_email),
-        date = esc(&fmt_date(post.created_at)),
-        mins = read_minutes(&post.body_md),
-        state = state_badge(&post, now),
-    );
+    let meta = render_reader_byline(&post, now);
 
     let actions = if is_owner && !preview_mode {
         format!(
@@ -682,7 +676,14 @@ pub async fn view(
         String::new()
     };
 
-    let body_html = markdown::render_html(&post.body_md);
+    let rendered_body = markdown::render_html(&post.body_md);
+    let outline = reader_outline(&post.body_md);
+    // Heading anchors and the Contents navigation fail OPEN together: on any alignment surprise
+    // the reader gets the exact current article body and no partial navigation.
+    let (body_html, toc) = match inject_heading_anchors(&rendered_body, &outline) {
+        Some(anchored) => (anchored, render_toc(&outline)),
+        None => (rendered_body, String::new()),
+    };
 
     // Related posts: top-3 OTHER published posts by keyword-overlap to this one (additive block).
     // Rank over the newest bounded page (same cap the index used before pagination).
@@ -698,9 +699,12 @@ pub async fn view(
             "{{COVER}}",
             &render_cover(&post.cover_url, "article__cover", &post.title),
         )
+        .replace("{{EYEBROW}}", &render_reader_eyebrow(&post.tags))
         .replace("{{META}}", &meta)
         .replace("{{TAGS}}", &tag_chips(&post.tags))
         .replace("{{ACTIONS}}", &actions)
+        .replace("{{TOC}}", &toc)
+        .replace("{{FOOTNAV}}", READER_FOOTNAV)
         .replace("{{BODY}}", &body_html)
         .replace("{{RELATED}}", &related);
     let preview_surface_note = if preview_mode {
@@ -958,9 +962,12 @@ pub async fn review_link_public(
             "{{COVER}}",
             &render_cover(&post.cover_url, "article__cover", &post.title),
         )
+        .replace("{{EYEBROW}}", "")
         .replace("{{META}}", &byline)
         .replace("{{TAGS}}", &tag_chips(&post.tags))
         .replace("{{ACTIONS}}", "")
+        .replace("{{TOC}}", "")
+        .replace("{{FOOTNAV}}", "")
         .replace("{{BODY}}", &markdown::render_html(&post.body_md))
         .replace("{{RELATED}}", "");
     let banner = format!(
@@ -3303,6 +3310,213 @@ fn render_related(posts: &[Post]) -> String {
   <ul class="related__list">{items}</ul>
 </aside>"#,
     )
+}
+
+/// Minimum listed sections before the reader's Contents navigation renders. Shorter posts read
+/// fine linearly; a fold would be noise there.
+const TOC_MIN_SECTIONS: usize = 3;
+
+/// Cap on how many heading characters feed one anchor id (bounds a runaway heading paste; the
+/// `-N` de-duplication suffix keeps truncated collisions unique).
+const ANCHOR_SLUG_MAX_CHARS: usize = 80;
+
+/// Footer wayfinding for the public/preview reader. Static markup, so the anonymous
+/// representation stays deterministic; the review-link surface replaces the placeholder with the
+/// empty string instead. `#article-top` targets the id carried by the reader `<main>`.
+const READER_FOOTNAV: &str = concat!(
+    r#"<nav class="article__footnav" aria-label="Article navigation">"#,
+    r#"<a class="article__footnav-link" href="/">&larr; All posts</a>"#,
+    r##"<a class="article__footnav-link" href="#article-top">Back to top &uarr;</a>"##,
+    r#"</nav>"#
+);
+
+/// One reader-outline section: an `##`/`###` markdown heading with its deterministic anchor id.
+/// `text` is the heading's plain text and may be empty (such a heading is still anchored, but
+/// never listed in the Contents navigation).
+struct OutlineEntry {
+    level: u8, // 2 | 3
+    text: String,
+    id: String,
+}
+
+/// Extract the h2/h3 outline of `body_md` with EXACTLY the parser options used by
+/// [`markdown::render_html`], so entries correspond 1:1 — count, order, and level — with the
+/// `<h2>`/`<h3>` tags of the rendered body. Labels collect only text/code events (the sanitizer
+/// renders raw HTML inside a heading as escaped text; the outline label simply omits it). Anchor
+/// ids reuse the estate ASCII slug rules ([`crate::tags::tag_slug`], mirroring
+/// [`markdown::slugify`]), fall back to `section` for headings with no ASCII content, and are
+/// de-duplicated with a `-2`, `-3`, … suffix so every id is unique within the article.
+fn reader_outline(body_md: &str) -> Vec<OutlineEntry> {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_TASKLISTS);
+    options.insert(Options::ENABLE_FOOTNOTES);
+
+    let mut entries: Vec<OutlineEntry> = Vec::new();
+    let mut seen_ids: BTreeSet<String> = BTreeSet::new();
+    let mut current: Option<(u8, String)> = None;
+    for event in Parser::new_ext(body_md, options) {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                current = match level {
+                    HeadingLevel::H2 => Some((2, String::new())),
+                    HeadingLevel::H3 => Some((3, String::new())),
+                    _ => None,
+                };
+            }
+            Event::End(TagEnd::Heading(HeadingLevel::H2 | HeadingLevel::H3)) => {
+                if let Some((level, raw_text)) = current.take() {
+                    let text = raw_text.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let bounded: String = text.chars().take(ANCHOR_SLUG_MAX_CHARS).collect();
+                    let base = {
+                        let slug = crate::tags::tag_slug(&bounded);
+                        if slug.is_empty() {
+                            "section".to_string()
+                        } else {
+                            slug
+                        }
+                    };
+                    let mut id = base.clone();
+                    let mut suffix = 1usize;
+                    while seen_ids.contains(&id) {
+                        suffix += 1;
+                        id = format!("{base}-{suffix}");
+                    }
+                    seen_ids.insert(id.clone());
+                    entries.push(OutlineEntry { level, text, id });
+                }
+            }
+            Event::Text(t) | Event::Code(t) => {
+                if let Some((_, buffer)) = current.as_mut() {
+                    buffer.push_str(&t);
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some((_, buffer)) = current.as_mut() {
+                    buffer.push(' ');
+                }
+            }
+            _ => {}
+        }
+    }
+    entries
+}
+
+/// Rewrite the sanitized body's `<h2>`/`<h3>` opening tags to carry the outline's anchor ids.
+///
+/// The sanitizer guarantees author markup can never contribute a literal `<h2>`/`<h3>` opening
+/// tag (raw HTML becomes escaped text; text and code content is entity-escaped by the renderer),
+/// so the rendered tags align with the parsed outline. The alignment is still VERIFIED here
+/// rather than assumed: any mismatch in count, order, or level returns `None`, and the caller
+/// falls back to today's un-anchored body with no Contents navigation — never a partially
+/// anchored article.
+fn inject_heading_anchors(html: &str, outline: &[OutlineEntry]) -> Option<String> {
+    let mut out = String::with_capacity(html.len() + outline.len() * 24);
+    let mut rest = html;
+    for entry in outline {
+        let (idx, level) = match (rest.find("<h2>"), rest.find("<h3>")) {
+            (Some(h2), Some(h3)) if h3 < h2 => (h3, 3),
+            (Some(h2), _) => (h2, 2),
+            (None, Some(h3)) => (h3, 3),
+            (None, None) => return None,
+        };
+        if level != entry.level {
+            return None;
+        }
+        out.push_str(&rest[..idx]);
+        out.push_str(&format!("<h{level} id=\"{id}\">", id = esc(&entry.id)));
+        rest = &rest[idx + "<h2>".len()..];
+    }
+    if rest.contains("<h2>") || rest.contains("<h3>") {
+        return None;
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// Render the SSR `<details>` Contents navigation from the reader outline. Sections without a
+/// text label are anchored but not listed; fewer than [`TOC_MIN_SECTIONS`] listed sections
+/// returns the empty string so short posts keep today's uninterrupted layout. Native disclosure
+/// only — works identically with JavaScript disabled.
+fn render_toc(outline: &[OutlineEntry]) -> String {
+    let listed: Vec<&OutlineEntry> = outline
+        .iter()
+        .filter(|entry| !entry.text.is_empty())
+        .collect();
+    if listed.len() < TOC_MIN_SECTIONS {
+        return String::new();
+    }
+    let mut items = String::new();
+    for entry in &listed {
+        items.push_str(&format!(
+            r##"<li class="article-toc__item article-toc__item--h{level}"><a class="article-toc__link" href="#{id}">{text}</a></li>"##,
+            level = entry.level,
+            id = esc(&entry.id),
+            text = esc(&entry.text),
+        ));
+    }
+    format!(
+        r#"<details class="article-toc"><summary class="article-toc__summary">Contents<span class="article-toc__count">{count} sections</span></summary><nav class="article-toc__nav" aria-label="Article sections"><ol class="article-toc__list" role="list">{items}</ol></nav></details>"#,
+        count = listed.len(),
+    )
+}
+
+/// The first normalized tag as a section eyebrow above the title, linking to its `/tag/{slug}`
+/// listing (the exact parse the footer chips use). Untagged posts render nothing.
+fn render_reader_eyebrow(raw_tags: &str) -> String {
+    let tags = crate::tags::parse_tags(raw_tags);
+    match tags.first() {
+        Some(tag) => format!(
+            r#"<p class="article__eyebrow"><a href="/tag/{slug}">{label}</a></p>"#,
+            slug = esc(&crate::tags::tag_slug(tag)),
+            label = esc(tag),
+        ),
+        None => String::new(),
+    }
+}
+
+/// The reader byline: avatar, author, machine-readable `<time>` publication date, reading time,
+/// an "Updated" date when the post was revised on a later calendar day, and the owner-facing
+/// state badge. A pure function of the post row (plus `now` for the existing badge), so the
+/// anonymous representation stays cacheable and deterministic.
+fn render_reader_byline(post: &Post, now: i64) -> String {
+    let updated = if post.updated_at > post.created_at
+        && fmt_date(post.updated_at) != fmt_date(post.created_at)
+    {
+        format!(
+            r#" · Updated <time datetime="{iso}">{human}</time>"#,
+            iso = esc(&fmt_date_iso(post.updated_at)),
+            human = esc(&fmt_date(post.updated_at)),
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<div class="ink-byline"><span class="ink-avatar ink-avatar--lg">{initial}</span><div class="ink-byline__col"><span class="ink-byline__author">{author}</span><span class="ink-byline__meta"><time datetime="{iso}">{date}</time> · {mins} min read{updated}{state}</span></div></div>"#,
+        initial = esc(&author_initial(&post.author_email)),
+        author = esc(&post.author_email),
+        iso = esc(&fmt_date_iso(post.created_at)),
+        date = esc(&fmt_date(post.created_at)),
+        mins = read_minutes(&post.body_md),
+        updated = updated,
+        state = state_badge(post, now),
+    )
+}
+
+/// Machine-readable `YYYY-MM-DD` UTC date for `<time datetime>`; pairs with [`fmt_date`]'s
+/// human-readable form.
+fn fmt_date_iso(secs: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp(secs)
+        .map(|dt| {
+            format!(
+                "{year:04}-{month:02}-{day:02}",
+                year = dt.year(),
+                month = u8::from(dt.month()),
+                day = dt.day(),
+            )
+        })
+        .unwrap_or_else(|_| secs.to_string())
 }
 
 fn read_minutes(body_md: &str) -> u64 {

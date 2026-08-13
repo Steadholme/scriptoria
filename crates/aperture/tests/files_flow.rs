@@ -797,6 +797,76 @@ async fn public_file_share_room_is_product_owned_and_escapes_remote_names() {
 }
 
 #[tokio::test]
+async fn forced_colors_keeps_explorer_and_share_room_state_visible() {
+    // Windows High Contrast (forced-colors: active) strips author backgrounds and
+    // box-shadows, so selection, focus, and progress state must survive on borders,
+    // outlines, and CSS system colors. The layer is additive: regular-mode rules
+    // stay untouched.
+    let app = app(build_dev_state());
+
+    // Explorer: service.css ships inline through {{CSS}}, so the signed-in gallery
+    // carries the forced-colors layer.
+    let gallery = send(&app, get("/", Some("alice"))).await;
+    assert_eq!(gallery.status, StatusCode::OK);
+    let html = gallery.text();
+    assert!(
+        html.contains("@media (forced-colors: active)"),
+        "Explorer must ship a forced-colors treatment layer"
+    );
+    // Focus: box-shadow rings are stripped, so focus gains a solid outline.
+    assert!(html.contains("outline: 2px solid CanvasText; outline-offset: 2px; box-shadow: none;"));
+    // The active view toggle re-expresses selection through system selection
+    // colors, anchored on the aria-pressed state the markup already maintains.
+    assert!(html.contains(".view-toggle__btn[aria-pressed=\"true\"]"));
+    assert!(html.contains("background: SelectedItem; color: SelectedItemText;"));
+    // Selected and Inspector-focused cards keep a visible outline; the floating
+    // bulk bar keeps a border and its disabled buttons stop relying on opacity.
+    assert!(html.contains(
+        ".file-card.is-selected, .folder-tile.is-selected { outline: 3px solid Highlight;"
+    ));
+    assert!(html.contains(".file-card.is-inspected { outline: 3px dotted Highlight;"));
+    assert!(html.contains(".ap-bulk.is-enhanced.has-selection { border: 2px solid Highlight; }"));
+    assert!(html.contains(
+        ".ap-bulk button:disabled { color: GrayText; border-color: GrayText; opacity: 1; }"
+    ));
+    // The Inspector drawer keeps a visible boundary when the scrim flattens.
+    assert!(html.contains(".ap-preview__panel { border-left: 3px solid CanvasText; }"));
+    // Usage and upload fills are length-as-information: they keep author colors
+    // inside a system-color track instead of vanishing with the theme.
+    assert!(html.contains(".usage-meter__track { border: 1px solid CanvasText; }"));
+    assert!(html.contains(".dropzone__bar { background: Highlight; forced-color-adjust: none; }"));
+
+    // Share Room: the strict-CSP external stylesheet carries its own layer on the
+    // anonymous asset route.
+    let asset = send(&app, get("/s/share-room.css", None)).await;
+    assert_eq!(asset.status, StatusCode::OK);
+    let css = asset.text();
+    assert!(
+        css.contains("@media (forced-colors: active)"),
+        "Share Room must ship a forced-colors treatment layer"
+    );
+    // The old translucent focus ring is gone in every mode; focus is solid.
+    assert!(!css.contains("rgba(56, 89, 217, .34)"));
+    assert!(css.contains("outline: 3px solid rgb(56, 89, 217);"));
+    assert!(css.contains("[data-ap-share-room] :focus-visible { outline: 3px solid CanvasText; }"));
+    // Primary and secondary buttons differ by border weight, not color alone.
+    assert!(css.contains("[data-ap-share-room] .sr-button--primary { border-width: 3px; }"));
+    // Upload progress keeps its length meaning; failed items gain a border edge
+    // on top of the existing Retry text affordance.
+    assert!(css.contains(
+        ".sr-queue__progress { border: 1px solid CanvasText; forced-color-adjust: none; }"
+    ));
+    assert!(css.contains(".sr-queue__item.is-error { border-inline-start: 4px solid CanvasText; }"));
+    assert!(css.contains("[data-ap-share-room] .sr-retry { text-decoration: underline; }"));
+    // Drag hover flips border-style instead of relying on color.
+    assert!(css.contains(".sr-dropzone.is-over { border-style: solid; border-width: 3px; }"));
+    // The lightbox dialog keeps a visible panel boundary.
+    assert!(
+        css.contains("[data-ap-share-room] .sr-dialog__panel { border: 3px solid CanvasText; }")
+    );
+}
+
+#[tokio::test]
 async fn share_expiry_returns_410_after_expiry() {
     let state = build_dev_state();
     let store: Arc<dyn Store> = state.store.clone();

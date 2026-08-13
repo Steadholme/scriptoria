@@ -666,6 +666,159 @@ async fn cover_image_renders_on_card_and_article_and_rejects_foreign_host() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "non-estate cover rejected");
 }
 
+#[tokio::test]
+async fn reader_long_post_gets_contents_nav_unique_anchors_and_wayfinding() {
+    let state = build_dev_state();
+    let md = "Intro.\n\n## Alpha\n\nA1.\n\n### Gamma\n\nG1.\n\n## Beta\n\nB1.\n\n## Alpha\n\nA2.";
+    let body = form(&[
+        ("title", "Way Finder"),
+        ("body", md),
+        ("tags", "Rust, async"),
+        ("published", "on"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, _) = call(
+        &state,
+        post_csrf("/new", &body, Some(("u_alice", "alice@hf"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    // The reader chrome (anchors, contents nav, eyebrow, footnav) is a pure function of the
+    // post row, so the anonymous representation keeps the public cache contract untouched.
+    let response = app(state.clone())
+        .oneshot(get("/p/way-finder"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers().get(header::CACHE_CONTROL).is_none(),
+        "anonymous article with contents nav keeps public cache semantics"
+    );
+    assert_eq!(response.headers().get(header::VARY).unwrap(), PUBLIC_VARY);
+    assert!(
+        response.headers().get(header::SET_COOKIE).is_none(),
+        "reader wayfinding never mints a cookie"
+    );
+    let article = String::from_utf8(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+
+    // Deterministic anchors: slug ids in document order, duplicate "Alpha" de-duplicated.
+    assert!(article.contains(r#"<h2 id="alpha">Alpha</h2>"#));
+    assert!(article.contains(r#"<h3 id="gamma">Gamma</h3>"#));
+    assert!(article.contains(r#"<h2 id="beta">Beta</h2>"#));
+    assert!(
+        article.contains(r#"<h2 id="alpha-2">Alpha</h2>"#),
+        "duplicate heading gets a unique -2 anchor"
+    );
+
+    // SSR contents navigation: native <details>, labelled nav, links matching the anchors.
+    assert!(article.contains(r#"<details class="article-toc">"#));
+    assert!(article.contains(r#"aria-label="Article sections""#));
+    assert!(article.contains("4 sections"));
+    assert!(article.contains(r##"href="#alpha""##));
+    assert!(article.contains(r##"href="#alpha-2""##));
+    assert!(article.contains(r##"href="#beta""##));
+    assert!(article.contains(r##"href="#gamma""##));
+    assert!(
+        article.contains(r#"class="article-toc__item article-toc__item--h3""#),
+        "h3 entries carry the indented modifier"
+    );
+
+    // Semantic metadata: first-tag eyebrow + machine-readable publication date.
+    assert!(article.contains(r#"class="article__eyebrow""#));
+    assert!(article.contains(r#"href="/tag/rust""#));
+    assert!(article.contains(r#"<time datetime=""#));
+
+    // Footer wayfinding: labelled nav whose back-to-top target exists on the page.
+    assert!(article.contains(r#"aria-label="Article navigation""#));
+    assert!(article.contains(r##"href="#article-top""##));
+    assert!(article.contains(r#"id="article-top""#));
+}
+
+#[tokio::test]
+async fn reader_short_post_keeps_anchors_but_skips_contents_nav() {
+    let state = build_dev_state();
+    let md = "Intro.\n\n## One\n\nx.\n\n## Two\n\ny.";
+    let body = form(&[
+        ("title", "Short Walk"),
+        ("body", md),
+        ("published", "on"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, _) = call(
+        &state,
+        post_csrf("/new", &body, Some(("u_alice", "alice@hf"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let (status, article) = call(&state, get("/p/short-walk")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        article.contains(r#"<h2 id="one">One</h2>"#),
+        "deep-link anchors are injected regardless of length"
+    );
+    assert!(
+        !article.contains(r#"<details class="article-toc">"#),
+        "fewer than 3 sections -> no contents fold"
+    );
+    assert!(
+        article.contains(r#"aria-label="Article navigation""#),
+        "footer wayfinding is independent of article length"
+    );
+}
+
+#[tokio::test]
+async fn reader_toc_and_anchors_escape_hostile_headings() {
+    let state = build_dev_state();
+    let md = "## Attack <img src=x onerror=alert(1)>\n\nx.\n\n## <script>alert(2)</script>\n\ny.\n\n## \"Quoted\" & <Tag>\n\nz.";
+    let body = form(&[
+        ("title", "Hostile Headings"),
+        ("body", md),
+        ("published", "on"),
+        ("csrf_token", CSRF),
+    ]);
+    let (status, _) = call(
+        &state,
+        post_csrf("/new", &body, Some(("u_alice", "alice@hf"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let (status, article) = call(&state, get("/p/hostile-headings")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Sanitizer boundary holds in the body AND in the contents nav: no live hostile tags.
+    assert!(!article.contains("<img src=x"), "no live img tag");
+    assert!(!article.contains("<script>alert(2)"), "no live script tag");
+    assert!(
+        article.contains("&lt;img src=x onerror=alert(1)&gt;"),
+        "hostile img shown as escaped text in the body"
+    );
+    assert!(article.contains("&lt;script&gt;"));
+
+    // Outline labels collect only text content; anchor ids stay plain ASCII slugs.
+    assert!(article.contains(r#"<h2 id="attack">"#));
+    assert!(article.contains(r##"href="#attack""##));
+    assert!(
+        article.contains(">Attack</a>"),
+        "contents label omits the raw-html payload entirely"
+    );
+    assert!(article.contains(r##"href="#alert-2""##));
+    assert!(article.contains(r##"href="#quoted""##));
+    assert!(
+        article.contains("&quot;Quoted&quot; &amp;</a>"),
+        "contents label is entity-escaped"
+    );
+    assert!(article.contains("3 sections"));
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------

@@ -2050,3 +2050,53 @@ body.has-preview { overflow:hidden; }
   .ap-inspector__stage .preview-pdf { min-height:260px; max-height:42vh; height:42vh; }
   .ap-inspector__content { padding:12px; }
 }
+
+/* ============================================================================
+   S12 forced-colors (Windows High Contrast / forced-colors: active)
+   状态语义全部改由 border/outline/系统色表达；不改任何常规模式规则。
+   ============================================================================ */
+@media (forced-colors: active) {
+  /* 焦点：box-shadow 会被剥离，统一补实色 outline */
+  input:focus-visible, textarea:focus-visible, select:focus-visible,
+  .ap-library-search__field:focus-within,
+  .ap-preview__close:focus-visible,
+  a:focus-visible, button:focus-visible, summary:focus-visible {
+    outline: 2px solid CanvasText; outline-offset: 2px; box-shadow: none;
+  }
+
+  /* View toggle：激活按钮用选中系统色，双按钮加边框分隔 */
+  .view-toggle, .view-toggle__btn { border: 1px solid ButtonText; }
+  .view-toggle__btn[aria-pressed="true"],
+  .view-toggle__btn.is-active {
+    background: SelectedItem; color: SelectedItemText;
+    forced-color-adjust: none; outline: 1px solid SelectedItemText; outline-offset: -3px;
+  }
+
+  /* 选中卡片 / Inspector 回指卡片 */
+  .file-card.is-selected, .folder-tile.is-selected { outline: 3px solid Highlight; outline-offset: 1px; }
+  .file-card.is-inspected { outline: 3px dotted Highlight; outline-offset: 1px; }
+  .ap-select { border: 1px solid CanvasText; }
+
+  /* Bulk 栏浮层与禁用 */
+  .ap-bulk.is-enhanced.has-selection { border: 2px solid Highlight; }
+  .ap-bulk button:disabled { color: GrayText; border-color: GrayText; opacity: 1; }
+
+  /* 当前导航行：背景不可用，改 inset 侧边 + 系统选中色 */
+  .ap-nav__row.is-active, .ap-nav__row[aria-current="page"],
+  .folder-item--active, .ap-tree__row.is-active, .request-filter.is-active {
+    background: SelectedItem; color: SelectedItemText; forced-color-adjust: none;
+  }
+
+  /* Inspector 抽屉：给弹层一条可见界与更强 scrim 替代 */
+  .ap-preview__panel { border-left: 3px solid CanvasText; }
+  .ap-preview__bar { border-bottom: 2px solid CanvasText; }
+
+  /* 用量计：长度即信息，保留自绘 */
+  .usage-meter__track { border: 1px solid CanvasText; }
+  .usage-meter__fill, .usage-meter__fill--warn,
+  .dropzone__bar { background: Highlight; forced-color-adjust: none; }
+
+  /* 拖拽态：用 border-style 变化（dashed→solid）表达，不靠颜色 */
+  .dropzone.dragging .dropzone__label, .dropzone.has-file .dropzone__label { border-style: solid; border-width: 3px; }
+  .ap-dropscrim::before { border: 3px solid Highlight; }
+}
