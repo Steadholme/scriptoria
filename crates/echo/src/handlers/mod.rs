@@ -16,7 +16,7 @@ use axum::response::{IntoResponse, Response};
 /// Echo's complete product-owned visual system.
 pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
 
-pub const APP_CSS_PATH: &str = "/assets/echo-20260823.css";
+pub const APP_CSS_PATH: &str = "/assets/echo-20260908.css";
 
 static APP_CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 

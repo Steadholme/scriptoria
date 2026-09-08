@@ -22,7 +22,7 @@ use std::sync::OnceLock;
 /// Aperture's complete product-owned visual system.
 pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
 
-pub const APP_CSS_PATH: &str = "/assets/aperture-20260823.css";
+pub const APP_CSS_PATH: &str = "/assets/aperture-20260908.css";
 pub const SHARE_ROOM_CSS_PATH: &str = "/s/share-room-20260821.css";
 pub const SHARE_ROOM_JS_PATH: &str = "/s/share-room-20260821.js";
 

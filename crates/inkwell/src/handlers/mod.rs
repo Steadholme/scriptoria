@@ -20,7 +20,7 @@ use axum::response::{IntoResponse, Response};
 /// Odyssey's CSS so the publishing product owns its typography, material, and components.
 pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
 
-pub const APP_CSS_PATH: &str = "/assets/inkwell-20260822-v3.css";
+pub const APP_CSS_PATH: &str = "/assets/inkwell-20260908.css";
 
 static APP_CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 

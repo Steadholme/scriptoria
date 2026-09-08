@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 /// Complete, product-owned Lattice visual system.
 const SERVICE_CSS: &str = include_str!("../static/service.css");
 
-pub const APP_CSS_PATH: &str = "/assets/lattice-20260822-v2.css";
+pub const APP_CSS_PATH: &str = "/assets/lattice-20260908.css";
 
 static APP_CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 

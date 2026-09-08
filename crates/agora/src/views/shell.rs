@@ -22,7 +22,7 @@ use super::{crumbs, escape, hidden_inputs, t};
 /// Complete, product-owned Agora visual system.
 pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
 
-pub const APP_CSS_PATH: &str = "/assets/agora-20260822-v2.css";
+pub const APP_CSS_PATH: &str = "/assets/agora-20260908.css";
 
 /// Page shell with `{{STYLE}}`/`{{DYNAMIC}}`/`{{APPBAR}}`/`{{TITLE}}`/`{{CONTENT}}` slots.
 pub const SHELL: &str = include_str!("../../templates/shell.html");
