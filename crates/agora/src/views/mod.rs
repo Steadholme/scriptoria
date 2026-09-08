@@ -479,7 +479,7 @@ pub(crate) fn thread_list(rows: &str, empty: Option<String>) -> String {
 }
 
 // ===========================================================================
-// Posts — the Speaker Floor (OP) and Reply Steps share one renderer; the Answer Dais reuses it
+// Posts — the original post and replies share one renderer; the accepted answer reuses it
 // with an explicit acceptance caveat and no chronological placement.
 // ===========================================================================
 
@@ -641,7 +641,7 @@ fn post_actions(a: &crate::view_model::PostActionsVM) -> String {
     out
 }
 
-/// The Answer Dais: one valid accepted reply, rendered ONCE directly below the original post and
+/// The accepted answer: one valid accepted reply, rendered ONCE directly below the original post and
 /// excluded from ordinary chronology. The caveat states acceptance meaning only — never
 /// "correct", "verified", "best", or "newest".
 pub(crate) fn answer_dais(d: &AnswerDaisVM, now: i64) -> String {
@@ -652,7 +652,7 @@ pub(crate) fn answer_dais(d: &AnswerDaisVM, now: i64) -> String {
     };
     format!(
         r#"<section class="ag-dais ag-key-shared" aria-labelledby="ag-dais-title">
-  <h2 class="eyebrow ag-eyebrow" id="ag-dais-title">Answer Dais</h2>
+  <h2 class="eyebrow ag-eyebrow" id="ag-dais-title">Accepted answer</h2>
   <p class="ag-dais__caveat">{caveat}</p>
   {post}
 </section>"#,
@@ -697,7 +697,7 @@ pub(crate) fn pagination(p: &PaginationVM) -> String {
         })
         .unwrap_or_default();
     format!(
-        r#"<nav class="ag-page" aria-label="Pagination"><span class="ag-page__bound">Page bound {limit}</span>{edge}<span class="ag-page__links">{jump}{newer}{older}</span></nav>"#,
+        r#"<nav class="ag-page" aria-label="Pagination"><span class="ag-page__bound">Up to {limit} per page</span>{edge}<span class="ag-page__links">{jump}{newer}{older}</span></nav>"#,
         limit = p.visible_limit,
         edge = edge,
         jump = jump,

@@ -27,9 +27,9 @@ use crate::auth::{self, Identity};
 use crate::config::{clamp_page, effective_quota, Config};
 use crate::error::AppError;
 use crate::handlers::{
-    app_css, dynamic_js, esc, expiry_options, fmt_ts, human_size, parse_expiry,
-    render_share_room_error, resolve_content_type, safe_filename, share_room_html,
-    share_room_html_with_csrf, sniff_verified_upload_type, userbox, FILE_SVG, SHIELD_SVG,
+    dynamic_js, esc, expiry_options, fmt_ts, human_size, parse_expiry, render_share_room_error,
+    resolve_content_type, safe_filename, share_room_html, share_room_html_with_csrf,
+    sniff_verified_upload_type, userbox, FILE_SVG, SHIELD_SVG,
 };
 use crate::model::{
     library_type_for, FileComment, FileRec, FolderRec, LibraryCursor, LibraryItem, LibraryItemKind,
@@ -1842,7 +1842,7 @@ fn delivery_receipt_unavailable() -> Response {
 
 fn delivery_receipt_message(title: &str, message: &str) -> String {
     format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><link rel=\"icon\" href=\"data:,\"><link rel=\"stylesheet\" href=\"/s/share-room.css\"><title>{title} · Aperture</title></head><body data-ap-share-room data-ap-surface=\"receipt\"><main class=\"sr-shell\"><section class=\"sr-card\"><p class=\"sr-eyebrow\">Delivery receipt</p><h1>{title}</h1><p class=\"sr-summary\">{message}</p></section></main></body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><link rel=\"icon\" href=\"data:,\"><link rel=\"stylesheet\" href=\"/s/share-room-20260821.css\"><title>{title} · Aperture</title></head><body data-ap-share-room data-ap-surface=\"receipt\"><main class=\"sr-shell\"><section class=\"sr-card\"><p class=\"sr-eyebrow\">Delivery receipt</p><h1>{title}</h1><p class=\"sr-summary\">{message}</p></section></main></body></html>",
         title = esc(title),
         message = esc(message),
     )
@@ -3709,7 +3709,7 @@ fn render_folder_tiles(children: &[&FolderRec], up_href: Option<&str>) -> String
     if let Some(href) = up_href {
         out.push_str(&format!(
             "<li class=\"folder-tile file-card file-card--folder file-card--up\">\
-               <a class=\"file-card__link\" href=\"{href}\">\
+               <a class=\"file-card__link\" href=\"{href}\" aria-label=\"Up one level\">\
                  <span class=\"thumb thumb--folder\">{FOLDER_UP_SVG}</span>\
                </a>\
                <div class=\"file-card__body folder-tile__body\">\
@@ -3734,7 +3734,7 @@ fn render_folder_tiles(children: &[&FolderRec], up_href: Option<&str>) -> String
         out.push_str(&format!(
             "<li class=\"folder-tile file-card file-card--folder\">\
                <label class=\"ap-select\" title=\"Select {name}\"><span class=\"sr-only\">Select {name}</span><input type=\"checkbox\" name=\"item:folder:{id}\" value=\"1\" form=\"bulkSelection\" data-bulk-item></label>\
-               <a class=\"file-card__link\" href=\"{href}\">\
+               <a class=\"file-card__link\" href=\"{href}\" aria-label=\"Open folder {name}\">\
                  <span class=\"thumb thumb--folder\">{FOLDER_SVG}</span>\
                </a>\
                <div class=\"file-card__body folder-tile__body\">\
@@ -3907,7 +3907,7 @@ fn render_library_cards(
                 LibraryItemKind::Folder => format!(
                     "<li class=\"file-card file-card--folder ap-library-item\">\
                        <label class=\"ap-select\" title=\"Select {name}\"><span class=\"sr-only\">Select {name}</span><input type=\"checkbox\" name=\"item:folder:{id}\" value=\"1\" form=\"bulkSelection\" data-bulk-item></label>\
-                       <a class=\"file-card__link\" href=\"/?folder={id}\"><span class=\"thumb thumb--folder\">{folder_svg}</span></a>\
+                       <a class=\"file-card__link\" href=\"/?folder={id}\" aria-label=\"Open folder {name}\"><span class=\"thumb thumb--folder\">{folder_svg}</span></a>\
                        <div class=\"file-card__body\">\
                          <div class=\"ap-name-row\"><a class=\"file-card__name\" href=\"/?folder={id}\" title=\"{name}\">{name}</a></div>\
                          <div class=\"file-card__meta\">{badges}<span class=\"ap-location\">In {location}</span><time class=\"ap-date\" data-spark-reltime data-ts=\"{ts}\" title=\"{updated}\">{updated}</time></div>\
@@ -3947,7 +3947,7 @@ fn render_library_cards(
                     format!(
                         "<li class=\"file-card file-card--{file_type} ap-library-item\" data-file-id=\"{id}\">\
                            <label class=\"ap-select\" title=\"Select {name}\"><span class=\"sr-only\">Select {name}</span><input type=\"checkbox\" name=\"item:file:{id}\" value=\"1\" form=\"bulkSelection\" data-bulk-item></label>\
-                           <a class=\"file-card__link\" href=\"/f/{id}\" data-wire-off data-inspector-link>{thumb}</a>\
+                           <a class=\"file-card__link\" href=\"/f/{id}\" data-wire-off data-inspector-link aria-label=\"Open {name}\">{thumb}</a>\
                            <div class=\"file-card__body\">\
                              <div class=\"ap-name-row\"><span class=\"ap-glyph {tone}\">{ext}</span><a class=\"file-card__name\" href=\"/f/{id}\" title=\"{name}\" data-wire-off data-inspector-link>{name}</a></div>\
                              <div class=\"file-card__meta\">{badges}<span class=\"ap-size\">{size}</span><span class=\"ap-location\">In {location}</span><time class=\"ap-date\" data-spark-reltime data-ts=\"{ts}\" title=\"{updated}\">{updated}</time></div>\
@@ -4020,7 +4020,6 @@ fn render_library_gallery(input: LibraryRender<'_>) -> String {
     let upload = render_upload_form(input.csrf, "");
 
     GALLERY_HTML
-        .replace("{{CSS}}", app_css())
         .replace("{{DYNAMIC}}", dynamic_js())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Drive", Some(&input.who.email)))
@@ -4121,7 +4120,7 @@ fn render_gallery(
             ("This folder is empty.", "")
         };
         format!(
-            "<li class=\"file-card file-card--empty ap-empty{class}\"><div class=\"ap-empty__art\" aria-hidden=\"true\"></div><h3>{title}</h3><p>Drag a file anywhere or use Upload file.</p></li>",
+            "<li class=\"file-card file-card--empty ap-empty{class}\"><div class=\"ap-empty__art\" aria-hidden=\"true\"></div><h3>{title}</h3><p>Drag a file anywhere, or choose one from the left.</p></li>",
             class = class,
             title = title,
         )
@@ -4139,7 +4138,6 @@ fn render_gallery(
     };
 
     GALLERY_HTML
-        .replace("{{CSS}}", app_css())
         .replace("{{DYNAMIC}}", dynamic_js())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Drive", Some(&who.email)))
@@ -4180,13 +4178,13 @@ fn render_upload_form(csrf: &str, folder_id: &str) -> String {
           <div class=\"ap-new__pick\">\
             <label for=\"fileInput\" class=\"ap-newbtn\">\
               <span class=\"ap-newbtn__plus\" aria-hidden=\"true\">+</span>\
-              <span>New / Upload</span>\
+              <span>Choose a file</span>\
             </label>\
             <input id=\"fileInput\" class=\"dropzone__input\" type=\"file\" name=\"file\" required>\
-            <span id=\"fileName\" class=\"dropzone__hint\">Nothing selected yet</span>\
+            <span id=\"fileName\" class=\"dropzone__hint\" aria-live=\"polite\">No file selected</span>\
           </div>\
           <div class=\"dropzone__actions\">\
-            <button class=\"btn btn-secondary btn-sm\" type=\"submit\">Upload</button>\
+            <button class=\"btn btn-primary btn-sm\" type=\"submit\">Upload to this folder</button>\
           </div>\
           <div class=\"dropzone__progress ap-upload-progress\" id=\"uploadProgress\" role=\"progressbar\" aria-label=\"Upload progress\" aria-valuemin=\"0\" aria-valuemax=\"100\" hidden>\
             <div class=\"dropzone__bar\" id=\"uploadBar\"></div>\
@@ -4270,7 +4268,6 @@ fn render_trash_gallery(input: TrashRender<'_>) -> String {
     let breadcrumb =
         "<nav class=\"breadcrumb\" aria-label=\"Folder path\"><a class=\"breadcrumb__crumb\" href=\"/\">My Drive</a><span class=\"breadcrumb__sep\" aria-hidden=\"true\">&rsaquo;</span><span class=\"breadcrumb__here\">Trash</span></nav>";
     GALLERY_HTML
-        .replace("{{CSS}}", app_css())
         .replace("{{DYNAMIC}}", dynamic_js())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Drive", Some(&input.who.email)))
@@ -4809,7 +4806,7 @@ fn render_cards(files: &[FileRec], csrf: &str, held_file_ids: &HashSet<String>) 
             format!(
                 "<li class=\"file-card file-card--{kind}{media_class}\" id=\"file-{id}\" data-file-id=\"{id}\">\
                    <label class=\"ap-select\" title=\"Select {name}\"><span class=\"sr-only\">Select {name}</span><input type=\"checkbox\" name=\"item:file:{id}\" value=\"1\" form=\"bulkSelection\" data-bulk-item></label>\
-                   <a class=\"file-card__link\" href=\"/f/{id}\" data-wire-off data-inspector-link>{thumb}</a>\
+                   <a class=\"file-card__link\" href=\"/f/{id}\" data-wire-off data-inspector-link aria-label=\"Open {name}\">{thumb}</a>\
                    <div class=\"file-card__body\">\
                      <div class=\"ap-name-row\"><span class=\"ap-glyph {tone}\" aria-hidden=\"true\">{ext}</span><a class=\"file-card__name\" href=\"/f/{id}\" title=\"{name}\" data-file-name data-wire-off data-inspector-link>{name}</a></div>\
                      <div class=\"file-card__meta\">{badges}<span class=\"ap-size\">{size}</span><time class=\"ap-date\" data-spark-reltime data-ts=\"{created_ts}\" title=\"{date}\">{date}</time></div>\
@@ -5361,7 +5358,6 @@ fn render_detail(ctx: DetailRender<'_>) -> String {
     );
 
     DETAIL_HTML
-        .replace("{{CSS}}", app_css())
         .replace("{{DYNAMIC}}", dynamic_js())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Drive", Some(&viewer.email)))

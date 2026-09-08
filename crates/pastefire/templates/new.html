@@ -3,10 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
+  <meta name="color-scheme" content="dark">
   <link rel="icon" href="data:,">
   <title>New paste · Pastefire · Steadholme</title>
-  <style>{{CSS}}</style>
+  <link rel="stylesheet" href="/assets/pastefire-20260823.css">
 </head>
 <body class="page-console">
   <header class="appbar">
@@ -24,7 +24,7 @@
   <main class="console">
     <div class="console__head">
       <h1>New paste</h1>
-      <p class="sub">Share code and text. Burn, protect, expire.</p>
+      <p class="sub">Share code or text with a clear lifetime and access policy.</p>
     </div>
     <div class="layout">
       <section class="card compose" data-spark>
@@ -32,11 +32,12 @@
           {{ERROR}}
           <form method="post" action="/" id="composeForm">
             <input type="hidden" name="csrf_token" value="{{CSRF}}">
+            <label class="sr-only" for="title">Paste title</label>
             <input class="compose__title" type="text" name="title" id="title" maxlength="200" data-spark-charcount
                    placeholder="Untitled paste — optional title" value="{{TITLE_VALUE}}" autocomplete="off">
-            <div class="pf-files" id="fileEditor">{{FILE_ROWS}}</div>
-            <button type="button" class="btn btn-ghost pf-addfile" id="addFileBtn">+ Add file</button>
-            <fieldset class="pf-options">
+            <fieldset class="pf-options" aria-describedby="sharingHelp">
+              <legend>Sharing and retention</legend>
+              <p class="pf-options__intro" id="sharingHelp">Set the format, lifetime, and access rules before adding content.</p>
               <div class="pf-opt">
                 <label for="language">Language</label>
                 <select class="select select--bar" name="language" id="language" aria-label="Language">{{LANGUAGE_OPTIONS}}</select>
@@ -45,20 +46,23 @@
                 <label for="expiry">Expiry</label>
                 <select class="select select--bar" name="expiry" id="expiry" aria-label="Expiry">{{EXPIRY_OPTIONS}}</select>
               </div>
-              <label class="pf-burn"><input type="checkbox" name="burn" value="on"{{BURN_CHECKED}}><span>Burn after read</span></label>
-              <span class="pf-burn__hint">Destroyed the moment it is first viewed — one reader, once.</span>
               <div class="pf-opt pf-opt--wide">
                 <label for="password">Password <span class="field-hint">optional</span></label>
                 <input class="input" type="password" name="password" id="password" autocomplete="new-password">
               </div>
+              <label class="pf-burn"><input type="checkbox" name="burn" value="on" aria-describedby="burnHelp"{{BURN_CHECKED}}><span class="pf-burn__label">Delete after the first recipient view <b class="pf-risk">Permanent</b></span></label>
+              <span class="pf-burn__hint" id="burnHelp">The first non-owner who opens this paste consumes it. The link stops working immediately and this cannot be undone.</span>
             </fieldset>
+            <div class="pf-editor-intro"><h2>Content</h2><span>Add one file, or group several related files in the same paste.</span></div>
+            <div class="pf-files" id="fileEditor">{{FILE_ROWS}}</div>
+            <button type="button" class="btn btn-ghost pf-addfile" id="addFileBtn">+ Add another file</button>
             <div class="pf-actions">
               <span class="pf-kbd">Ctrl + Enter</span>
               <button type="submit" class="btn btn-primary" title="Ctrl+Enter">Create paste</button>
             </div>
           </form>
 
-          <template id="fileRowTemplate"><div class="pf-file" data-file-row><div class="pf-file__head"><input class="pf-file__name" type="text" name="file_name" maxlength="128" value="" placeholder="Filename including extension (optional)" autocomplete="off"><button class="btn btn-ghost btn-sm editor__remove" type="button" data-file-remove>Remove</button></div><textarea name="file_content" class="code-input pf-editor" spellcheck="false" autocomplete="off" placeholder="Paste your content here…"></textarea></div></template>
+          <template id="fileRowTemplate"><div class="pf-file" data-file-row><div class="pf-file__head"><input class="pf-file__name" type="text" name="file_name" maxlength="128" value="" aria-label="Filename" placeholder="Filename including extension (optional)" autocomplete="off"><button class="btn btn-ghost btn-sm editor__remove" type="button" data-file-remove>Remove file</button></div><textarea name="file_content" class="code-input pf-editor" spellcheck="false" autocomplete="off" aria-label="File content" placeholder="Paste your content here…"></textarea></div></template>
         </div>
       </section>
       <aside class="rail">

@@ -14,7 +14,7 @@ name = "inkwell"
 path = "src/main.rs"
 
 [dependencies]
-# Odyssey canonical design system (vendored path-dep): its APP_CSS is prepended to service.css.
+# Odyssey remains available for nonvisual gateway and preference helpers.
 odyssey = { path = "../odyssey" }
 # HTTP framework (shared with keystone/keyward/beacon): Form/State/Path extractors, typed responses.
 axum = "0.8"

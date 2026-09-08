@@ -3,32 +3,44 @@
 //! `health` is the unauthenticated liveness probe; `comments` carries the dashboard, the thread
 //! view, the embeddable view, and the SSO+CSRF comment/moderate flow.
 //!
-//! The shared design tokens / CSS are embedded (via `include_str!`) and inlined into every page,
-//! matching the Steadholme enterprise brand (the same look as the Keystone/inkwell UI): brand
-//! gradient, indigo accent, cards, app-bar.
+//! Echo's product-owned design tokens / CSS are embedded (via `include_str!`) and served to every
+//! page. Nonvisual gateway and identity helpers remain shared without owning Echo's presentation.
 
 pub mod admin;
 pub mod comments;
 pub mod health;
 
-use axum::http::StatusCode;
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 
-/// Echo-only CSS layered after Odyssey's canonical font, tokens, and components.
+/// Echo's complete product-owned visual system.
 pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
+
+pub const APP_CSS_PATH: &str = "/assets/echo-20260823.css";
 
 static APP_CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// Embedded design system, inlined into each rendered page's `<style>`:
-/// Odyssey's canonical CSS followed by Echo's service surface CSS.
+/// Complete, product-owned Echo visual system.
 pub fn app_css() -> &'static str {
-    APP_CSS
-        .get_or_init(|| {
-            let mut css = String::with_capacity(odyssey::APP_CSS.len() + SERVICE_CSS.len());
-            css.push_str(odyssey::APP_CSS);
-            css.push_str(SERVICE_CSS);
-            css
-        })
-        .as_str()
+    APP_CSS.get_or_init(|| SERVICE_CSS.to_owned()).as_str()
+}
+
+pub async fn app_css_asset() -> Response {
+    let mut response = app_css().into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/css; charset=utf-8"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 
 /// Cross-subdomain gateway logout (Echo lives at comments.w33d.xyz; the IdP is at id.w33d.xyz).
@@ -49,12 +61,16 @@ pub fn esc(s: &str) -> String {
 /// The Echo (Comments) app-tile icon — a Lucide-style `messages-square` glyph.
 pub const APP_ICON: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 9a2 2 0 0 1-2 2H6l-4 4V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2z"/><path d="M18 9h2a2 2 0 0 1 2 2v11l-4-4h-6a2 2 0 0 1-2-2v-1"/></svg>"##;
 
-/// Render the shared Odyssey v2 app-bar: the Comments app-tile + name, the moderator nav (current
+/// Render Echo's app-bar: the Comments app-tile + name, the moderator nav (current
 /// marked `.is-active`), then the "All apps" waffle and the avatar user-menu (Account / All apps /
 /// the preserved gateway Sign-out). `page_title` selects the active nav item; `email` empty or `—`
 /// → a minimal, no-identity avatar (never breaks rendering).
 pub fn topbar(page_title: &str, email: &str) -> String {
-    let a_dash = if page_title == "Admin" { "" } else { " is-active" };
+    let a_dash = if page_title == "Admin" {
+        ""
+    } else {
+        " is-active"
+    };
     let nav = format!(
         concat!(
             r#"<nav class="appbar__nav" aria-label="Echo">"#,
@@ -170,9 +186,9 @@ pub fn error_page(status: StatusCode, message: &str) -> String {
         r#"<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="light">
+<meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:,">
-<title>{code} {reason} · Echo</title><style>{css}</style></head>
+<title>{code} {reason} · Echo</title><link rel="stylesheet" href="{css_path}"></head>
 <body class="page-reading">
 {topbar}
 <main class="reader">
@@ -184,7 +200,7 @@ pub fn error_page(status: StatusCode, message: &str) -> String {
   </div>
 </main>
 </body></html>"#,
-        css = app_css(),
+        css_path = APP_CSS_PATH,
         topbar = topbar("Echo", "—"),
         code = code,
         reason = esc(reason),

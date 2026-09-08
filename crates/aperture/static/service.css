@@ -1,13 +1,149 @@
-/* Aperture (Drive / image host) service surface, layered AFTER Odyssey canonical CSS.
-   The base kit (font + tokens + reset + shared components: app-bar, card, btn, pill,
-   field, stat, table, tabs, empty, toast, layout, pagehead, modal, pager, site-foot …)
-   now comes from odyssey::APP_CSS. This file keeps only Aperture (Drive / image host)'s own domain chrome and the
-   legacy-compat gap-fillers its templates/tests still reference. */
+/* Aperture — a light-first file workspace with stable navigation and contextual inspection.
+   This file owns the complete product visual system. */
 
-/* --- Token bridge: only the helper token canonical does not provide. Every shared
-   token (--accent/--bg/--surface/--ink/--sh-*/--r*/--sp-*/--ok-border …) is left to
-   canonical so it wins and future kit changes propagate. */
-:root { --accent-border: var(--accent-soft-2); }
+:root {
+  color-scheme: light;
+  --font: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  --bg: #f4f6f9;
+  --surface: #ffffff;
+  --surface-2: #f7f9fb;
+  --surface-3: #edf1f5;
+  --surface-soft: #f8fafc;
+  --ink: #17243a;
+  --ink-2: #46556b;
+  --ink-3: #6b778a;
+  --ink-4: #929baa;
+  --text: var(--ink);
+  --muted: var(--ink-3);
+  --accent: #315f9b;
+  --accent-2: #244c7d;
+  --accent-ink: #244c7d;
+  --accent-soft: #e4edf7;
+  --accent-soft-2: #cedced;
+  --accent-border: #b4c9e1;
+  --brand: #315f9b;
+  --brand-soft: #e4edf7;
+  --brand-ink: #244c7d;
+  --ring: rgba(49, 95, 155, .2);
+  --border: #dce2ea;
+  --border-2: #c5ced9;
+  --hairline: #e9edf2;
+  --hairline-strong: #c8d0da;
+  --ok-soft: #e4f4eb;
+  --ok-border: #a9d4ba;
+  --ok-ink: #1f6844;
+  --up-soft: #e4f4eb;
+  --up-border: #a9d4ba;
+  --up-ink: #1f6844;
+  --warn-soft: #fff5dc;
+  --warn-border: #e6ca84;
+  --warn-ink: #795410;
+  --down: #b53c4a;
+  --down-soft: #fdebed;
+  --down-border: #e7adb4;
+  --down-ink: #8c2d39;
+  --danger-ink: var(--down-ink);
+  --r: 14px;
+  --r-md: 12px;
+  --r-sm: 10px;
+  --r-xs: 7px;
+  --r-pill: 999px;
+  --radius: var(--r);
+  --radius-md: var(--r-md);
+  --radius-sm: var(--r-sm);
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --fs-sm: 13px;
+  --fs-h3: 18px;
+  --appbar-h: 64px;
+  --sh-xs: 0 1px 2px rgba(23, 36, 58, .06);
+  --sh-sm: 0 6px 18px rgba(23, 36, 58, .07);
+  --sh-md: 0 10px 30px rgba(23, 36, 58, .1);
+  --sh-lg: 0 22px 60px rgba(23, 36, 58, .16);
+  --sh-pop: 0 18px 48px rgba(23, 36, 58, .16);
+  --dur: 150ms;
+  --dur-slow: 240ms;
+  --ease: cubic-bezier(.2, .7, .2, 1);
+  --ease-out: cubic-bezier(.16, 1, .3, 1);
+}
+
+*, *::before, *::after { box-sizing:border-box; }
+html { min-height:100%; background:var(--bg); font-family:var(--font); }
+body { min-height:100%; margin:0; background:var(--bg); color:var(--ink); font:14px/1.5 var(--font); -webkit-font-smoothing:antialiased; }
+button, input, textarea, select { font:inherit; }
+button, summary, a { -webkit-tap-highlight-color:transparent; }
+a { color:var(--accent-ink); text-decoration:none; }
+a:hover { text-decoration:underline; text-underline-offset:3px; }
+:focus-visible { outline:3px solid var(--accent); outline-offset:3px; }
+.muted { color:var(--ink-3); }
+.sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
+
+.appbar {
+  position:sticky; top:0; z-index:50; min-height:var(--appbar-h); padding:8px 20px;
+  display:flex; align-items:center; gap:18px; background:rgba(255,255,255,.92);
+  border-bottom:1px solid var(--border); backdrop-filter:blur(18px);
+}
+.appbar__brand { min-height:46px; display:inline-flex; align-items:center; gap:10px; color:var(--ink); text-decoration:none; }
+.appbar__brand:hover { text-decoration:none; }
+.app-tile { width:38px; height:38px; display:grid; place-items:center; border-radius:11px; background:var(--brand); color:#fff; }
+.app-tile svg { width:21px; height:21px; }
+.appbar__name { display:grid; line-height:1.12; }
+.appbar__name b { font-size:14px; font-weight:750; }
+.appbar__name span { margin-top:3px; color:var(--ink-3); font-size:10.5px; }
+.appbar__nav, .appbar__right { display:flex; align-items:center; gap:6px; }
+.appbar__spacer { flex:1; }
+.appnav { min-height:44px; padding:0 12px; display:inline-flex; align-items:center; gap:7px; border-radius:10px; color:var(--ink-2); font-size:13px; font-weight:650; }
+.appnav svg { width:17px; height:17px; }
+.appnav:hover, .appnav.is-active { color:var(--brand-ink); background:var(--brand-soft); text-decoration:none; }
+.iconbtn { width:44px; height:44px; display:inline-grid; place-items:center; border-radius:10px; color:var(--ink-2); }
+.iconbtn:hover { color:var(--ink); background:var(--surface-2); text-decoration:none; }
+.iconbtn svg { width:19px; height:19px; }
+.usermenu { position:relative; }
+.usermenu__btn { min-height:44px; padding:4px 8px 4px 5px; display:flex; align-items:center; gap:8px; border:0; border-radius:11px; background:transparent; color:var(--ink); cursor:pointer; }
+.usermenu__btn:hover, .usermenu:focus-within .usermenu__btn { background:var(--surface-2); }
+.avatar { width:34px; height:34px; display:inline-grid; place-items:center; border-radius:10px; background:var(--brand-soft); color:var(--brand-ink); font-size:12px; font-weight:750; }
+.usermenu__name { max-width:160px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }
+.usermenu__caret { width:14px; height:14px; color:var(--ink-3); }
+.usermenu__pop { position:absolute; top:calc(100% + 8px); right:0; width:260px; padding:7px; display:none; background:var(--surface); border:1px solid var(--border); border-radius:13px; box-shadow:var(--sh-pop); }
+.usermenu:hover .usermenu__pop, .usermenu:focus-within .usermenu__pop { display:block; }
+.usermenu__head { padding:10px; display:flex; align-items:center; gap:10px; margin-bottom:5px; border-bottom:1px solid var(--hairline); }
+.usermenu__head div { min-width:0; display:grid; }
+.usermenu__head b, .usermenu__head span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.usermenu__head b { font-size:12.5px; }
+.usermenu__head span { color:var(--ink-3); font-size:11px; }
+.menuitem { min-height:44px; padding:0 10px; display:flex; align-items:center; gap:9px; border-radius:9px; color:var(--ink-2); font-size:13px; }
+.menuitem:hover { color:var(--ink); background:var(--surface-2); text-decoration:none; }
+.menuitem svg { width:17px; height:17px; }
+.menuitem--danger { color:var(--down-ink); }
+
+.card { background:var(--surface); border:1px solid var(--border); border-radius:var(--r); box-shadow:var(--sh-xs); }
+.card__head { min-height:48px; padding:0 16px; display:flex; align-items:center; border-bottom:1px solid var(--hairline); }
+.card__head h2 { margin:0; font-size:14px; }
+.card__body { padding:18px; }
+.btn { min-height:44px; padding:0 15px; display:inline-flex; align-items:center; justify-content:center; gap:7px; border:1px solid transparent; border-radius:10px; font-family:var(--font); font-size:13px; font-weight:700; cursor:pointer; transition:background var(--dur) var(--ease), border-color var(--dur) var(--ease), color var(--dur) var(--ease), transform var(--dur) var(--ease); }
+.btn:hover { text-decoration:none; transform:translateY(-1px); }
+.btn:disabled { opacity:.55; cursor:not-allowed; transform:none; }
+.btn-primary { background:var(--brand); color:#fff; border-color:var(--brand); }
+.btn-primary:hover { background:var(--brand-ink); border-color:var(--brand-ink); color:#fff; }
+.btn-ghost { background:transparent; color:var(--ink-2); border-color:transparent; }
+.btn-ghost:hover { background:var(--surface-2); color:var(--ink); }
+.btn-danger { background:var(--down); color:#fff; border-color:var(--down); }
+.btn-danger:hover { background:var(--down-ink); color:#fff; }
+.btn-sm { min-height:40px; padding-inline:12px; font-size:12.5px; }
+.field { display:grid; gap:7px; }
+.field label { color:var(--ink-2); font-size:12.5px; font-weight:650; }
+.toast { padding:11px 14px; border-radius:10px; background:var(--ink); color:#fff; box-shadow:var(--sh-pop); font-size:13px; }
+.toast--ok { background:#27704d; }
+
+@media (forced-colors:active) {
+  * { box-shadow:none !important; }
+  .app-tile, .btn-primary, .appnav.is-active, .ap-nav__row.is-active, .view-toggle__btn.is-active { forced-color-adjust:none; background:Highlight; color:HighlightText; border-color:Highlight; }
+  :focus-visible { outline:3px solid Highlight; }
+}
 
 /* --- App-bar dropdown logout form (canonical has .menuitem, not the form wrapper). */
 .menuitem-form { margin:0; } .menuitem-form .menuitem { width:100%; border:0; background:transparent; font-family:inherit; cursor:pointer; text-align:left; }
@@ -22,7 +158,7 @@ input[type=text], input[type=search], input[type=password], input[type=number], 
 input[type=url], input[type=datetime-local], input[type=date], textarea, select {
   width:100%; font-family:inherit; font-size:14px; color:var(--ink);
   background:var(--surface); border:1px solid var(--border-2); border-radius:var(--r-sm);
-  padding:10px 12px; outline:none; transition:border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+  min-height:44px; padding:10px 12px; outline:none; transition:border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
 }
 
 /* Durable current-page selection. The checkbox belongs to the external bulk form via HTML's
@@ -184,11 +320,8 @@ body.page { max-width:none; margin:0; padding:0; }
 @media (prefers-reduced-motion:reduce){ * { transition:none !important; animation:none !important; } }
 
 /* ================================================================== Aperture (Drive) surfaces
- *
- * Drive layers its own component vocabulary on top of the shared kit — the upload dropzone, the
- * gallery grid of file cards, the detail preview + meta list + share row, and the message page.
- * All drawn in the Odyssey tokens (neutral grays, the primary blue, hairline borders, small
- * radii, near-flat surfaces) so the page reads clean and cohesive end-to-end.
+ * Upload, gallery, file detail, sharing, and state components use Aperture's
+ * local cool-neutral palette and stable file-workspace geometry.
  */
 
 /* the body already paints the canvas; keep the page-console class inert */
@@ -387,10 +520,8 @@ body.page { max-width:none; margin:0; padding:0; }
 }
 
 /* ============================================================================
-   Odyssey v2 — progressive-enhancement layer (ADDITIVE; redefines no selector
-   above). Toast host + optimistic busy/pending states used by the JS layer.
-   All motion rides the shared --dur/--ease tokens and is neutralised by the
-   global prefers-reduced-motion rule already declared above.
+   Progressive enhancement: toast host + optimistic busy/pending states used
+   by the JavaScript layer. Motion uses Aperture's local duration tokens.
    ============================================================================ */
 .toast-host { position:fixed; z-index:80; left:50%; bottom:22px; transform:translateX(-50%);
   display:flex; flex-direction:column; gap:9px; align-items:center; width:auto; max-width:92vw; pointer-events:none; }
@@ -662,7 +793,7 @@ body.page-share-landing {
   pointer-events:none; background:color-mix(in srgb, var(--brand) 10%, transparent);
 }
 .ap-dropscrim::before {
-  content:"Drop to upload"; display:grid; place-items:center; min-width:260px; min-height:132px;
+  content:"Drop to review"; display:grid; place-items:center; min-width:260px; min-height:132px;
   border:2px dashed var(--brand); border-radius:var(--r); background:var(--surface);
   color:var(--brand-ink); font-weight:700; box-shadow:0 0 0 4px color-mix(in srgb, var(--brand) 24%, transparent), var(--sh-lg);
 }
@@ -982,8 +1113,8 @@ body.is-dragging .ap-dropscrim { display:grid; }
 }
 .console--drive .drive-layout {
   display:grid;
-  grid-template-columns:minmax(0, 1fr) 260px;
-  grid-template-areas:"content rail";
+  grid-template-columns:260px minmax(0, 1fr);
+  grid-template-areas:"rail content";
   gap:0;
   min-height:calc(100vh - var(--appbar-h, 56px));
 }
@@ -999,7 +1130,7 @@ body.is-dragging .ap-dropscrim { display:grid; }
   padding:18px 14px;
   overflow:auto;
   border:0;
-  border-left:1px solid var(--border);
+  border-right:1px solid var(--border);
   border-radius:0;
   background:var(--surface);
   box-shadow:none;
@@ -1104,7 +1235,7 @@ body.is-dragging .ap-dropscrim { display:grid; }
 .ap-nav__tree .ap-nav__tree { margin-left:10px; }
 .ap-nav__tree li { margin:0; padding:0; }
 .ap-nav__row {
-  min-height:36px;
+  min-height:44px;
   display:flex;
   align-items:center;
   gap:10px;
@@ -1958,7 +2089,7 @@ body.has-preview { overflow:hidden; }
   .page-console .appbar__right .allapps,
   .page-console .usermenu__caret { display:none; }
   .page-console .usermenu__btn {
-    width:36px;
+    width:44px;
     padding:0;
     justify-content:center;
   }
@@ -2051,6 +2182,30 @@ body.has-preview { overflow:hidden; }
   .ap-inspector__content { padding:12px; }
 }
 
+/* Core file actions remain comfortably targetable on touch and pointer devices. */
+.btn-sm,
+.view-toggle__btn,
+.card-menu__btn,
+.ap-preview__close {
+  min-width:44px;
+  min-height:44px;
+}
+.view-toggle__btn,
+.card-menu__btn,
+.ap-preview__close { width:44px; height:44px; }
+.gallery-grid.is-list .file-card__link,
+.folder-grid .file-card__link { min-width:44px; min-height:44px; }
+.ap-select {
+  inset-block-start:0;
+  inset-inline-start:0;
+  width:44px;
+  height:44px;
+  border:0;
+  background:transparent;
+  box-shadow:none;
+}
+.ap-select input { width:19px; height:19px; }
+
 /* ============================================================================
    S12 forced-colors (Windows High Contrast / forced-colors: active)
    状态语义全部改由 border/outline/系统色表达；不改任何常规模式规则。
@@ -2099,4 +2254,51 @@ body.has-preview { overflow:hidden; }
   /* 拖拽态：用 border-style 变化（dashed→solid）表达，不靠颜色 */
   .dropzone.dragging .dropzone__label, .dropzone.has-file .dropzone__label { border-style: solid; border-width: 3px; }
   .ap-dropscrim::before { border: 3px solid Highlight; }
+}
+
+/* ==========================================================================
+   Aperture v2 · retint onto the shared Steadholme neutral system.
+   Figma AgW9572aDQMEDkSzerg9lR (Scriptoria, plum accent). This surface is
+   `surf/drive` in the design, so it keeps the suite's neutral ground and
+   carries its own colour on the accent.
+
+   This crate defines a COMPLETE palette in its own `:root`, so the shared kit
+   cannot be prepended — it would simply be overridden. The tokens are
+   re-pointed here instead, after everything else in the file.
+   ========================================================================== */
+:root {
+  --bg:#f6f7f9; --bg-2:#eef0f4;
+  --surface:#ffffff; --surface-2:#f6f7f9; --surface-3:#eef0f4;
+  --border:#e5e7ec; --border-2:#d3d7e0; --hairline:#eef0f4;
+  --ink:#17191f; --ink-2:#4a5160; --ink-3:#727a8a; --ink-4:#9aa2b1;
+  --accent:#1d4ed8; --accent-2:#2563eb; --accent-ink:#1e40af;
+  --accent-soft:#dbeafe; --accent-soft-2:#bfdbfe; --accent-border:#bfdbfe;
+  --brand:var(--accent); --brand-soft:var(--accent-soft); --brand-ink:var(--accent-ink);
+  --ring:rgba(29,78,216,.30);
+  --r-xs:4px; --r-sm:8px; --r:10px; --r-lg:12px;
+  --sh-xs:0 1px 2px rgba(23,25,31,.05);
+  --sh-sm:0 1px 3px rgba(23,25,31,.08),0 1px 2px rgba(23,25,31,.04);
+  --sh-md:0 6px 20px rgba(23,25,31,.10);
+
+  /* The reading sheet stays warm — a long read is not a console. */
+  --paper-bg:#fffdf9; --paper-rule:#eae4d8;
+  --code-bg:#0f1115; --code-ink:#c9d1d9; --code-dim:#5c6673;
+  --hl-mark:#ffe89a; --hl-text:#4a3a06;
+}
+:root[data-theme="dark"] {
+  --bg:#0d1117; --bg-2:#0b0f14;
+  --surface:#161b22; --surface-2:#11161d; --surface-3:#1c2129;
+  --border:#30363d; --border-2:#484f58; --hairline:#262c34;
+  --ink:#e6edf3; --ink-2:#b1bac4; --ink-3:#8b949e; --ink-4:#6e7681;
+  --accent:#93c5fd; --accent-2:#93c5fd; --accent-ink:#bfdbfe;
+  --accent-soft:#152241; --accent-soft-2:#152241; --accent-border:#152241;
+  --brand:var(--accent); --brand-soft:var(--accent-soft); --brand-ink:var(--accent-ink);
+  --paper-bg:#161b22; --paper-rule:#30363d;
+  --hl-mark:#5a4a12; --hl-text:#ffe89a;
+}
+
+/* The layer pins --brand on the body classes, which beats the :root value above.
+   Re-point it on the same scope or the buttons keep the old slate. */
+body.page-console, body.page-share-landing {
+  --brand:var(--accent); --brand-soft:var(--accent-soft); --brand-ink:var(--accent-ink);
 }

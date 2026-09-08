@@ -5,11 +5,10 @@
 //! - [`requests`] — owner control plane for finite public Upload Request rooms.
 //! - [`admin`] — the admin panel (per-owner storage usage + quota overrides; admin groups only).
 //!
-//! The shared design tokens / CSS are embedded (via `include_str!`) and inlined into every page,
-//! matching the Steadholme enterprise brand: brand gradient, indigo accent, cards, buttons, the
-//! app-bar with the shield + wordmark. All producer-supplied text (file names, types) is
-//! HTML-escaped on render (defense-in-depth against stored XSS); blob bytes are served as inline
-//! images only when magic-sniffed, otherwise as downloads.
+//! Aperture's product-owned design tokens / CSS are embedded (via `include_str!`) and served to
+//! every signed-in page. All producer-supplied text (file names, types) is HTML-escaped on render
+//! (defense-in-depth against stored XSS); blob bytes are served as inline images only when
+//! magic-sniffed, otherwise as downloads.
 
 pub mod admin;
 pub mod files;
@@ -20,8 +19,12 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use std::sync::OnceLock;
 
-/// Aperture-only CSS layered after Odyssey's canonical font, tokens, and components.
+/// Aperture's complete product-owned visual system.
 pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
+
+pub const APP_CSS_PATH: &str = "/assets/aperture-20260823.css";
+pub const SHARE_ROOM_CSS_PATH: &str = "/s/share-room-20260821.css";
+pub const SHARE_ROOM_JS_PATH: &str = "/s/share-room-20260821.js";
 
 /// Product-owned public Share Room assets. These intentionally do not include Odyssey CSS,
 /// Components, Shell, Wire, Spark, or Motion: the anonymous capability surface owns its DOM and
@@ -36,17 +39,28 @@ pub const SHARE_ROOM_CSP: &str = "default-src 'none'; style-src 'self'; script-s
 static APP_CSS: OnceLock<String> = OnceLock::new();
 static DYNAMIC_JS: OnceLock<String> = OnceLock::new();
 
-/// Embedded design system, inlined into each rendered page's `<style>`:
-/// Odyssey's canonical CSS followed by Aperture's service surface CSS.
+/// Complete, product-owned Aperture visual system.
 pub fn app_css() -> &'static str {
-    APP_CSS
-        .get_or_init(|| {
-            let mut css = String::with_capacity(odyssey::APP_CSS.len() + SERVICE_CSS.len());
-            css.push_str(odyssey::APP_CSS);
-            css.push_str(SERVICE_CSS);
-            css
-        })
-        .as_str()
+    APP_CSS.get_or_init(|| SERVICE_CSS.to_owned()).as_str()
+}
+
+fn immutable_asset(content_type: &'static str, body: &'static str) -> Response {
+    let mut response = body.into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
+pub async fn app_css_asset() -> Response {
+    immutable_asset("text/css; charset=utf-8", app_css())
 }
 
 pub fn dynamic_js() -> &'static str {
@@ -105,6 +119,14 @@ pub async fn share_room_css_asset() -> Response {
 /// Product-owned, public, read-only Share Room runtime.
 pub async fn share_room_js_asset() -> Response {
     share_room_asset("text/javascript; charset=utf-8", SHARE_ROOM_JS)
+}
+
+pub async fn versioned_share_room_css_asset() -> Response {
+    immutable_asset("text/css; charset=utf-8", SHARE_ROOM_CSS)
+}
+
+pub async fn versioned_share_room_js_asset() -> Response {
+    immutable_asset("text/javascript; charset=utf-8", SHARE_ROOM_JS)
 }
 
 /// The Steadholme shield glyph (small, for the app-bar brand lockup).
@@ -335,7 +357,6 @@ pub fn render_error(
     email: Option<&str>,
 ) -> (StatusCode, Html<String>) {
     let body = ERROR_HTML
-        .replace("{{CSS}}", app_css())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Drive", email))
         .replace("{{STATUS}}", &status.as_u16().to_string())

@@ -124,10 +124,11 @@ async fn thread_follow_preference_form_and_filter() {
     assert!(thread_page.contains(r#"<select id="ag-sub-level" name="level">"#));
     assert!(thread_page.contains(r#"value="watch" selected"#));
     assert!(thread_page.contains(r#"<option value="none">Not following</option>"#));
-    assert!(thread_page.contains(r#"<option value="watch" selected>Watch</option>"#));
-    assert!(thread_page.contains(r#"<option value="follow">Follow</option>"#));
+    assert!(thread_page.contains(r#"<option value="watch" selected>Add to reading list</option>"#));
+    assert!(thread_page.contains(r#"<option value="follow">Prioritize</option>"#));
     assert!(thread_page.contains(r#"<option value="mute">Mute</option>"#));
-    assert!(thread_page.contains("Private: this shapes your catch-up, not notification delivery."));
+    assert!(thread_page
+        .contains("Private: this changes your reading view. It does not send notifications."));
     assert_eq!(
         thread_page
             .matches(&format!(r#"action="{subscribe_uri}""#))

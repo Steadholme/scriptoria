@@ -231,11 +231,11 @@ async fn author_marks_accepted_answer_renders_dais_first() {
     let reloaded = state.store.get_thread(&tid).await.unwrap().unwrap();
     assert_eq!(reloaded.accepted_post_id, second_reply);
 
-    // Render: the accepted reply owns one labelled Answer Dais and appears before the first
+    // Render: the accepted reply owns one labelled Accepted answer section and appears before the first
     // ordinary reply. Its content is not duplicated in the normal stream.
     let (_s, _h, page) = send(&state, get_as(&loc, ALICE_SUB, ALICE_EMAIL)).await;
     assert!(
-        page.contains(r#"id="ag-dais-title">Answer Dais</h2>"#),
+        page.contains(r#"id="ag-dais-title">Accepted answer</h2>"#),
         "accepted heading rendered in the typed dais"
     );
     assert_eq!(

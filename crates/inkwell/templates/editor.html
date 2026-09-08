@@ -44,15 +44,20 @@
       </div>
       <div class="editor__actions ink-editor__actionbar">
         {{STATE_PILL}}
+        <div class="ink-editor__utilities" aria-label="Document utilities">
+          <a class="btn btn-ghost" href="{{CANCEL_HREF}}">Keep for later</a>
+          {{HISTORY_ACTION}}
+          {{PRESERVE_ACTION}}
+        </div>
         <span class="spacer"></span>
-        <a class="btn btn-ghost" href="{{CANCEL_HREF}}">Cancel</a>
-        {{HISTORY_ACTION}}
-        {{PRESERVE_ACTION}}
         <button class="btn btn-secondary" type="submit" name="intent" value="save_draft" data-final-state="draft">Save draft</button>
-        <button class="btn btn-secondary" type="submit" name="intent" value="schedule" formaction="{{REVIEW_ACTION}}" data-review-submit data-final-state="scheduled">Review schedule</button>
-        <button class="btn btn-primary" type="submit" name="intent" value="publish_now" formaction="{{REVIEW_ACTION}}" data-review-submit data-final-state="published">Review &amp; publish</button>
+        <button class="btn btn-primary" id="continueReview" type="submit" name="intent" value="publish_now" formaction="{{REVIEW_ACTION}}" data-review-submit data-final-state="published">Continue to review</button>
+        <noscript><button class="btn btn-secondary" type="submit" name="intent" value="schedule" formaction="{{REVIEW_ACTION}}" data-review-submit data-final-state="scheduled">Review schedule</button></noscript>
       </div>
-      <p class="writer-privacy muted">Crash recovery can remain in this browser profile until Writer Studio deletes it: after 24 hours while open, or on your next visit. It is not a server save, and other users of this browser profile may be able to read it.</p>
+      <details class="writer-privacy muted">
+        <summary>About crash recovery</summary>
+        <p>Inkwell keeps a temporary recovery copy in this browser for up to 24 hours. It is not a server save and may be visible to other people using this browser profile.</p>
+      </details>
     </div>
     <aside class="ink-editor__rail">
       <section class="card">
@@ -60,12 +65,12 @@
           <h2 class="card__title">Publish</h2>
           <p class="field__hint muted">Choose an explicit action below the editor. Saving a draft never publishes it.</p>
           <div class="field">
-            <label for="publish_at">Schedule date and time</label>
+            <label for="publish_at">Publication time <span class="muted">(optional)</span></label>
             <input type="datetime-local" id="publish_at" name="publish_at" value="{{PUBLISH_AT_VALUE}}" data-utc-value="{{PUBLISH_AT_VALUE}}" data-utc-epoch="{{PUBLISH_AT_EPOCH}}">
             <input type="hidden" id="publish_at_epoch" name="publish_at_epoch" value="">
             <input type="hidden" id="schedule_timezone" name="schedule_timezone" value="">
             <input type="hidden" id="schedule_offset_minutes" name="schedule_offset_minutes" value="">
-            <p class="field__hint muted" id="scheduleConfirm">Choose a time, then review the exact UTC instant before scheduling.</p>
+            <p class="field__hint muted" id="scheduleConfirm">Leave blank to publish after review, or choose a local time to schedule.</p>
             <noscript><p class="field__hint muted">JavaScript is off: this value is interpreted as UTC.</p></noscript>
           </div>
           <div class="field field--inline ink-setting">
@@ -88,9 +93,9 @@
         <div class="card__body">
           <h2 class="card__title">Cover image</h2>
           <div class="field">
-            <label for="cover_url">Cover image <span class="muted">(Aperture share URL)</span></label>
+            <label for="cover_url">Cover image</label>
             <input type="url" id="cover_url" name="cover_url" maxlength="600" placeholder="https://drive.w33d.xyz/s/&hellip;" value="{{COVER_VALUE}}">
-            <p class="field__hint muted">Paste a share link from Drive. Inline images use the same estate share URLs in Markdown.</p>
+            <p class="field__hint muted">Paste a trusted Drive share link. Inline images can use the same links in Markdown.</p>
             <img id="coverPreview" class="ink-cover__thumb" alt="" hidden>
           </div>
         </div>
@@ -302,6 +307,7 @@
     var scheduleTimezoneEl = document.getElementById('schedule_timezone');
     var scheduleOffsetEl = document.getElementById('schedule_offset_minutes');
     var scheduleConfirm = document.getElementById('scheduleConfirm');
+    var continueReview = document.getElementById('continueReview');
     function localInputValue(date) {
       function pad(n) { return String(n).padStart(2, '0'); }
       return date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate()) + 'T' + pad(date.getHours()) + ':' + pad(date.getMinutes());
@@ -337,7 +343,7 @@
       if (!publishAtEl || !publishEpochEl || !scheduleConfirm) { return false; }
       if (!publishAtEl.value) {
         publishEpochEl.value = '';
-        scheduleConfirm.textContent = 'Choose a time, then review the exact UTC instant before scheduling.';
+        scheduleConfirm.textContent = 'Leave blank to publish after review, or choose a local time to schedule.';
         return false;
       }
       var local = new Date(publishAtEl.value);
@@ -359,6 +365,13 @@
       if (publishEpochEl && restoreExactSchedule(publishEpochEl.value)) { return true; }
       return syncSchedule();
     }
+    function syncReviewIntent() {
+      if (!continueReview) { return; }
+      var scheduled = !!(publishAtEl && publishAtEl.value);
+      continueReview.value = scheduled ? 'schedule' : 'publish_now';
+      continueReview.setAttribute('data-final-state', scheduled ? 'scheduled' : 'published');
+      continueReview.textContent = scheduled ? 'Continue to schedule review' : 'Continue to review';
+    }
     if (publishAtEl) {
       var initialExact = exactDateFromEpoch(publishAtEl.getAttribute('data-utc-epoch'));
       if (initialExact) {
@@ -378,8 +391,12 @@
           syncSchedule();
         }
       }
-      publishAtEl.addEventListener('input', syncSchedule);
+      publishAtEl.addEventListener('input', function () {
+        syncSchedule();
+        syncReviewIntent();
+      });
     }
+    syncReviewIntent();
 
     // ---- Write / Preview tabs --------------------------------------------
     var tabWrite = document.getElementById('tab-write');

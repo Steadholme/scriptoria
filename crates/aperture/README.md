@@ -147,3 +147,18 @@ docker build -t steadholme/aperture:dev .
   `DATABASE_URL=${APERTURE_DATABASE_URL}`、`S3_*` 指向 Cairn，仅内网（`http://aperture:8900`）。
 - Sluice 路由（host `drive.w33d.xyz`）：`/s/`、`/u/` 前缀 `auth=public`，`/` 根 `auth=sso`。
 - 依赖：Postgres（库 `aperture`）+ Cairn（bucket `aperture`）。
+
+## Frontend (v2, 2026-09-08)
+
+This surface follows the shared Steadholme v2 system implemented from the Figma
+file `AgW9572aDQMEDkSzerg9lR` (Scriptoria, plum accent), carrying its own
+`surf/*` colour on the accent.
+
+Each crate here defines a COMPLETE palette in its own `:root`, so the shared
+kit cannot be prepended — it would simply be overridden. `static/service.css`
+is therefore this crate's original layer with a token re-point appended after
+everything else.
+
+Aperture pins `--brand` on `body.page-console` and `body.page-share-landing`,
+and a class-scoped custom property beats the `:root` value. The re-point has to
+happen on the same scope or the buttons keep the old slate.

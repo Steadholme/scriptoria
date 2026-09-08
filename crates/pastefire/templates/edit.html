@@ -3,10 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
+  <meta name="color-scheme" content="dark">
   <link rel="icon" href="data:,">
   <title>Edit paste · Pastefire · Steadholme</title>
-  <style>{{CSS}}</style>
+  <link rel="stylesheet" href="/assets/pastefire-20260823.css">
 </head>
 <body class="page-console">
   <header class="appbar">
@@ -35,23 +35,26 @@
         {{ERROR}}
         <form method="post" action="/edit/{{ID}}" id="composeForm">
           <input type="hidden" name="csrf_token" value="{{CSRF}}">
+          <label class="sr-only" for="title">Paste title</label>
           <input class="compose__title" type="text" name="title" id="title" maxlength="200" data-spark-charcount
                  placeholder="Untitled paste — optional title" value="{{TITLE_VALUE}}" autocomplete="off">
-          <div class="pf-files" id="fileEditor">{{FILE_ROWS}}</div>
-          <button type="button" class="btn btn-ghost pf-addfile" id="addFileBtn">+ Add file</button>
-          <fieldset class="pf-options">
+            <fieldset class="pf-options">
+            <legend>Content settings</legend>
             <div class="pf-opt pf-opt--wide">
               <label for="language">Language</label>
               <select class="select select--bar" name="language" id="language" aria-label="Language">{{LANGUAGE_OPTIONS}}</select>
             </div>
           </fieldset>
+          <div class="pf-editor-intro"><h2>Files</h2><span>Saving creates a new revision and keeps the current version in history.</span></div>
+          <div class="pf-files" id="fileEditor">{{FILE_ROWS}}</div>
+          <button type="button" class="btn btn-ghost pf-addfile" id="addFileBtn">+ Add another file</button>
           <div class="pf-actions">
             <span class="pf-kbd">Ctrl + Enter</span>
             <button type="submit" class="btn btn-primary" title="Ctrl+Enter">Save changes</button>
           </div>
         </form>
 
-        <template id="fileRowTemplate"><div class="pf-file" data-file-row><div class="pf-file__head"><input class="pf-file__name" type="text" name="file_name" maxlength="128" value="" placeholder="Filename including extension (optional)" autocomplete="off"><button class="btn btn-ghost btn-sm editor__remove" type="button" data-file-remove>Remove</button></div><textarea name="file_content" class="code-input pf-editor" spellcheck="false" autocomplete="off" placeholder="Paste your content here…"></textarea></div></template>
+        <template id="fileRowTemplate"><div class="pf-file" data-file-row><div class="pf-file__head"><input class="pf-file__name" type="text" name="file_name" maxlength="128" value="" aria-label="Filename" placeholder="Filename including extension (optional)" autocomplete="off"><button class="btn btn-ghost btn-sm editor__remove" type="button" data-file-remove>Remove file</button></div><textarea name="file_content" class="code-input pf-editor" spellcheck="false" autocomplete="off" aria-label="File content" placeholder="Paste your content here…"></textarea></div></template>
       </div>
     </section>
   </main>

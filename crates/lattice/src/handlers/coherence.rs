@@ -31,7 +31,7 @@ pub async fn coherence(
     let contradictions = corpus.contradictions();
 
     let content = render_coherence(total, state.config.stale_days, &stale, &contradictions);
-    Ok(Html(layout("Coherence", &headers, &content)))
+    Ok(Html(layout("Workspace health", &headers, &content)))
 }
 
 fn render_coherence(
@@ -43,7 +43,7 @@ fn render_coherence(
     let head = format!(
         "<div class=\"page-head\">\
            <div>\
-             <h1>Coherence</h1>\
+             <h1>Workspace health</h1>\
              <p class=\"muted\">{total} page{plural} · {stale_n} stale · {contra_n} contradiction candidate{contra_plural}</p>\
            </div>\
            <a class=\"btn btn-secondary btn-sm\" href=\"/\">Back to the index</a>\

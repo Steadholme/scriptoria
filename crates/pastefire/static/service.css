@@ -1,13 +1,144 @@
-/* Pastefire (Pastebin) service surface, layered AFTER Odyssey canonical CSS.
-   The base kit (font + tokens + reset + shared components: app-bar, card, btn, pill,
-   field, stat, table, tabs, empty, toast, layout, pagehead, modal, pager, site-foot …)
-   now comes from odyssey::APP_CSS. This file keeps only Pastefire (Pastebin)'s own domain chrome and the
-   legacy-compat gap-fillers its templates/tests still reference. */
+/* Pastefire — a dark-first workspace for disposable code and text artifacts.
+   This file owns the complete product visual system. */
 
-/* --- Token bridge: only the helper token canonical does not provide. Every shared
-   token (--accent/--bg/--surface/--ink/--sh-*/--r*/--sp-*/--ok-border …) is left to
-   canonical so it wins and future kit changes propagate. */
-:root { --accent-border: var(--accent-soft-2); }
+:root {
+  color-scheme: dark;
+  --font: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  --bg: #0d0e10;
+  --bg-2: #121417;
+  --surface: #181a1e;
+  --surface-2: #202328;
+  --ink: #f2efe9;
+  --ink-2: #c6c0b6;
+  --ink-3: #999289;
+  --ink-4: #777169;
+  --accent: #f59e0b;
+  --accent-2: #fbbf24;
+  --accent-ink: #fcd06a;
+  --accent-soft: #3d2c0d;
+  --accent-soft-2: #5a3b0b;
+  --accent-border: #755016;
+  --ring: rgba(245, 158, 11, .24);
+  --border: #32363c;
+  --border-2: #4b5058;
+  --hairline: #292c31;
+  --ok: #36a978;
+  --ok-soft: #153c2d;
+  --ok-border: #276348;
+  --ok-ink: #9be0bd;
+  --warn: #d99118;
+  --warn-soft: #42310f;
+  --warn-border: #71531a;
+  --warn-ink: #f4cf78;
+  --down: #c64a57;
+  --down-soft: #452128;
+  --down-border: #793a44;
+  --down-ink: #f1b3bc;
+  --info-soft: #202f47;
+  --info-ink: #b9d4ff;
+  --r: 10px;
+  --r-sm: 8px;
+  --r-xs: 6px;
+  --r-pill: 999px;
+  --radius: var(--r);
+  --radius-sm: var(--r-sm);
+  --sh-xs: 0 1px 2px rgba(0, 0, 0, .3), 0 12px 30px rgba(0, 0, 0, .12);
+  --dur: 140ms;
+  --ease: cubic-bezier(.2, .7, .2, 1);
+  --c-indigo-600: #9b9cff;
+  --c-indigo-50: #29294a;
+  --c-indigo-700: #c3c4ff;
+  --c-green-600: #53c58d;
+  --c-green-50: #17392a;
+  --c-green-700: #9ce1bc;
+  --c-amber-600: #f59e0b;
+  --c-amber-50: #3c2c10;
+  --c-amber-700: #f5ce78;
+  --c-cyan-600: #43bfd3;
+  --c-cyan-50: #14363d;
+  --c-cyan-700: #94dce8;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+html { min-height: 100%; background: var(--bg); }
+body { min-height: 100%; margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 var(--font); -webkit-font-smoothing: antialiased; }
+button, input, textarea, select { font: inherit; }
+button, summary, a { -webkit-tap-highlight-color: transparent; }
+a { color: var(--accent-ink); text-decoration: none; }
+a:hover { text-decoration: underline; text-underline-offset: 3px; }
+:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+.muted { color: var(--ink-3); }
+.sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
+
+.appbar {
+  position: sticky; top: 0; z-index: 40; min-height: 58px; padding: 6px max(18px, calc((100vw - 1180px) / 2));
+  display: flex; align-items: center; gap: 18px; background: rgba(13, 14, 16, .9);
+  border-bottom: 1px solid var(--border); backdrop-filter: blur(18px);
+}
+.appbar__brand { min-height: 46px; display:inline-flex; align-items:center; gap:10px; color:var(--ink); text-decoration:none; }
+.appbar__brand:hover { text-decoration:none; }
+.app-tile { width:36px; height:36px; display:grid; place-items:center; border-radius:8px; background:var(--accent); color:#1b1204; }
+.app-tile svg { width:20px; height:20px; }
+.appbar__name { display:grid; line-height:1.1; }
+.appbar__name b { font:700 13px/1.2 var(--mono); letter-spacing:.02em; }
+.appbar__name span { margin-top:3px; color:var(--ink-3); font:10.5px/1.2 var(--mono); }
+.appbar__nav, .appbar__right { display:flex; align-items:center; gap:6px; }
+.appbar__spacer { flex:1; }
+.appnav { min-height:44px; padding:0 12px; display:inline-flex; align-items:center; gap:7px; border-radius:8px; color:var(--ink-2); font-size:12.5px; font-weight:650; }
+.appnav svg { width:16px; height:16px; }
+.appnav:hover, .appnav.is-active { color:var(--accent-ink); background:var(--accent-soft); text-decoration:none; }
+.iconbtn { width:44px; height:44px; display:inline-grid; place-items:center; border-radius:8px; color:var(--ink-2); }
+.iconbtn:hover { color:var(--ink); background:var(--surface-2); text-decoration:none; }
+.iconbtn svg { width:19px; height:19px; }
+.usermenu { position:relative; }
+.usermenu__btn { min-height:44px; padding:4px 7px 4px 5px; display:flex; align-items:center; gap:8px; border:0; border-radius:9px; background:transparent; color:var(--ink); cursor:pointer; }
+.usermenu__btn:hover, .usermenu:focus-within .usermenu__btn { background:var(--surface-2); }
+.avatar { width:34px; height:34px; display:inline-grid; place-items:center; border-radius:8px; background:var(--accent-soft); color:var(--accent-ink); font:700 12px/1 var(--mono); }
+.usermenu__name { max-width:150px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }
+.usermenu__caret { width:14px; height:14px; color:var(--ink-3); }
+.usermenu__pop { position:absolute; top:calc(100% + 8px); right:0; width:260px; padding:7px; display:none; background:var(--surface); border:1px solid var(--border); border-radius:10px; box-shadow:0 20px 52px rgba(0,0,0,.42); }
+.usermenu:hover .usermenu__pop, .usermenu:focus-within .usermenu__pop { display:block; }
+.usermenu__head { padding:10px; display:flex; align-items:center; gap:10px; margin-bottom:5px; border-bottom:1px solid var(--hairline); }
+.usermenu__head div { min-width:0; display:grid; }
+.usermenu__head b, .usermenu__head span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.usermenu__head b { font-size:12px; }
+.usermenu__head span { color:var(--ink-3); font-size:11px; }
+.menuitem { min-height:44px; padding:0 10px; display:flex; align-items:center; gap:9px; border-radius:7px; color:var(--ink-2); font-size:12.5px; }
+.menuitem:hover { color:var(--ink); background:var(--surface-2); text-decoration:none; }
+.menuitem svg { width:17px; height:17px; }
+.menuitem--danger { color:var(--down-ink); }
+
+.card { background:var(--surface); border:1px solid var(--border); border-radius:var(--r); box-shadow:var(--sh-xs); }
+.card__head { min-height:48px; padding:0 16px; display:flex; align-items:center; border-bottom:1px solid var(--hairline); }
+.card__head h2 { margin:0; font-size:13px; font-weight:700; }
+.card__body { padding:18px; }
+.btn { min-height:44px; padding:0 15px; display:inline-flex; align-items:center; justify-content:center; gap:7px; border:1px solid transparent; border-radius:8px; font-family:var(--font); font-size:12.5px; font-weight:700; cursor:pointer; transition:background var(--dur) var(--ease), border-color var(--dur) var(--ease), color var(--dur) var(--ease); }
+.btn:hover { text-decoration:none; }
+.btn:disabled { opacity:.55; cursor:not-allowed; }
+.btn-primary { background:var(--accent); color:#1b1204; border-color:var(--accent); }
+.btn-primary:hover { background:var(--accent-2); border-color:var(--accent-2); color:#1b1204; }
+.btn-ghost { background:transparent; color:var(--ink-2); border-color:transparent; }
+.btn-ghost:hover { background:var(--surface-2); color:var(--ink); }
+.btn-danger { background:var(--down); color:#fff; border-color:var(--down); }
+.btn-danger:hover { background:#d75b66; color:#fff; }
+.btn-sm { min-height:44px; padding-inline:12px; font-size:12px; }
+.tabs { display:flex; align-items:center; gap:4px; border-bottom:1px solid var(--border); }
+.tab { min-height:44px; padding:0 12px; display:inline-flex; align-items:center; border-bottom:2px solid transparent; color:var(--ink-3); font-size:12.5px; font-weight:650; }
+.tab:hover, .tab.is-active { color:var(--ink); text-decoration:none; }
+.tab.is-active { border-bottom-color:var(--accent); }
+.pill { min-height:26px; padding:0 8px; display:inline-flex; align-items:center; border:1px solid var(--border); border-radius:var(--r-pill); color:var(--ink-2); background:var(--surface-2); font-size:11px; font-weight:650; }
+.pill-warn { background:var(--warn-soft); border-color:var(--warn-border); color:var(--warn-ink); }
+.pill-down { background:var(--down-soft); border-color:var(--down-border); color:var(--down-ink); }
+.pill-info { background:var(--info-soft); border-color:#365277; color:var(--info-ink); }
+.toast { padding:11px 14px; border-radius:8px; background:var(--ink); color:var(--bg); box-shadow:0 14px 36px rgba(0,0,0,.35); font-size:12.5px; }
+.toast--ok { background:var(--ok); color:#fff; }
+
+@media (forced-colors: active) {
+  * { box-shadow:none !important; }
+  .app-tile, .btn-primary, .tab.is-active, .pf-burn:has(input:checked) { forced-color-adjust:none; background:Highlight; color:HighlightText; border-color:Highlight; }
+  :focus-visible { outline:3px solid Highlight; }
+}
 
 /* --- App-bar dropdown logout form (canonical has .menuitem, not the form wrapper). */
 .menuitem-form { margin:0; } .menuitem-form .menuitem { width:100%; border:0; background:transparent; font-family:inherit; cursor:pointer; text-align:left; }
@@ -22,7 +153,7 @@ input[type=text], input[type=search], input[type=password], input[type=number], 
 input[type=url], input[type=datetime-local], input[type=date], textarea, select {
   width:100%; font-family:inherit; font-size:14px; color:var(--ink);
   background:var(--surface); border:1px solid var(--border-2); border-radius:var(--r-sm);
-  padding:10px 12px; outline:none; transition:border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+  min-height:44px; padding:10px 12px; outline:none; transition:border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
 }
 textarea { resize:vertical; min-height:88px; line-height:1.6; }
 select { appearance:none; padding-right:36px;
@@ -118,14 +249,14 @@ body.page { max-width:none; margin:0; padding:0; }
 @media (prefers-reduced-motion:reduce){ * { transition:none !important; animation:none !important; } }
 
 /* ==================================================================
- * Pastefire — service components (compose form / paste view / lists)
- * Layered on the Steadholme Odyssey kit above. Tokens only; flat
- * surfaces, hairline borders, soft accent tints, small radii.
+ * Pastefire service components (compose form / paste view / lists).
+ * Flat surfaces, hairline borders, ember accents, compact radii.
  * ================================================================== */
 
 /* head row: title block + a trailing action cluster (view page) */
 .console__head--row { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
-.console__actions { display:flex; align-items:center; gap:8px; flex-shrink:0; }
+.console__actions { display:flex; align-items:center; justify-content:flex-end; gap:8px; flex-shrink:0; flex-wrap:wrap; }
+.action-label { color:var(--ink-4); font:650 10px/1 var(--mono); letter-spacing:.06em; text-transform:uppercase; white-space:nowrap; }
 
 /* ---- Compose: document title -------------------------------------------- */
 /* element-qualified: must outrank the legacy-compat input[type=text] rule above */
@@ -140,7 +271,7 @@ input.compose__title::placeholder { color:var(--ink-4); }
 .code-input { font-family:var(--mono); font-size:13px; line-height:1.65; tab-size:2; width:100%; min-height:clamp(320px, 55vh, 720px); padding:14px 16px; border:0; border-radius:0; background:var(--surface); resize:vertical; display:block; }
 .code-input:focus { box-shadow:none; } /* the editor box is the frame; global :focus-visible still applies */
 
-.select--bar { height:32px; font-size:13px; padding:0 30px 0 10px; width:auto; min-width:130px; }
+.select--bar { min-height:44px; font-size:13px; padding:0 36px 0 11px; width:100%; min-width:130px; }
 
 /* ---- View tabs: shared .tabs/.tab kit, tightened above the code card ----- */
 .tabs--view { margin-bottom:12px; }
@@ -159,7 +290,7 @@ input.compose__title::placeholder { color:var(--ink-4); }
 /* ---- File block (view page): sticky file head + Copy/Raw/Download -------- */
 .card--code { overflow:clip; } /* clip (not hidden) keeps the sticky head working */
 .file-block + .file-block { border-top: 1px solid var(--border); }
-.file-block__head { position:sticky; top:56px; z-index:5; display:flex; align-items:center; gap:10px; min-height:40px; padding:6px 10px 6px 16px; background:var(--surface-2); border-bottom:1px solid var(--border); user-select:none; -webkit-user-select:none; } /* top:56px = sticky appbar height; keep in sync */
+.file-block__head { position:sticky; top:58px; z-index:5; display:flex; align-items:center; gap:10px; min-height:56px; padding:6px 10px 6px 16px; background:var(--surface-2); border-bottom:1px solid var(--border); user-select:none; -webkit-user-select:none; }
 .file-block__head svg { width: 15px; height: 15px; color: var(--ink-3); flex: 0 0 auto; }
 .file-block__fname { font:600 12.5px/1.4 var(--mono); color:var(--ink); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .file-block__meta { font-size:12px; color:var(--ink-3); font-variant-numeric:tabular-nums; white-space:nowrap; }
@@ -215,10 +346,8 @@ input.compose__title::placeholder { color:var(--ink-4); }
 .message-body { margin: 0 0 24px; color: var(--ink-2); font-size: 14px; }
 
 /* ============================================================================
-   Odyssey v2 — progressive-enhancement layer (ADDITIVE; redefines no selector
-   above). Toast host + optimistic busy/pending states used by the JS layer.
-   All motion rides the shared --dur/--ease tokens and is neutralised by the
-   global prefers-reduced-motion rule already declared above.
+   Progressive enhancement: toast host + optimistic busy/pending states used
+   by the JavaScript layer. Motion uses Pastefire's local duration tokens.
    ============================================================================ */
 .toast-host { position:fixed; z-index:80; left:50%; bottom:22px; transform:translateX(-50%);
   display:flex; flex-direction:column; gap:9px; align-items:center; width:auto; max-width:92vw; pointer-events:none; }
@@ -243,10 +372,10 @@ input.compose__title::placeholder { color:var(--ink-4); }
    ============================================================================ */
 
 body.page-console{
-  --brand:#1c1917;
-  --brand-soft:#f0eeeb;
-  --brand-ink:color-mix(in srgb,var(--brand) 82%,var(--ink));
-  --app:#ea580c;
+  --brand:#f2ede4;
+  --brand-soft:#28241f;
+  --brand-ink:#e7dfd3;
+  --app:#f59e0b;
 }
 
 .card--code{
@@ -378,7 +507,7 @@ input.pf-file__name{
   font:500 12.5px/1 var(--mono);
   flex:1 1 auto;
   max-width:360px;
-  height:28px;
+  height:44px;
   padding:0 8px;
   border-color:color-mix(in srgb,var(--brand-soft) 18%,var(--brand));
   background:color-mix(in srgb,var(--brand-soft) 8%,var(--brand));
@@ -423,11 +552,23 @@ input.pf-file__name:focus{
   display:grid;
   grid-template-columns:repeat(2,minmax(0,1fr));
   gap:12px;
-  margin:16px 0 0;
+  margin:10px 0 20px;
   padding:14px;
   border:1px solid var(--border);
   border-radius:var(--r-sm);
   background:var(--surface-2);
+}
+.pf-options legend{
+  padding:0 6px;
+  color:var(--ink);
+  font:700 12.5px/1.2 var(--font);
+}
+.pf-options__intro{
+  grid-column:1/-1;
+  margin:0;
+  color:var(--ink-3);
+  font-size:12.5px;
+  line-height:1.5;
 }
 .pf-opt{
   display:grid;
@@ -444,9 +585,11 @@ input.pf-file__name:focus{
   grid-column:1/-1;
 }
 .pf-burn{
+  grid-column:1/-1;
   display:flex;
   align-items:flex-start;
   gap:8px;
+  min-height:52px;
   padding:10px 12px;
   border:1px solid var(--border);
   border-radius:var(--r-sm);
@@ -454,21 +597,26 @@ input.pf-file__name:focus{
   color:var(--ink-2);
   cursor:pointer;
 }
+.pf-burn input{ width:18px; height:18px; margin:2px 0 0; accent-color:var(--down); }
+.pf-burn__label{ display:flex !important; align-items:center; justify-content:space-between; gap:10px; width:100%; font-weight:650; }
+.pf-risk{ padding:3px 7px; border-radius:var(--r-pill); background:var(--down-soft); color:var(--down-ink); font:700 10px/1 var(--mono); letter-spacing:.04em; text-transform:uppercase; }
 .pf-burn:has(input:checked){
-  background:var(--warn-soft);
-  border-color:var(--warn-border);
-  color:var(--warn-ink);
+  background:var(--down-soft);
+  border-color:var(--down-border);
+  color:var(--down-ink);
 }
 .pf-burn__hint{
-  display:none;
+  display:block;
   grid-column:1/-1;
-  color:var(--warn-ink);
+  margin-top:-5px;
+  color:var(--ink-3);
   font-size:12.5px;
   line-height:1.5;
 }
-.pf-options:has(.pf-burn input:checked) .pf-burn__hint{
-  display:block;
-}
+.pf-options:has(.pf-burn input:checked) .pf-burn__hint{ color:var(--down-ink); }
+.pf-editor-intro{ display:flex; align-items:baseline; justify-content:space-between; gap:16px; margin:0 0 10px; }
+.pf-editor-intro h2{ margin:0; color:var(--ink); font-size:13px; }
+.pf-editor-intro span{ color:var(--ink-3); font-size:12px; text-align:right; }
 .pf-actions{
   display:flex;
   align-items:center;
@@ -721,4 +869,39 @@ input.pf-file__name:focus{
   .pf-gate,.pf-msg{ max-width:none; }
   .pf-actions{ justify-content:stretch; }
   .pf-actions .btn-primary{ flex:1 1 auto; justify-content:center; }
+  .console__head--row{ flex-direction:column; }
+  .console__actions{ width:100%; justify-content:flex-start; }
+  .action-label{ flex-basis:100%; }
+  .file-block__head{ align-items:flex-start; flex-wrap:wrap; padding-block:10px; }
+  .file-block__tools{ width:100%; margin-left:0; justify-content:flex-start; }
+  .pf-editor-intro{ display:grid; gap:3px; }
+  .pf-editor-intro span{ text-align:left; }
+}
+
+@media (forced-colors:active){
+  .pf-burn__hint{ color:CanvasText; }
+  .file-block__head{ border-bottom:1px solid CanvasText; }
+}
+
+/* ==========================================================================
+   Pastefire v2 · retint onto the shared Steadholme system.
+   Figma AgW9572aDQMEDkSzerg9lR (Scriptoria); this surface is `surf/paste`.
+
+   Pastefire is dark-first BY DESIGN — its :root declares `color-scheme: dark`
+   and the app bar hard-codes a dark ground while its text resolves through
+   --ink. Mapping it to the light neutrals inverts that: the page turns light
+   and the bar keeps its dark ground with near-black text on it. So this
+   surface takes the v2 DARK neutrals, which are the same family the rest of
+   the suite uses after dark, plus the amber `surf/paste` accent.
+   ========================================================================== */
+:root {
+  --bg:#0d1117; --bg-2:#0b0f14;
+  --surface:#161b22; --surface-2:#11161d; --surface-3:#1c2129;
+  --border:#30363d; --border-2:#484f58; --hairline:#262c34;
+  --ink:#e6edf3; --ink-2:#b1bac4; --ink-3:#8b949e; --ink-4:#6e7681;
+  --accent:#fbbf24; --accent-2:#fcd34d; --accent-ink:#fcd34d;
+  --accent-soft:#3a2a08; --accent-soft-2:#4a350a; --accent-border:#4a350a;
+  --ring:rgba(251,191,36,.34);
+  --r-xs:4px; --r-sm:8px; --r:10px; --r-lg:12px;
+  --code-bg:#0f1115; --code-ink:#c9d1d9; --code-dim:#5c6673;
 }

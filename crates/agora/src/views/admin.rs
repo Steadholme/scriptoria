@@ -43,7 +43,7 @@ fn admin_main(s: &AdminShared, vs: &AdminViewerState) -> String {
   </section>
 </div>"#,
         crumb = crumbs(&[("Home", Some("/")), ("Administration", None)]),
-        eyebrow = eyebrow("Civic Authority"),
+        eyebrow = eyebrow("Forum administration"),
         create = create_category_form(&vs.create_category),
         categories = admin_categories(&vs.categories),
         bound = s.visible_thread_bound,

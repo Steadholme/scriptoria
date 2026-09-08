@@ -1,16 +1,16 @@
-//! Shared civic truth — the forum's public rooms.
+//! Shared forum truth — the discussion rooms.
 //!
-//! Renders the Topic Terraces (home / category), the Speaker Floor + Answer Dais + Reply Steps
-//! (thread), and the compose desk. Every value arrives already authorized and typed; this module
+//! Renders categories, original posts, accepted answers, replies, and the compose flow. Every
+//! value arrives already authorized and typed; this module
 //! only formats and escapes it. Sort/scope/subscription switches use exact handler-issued links so
 //! the shell's `data-sort-tab` swap script is a pure enhancement over working no-JS navigation.
 
 use crate::view_model::{
     CategoryFocusFormVM, CategoryFocusLevelVM, CategoryPageShared, CategoryPageViewerState,
     CategoryVM, CategoryView, ComposeMode, ComposeShared, ComposeView, ComposeViewerState,
-    HomeShared, HomeView, ReplyFormVM, SubscriptionFormVM, SummaryStateVM,
-    SummaryUnavailableReason, ThreadFollowLevelVM, ThreadKind, ThreadListControlsVM, ThreadOrder,
-    ThreadRowVM, ThreadScope, ThreadShared, ThreadView, ThreadViewerState,
+    HomeShared, HomeView, ReplyFormVM, SubscriptionFormVM, SummaryStateVM, ThreadFollowLevelVM,
+    ThreadKind, ThreadListControlsVM, ThreadOrder, ThreadRowVM, ThreadScope, ThreadShared,
+    ThreadView, ThreadViewerState,
 };
 
 use super::shell;
@@ -142,7 +142,7 @@ fn rows_html(rows: &[ThreadRowVM], now: i64) -> String {
 }
 
 // ===========================================================================
-// Home — Topic Terraces + the amphitheatre feed.
+// Home — category navigation + discussion feed.
 // ===========================================================================
 
 pub fn home(v: &HomeView) -> String {
@@ -152,6 +152,10 @@ pub fn home(v: &HomeView) -> String {
 fn home_main(s: &HomeShared, thread_rows: &[ThreadRowVM]) -> String {
     let controls = thread_controls(&s.controls);
     let rows = rows_html(thread_rows, s.now);
+    let shown = match thread_rows.len() {
+        1 => "1 discussion".to_string(),
+        count => format!("{count} discussions"),
+    };
     let list = thread_list(
         &rows,
         collection_note(s.state, "No threads here yet. Start the first one."),
@@ -170,41 +174,39 @@ fn home_main(s: &HomeShared, thread_rows: &[ThreadRowVM]) -> String {
         .unwrap_or_default();
     format!(
         r#"<div class="ag-home">
+  <section class="ag-home__feed" id="threads" aria-labelledby="ag-home-title">
+    <div class="pagehead ag-head-tools">
+      <div class="ag-head-tools__lead">
+        {eyebrow}
+        <h1 class="ag-head__title" id="ag-home-title">{heading}</h1>
+        <p class="muted ag-feed__bound">{shown} in this view</p>
+      </div>
+    </div>
+    {controls}
+    {list}
+  </section>
   <aside class="ag-home__rail">
     {terraces}
     {ledgers}
     {questions}
     <a class="btn btn-primary ag-cta" href="/new">Start a new thread</a>
   </aside>
-  <section class="ag-home__feed" id="threads" aria-labelledby="ag-home-title">
-    <div class="pagehead ag-head-tools">
-      <div class="ag-head-tools__lead">
-        {eyebrow}
-        <h1 class="ag-head__title" id="ag-home-title">{heading}</h1>
-        <p class="muted ag-feed__bound">Showing {shown} · page bound {bound}</p>
-      </div>
-    </div>
-    {controls}
-    {list}
-  </section>
 </div>"#,
         terraces = category_terraces(&s.categories),
         ledgers = ledger_nav(),
         questions = questions,
-        eyebrow = eyebrow("Amphitheatre"),
+        eyebrow = eyebrow("Discussions"),
         heading = escape(&scope_heading(
             s.controls.active_scope,
             s.controls.subscribed_only
         )),
-        shown = thread_rows.len(),
-        bound = s.visible_bound,
+        shown = shown,
         controls = controls,
         list = list,
     )
 }
 
-/// The Topic Terraces navigation: bounded category containment. Each terrace states its civic
-/// kind (Discussion/Question) as shared truth.
+/// Category navigation. Each entry states its discussion kind as shared truth.
 fn category_terraces(cats: &[CategoryVM]) -> String {
     if cats.is_empty() {
         return String::new();
@@ -219,22 +221,21 @@ fn category_terraces(cats: &[CategoryVM]) -> String {
         ));
     }
     format!(
-        r#"<nav class="ag-terraces" aria-label="Topic Terraces">{eyebrow}<ul class="ag-terraces__list">{items}</ul></nav>"#,
-        eyebrow = eyebrow("Topic Terraces"),
+        r#"<nav class="ag-terraces" aria-label="Categories">{eyebrow}<ul class="ag-terraces__list">{items}</ul></nav>"#,
+        eyebrow = eyebrow("Categories"),
     )
 }
 
-/// Entry points to the private Civic Ledgers. Dashed private keylines signal these lead to
-/// subject-scoped truth, not shared rooms.
+/// Entry points to private personal views.
 fn ledger_nav() -> String {
     format!(
-        r#"<nav class="ag-ledgers" aria-label="Your civic ledgers">{eyebrow}<ul class="ag-ledgers__list">
+        r#"<nav class="ag-ledgers" aria-label="My activity">{eyebrow}<ul class="ag-ledgers__list">
     <li><a class="ag-ledger-link ag-key-private" href="/for-you">For You</a></li>
-    <li><a class="ag-ledger-link ag-key-private" href="/focus">Focus</a></li>
+    <li><a class="ag-ledger-link ag-key-private" href="/focus">Reading priorities</a></li>
     <li><a class="ag-ledger-link ag-key-private" href="/activity">Activity</a></li>
     <li><a class="ag-ledger-link ag-key-private" href="/bookmarks">Bookmarks</a></li>
   </ul></nav>"#,
-        eyebrow = eyebrow("Civic Ledgers"),
+        eyebrow = eyebrow("My activity"),
     )
 }
 
@@ -271,7 +272,7 @@ fn category_main(
     <div class="ag-head-tools__lead">
       <div class="ag-thread__chips">{kind}</div>
       <h1 class="ag-head__title">{name}</h1>
-      <p class="muted ag-feed__bound">Showing {shown} · page bound {bound}</p>
+      <p class="muted ag-feed__bound">{shown} discussions in this view</p>
     </div>
   </header>
   {focus}
@@ -282,7 +283,6 @@ fn category_main(
         kind = kind_chip(s.category.kind),
         name = name,
         shown = thread_rows.len(),
-        bound = s.visible_bound,
         focus = focus,
         controls = controls,
         list = list,
@@ -329,13 +329,13 @@ fn category_focus_form(f: &CategoryFocusFormVM) -> String {
     };
     format!(
         r#"<form class="ag-form ag-focus-form ag-key-private" id="category-focus-heading" method="post" action="{action}">{hidden}
-  <label class="ag-form__label" for="ag-focus-level">Your focus for this category</label>
+  <label class="ag-form__label" for="ag-focus-level">Reading priority for this category</label>
   <div class="ag-form__row">
     <select id="ag-focus-level" name="level">{options}</select>
     <button class="btn btn-secondary btn-sm" type="submit">Apply</button>
   </div>
   {saved}
-  <p class="ag-mark-note muted">Focus is private. It changes only what you see — never the shared category.</p>
+  <p class="ag-mark-note muted">This preference is private and changes only what appears in your reading view.</p>
 </form>"#,
         action = o(&f.submit.action),
         hidden = hidden_inputs(&f.submit.csrf.0, &f.submit.fields),
@@ -345,7 +345,7 @@ fn category_focus_form(f: &CategoryFocusFormVM) -> String {
 }
 
 // ===========================================================================
-// Thread page — Speaker Floor, Answer Dais, Reply Steps.
+// Thread page — original post, accepted answer, replies.
 // ===========================================================================
 
 pub fn thread(v: &ThreadView) -> String {
@@ -374,7 +374,7 @@ fn thread_main(v: &ThreadView) -> String {
     };
 
     let floor = format!(
-        r#"<section class="ag-floor" aria-labelledby="ag-floor-title"><h2 class="eyebrow ag-eyebrow" id="ag-floor-title">Speaker Floor</h2>{post}</section>"#,
+        r#"<section class="ag-floor" aria-labelledby="ag-floor-title"><h2 class="eyebrow ag-eyebrow" id="ag-floor-title">Original post</h2>{post}</section>"#,
         post = post(&v.op, now),
     );
     let dais = v
@@ -419,7 +419,7 @@ fn thread_main(v: &ThreadView) -> String {
         ""
     };
     let steps = format!(
-        r#"<section class="ag-steps" aria-labelledby="ag-steps-title"><h2 class="eyebrow ag-eyebrow" id="ag-steps-title">Reply Steps</h2>{bounds_start}{replies}{bounds_end}{read_sentinel}<span class="ag-thread-latest-anchor" id="thread-latest" tabindex="-1"></span></section>"#,
+        r#"<section class="ag-steps" aria-labelledby="ag-steps-title"><h2 class="eyebrow ag-eyebrow" id="ag-steps-title">Replies</h2>{bounds_start}{replies}{bounds_end}{read_sentinel}<span class="ag-thread-latest-anchor" id="thread-latest" tabindex="-1"></span></section>"#,
         bounds_start = bounds_start,
         replies = replies,
         bounds_end = bounds_end,
@@ -539,8 +539,8 @@ fn follow_level_options(selected: ThreadFollowLevelVM) -> String {
     format!(
         "{}{}{}{}",
         opt("none", "Not following", ThreadFollowLevelVM::None),
-        opt("watch", "Watch", ThreadFollowLevelVM::Watch),
-        opt("follow", "Follow", ThreadFollowLevelVM::Follow),
+        opt("watch", "Add to reading list", ThreadFollowLevelVM::Watch),
+        opt("follow", "Prioritize", ThreadFollowLevelVM::Follow),
         opt("mute", "Mute", ThreadFollowLevelVM::Mute),
     )
 }
@@ -550,12 +550,12 @@ fn follow_level_options(selected: ThreadFollowLevelVM) -> String {
 fn subscription_form(s: &SubscriptionFormVM) -> String {
     format!(
         r#"<form class="ag-form ag-subscribe" method="post" action="{action}">{hidden}
-  <label class="ag-form__label" for="ag-sub-level">Your subscription</label>
+  <label class="ag-form__label" for="ag-sub-level">Reading preference</label>
   <div class="ag-form__row">
     <select id="ag-sub-level" name="level">{options}</select>
     <button class="btn btn-secondary btn-sm" type="submit">Update</button>
   </div>
-  <p class="ag-mark-note muted">Private: this shapes your catch-up, not notification delivery.</p>
+  <p class="ag-mark-note muted">Private: this changes your reading view. It does not send notifications.</p>
 </form>"#,
         action = o(&s.submit.action),
         hidden = hidden_inputs(&s.submit.csrf.0, &s.submit.fields),
@@ -691,9 +691,7 @@ fn reading_controls(v: &ThreadView) -> String {
     )
 }
 
-/// The page-local extractive summary (Deliberation Desk). Server-rendered from the SAME page
-/// boundary the JSON enhancement uses; the label states the exact bound and disclaims any
-/// whole-thread / consensus / correctness reading.
+/// Page-local extractive summary. Server-rendered from the same page boundary used by JSON.
 fn summary_block(s: &SummaryStateVM) -> String {
     match s {
         SummaryStateVM::Available(sv) => {
@@ -704,31 +702,16 @@ fn summary_block(s: &SummaryStateVM) -> String {
                 .collect();
             format!(
                 r#"<details class="ag-desk ag-summary">
-  <summary class="ag-desk__summary">Local extractive summary of this page</summary>
-  <p class="muted ag-desk__bound">Selected from {posts} posts / {words} words on this page · at most {bound} sentences. Not whole-thread, not consensus, not correctness.</p>
+  <summary class="ag-desk__summary">Summary of the replies shown here</summary>
+  <p class="muted ag-desk__bound">Based on {posts} posts on this page · up to {bound} sentences. This may not represent the entire thread or consensus.</p>
   <ol class="ag-summary__list">{items}</ol>
 </details>"#,
                 posts = sv.source_post_count,
-                words = sv.source_word_count,
                 bound = sv.sentence_bound,
                 items = items,
             )
         }
-        SummaryStateVM::Unavailable(reason) => {
-            let msg = match reason {
-                SummaryUnavailableReason::TooFewPosts => {
-                    "Not enough posts on this page to summarize."
-                }
-                SummaryUnavailableReason::TooFewWords => {
-                    "Not enough text on this page to summarize."
-                }
-                SummaryUnavailableReason::Unavailable => "A page summary is unavailable right now.",
-            };
-            format!(
-                r#"<p class="muted ag-summary ag-summary--none">{}</p>"#,
-                escape(msg),
-            )
-        }
+        SummaryStateVM::Unavailable(_) => String::new(),
     }
 }
 

@@ -99,8 +99,17 @@ pub fn app(state: AppState) -> Router {
     let body_limit = state.config.max_upload.saturating_add(1024 * 1024);
     Router::new()
         .route("/healthz", get(handlers::health::healthz))
+        .route(handlers::APP_CSS_PATH, get(handlers::app_css_asset))
         .route("/s/share-room.css", get(handlers::share_room_css_asset))
         .route("/s/share-room.js", get(handlers::share_room_js_asset))
+        .route(
+            handlers::SHARE_ROOM_CSS_PATH,
+            get(handlers::versioned_share_room_css_asset),
+        )
+        .route(
+            handlers::SHARE_ROOM_JS_PATH,
+            get(handlers::versioned_share_room_js_asset),
+        )
         .route("/", get(handlers::files::gallery))
         .route("/upload", post(handlers::files::upload))
         .route("/f/{id}", get(handlers::files::detail))
@@ -409,7 +418,16 @@ async fn require_gateway_sig(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let path = req.uri().path();
+    let anonymous_asset = matches!(
+        path,
+        handlers::APP_CSS_PATH
+            | "/s/share-room.css"
+            | "/s/share-room.js"
+            | handlers::SHARE_ROOM_CSS_PATH
+            | handlers::SHARE_ROOM_JS_PATH
+    );
     let anonymous_capability = path == "/healthz"
+        || anonymous_asset
         || path.starts_with("/s/")
         || path.starts_with("/u/")
         || path.starts_with("/receipts/");
@@ -451,18 +469,23 @@ async fn response_cache_policy(
 ) -> axum::response::Response {
     let read_only = matches!(*req.method(), Method::GET | Method::HEAD);
     let is_health = read_only && req.uri().path() == "/healthz";
-    let is_public_asset =
-        read_only && matches!(req.uri().path(), "/s/share-room.css" | "/s/share-room.js");
+    let is_public_asset = read_only
+        && matches!(
+            req.uri().path(),
+            handlers::APP_CSS_PATH
+                | "/s/share-room.css"
+                | "/s/share-room.js"
+                | handlers::SHARE_ROOM_CSS_PATH
+                | handlers::SHARE_ROOM_JS_PATH
+        );
     let mut response = next.run(req).await;
-    if is_health {
+    if is_health || is_public_asset {
         return response;
     }
-    let policy = if is_public_asset {
-        HeaderValue::from_static("public, max-age=300")
-    } else {
-        HeaderValue::from_static("private, no-store")
-    };
-    response.headers_mut().insert(header::CACHE_CONTROL, policy);
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
     response
 }
 

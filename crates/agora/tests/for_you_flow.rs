@@ -723,7 +723,9 @@ async fn preference_form_is_csrf_guarded_no_js_and_json_compatible() {
     assert!(page.contains(&format!(r#"name="csrf" value="{TOK}""#)));
     assert!(page.contains(r#"name="level""#));
     assert!(page.contains(r#"value="follow" selected"#));
-    assert!(page.contains("Private: this shapes your catch-up, not notification delivery."));
+    assert!(
+        page.contains("Private: this changes your reading view. It does not send notifications.")
+    );
     assert!(!page.contains(r#"data-wire-target=".subscription-form""#));
 
     let (status, headers, _) = send(

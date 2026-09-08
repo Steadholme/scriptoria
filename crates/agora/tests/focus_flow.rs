@@ -285,8 +285,9 @@ async fn focus_handlers_use_native_csrf_form_and_explain_each_row() {
         .unwrap();
     assert!(category_page.contains(&format!(r#"name="csrf" value="{csrf}""#)));
     assert!(category_page.contains(r#"name="level""#));
-    assert!(category_page
-        .contains("Focus is private. It changes only what you see — never the shared category."));
+    assert!(category_page.contains(
+        "This preference is private and changes only what appears in your reading view."
+    ));
     assert!(!category_page.contains(r#"action="/focus""#));
 
     let (status, _, _) = send(
@@ -337,8 +338,9 @@ async fn focus_handlers_use_native_csrf_form_and_explain_each_row() {
     assert_eq!(status, StatusCode::OK);
     assert!(saved_page.contains(r#"value="priority" selected"#));
     assert!(saved_page.contains(r#"method="post" action="/c/general/focus""#));
-    assert!(saved_page
-        .contains("Focus is private. It changes only what you see — never the shared category."));
+    assert!(saved_page.contains(
+        "This preference is private and changes only what appears in your reading view."
+    ));
 
     let (status, _, focus_page) = send(&state, get_as("/focus", ALICE_SUB, ALICE_EMAIL)).await;
     assert_eq!(status, StatusCode::OK);

@@ -20,7 +20,7 @@ use crate::config::{
     REACTION_KINDS, RECENT_LIMIT,
 };
 use crate::error::AppError;
-use crate::handlers::{esc, fmt_datetime, topbar, app_css};
+use crate::handlers::{esc, fmt_datetime, topbar};
 use crate::markdown;
 use crate::store::{Comment, CommentCursor, CommentReport, CommentVote, Reaction, Sort, Thread};
 use crate::{now_nanos, now_secs, rand_suffix, AppState};
@@ -212,7 +212,6 @@ pub async fn dashboard(
     }
 
     let body = DASHBOARD_HTML
-        .replace("{{CSS}}", app_css())
         .replace("{{TOPBAR}}", &topbar("Dashboard", &email))
         .replace("{{THREADS}}", &threads_table)
         .replace("{{THREADS_MORE}}", &threads_more)
@@ -294,7 +293,6 @@ pub async fn thread_view(
     );
 
     let body = THREAD_HTML
-        .replace("{{CSS}}", app_css())
         .replace("{{TOPBAR}}", &topbar("Thread", &email))
         .replace("{{TITLE_TEXT}}", &esc(&title))
         .replace("{{TITLE}}", &esc(&title))
@@ -344,7 +342,6 @@ pub async fn embed_view(
     let composer = render_composer(&csrf, &key, "", &return_to, thread_url(&page.thread));
 
     let body = EMBED_HTML
-        .replace("{{CSS}}", app_css())
         .replace("{{SORT}}", &sort_html)
         .replace("{{COMMENTS}}", &comments_html)
         .replace("{{MORE}}", &more_html)
@@ -536,10 +533,10 @@ pub async fn post_comment(
             &form.csrf_token,
             &thread.key,
             &form.return_to,
-            true,                              // moderate — mirror thread_view
-            !comment.parent_id.is_empty(),     // is_reply
-            &comment.author_sub,               // viewer_sub — the poster owns it
-            false,                             // embed
+            true,                          // moderate — mirror thread_view
+            !comment.parent_id.is_empty(), // is_reply
+            &comment.author_sub,           // viewer_sub — the poster owns it
+            false,                         // embed
         );
         return Ok(axum::Json(serde_json::json!({
             "ok": true,
@@ -1153,34 +1150,44 @@ fn render_comment(
     } else {
         report_control(c, csrf, return_to)
     };
-    let reply_form = if is_reply {
+    let reply_form = if is_reply || c.hidden {
         String::new()
     } else {
         render_reply_form(csrf, thread_key, &c.id, return_to)
+    };
+    let more_controls = if vote_html.is_empty()
+        && self_ctl.is_empty()
+        && report_html.is_empty()
+        && control.is_empty()
+    {
+        String::new()
+    } else {
+        format!(
+            r#"<details class="comment-more">
+  <summary>More actions</summary>
+  <div class="comment-more__panel">{votes}{self_ctl}{report}{control}</div>
+</details>"#,
+            votes = vote_html,
+            self_ctl = self_ctl,
+            report = report_html,
+            control = control,
+        )
     };
     format!(
         r#"<article class="comment">
   <div class="comment__head">
     <span class="comment__author">{author}</span>
     <span class="comment__date">{date}</span>
-    {control}
   </div>
   <div class="comment__body">{body}</div>
-  {votes}
-  {reactions}
-  {self_ctl}
-  {report}
-  {reply}
+  <div class="comment__actions">{reply}{reactions}{more}</div>
 </article>"#,
         author = esc(&author_label(c)),
         date = esc(&fmt_datetime(c.created_at)),
-        control = control,
         body = body_html,
-        votes = vote_html,
         reactions = reactions,
-        self_ctl = self_ctl,
-        report = report_html,
         reply = reply_form,
+        more = more_controls,
     )
 }
 
@@ -1258,7 +1265,7 @@ fn reaction_bar(c: &Comment, rx: &Reactions, csrf: &str, return_to: &str) -> Str
   <input type="hidden" name="comment_id" value="{id}">
   <input type="hidden" name="kind" value="{kind}">
   <input type="hidden" name="return_to" value="{ret}">
-  <button class="react-btn{on_cls}" type="submit" title="{label}" aria-pressed="{pressed}"><span class="react-btn__glyph" aria-hidden="true">{glyph}</span><span class="react-btn__count">{n}</span></button>
+  <button class="react-btn{on_cls}" type="submit" title="{label}" aria-label="{label}, {n}" aria-pressed="{pressed}"><span class="react-btn__glyph" aria-hidden="true">{glyph}</span><span class="react-btn__count">{n}</span></button>
 </form>"#,
             csrf = esc(csrf),
             id = esc(&c.id),
@@ -1271,7 +1278,12 @@ fn reaction_bar(c: &Comment, rx: &Reactions, csrf: &str, return_to: &str) -> Str
             n = n,
         ));
     }
-    format!(r#"<div class="reactions">{buttons}</div>"#)
+    format!(
+        r#"<details class="reaction-picker">
+  <summary>React</summary>
+  <div class="reactions">{buttons}</div>
+</details>"#
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1362,7 +1374,7 @@ fn report_control(c: &Comment, csrf: &str, return_to: &str) -> String {
     <input type="hidden" name="csrf_token" value="{csrf}">
     <input type="hidden" name="comment_id" value="{id}">
     <input type="hidden" name="return_to" value="{ret}">
-    <textarea name="reason" class="composer__body report__reason" maxlength="{max}" required placeholder="Reason"></textarea>
+    <textarea name="reason" class="composer__body report__reason" maxlength="{max}" required aria-label="Reason for reporting" placeholder="Describe the concern"></textarea>
     <div class="composer__actions"><button class="btn btn-secondary btn-sm" type="submit">Report</button></div>
   </form>
 </details>"#,
@@ -1463,7 +1475,7 @@ fn self_controls(c: &Comment, csrf: &str, return_to: &str) -> String {
       <input type="hidden" name="csrf_token" value="{csrf}">
       <input type="hidden" name="comment_id" value="{id}">
       <input type="hidden" name="return_to" value="{ret}">
-      <textarea name="body" class="composer__body" required>{body}</textarea>
+      <textarea name="body" class="composer__body" required aria-label="Edit comment">{body}</textarea>
       <div class="composer__actions"><button class="btn btn-primary btn-sm" type="submit">Save</button></div>
     </form>
   </details>
@@ -1524,7 +1536,7 @@ fn render_reply_form(csrf: &str, thread_key: &str, parent_id: &str, return_to: &
     <input type="hidden" name="thread_key" value="{key}">
     <input type="hidden" name="parent_id" value="{parent}">
     <input type="hidden" name="return_to" value="{ret}">
-    <textarea name="body" class="composer__body" required placeholder="Write a reply (Markdown)&hellip;"></textarea>
+    <textarea name="body" class="composer__body" required aria-label="Reply" placeholder="Write a reply&hellip;"></textarea>
     <div class="composer__actions"><button class="btn btn-primary btn-sm" type="submit">Post reply</button></div>
   </form>
 </details>"#,
@@ -1550,7 +1562,7 @@ fn render_composer(
   <input type="hidden" name="thread_key" value="{key}">
   <input type="hidden" name="parent_id" value="{parent}">
   <input type="hidden" name="return_to" value="{ret}">
-  <textarea name="body" class="composer__body" required placeholder="Write a comment (Markdown)&hellip;"></textarea>
+  <textarea name="body" class="composer__body" required aria-label="Comment" placeholder="Write a comment&hellip;"></textarea>
   <div class="composer__actions"><button class="btn btn-primary" type="submit">Post comment</button></div>
 </form>"#,
         csrf = esc(csrf),

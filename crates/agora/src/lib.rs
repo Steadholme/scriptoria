@@ -52,6 +52,10 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::routing::{get, post};
+use axum::{
+    http::{header, HeaderValue},
+    response::{IntoResponse, Response},
+};
 use axum::Router;
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -79,6 +83,7 @@ pub struct AppState {
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(handlers::health::healthz))
+        .route(views::shell::APP_CSS_PATH, get(app_css_asset))
         .route("/", get(handlers::forum::home))
         .route("/for-you", get(handlers::forum::for_you))
         .route("/focus", get(handlers::forum::focus))
@@ -157,12 +162,34 @@ pub fn app(state: AppState) -> Router {
         .with_state(state)
 }
 
+async fn app_css_asset() -> Response {
+    let mut response = views::shell::app_css().into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/css; charset=utf-8"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
 async fn private_dynamic_no_store(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
+    let is_static_asset = matches!(
+        *req.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD
+    ) && req.uri().path() == views::shell::APP_CSS_PATH;
     let wants_json = req.uri().path().starts_with("/api/")
         || req
             .headers()
@@ -170,6 +197,9 @@ async fn private_dynamic_no_store(
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.contains("application/json"));
     let mut response = next.run(req).await;
+    if is_static_asset {
+        return response;
+    }
     let status = response.status();
     if wants_json && (status.is_client_error() || status.is_server_error()) {
         response = (
@@ -270,7 +300,8 @@ async fn require_gateway_sig(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let require_subject = state.config.is_production() && req.uri().path() != "/healthz";
+    let require_subject = state.config.is_production()
+        && !matches!(req.uri().path(), "/healthz" | views::shell::APP_CSS_PATH);
     if auth::gateway_identity_ok_for(
         req.headers(),
         state.config.gateway_hmac_key(),
@@ -427,6 +458,25 @@ mod runtime_policy_tests {
         assert_eq!(
             response.headers().get(header::CACHE_CONTROL).unwrap(),
             "private, no-store"
+        );
+
+        let response = super::app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(crate::views::shell::APP_CSS_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/css; charset=utf-8"
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=31536000, immutable"
         );
 
         let response = super::app(state)

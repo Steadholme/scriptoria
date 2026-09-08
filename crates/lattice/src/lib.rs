@@ -57,7 +57,9 @@ pub struct AppState {
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(handlers::health::healthz))
+        .route(render::APP_CSS_PATH, get(render::app_css_asset))
         .route("/", get(handlers::pages::index))
+        .route("/search", get(handlers::pages::search))
         .route("/recent", get(handlers::pages::recent))
         .route("/new", get(handlers::pages::new_page))
         .route("/w/{slug}", get(handlers::pages::view))

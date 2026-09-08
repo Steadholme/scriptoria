@@ -3,9 +3,7 @@
 //! `health` is the unauthenticated liveness probe; `posts` carries the reading views and the
 //! SSO-gated compose/edit/delete flow.
 //!
-//! The shared design tokens / CSS are embedded (via `include_str!`) and inlined into every
-//! page, matching the Steadholme enterprise brand (the same look as the Keystone login UI):
-//! brand gradient, indigo accent, cards, app-bar.
+//! Inkwell's product-owned CSS is embedded into the binary and served as a versioned asset.
 
 pub mod admin;
 pub mod ask;
@@ -15,24 +13,38 @@ pub mod library;
 pub mod posts;
 pub mod search;
 
-use axum::http::StatusCode;
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 
-/// Inkwell-only CSS layered after Odyssey's canonical font, tokens, and components.
+/// Complete Inkwell visual system. Theme resolution stays non-visual; the UI no longer inherits
+/// Odyssey's CSS so the publishing product owns its typography, material, and components.
 pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
+
+pub const APP_CSS_PATH: &str = "/assets/inkwell-20260822-v3.css";
 
 static APP_CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// Embedded design system, inlined into each rendered page's `<style>`:
-/// Odyssey's canonical CSS followed by Inkwell's service surface CSS.
+/// Embedded, product-owned design system.
 pub fn app_css() -> &'static str {
-    APP_CSS
-        .get_or_init(|| {
-            let mut css = String::with_capacity(odyssey::APP_CSS.len() + SERVICE_CSS.len());
-            css.push_str(odyssey::APP_CSS);
-            css.push_str(SERVICE_CSS);
-            css
-        })
-        .as_str()
+    APP_CSS.get_or_init(|| SERVICE_CSS.to_owned()).as_str()
+}
+
+pub async fn app_css_asset() -> Response {
+    let mut response = app_css().into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/css; charset=utf-8"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 
 /// Cross-subdomain gateway logout (Inkwell lives at blog.w33d.xyz; the IdP is at id.w33d.xyz).
@@ -53,7 +65,7 @@ pub fn esc(s: &str) -> String {
 /// The Inkwell (Blog) app-tile icon — a Lucide-style `file-text` glyph.
 pub const APP_ICON: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M16 13H8"/><path d="M16 17H8"/><path d="M10 9H8"/></svg>"##;
 
-/// Render the shared Odyssey v2 app-bar: the Blog app-tile + name on the left, reader navigation
+/// Render Inkwell's app-bar: the Blog app-tile + name on the left, reader navigation
 /// followed by one stable Studio entry, then an "All apps" waffle back to the apex portal and the
 /// avatar user-menu (Account / All apps / the preserved gateway Sign-out) on the right. Ordinary
 /// Reader pages keep Studio representation-stable; the separate bearer-review shell suppresses it
@@ -146,8 +158,8 @@ fn topbar_with_studio(
 /// The estate three-state theme switcher (light / dark / system) for the app-bar. Pure SSR
 /// `<a href>` links to the gateway `/_gw/theme` route — no JS, no new Inkwell route. `current` marks
 /// the resolved theme `.is-active`. `__Secure-theme` is a display-only preference living OUTSIDE the
-/// gateway HMAC, so it is never consulted for identity/authz — it only repaints. `.themeswitch` CSS
-/// ships in Odyssey's canonical bundle (do not add it to service.css).
+/// gateway HMAC, so it is never consulted for identity/authz — it only repaints. Inkwell owns the
+/// `.themeswitch` presentation in its service stylesheet.
 fn theme_switcher(current: &str) -> String {
     let light_active = if current == "light" { " is-active" } else { "" };
     let dark_active = if current == "dark" { " is-active" } else { "" };
@@ -220,14 +232,14 @@ pub fn page_shell(page: PageShell<'_>) -> String {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="{color_scheme}">
 <link rel="icon" href="data:,">
-<title>{title}</title>{rss_link}{head_meta}<style>{css}</style></head><body class="{body_class}">
+<title>{title}</title>{rss_link}{head_meta}<link rel="stylesheet" href="{css_path}"></head><body class="{body_class}">
 {topbar}{fragment}</body></html>"#,
         theme_attr = odyssey::html_theme_attr(page.theme),
         color_scheme = odyssey::color_scheme_meta(page.theme),
         title = esc(page.head_title),
         rss_link = rss_link,
         head_meta = head_meta,
-        css = app_css(),
+        css_path = APP_CSS_PATH,
         body_class = page.body_class,
         topbar = topbar(page.nav_title, page.email, page.is_admin, page.theme),
         fragment = page.fragment,
@@ -250,13 +262,13 @@ pub fn review_page_shell(
 <meta name="color-scheme" content="{color_scheme}">
 <meta name="referrer" content="no-referrer">
 <link rel="icon" href="data:,">
-<title>{title}</title>{head_meta}<style>{css}</style></head><body class="page-reading page-review-link">
+<title>{title}</title>{head_meta}<link rel="stylesheet" href="{css_path}"></head><body class="page-reading page-review-link">
 {topbar}{fragment}</body></html>"#,
         theme_attr = odyssey::html_theme_attr(theme),
         color_scheme = odyssey::color_scheme_meta(theme),
         title = esc(head_title),
         head_meta = head_meta,
-        css = app_css(),
+        css_path = APP_CSS_PATH,
         topbar = topbar_with_studio("Reading", "—", false, theme, false),
         fragment = fragment,
     )

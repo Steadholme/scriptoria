@@ -14,7 +14,7 @@ name = "lattice"
 path = "src/main.rs"
 
 [dependencies]
-# Odyssey canonical design system (vendored path-dep): its APP_CSS is prepended to service.css.
+# Odyssey remains available for nonvisual gateway, locale, and theme helpers.
 odyssey = { path = "../odyssey" }
 # HTTP framework (shared with keystone/keyward/watchtower): Path/State/Form extractors,
 # typed Html/Redirect responses.

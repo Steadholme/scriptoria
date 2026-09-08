@@ -18,7 +18,7 @@ use crate::auth::{self, Identity};
 use crate::config::{clamp_page, DEFAULT_PAGE, MAX_BODY_BYTES, MAX_TITLE_CHARS};
 use crate::error::AppError;
 use crate::handlers::{
-    app_css, dynamic_js, esc, expiry_options, fmt_dur_short, fmt_size, fmt_ts, language_label,
+    dynamic_js, esc, expiry_options, fmt_dur_short, fmt_size, fmt_ts, language_label,
     language_options, parse_expiry, userbox, LANGUAGES, SHIELD_SVG,
 };
 use crate::model::{Paste, PasteFile, PasteRevision};
@@ -1128,7 +1128,6 @@ fn render_new(
     let burn_checked = if burn { " checked" } else { "" };
     let opts_open = if burn { " open" } else { "" };
     NEW_HTML
-        .replace("{{CSS}}", app_css())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("New paste", Some(&who.email)))
         .replace("{{CSRF}}", &esc(csrf))
@@ -1163,7 +1162,7 @@ fn render_file_rows(files: &[FileInput], autofocus_first: bool) -> String {
 fn render_file_row(filename: &str, content: &str, autofocus: bool) -> String {
     let maybe_autofocus = if autofocus { " autofocus" } else { "" };
     format!(
-        "<div class=\"pf-file\" data-file-row><div class=\"pf-file__head\"><input class=\"pf-file__name\" type=\"text\" name=\"file_name\" maxlength=\"128\" value=\"{name}\" placeholder=\"Filename including extension (optional)\" autocomplete=\"off\"><button class=\"btn btn-ghost btn-sm editor__remove\" type=\"button\" data-file-remove>Remove</button></div><textarea name=\"file_content\" class=\"code-input pf-editor\" spellcheck=\"false\" autocomplete=\"off\"{autofocus} placeholder=\"Paste your content here…\">{content}</textarea></div>",
+        "<div class=\"pf-file\" data-file-row><div class=\"pf-file__head\"><input class=\"pf-file__name\" type=\"text\" name=\"file_name\" maxlength=\"128\" value=\"{name}\" aria-label=\"Filename\" placeholder=\"Filename including extension (optional)\" autocomplete=\"off\"><button class=\"btn btn-ghost btn-sm editor__remove\" type=\"button\" data-file-remove>Remove file</button></div><textarea name=\"file_content\" class=\"code-input pf-editor\" spellcheck=\"false\" autocomplete=\"off\"{autofocus} aria-label=\"File content\" placeholder=\"Paste your content here…\">{content}</textarea></div>",
         name = esc(filename),
         content = esc(content),
         autofocus = maybe_autofocus,
@@ -1358,7 +1357,7 @@ fn render_file_block(
         "<div class=\"file-block\">\
            <div class=\"file-block__head\">{icon}<span class=\"file-block__fname\">{filename}</span>\
              <span class=\"file-block__meta\">{line_count} {line_word} · {size}</span>\
-             <span class=\"file-block__tools\">{tools}</span>\
+             <span class=\"file-block__tools\" aria-label=\"File actions\"><span class=\"action-label\">File actions</span>{tools}</span>\
            </div>\
            <div class=\"code-pre code-lines\">{lines}</div>\
          </div>",
@@ -1586,7 +1585,6 @@ fn fill_view(
     layout_mod: &str,
 ) -> String {
     VIEW_HTML
-        .replace("{{CSS}}", app_css())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("View paste", Some(viewer_email)))
         .replace("{{TABS}}", tabs)
@@ -1648,7 +1646,6 @@ fn render_revision(viewer: &Identity, paste_id: &str, rev: &PasteRevision) -> St
 /// the unlock form.
 fn render_unlock(viewer: &Identity, id: &str, csrf: &str, error: Option<&str>) -> String {
     UNLOCK_HTML
-        .replace("{{CSS}}", app_css())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Locked paste", Some(&viewer.email)))
         .replace("{{ERROR}}", &error_block(error))
@@ -1668,7 +1665,6 @@ fn render_edit(
     csrf: &str,
 ) -> String {
     EDIT_HTML
-        .replace("{{CSS}}", app_css())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Edit paste", Some(&who.email)))
         .replace("{{ID}}", &esc(id))
@@ -1684,7 +1680,6 @@ fn render_edit(
 /// first, each linking to that version.
 fn render_history(viewer: &Identity, paste: &Paste, revisions: &[PasteRevision]) -> String {
     HISTORY_HTML
-        .replace("{{CSS}}", app_css())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace(
             "{{USERBOX}}",

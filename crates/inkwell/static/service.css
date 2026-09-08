@@ -1,7 +1,84 @@
-/* Inkwell (Blog) service surface, layered AFTER Odyssey canonical CSS.
-   The base kit supplies tokens, app-bar, cards, buttons, forms, tables, tabs, pills,
-   toast, and layout primitives. This file keeps Inkwell's domain chrome plus
-   legacy-compatible selectors its SSR templates and tests still reference. */
+/* INKWELL · product-owned publishing interface --------------------------- */
+:root {
+  --font:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,"PingFang SC","Hiragino Sans",sans-serif;
+  --serif:Iowan Old Style,"Palatino Linotype",Palatino,Georgia,"Songti SC",serif;
+  --mono:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace; --font-mono:var(--mono);
+  --bg:#eee8de; --bg-2:#e8e0d4;
+  --surface:#f8f4ed; --surface-2:#f2ece3; --surface-3:#e9e1d6;
+  --border:#d7cdc0; --border-2:#b7ada0; --hairline:#e4dbd0;
+  --ink:#2b2a28; --ink-2:#4d4a45; --ink-3:#6f6962; --ink-4:#827a71;
+  --accent:#0f3d2e; --accent-2:#1d5a46; --accent-ink:#0b3427;
+  --accent-soft:#dfeae4; --accent-soft-2:#c8dbd1; --ring:rgba(15,61,46,.28);
+  --brand:var(--accent); --brand-soft:var(--accent-soft); --brand-ink:var(--accent-ink);
+  --ok:#1e6a4d; --ok-soft:#deeee6; --ok-ink:#14523c; --ok-border:#b9d9c9;
+  --warn:#986112; --warn-soft:#f4e8d1; --warn-ink:#6f4508; --warn-border:#e1c99c;
+  --down:#a53b4f; --down-soft:#f4e1e5; --down-ink:#7a2436; --down-border:#e2bac3;
+  --up-soft:var(--ok-soft); --up-ink:var(--ok-ink);
+  --r-xs:2px; --r-sm:4px; --r:6px; --r-lg:10px; --r-pill:999px;
+  --sh-xs:0 1px 1px rgba(43,42,40,.06); --sh-sm:0 6px 18px rgba(43,42,40,.08);
+  --sh-md:0 16px 38px rgba(43,42,40,.12); --shadow-sm:var(--sh-sm);
+  --sp-1:4px; --sp-2:8px; --sp-3:12px; --sp-4:16px; --sp-5:20px; --sp-6:24px; --sp-8:32px;
+  --fs-body:14px; --lh-body:1.55; --fs-h1:28px; --fs-h2:20px; --fs-h3:15px;
+  --fs-eyebrow:11px; --track-eyebrow:.1em; --fs-sm:12px; --fs-micro:11px;
+  --fw-medium:550; --fw-semibold:680; --lh-h3:1.35;
+  --ease:cubic-bezier(.2,.7,.2,1); --dur:150ms; --appbar-h:64px;
+}
+
+:root[data-theme="dark"] {
+  --bg:#171a17; --bg-2:#111411; --surface:#1d211d; --surface-2:#242a25; --surface-3:#2c342d;
+  --border:#394239; --border-2:#586258; --hairline:#303830;
+  --ink:#f1ece2; --ink-2:#d0c8bb; --ink-3:#aaa296; --ink-4:#8f887d;
+  --accent:#79b89c; --accent-2:#9ac9b4; --accent-ink:#a8d5c1; --accent-soft:#20382d; --accent-soft-2:#294a3a;
+  --brand:var(--accent); --brand-soft:var(--accent-soft); --brand-ink:var(--accent-ink); --ring:rgba(121,184,156,.34);
+  --ok:#77c29e; --ok-soft:#173225; --ok-ink:#9ad8b9; --ok-border:#315f49;
+  --warn:#d7ad64; --warn-soft:#382b17; --warn-ink:#e9c986; --warn-border:#614b26;
+  --down:#e08798; --down-soft:#3b2027; --down-ink:#f1a9b7; --down-border:#673440;
+  color-scheme:dark;
+}
+@media (prefers-color-scheme:dark) {
+  :root[data-theme="auto"] {
+    --bg:#171a17; --bg-2:#111411; --surface:#1d211d; --surface-2:#242a25; --surface-3:#2c342d;
+    --border:#394239; --border-2:#586258; --hairline:#303830;
+    --ink:#f1ece2; --ink-2:#d0c8bb; --ink-3:#aaa296; --ink-4:#8f887d;
+    --accent:#79b89c; --accent-2:#9ac9b4; --accent-ink:#a8d5c1; --accent-soft:#20382d; --accent-soft-2:#294a3a;
+    --brand:var(--accent); --brand-soft:var(--accent-soft); --brand-ink:var(--accent-ink); --ring:rgba(121,184,156,.34);
+    color-scheme:dark;
+  }
+}
+
+*,*::before,*::after{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%;scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--ink);font:var(--fs-body)/var(--lh-body) var(--font);letter-spacing:-.006em;-webkit-font-smoothing:antialiased}
+h1,h2,h3,h4,p{margin-top:0} h1,h2,h3,h4{color:var(--ink);font-weight:var(--fw-semibold);text-wrap:balance}
+a{color:var(--accent-ink);text-decoration:none} a:hover{text-decoration:underline;text-underline-offset:3px}
+button,input,textarea,select{font:inherit} img{max-width:100%} svg{flex:0 0 auto}
+::selection{background:var(--accent-soft-2)}
+*:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+.muted{color:var(--ink-3)} .mono,.ver{font-family:var(--mono)} .num{font-variant-numeric:tabular-nums}
+.sr-only{position:absolute!important;width:1px!important;height:1px!important;padding:0!important;margin:-1px!important;overflow:hidden!important;clip:rect(0,0,0,0)!important;white-space:nowrap!important;border:0!important}
+
+.appbar{position:sticky;top:0;z-index:40;min-height:var(--appbar-h);display:flex;align-items:center;gap:16px;padding:0 24px;background:var(--surface);border-bottom:1px solid var(--border)}
+.appbar__brand{display:flex;align-items:center;gap:10px;color:inherit;text-decoration:none}.appbar__brand:hover{text-decoration:none}
+.app-tile{width:36px;height:36px;display:grid;place-items:center;background:var(--brand);color:var(--surface);border-radius:50%}.app-tile svg{width:18px;height:18px}
+.appbar__name{display:flex;flex-direction:column;line-height:1.1}.appbar__name b{font-family:var(--serif);font-size:16px}.appbar__name span{font-size:10px;color:var(--ink-3)}
+.appbar__nav{display:flex;align-items:center;gap:2px}.appnav{min-height:44px;display:inline-flex;align-items:center;gap:7px;padding:0 12px;color:var(--ink-2);font-weight:600}.appnav svg{width:16px;height:16px}.appnav:hover,.appnav.is-active{color:var(--accent-ink);background:var(--accent-soft);text-decoration:none}.appnav.is-active{box-shadow:inset 0 -2px var(--accent)}
+.appbar__spacer{flex:1}.appbar__right{display:flex;align-items:center;gap:8px}
+.iconbtn{width:44px;height:44px;display:inline-grid;place-items:center;border-radius:var(--r-sm);color:var(--ink-2)}.iconbtn:hover{background:var(--surface-2);color:var(--ink);text-decoration:none}.iconbtn svg{width:18px;height:18px}
+.btn{min-height:44px;display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:0 16px;border:1px solid transparent;border-radius:var(--r-sm);background:transparent;color:var(--ink);font-weight:650;cursor:pointer;transition:background var(--dur) var(--ease),border-color var(--dur) var(--ease),transform var(--dur) var(--ease)}
+.btn:hover{text-decoration:none}.btn:active{transform:translateY(1px)}.btn[disabled]{opacity:.52;cursor:not-allowed}.btn-sm{min-height:36px;padding:0 12px;font-size:12px}
+.btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:var(--accent-2)}
+.btn-secondary,.btn-ghost,.btn-subtle{background:var(--surface);border-color:var(--border);color:var(--ink)}.btn-secondary:hover,.btn-ghost:hover,.btn-subtle:hover{background:var(--surface-2);border-color:var(--border-2)}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);box-shadow:var(--sh-xs);overflow:hidden}.card__head{display:flex;align-items:center;gap:12px;padding:16px 18px;border-bottom:1px solid var(--hairline)}.card__body{padding:18px}.card__title{margin:0;font-size:15px}
+.field{display:flex;flex-direction:column;gap:7px;margin-bottom:16px}.field label,.field__labelrow{font-size:12px;font-weight:650;color:var(--ink-2)}.field__labelrow{display:flex;justify-content:space-between}.field__hint{margin:0;font-size:12px;line-height:1.45}
+.tabs{display:flex;align-items:center;gap:2px;border-bottom:1px solid var(--border)}.tab{min-height:44px;padding:0 12px;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--ink-3);font-weight:650;cursor:pointer}.tab.is-active{color:var(--accent-ink);border-bottom-color:var(--accent)}
+.pill,.badge,.state-badge{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border:1px solid var(--border);border-radius:var(--r-pill);background:var(--surface-2);font-size:11px;font-weight:650}
+.flash{margin:0 0 16px;padding:12px 14px;border:1px solid var(--border);border-left-width:3px;background:var(--surface)}.flash-ok{border-left-color:var(--ok);background:var(--ok-soft);color:var(--ok-ink)}.flash-warn{border-left-color:var(--warn);background:var(--warn-soft);color:var(--warn-ink)}.flash-error{border-left-color:var(--down);background:var(--down-soft);color:var(--down-ink)}
+.themeswitch{display:flex;align-items:center;border:1px solid var(--border);border-radius:var(--r-pill);padding:2px}.themeswitch__opt{width:36px;height:36px;display:grid;place-items:center;border-radius:50%;color:var(--ink-3)}.themeswitch__opt svg{width:16px;height:16px}.themeswitch__opt:hover,.themeswitch__opt.is-active{background:var(--accent-soft);color:var(--accent-ink);text-decoration:none}
+.usermenu{position:relative}.usermenu__btn{min-height:44px;display:flex;align-items:center;gap:8px;padding:4px 8px;border:1px solid var(--border);border-radius:var(--r-pill);background:var(--surface);color:var(--ink);cursor:pointer}.avatar{width:32px;height:32px;display:grid;place-items:center;border-radius:50%;background:var(--accent-soft);color:var(--accent-ink);font-weight:700}.usermenu__name{max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}.usermenu__caret{width:15px;height:15px;color:var(--ink-3)}.usermenu__pop{display:none;position:absolute;right:0;top:calc(100% + 8px);z-index:50;width:240px;padding:6px;background:var(--surface);border:1px solid var(--border);border-radius:var(--r);box-shadow:var(--sh-md)}.usermenu:focus-within .usermenu__pop,.usermenu:hover .usermenu__pop{display:block}.usermenu__head{display:flex;align-items:center;gap:10px;margin-bottom:5px;padding:10px;border-bottom:1px solid var(--hairline)}.usermenu__head div{min-width:0;display:grid}.usermenu__head b,.usermenu__head span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.usermenu__head span{color:var(--ink-3);font-size:12px}.menuitem{min-height:44px;display:flex;align-items:center;gap:9px;padding:0 12px;border-radius:var(--r-sm);color:var(--ink)}.menuitem svg{width:17px;height:17px;flex:0 0 auto}.menuitem:hover{background:var(--surface-2);text-decoration:none}
+.toast-host{position:fixed;right:20px;bottom:20px;z-index:80;display:grid;gap:8px}.toast{min-width:240px;padding:12px 14px;border:1px solid var(--border);border-left:3px solid var(--ok);background:var(--surface);box-shadow:var(--sh-md);opacity:0;transform:translateY(6px);transition:all 180ms var(--ease)}.toast.is-in{opacity:1;transform:none}.toast--err{border-left-color:var(--down)}
+@media(max-width:780px){.appbar{padding:8px 14px;flex-wrap:wrap}.appbar__nav{order:3;width:100%;overflow:auto}.appnav{flex:0 0 auto}.appbar__name span{display:none}}
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
+@media(forced-colors:active){*:focus-visible{outline:2px solid Highlight}.btn,.card,input,textarea,select,.themeswitch,.usermenu__btn{border-color:CanvasText}.btn-primary{background:Highlight;color:HighlightText}}
 
 /* S0 BRAND + SERIF BRIDGE -------------------------------------------------- */
 :root { --accent-border: var(--accent-soft-2); }
@@ -433,11 +510,8 @@ body.page {
   .card-post:hover .card-post__cover img { transform:none; }
 }
 
-/* Opt Inkwell out of Odyssey's shared cross-document View Transition: motion.css
-   declares `@view-transition{ navigation:auto }`, but service.css is inlined after
-   Odyssey's APP_CSS so this later rule wins the cascade and the Writer/Review/Edit
-   SSR round-trip no longer starts a transition to skip (both JavaScript and no-
-   JavaScript). Reduced-motion continuity above is unchanged: no transition, no motion. */
+/* Keep Writer/Review/Edit SSR round-trips immediate in both JavaScript and
+   no-JavaScript paths. Reduced-motion continuity above remains unchanged. */
 @view-transition { navigation:none; }
 
 /* S2 MASTHEAD -------------------------------------------------------------- */
@@ -1270,40 +1344,40 @@ body.page {
    whole rule where :has() is unsupported). Dark + forced-colors remaps in S20. */
 .ink-editwrap,
 .ink-preflight {
-  --pal-ground:#ece4cf;
-  --pal-plane:#f8f3e4;
-  --pal-inset:#efe7d1;
-  --pal-ink:#251a44;
-  --pal-ink-2:#4a3f6b;
-  --pal-ink-3:#6f648e;
-  --pal-line:#d9cdb0;
-  --pal-line-strong:#bda982;
-  --pal-draft:#2e44c4;
-  --pal-draft-ink:#2a3aa8;
-  --pal-draft-soft:#e2e6f8;
-  --pal-proof:#8574c9;
-  --pal-proof-ink:#6350ab;
-  --pal-proof-soft:#eae6f7;
-  --pal-ring:rgba(46,68,196,.30);
+  --pal-ground:#e8e1d6;
+  --pal-plane:#f4efe6;
+  --pal-inset:#ebe3d7;
+  --pal-ink:#2b2a28;
+  --pal-ink-2:#4d4a45;
+  --pal-ink-3:#756e65;
+  --pal-line:#d4c9ba;
+  --pal-line-strong:#b7ada0;
+  --pal-draft:#0f3d2e;
+  --pal-draft-ink:#0b3427;
+  --pal-draft-soft:#dce7e2;
+  --pal-proof:#7a2436;
+  --pal-proof-ink:#681e2e;
+  --pal-proof-soft:#f1e2e5;
+  --pal-ring:rgba(15,61,46,.28);
 }
 
 body.page-console:has(> .ink-editwrap),
 body.page-preflight {
-  --pal-ground:#ece4cf;
-  --pal-plane:#f8f3e4;
-  --pal-inset:#efe7d1;
-  --pal-ink:#251a44;
-  --pal-ink-2:#4a3f6b;
-  --pal-ink-3:#6f648e;
-  --pal-line:#d9cdb0;
-  --pal-line-strong:#bda982;
-  --pal-draft:#2e44c4;
-  --pal-draft-ink:#2a3aa8;
-  --pal-draft-soft:#e2e6f8;
-  --pal-proof:#8574c9;
-  --pal-proof-ink:#6350ab;
-  --pal-proof-soft:#eae6f7;
-  --pal-ring:rgba(46,68,196,.30);
+  --pal-ground:#e8e1d6;
+  --pal-plane:#f4efe6;
+  --pal-inset:#ebe3d7;
+  --pal-ink:#2b2a28;
+  --pal-ink-2:#4d4a45;
+  --pal-ink-3:#756e65;
+  --pal-line:#d4c9ba;
+  --pal-line-strong:#b7ada0;
+  --pal-draft:#0f3d2e;
+  --pal-draft-ink:#0b3427;
+  --pal-draft-soft:#dce7e2;
+  --pal-proof:#7a2436;
+  --pal-proof-ink:#681e2e;
+  --pal-proof-soft:#f1e2e5;
+  --pal-ring:rgba(15,61,46,.28);
 }
 
 body.page-console:has(> .ink-editwrap) { background:var(--pal-ground); }
@@ -1533,6 +1607,25 @@ body.page-console:has(> .ink-editwrap) { background:var(--pal-ground); }
   font-weight:var(--fw-semibold);
 }
 
+.ink-editor__utilities {
+  display:flex;
+  align-items:center;
+  gap:var(--sp-2);
+}
+
+.ink-editor__utilities .btn {
+  min-height:36px;
+  padding-inline:var(--sp-3);
+  color:var(--pal-ink-2);
+  background:transparent;
+  border-color:transparent;
+}
+
+.ink-editor__utilities .btn:hover {
+  color:var(--pal-ink);
+  background:var(--pal-inset);
+}
+
 /* Square registration mark with a one-step offset echo; the text label beside
    it always carries the state, never the mark alone. */
 .ink-editor__actionbar .writer-state__dot {
@@ -1568,6 +1661,17 @@ body.page-console:has(> .ink-editwrap) { background:var(--pal-ground); }
   margin:0 0 var(--sp-4);
   font-size:var(--fs-micro);
   color:var(--pal-ink-3);
+}
+
+.ink-editor__canvas .writer-privacy summary {
+  width:max-content;
+  cursor:pointer;
+  font-weight:var(--fw-semibold);
+}
+
+.ink-editor__canvas .writer-privacy p {
+  max-width:68ch;
+  margin:var(--sp-2) 0 0;
 }
 
 /* Recovery bar: ultramarine Draft registration, flat limestone tint. */
@@ -2448,7 +2552,14 @@ body.page-console:has(> .ink-editwrap) { background:var(--pal-ground); }
   font-size:13px;
 }
 
+.draftbar[hidden] { display:none; }
 .draftbar__spacer { margin-left:auto; }
+
+@media (max-width:520px) {
+  .ink-editor__canvas .draftbar { align-items:stretch; flex-direction:column; }
+  .ink-editor__canvas .draftbar__spacer { display:none; }
+  .ink-editor__canvas .draftbar .btn { width:100%; }
+}
 
 /* S15 REVIEW & PUBLISH — FINAL PROOF -----------------------------------------
    Preflight resolves the palimpsest into one clean proof: flat limestone
@@ -3033,16 +3144,9 @@ body.page-preflight { background:var(--pal-ground); }
 }
 
 /* S18 DARK RAMP ----------------------------------------------------------- */
-/* Odyssey's canonical dark ramp (tokens.css :root[data-theme="dark"]) already remaps every
-   --accent/--ink/--surface/--border token this service leans on, so no --accent* remap is needed
-   here. The one gap is Inkwell's own brand family: it is a teal defined at the BODY scope
-   (body.page-reading/.page-console), which — because custom properties inherit from the nearest
-   defining ancestor — shadows Odyssey's :root-level dark --brand. A :root[data-theme="dark"] remap
-   would therefore never reach page content; the remap must target the same body scope. Values only;
-   the LIGHT cascade is byte-identical (this block is dark-gated). --brand lifts to a teal that stays
-   legible on dark surfaces (carrying the color:var(--surface) white-label idiom for .btn-primary),
-   --brand-soft becomes a dark teal tint instead of the near-white light chip, and --brand-ink a
-   bright teal for chip/label text. Mirrors Odyssey's dual dark + prefers-dark(auto) structure. */
+/* The shared product ramp already remaps the surface and text tokens. Inkwell's
+   body-scoped brand family needs an equally specific dark override so the teal
+   remains legible without changing the light cascade. */
 :root[data-theme="dark"] body.page-reading,
 :root[data-theme="dark"] body.page-console {
   --brand:#2dd4bf;
@@ -3149,79 +3253,79 @@ body.page-preflight { background:var(--pal-ground); }
    the global S1 reduce block, which also silences the saving pulse. */
 :root[data-theme="dark"] .ink-editwrap,
 :root[data-theme="dark"] .ink-preflight {
-  --pal-ground:#120d1e;
-  --pal-plane:#1c1629;
-  --pal-inset:#221a33;
-  --pal-ink:#ece5f7;
-  --pal-ink-2:#c6bce0;
-  --pal-ink-3:#9d92c0;
-  --pal-line:#372c50;
-  --pal-line-strong:#4e4073;
-  --pal-draft:#9dadff;
-  --pal-draft-ink:#bcc7ff;
-  --pal-draft-soft:#252e55;
-  --pal-proof:#c3b1ef;
-  --pal-proof-ink:#cfc2f4;
-  --pal-proof-soft:#291f42;
-  --pal-ring:rgba(157,173,255,.40);
+  --pal-ground:#141814;
+  --pal-plane:#1d231e;
+  --pal-inset:#252d26;
+  --pal-ink:#f1ece2;
+  --pal-ink-2:#d0c8bb;
+  --pal-ink-3:#aaa296;
+  --pal-line:#384239;
+  --pal-line-strong:#586258;
+  --pal-draft:#79b89c;
+  --pal-draft-ink:#a8d5c1;
+  --pal-draft-soft:#20382d;
+  --pal-proof:#d68a9a;
+  --pal-proof-ink:#efa9b6;
+  --pal-proof-soft:#3b2027;
+  --pal-ring:rgba(121,184,156,.34);
 }
 
 :root[data-theme="dark"] body.page-console:has(> .ink-editwrap),
 :root[data-theme="dark"] body.page-preflight {
-  --pal-ground:#120d1e;
-  --pal-plane:#1c1629;
-  --pal-inset:#221a33;
-  --pal-ink:#ece5f7;
-  --pal-ink-2:#c6bce0;
-  --pal-ink-3:#9d92c0;
-  --pal-line:#372c50;
-  --pal-line-strong:#4e4073;
-  --pal-draft:#9dadff;
-  --pal-draft-ink:#bcc7ff;
-  --pal-draft-soft:#252e55;
-  --pal-proof:#c3b1ef;
-  --pal-proof-ink:#cfc2f4;
-  --pal-proof-soft:#291f42;
-  --pal-ring:rgba(157,173,255,.40);
+  --pal-ground:#141814;
+  --pal-plane:#1d231e;
+  --pal-inset:#252d26;
+  --pal-ink:#f1ece2;
+  --pal-ink-2:#d0c8bb;
+  --pal-ink-3:#aaa296;
+  --pal-line:#384239;
+  --pal-line-strong:#586258;
+  --pal-draft:#79b89c;
+  --pal-draft-ink:#a8d5c1;
+  --pal-draft-soft:#20382d;
+  --pal-proof:#d68a9a;
+  --pal-proof-ink:#efa9b6;
+  --pal-proof-soft:#3b2027;
+  --pal-ring:rgba(121,184,156,.34);
 }
 
 @media (prefers-color-scheme:dark) {
   :root[data-theme="auto"] .ink-editwrap,
   :root[data-theme="auto"] .ink-preflight {
-    --pal-ground:#120d1e;
-    --pal-plane:#1c1629;
-    --pal-inset:#221a33;
-    --pal-ink:#ece5f7;
-    --pal-ink-2:#c6bce0;
-    --pal-ink-3:#9d92c0;
-    --pal-line:#372c50;
-    --pal-line-strong:#4e4073;
-    --pal-draft:#9dadff;
-    --pal-draft-ink:#bcc7ff;
-    --pal-draft-soft:#252e55;
-    --pal-proof:#c3b1ef;
-    --pal-proof-ink:#cfc2f4;
-    --pal-proof-soft:#291f42;
-    --pal-ring:rgba(157,173,255,.40);
+    --pal-ground:#141814;
+    --pal-plane:#1d231e;
+    --pal-inset:#252d26;
+    --pal-ink:#f1ece2;
+    --pal-ink-2:#d0c8bb;
+    --pal-ink-3:#aaa296;
+    --pal-line:#384239;
+    --pal-line-strong:#586258;
+    --pal-draft:#79b89c;
+    --pal-draft-ink:#a8d5c1;
+    --pal-draft-soft:#20382d;
+    --pal-proof:#d68a9a;
+    --pal-proof-ink:#efa9b6;
+    --pal-proof-soft:#3b2027;
+    --pal-ring:rgba(121,184,156,.34);
   }
 
   :root[data-theme="auto"] body.page-console:has(> .ink-editwrap),
   :root[data-theme="auto"] body.page-preflight {
-    --pal-ground:#120d1e;
-    --pal-plane:#1c1629;
-    --pal-inset:#221a33;
-    --pal-ink:#ece5f7;
-    --pal-ink-2:#c6bce0;
-    --pal-ink-3:#9d92c0;
-    --pal-line:#372c50;
-    --pal-line-strong:#4e4073;
-    --pal-draft:#9dadff;
-    --pal-draft-ink:#bcc7ff;
-    --pal-draft-soft:#252e55;
-    --pal-proof:#c3b1ef;
-    --pal-proof-ink:#cfc2f4;
-    --pal-proof-soft:#291f42;
-    --pal-ring:rgba(157,173,255,.40);
+    --pal-ground:#141814;
+    --pal-plane:#1d231e;
+    --pal-inset:#252d26;
+    --pal-ink:#f1ece2;
+    --pal-ink-2:#d0c8bb;
+    --pal-ink-3:#aaa296;
+    --pal-line:#384239;
+    --pal-line-strong:#586258;
+    --pal-draft:#79b89c;
+    --pal-draft-ink:#a8d5c1;
+    --pal-draft-soft:#20382d;
+    --pal-proof:#d68a9a;
+    --pal-proof-ink:#efa9b6;
+    --pal-proof-soft:#3b2027;
+    --pal-ring:rgba(121,184,156,.34);
   }
 }
 
@@ -3250,4 +3354,45 @@ body.page-preflight { background:var(--pal-ground); }
   }
 
   .ink-editor__actionbar .writer-state--saving .writer-state__dot { animation:none; }
+}
+
+/* ==========================================================================
+   Inkwell v2 · retint onto the shared Steadholme neutral system.
+   Figma AgW9572aDQMEDkSzerg9lR (Scriptoria, plum accent). This surface is
+   `surf/blog` in the design, so it keeps the suite's neutral ground and
+   carries its own colour on the accent.
+
+   This crate defines a COMPLETE palette in its own `:root`, so the shared kit
+   cannot be prepended — it would simply be overridden. The tokens are
+   re-pointed here instead, after everything else in the file.
+   ========================================================================== */
+:root {
+  --bg:#f6f7f9; --bg-2:#eef0f4;
+  --surface:#ffffff; --surface-2:#f6f7f9; --surface-3:#eef0f4;
+  --border:#e5e7ec; --border-2:#d3d7e0; --hairline:#eef0f4;
+  --ink:#17191f; --ink-2:#4a5160; --ink-3:#727a8a; --ink-4:#9aa2b1;
+  --accent:#7e22ce; --accent-2:#9333ea; --accent-ink:#6b21a8;
+  --accent-soft:#f3e8ff; --accent-soft-2:#e9d5ff; --accent-border:#e9d5ff;
+  --brand:var(--accent); --brand-soft:var(--accent-soft); --brand-ink:var(--accent-ink);
+  --ring:rgba(126,34,206,.30);
+  --r-xs:4px; --r-sm:8px; --r:10px; --r-lg:12px;
+  --sh-xs:0 1px 2px rgba(23,25,31,.05);
+  --sh-sm:0 1px 3px rgba(23,25,31,.08),0 1px 2px rgba(23,25,31,.04);
+  --sh-md:0 6px 20px rgba(23,25,31,.10);
+
+  /* The reading sheet stays warm — a long read is not a console. */
+  --paper-bg:#fffdf9; --paper-rule:#eae4d8;
+  --code-bg:#0f1115; --code-ink:#c9d1d9; --code-dim:#5c6673;
+  --hl-mark:#ffe89a; --hl-text:#4a3a06;
+}
+:root[data-theme="dark"] {
+  --bg:#0d1117; --bg-2:#0b0f14;
+  --surface:#161b22; --surface-2:#11161d; --surface-3:#1c2129;
+  --border:#30363d; --border-2:#484f58; --hairline:#262c34;
+  --ink:#e6edf3; --ink-2:#b1bac4; --ink-3:#8b949e; --ink-4:#6e7681;
+  --accent:#c084fc; --accent-2:#c084fc; --accent-ink:#d8b4fe;
+  --accent-soft:#3b0764; --accent-soft-2:#3b0764; --accent-border:#3b0764;
+  --brand:var(--accent); --brand-soft:var(--accent-soft); --brand-ink:var(--accent-ink);
+  --paper-bg:#161b22; --paper-rule:#30363d;
+  --hl-mark:#5a4a12; --hl-text:#ffe89a;
 }

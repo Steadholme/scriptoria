@@ -90,3 +90,14 @@ curl -fsS http://127.0.0.1:8700/healthz       # ok
 - 部署期创建数据库 `inkwell`。
 - Sluice 路由表新增：`blog.w33d.xyz`（path_prefix `/`）→ 上游 `http://inkwell:8700`、`auth=sso`。通配 `*.w33d.xyz` DNS 已解析到本机，autocert 首次握手即签发 LE 证书，无需 DNS 动作。
 - Portal 磁贴：名称 `Blog`，描述「个人博客与札记」，icon 提示 `mail`/文档类；Beacon 组件名 `Blog`。
+
+## Frontend (v2, 2026-09-08)
+
+This surface follows the shared Steadholme v2 system implemented from the Figma
+file `AgW9572aDQMEDkSzerg9lR` (Scriptoria, plum accent), carrying its own
+`surf/*` colour on the accent.
+
+Each crate here defines a COMPLETE palette in its own `:root`, so the shared
+kit cannot be prepended — it would simply be overridden. `static/service.css`
+is therefore this crate's original layer with a token re-point appended after
+everything else.

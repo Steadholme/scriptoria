@@ -10,7 +10,7 @@ use axum::body::Body;
 use axum::http::{header, HeaderMap, Request, StatusCode};
 use pastefire::model::Paste;
 use pastefire::store::Store;
-use pastefire::{app, build_dev_state, now_secs, AppState};
+use pastefire::{app, build_dev_state, handlers, now_secs, AppState};
 use tower::ServiceExt;
 
 /// Percent-encode a form value (encode everything that is not an unreserved character).
@@ -77,6 +77,27 @@ fn get(path: &str, subject: Option<&str>) -> Request<Body> {
     b.body(Body::empty()).unwrap()
 }
 
+#[tokio::test]
+async fn static_css_is_public_and_immutable() {
+    let response = send(&app(build_dev_state()), get(handlers::APP_CSS_PATH, None)).await;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(
+        response.headers.get(header::CONTENT_TYPE).unwrap(),
+        "text/css; charset=utf-8"
+    );
+    assert_eq!(
+        response.headers.get(header::CACHE_CONTROL).unwrap(),
+        "public, max-age=31536000, immutable"
+    );
+    assert!(response.body.contains("Pastefire — a dark-first workspace"));
+    assert!(response.body.contains(".btn-sm { min-height:44px;"));
+    assert!(response
+        .body
+        .contains("min-height:44px; padding:10px 12px;"));
+    assert!(response.body.contains("height:44px;"));
+    assert!(!response.body.contains("GENERATED FROM odyssey"));
+}
+
 fn post_form(
     path: &str,
     fields: &[(&str, &str)],
@@ -109,6 +130,9 @@ async fn create_view_raw_delete_lifecycle() {
     let form_page = send(&app, get("/", Some("alice"))).await;
     assert_eq!(form_page.status, StatusCode::OK);
     assert!(form_page.body.contains("New paste"));
+    assert!(form_page
+        .body
+        .contains("<label class=\"sr-only\" for=\"title\">Paste title</label>"));
     assert!(form_page.body.contains("You have no active pastes yet."));
     let csrf = form_page.csrf_cookie().expect("csrf cookie set on GET /");
 

@@ -171,3 +171,14 @@ docker build -t steadholme/agora:dev .
 
 Rust + axum，沿用 Steadholme 共享品牌令牌（brand tokens）：深蓝渐变品牌、靛蓝强调色、柔和卡片与阴影，
 顶栏含 Steadholme 盾徽 + 服务名 + 当前登录邮箱 + 退出链接。CSS 通过 `include_str!` 内联，无静态资源往返。
+
+## Frontend (v2, 2026-09-08)
+
+This surface follows the shared Steadholme v2 system implemented from the Figma
+file `AgW9572aDQMEDkSzerg9lR` (Scriptoria, plum accent), carrying its own
+`surf/*` colour on the accent.
+
+Each crate here defines a COMPLETE palette in its own `:root`, so the shared
+kit cannot be prepended — it would simply be overridden. `static/service.css`
+is therefore this crate's original layer with a token re-point appended after
+everything else.

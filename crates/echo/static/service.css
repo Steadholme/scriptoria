@@ -1,11 +1,153 @@
-/* Echo (embeddable comments) service surface, layered AFTER Odyssey canonical CSS.
-   The base kit (font + tokens + reset + shared components: app-bar, card, btn, pill,
-   field, stat, table, tabs, empty, toast, layout, pagehead, modal, pager, site-foot …)
-   now comes from odyssey::APP_CSS. This file keeps only Echo (embeddable comments)'s own domain chrome and the
-   legacy-compat gap-fillers its templates/tests still reference. */
+/* Echo — a neutral, adaptive conversation workspace.
+   This file is the complete product-owned visual system; Odyssey is not part of
+   Echo's rendering layer. */
 
-/* --- Token bridge: none needed — every token this surface references is provided by
-   canonical odyssey (tokens.css). Shared tokens are deliberately left to canonical. */
+:root {
+  color-scheme: light dark;
+  --font: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --bg: #f3f4f6;
+  --bg-2: #ebecef;
+  --surface: #ffffff;
+  --surface-2: #f7f7f9;
+  --ink: #211c24;
+  --ink-2: #514b55;
+  --ink-3: #746d79;
+  --ink-4: #918a96;
+  --accent: #635bff;
+  --accent-2: #4b2c5a;
+  --accent-ink: #4b2c5a;
+  --accent-soft: #eeecff;
+  --accent-soft-2: #e2dfff;
+  --ring: rgba(99, 91, 255, .22);
+  --border: #dedbe1;
+  --border-2: #c9c4cc;
+  --hairline: #ebe8ed;
+  --ok: #267a55;
+  --ok-soft: #e5f5ed;
+  --ok-border: #a8d8c0;
+  --ok-ink: #18583d;
+  --warn: #956015;
+  --warn-soft: #fff3d6;
+  --warn-border: #e6c77e;
+  --warn-ink: #70470d;
+  --down: #a53b48;
+  --down-soft: #fdebee;
+  --down-border: #e9aeb7;
+  --down-ink: #812d38;
+  --radius: 16px;
+  --radius-md: 12px;
+  --radius-sm: 9px;
+  --r: var(--radius);
+  --r-sm: var(--radius-sm);
+  --r-pill: 999px;
+  --sh-xs: 0 1px 2px rgba(33, 28, 36, .06), 0 8px 24px rgba(33, 28, 36, .035);
+  --dur: 150ms;
+  --ease: cubic-bezier(.2, .7, .2, 1);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161318;
+    --bg-2: #1d1920;
+    --surface: #211d24;
+    --surface-2: #29242c;
+    --ink: #f3eff5;
+    --ink-2: #cec6d2;
+    --ink-3: #aaa0af;
+    --ink-4: #8f8494;
+    --accent: #a79fff;
+    --accent-2: #c9c2ff;
+    --accent-ink: #d8d2ff;
+    --accent-soft: #332d59;
+    --accent-soft-2: #3e376a;
+    --ring: rgba(167, 159, 255, .28);
+    --border: #3c3540;
+    --border-2: #554b5a;
+    --hairline: #312b34;
+    --ok-soft: #173d2c;
+    --ok-border: #286548;
+    --ok-ink: #a8e2c5;
+    --warn-soft: #453517;
+    --warn-border: #765b27;
+    --warn-ink: #f1d18b;
+    --down-soft: #4a242b;
+    --down-border: #7e3d48;
+    --down-ink: #f3b9c1;
+    --sh-xs: 0 1px 2px rgba(0, 0, 0, .22), 0 12px 28px rgba(0, 0, 0, .12);
+  }
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+html { min-height: 100%; background: var(--bg); font-family: var(--font); }
+body { min-height: 100%; margin: 0; background: var(--bg); color: var(--ink); font-family: var(--font); line-height: 1.5; -webkit-font-smoothing: antialiased; }
+button, input, textarea, select { font: inherit; }
+button, summary, a { -webkit-tap-highlight-color: transparent; }
+a { color: var(--accent-ink); text-decoration: none; }
+a:hover { text-decoration: underline; text-underline-offset: 3px; }
+:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+.muted { color: var(--ink-3); }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+
+.appbar {
+  position: sticky; top: 0; z-index: 40; min-height: 64px; padding: 8px max(20px, calc((100vw - 1160px) / 2));
+  display: flex; align-items: center; gap: 18px; background: color-mix(in srgb, var(--surface) 88%, transparent);
+  border-bottom: 1px solid var(--border); backdrop-filter: blur(18px);
+}
+.appbar__brand { min-height: 46px; display: inline-flex; align-items: center; gap: 10px; color: var(--ink); text-decoration: none; }
+.appbar__brand:hover { text-decoration: none; }
+.app-tile { width: 38px; height: 38px; display: grid; place-items: center; border-radius: 11px; color: #fff; background: var(--accent-2); }
+.app-tile svg { width: 21px; height: 21px; }
+.appbar__name { display: grid; line-height: 1.15; }
+.appbar__name b { font-size: 14px; font-weight: 700; }
+.appbar__name span { margin-top: 3px; color: var(--ink-3); font-size: 11px; }
+.appbar__nav, .appbar__right { display: flex; align-items: center; gap: 6px; }
+.appbar__spacer { flex: 1; }
+.appnav { min-height: 44px; padding: 0 12px; display: inline-flex; align-items: center; gap: 7px; border-radius: 10px; color: var(--ink-2); font-size: 13px; font-weight: 650; }
+.appnav svg { width: 17px; height: 17px; }
+.appnav:hover, .appnav.is-active { color: var(--accent-ink); background: var(--accent-soft); text-decoration: none; }
+.iconbtn { width: 44px; height: 44px; display: inline-grid; place-items: center; border-radius: 10px; color: var(--ink-2); }
+.iconbtn:hover { color: var(--ink); background: var(--surface-2); text-decoration: none; }
+.iconbtn svg { width: 19px; height: 19px; }
+
+.usermenu { position: relative; }
+.usermenu__btn { min-height: 44px; padding: 4px 8px 4px 5px; display: flex; align-items: center; gap: 8px; border: 0; border-radius: 12px; background: transparent; color: var(--ink); cursor: pointer; }
+.usermenu__btn:hover, .usermenu:focus-within .usermenu__btn { background: var(--surface-2); }
+.avatar { width: 34px; height: 34px; display: inline-grid; place-items: center; flex: 0 0 auto; border-radius: 50%; background: var(--accent-soft); color: var(--accent-ink); font-size: 13px; font-weight: 750; }
+.usermenu__name { max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; }
+.usermenu__caret { width: 15px; height: 15px; color: var(--ink-3); }
+.usermenu__pop { position: absolute; top: calc(100% + 8px); right: 0; width: 260px; padding: 7px; display: none; background: var(--surface); border: 1px solid var(--border); border-radius: 14px; box-shadow: 0 18px 48px rgba(33, 28, 36, .18); }
+.usermenu:hover .usermenu__pop, .usermenu:focus-within .usermenu__pop { display: block; }
+.usermenu__head { padding: 10px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid var(--hairline); margin-bottom: 5px; }
+.usermenu__head div { min-width: 0; display: grid; }
+.usermenu__head b, .usermenu__head span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.usermenu__head b { font-size: 12.5px; }
+.usermenu__head span { color: var(--ink-3); font-size: 11.5px; }
+.menuitem { min-height: 44px; padding: 0 10px; display: flex; align-items: center; gap: 9px; border-radius: 9px; color: var(--ink-2); font-size: 13px; }
+.menuitem:hover { color: var(--ink); background: var(--surface-2); text-decoration: none; }
+.menuitem svg { width: 17px; height: 17px; }
+.menuitem--danger { color: var(--down-ink); }
+
+.btn { min-height: 44px; padding: 0 16px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; border: 1px solid transparent; border-radius: 10px; font-family: var(--font); font-size: 13px; font-weight: 700; cursor: pointer; transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease), color var(--dur) var(--ease), transform var(--dur) var(--ease); }
+.btn:hover { text-decoration: none; transform: translateY(-1px); }
+.btn:disabled { opacity: .55; cursor: not-allowed; transform: none; }
+.btn-primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+.btn-primary:hover { background: var(--accent-2); border-color: var(--accent-2); color: #fff; }
+.btn-ghost { background: transparent; color: var(--ink-2); border-color: transparent; }
+.btn-ghost:hover { background: var(--surface-2); color: var(--ink); }
+.btn-danger { background: var(--down); color: #fff; border-color: var(--down); }
+.btn-sm { min-height: 44px; padding-inline: 13px; font-size: 12.5px; }
+.field { display: grid; gap: 7px; }
+.field > span, .field > label { color: var(--ink-2); font-size: 12.5px; font-weight: 650; }
+.pagination { margin-top: 18px; display: flex; justify-content: center; }
+.toast { padding: 11px 14px; border-radius: 10px; background: var(--ink); color: var(--surface); box-shadow: 0 12px 32px rgba(0, 0, 0, .18); font-size: 13px; }
+.toast--ok { background: var(--ok); color: #fff; }
+
+@media (forced-colors: active) {
+  * { box-shadow: none !important; }
+  .app-tile, .btn-primary, .sort-tab--on, .react-btn--on, .vote-btn--on { forced-color-adjust: none; background: Highlight; color: HighlightText; border-color: Highlight; }
+  :focus-visible { outline: 3px solid Highlight; }
+}
 
 /* --- App-bar dropdown logout form (canonical has .menuitem, not the form wrapper). */
 .menuitem-form { margin:0; } .menuitem-form .menuitem { width:100%; border:0; background:transparent; font-family:inherit; cursor:pointer; text-align:left; }
@@ -116,9 +258,9 @@ body.page { max-width:none; margin:0; padding:0; }
 @media (prefers-reduced-motion:reduce){ * { transition:none !important; animation:none !important; } }
 
 /* ==========================================================================
-   Echo service components — the comments reading surface, in the Odyssey kit.
+   Echo service components — the product-owned comments reading surface.
    Flat surfaces, hairline borders, small radii, medium heading weights, soft
-   tints over saturated fills. Extends the shared kit above; reuses its tokens.
+   tints over saturated fills. Extends Echo's adaptive token foundation above.
    ========================================================================== */
 
 /* ---- Reading layout ----------------------------------------------------- */
@@ -206,6 +348,36 @@ body.page { max-width:none; margin:0; padding:0; }
 }
 .comment__body ul, .comment__body ol { margin: 0 0 12px; padding-left: 24px; }
 .comment__hidden { color: var(--ink-3); }
+.comment__actions { position: relative; display: flex; align-items: flex-start; flex-wrap: wrap; gap: 6px; margin-top: 12px; padding-top: 8px; border-top: 1px solid var(--hairline); }
+.comment__actions details { margin: 0; }
+.comment__actions > details > summary {
+  min-height: 44px; padding: 0 11px; display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 9px; color: var(--ink-2); font-size: 12.5px; font-weight: 650; cursor: pointer;
+  list-style: none; user-select: none;
+}
+.comment__actions > details > summary::-webkit-details-marker { display: none; }
+.comment__actions > details > summary:hover, .comment__actions > details[open] > summary { color: var(--accent-ink); background: var(--accent-soft); }
+.comment__actions > .comment-more { margin-left: auto; }
+.comment__actions > .reply-toggle[open] { flex: 1 0 100%; }
+.comment__actions > .reply-toggle[open] > summary { margin-bottom: 10px; }
+.reaction-picker, .comment-more { position: relative; }
+.reaction-picker .reactions, .comment-more__panel {
+  position: absolute; z-index: 12; top: calc(100% + 6px); min-width: max-content; padding: 8px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 16px 38px rgba(33, 28, 36, .16);
+}
+.reaction-picker .reactions { left: 0; margin: 0; flex-wrap: nowrap; }
+.comment-more__panel { right: 0; width: min(320px, calc(100vw - 40px)); min-width: 260px; display: grid; gap: 8px; }
+.comment-more__panel > * { margin: 0; }
+.comment-more__panel .votes { padding-bottom: 8px; border-bottom: 1px solid var(--hairline); }
+.comment-more__panel .report-toggle > summary, .comment-more__panel .edit-toggle > summary {
+  min-height: 44px; padding: 0 10px; display: flex; align-items: center; border-radius: 9px;
+}
+.comment-more__panel .report-toggle > summary:hover, .comment-more__panel .edit-toggle > summary:hover { background: var(--surface-2); }
+.comment-more__panel .composer-form { margin: 8px 0 4px; }
+.self-controls { display: grid; gap: 4px; }
+.self-controls .mod-form { display: block; }
+.self-controls .mod-form .btn, .comment-more__panel > .mod-form .btn { width: 100%; justify-content: flex-start; }
+.self-controls .mod-form .btn { color: var(--down-ink); }
 
 .replies { margin: 12px 0 0 24px; padding-left: 16px; border-left: 2px solid var(--border); display: flex; flex-direction: column; gap: 12px; }
 
@@ -224,7 +396,7 @@ body.page { max-width:none; margin:0; padding:0; }
 .react-form { display: inline; margin: 0; }
 .react-btn {
   display: inline-flex; align-items: center; gap: 6px;
-  padding: 3px 10px; cursor: pointer;
+  min-height: 44px; padding: 0 12px; cursor: pointer;
   background: var(--surface); color: var(--ink-2);
   border: 1px solid var(--border-2); border-radius: 999px;
   font-family: var(--font); font-size: 13px; font-weight: 500; line-height: 1.4;
@@ -239,13 +411,13 @@ body.page { max-width:none; margin:0; padding:0; }
 .votes { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
 .vote-form { display: inline; margin: 0; }
 .vote-score {
-  display: inline-flex; align-items: center; min-height: 28px;
+  display: inline-flex; align-items: center; min-height: 44px;
   color: var(--ink-3); font-size: 12.5px; font-weight: 500;
 }
 .vote-score b { color: var(--ink); font-variant-numeric: tabular-nums; margin-left: 4px; }
 .vote-btn {
   display: inline-flex; align-items: center; justify-content: center;
-  min-width: 48px; height: 28px; padding: 0 10px; cursor: pointer;
+  min-width: 56px; height: 44px; padding: 0 12px; cursor: pointer;
   background: var(--surface); color: var(--ink-2);
   border: 1px solid var(--border-2); border-radius: 999px;
   font-family: var(--font); font-size: 12.5px; font-weight: 600; line-height: 1;
@@ -317,13 +489,18 @@ body.page-embed { background: transparent; }
   .table tbody td { border-bottom: 0; padding: 4px 16px; }
   .table tbody tr { border-bottom: 1px solid var(--border); padding: 12px 0; }
   .table tbody tr:last-child { border-bottom: 0; }
+  .reader { padding: 24px 14px 52px; }
+  .comment { padding: 14px; }
+  .replies { margin-left: 8px; padding-left: 10px; }
+  .reaction-picker, .comment-more { position: static; }
+  .reaction-picker .reactions, .comment-more__panel { position: static; left: auto; right: auto; top: auto; width: 100%; min-width: 0; margin-top: 4px; }
+  .reaction-picker[open], .comment-more[open] { flex: 1 0 100%; }
+  .comment__actions > .comment-more { margin-left: 0; }
 }
 
 /* ============================================================================
-   Odyssey v2 — progressive-enhancement layer (ADDITIVE; redefines no selector
-   above). Toast host + optimistic busy/pending states used by the JS layer.
-   All motion rides the shared --dur/--ease tokens and is neutralised by the
-   global prefers-reduced-motion rule already declared above.
+   Progressive enhancement: toast host + optimistic busy/pending states used
+   by the JavaScript layer. Motion uses Echo's local duration tokens.
    ============================================================================ */
 .toast-host { position:fixed; z-index:80; left:50%; bottom:22px; transform:translateX(-50%);
   display:flex; flex-direction:column; gap:9px; align-items:center; width:auto; max-width:92vw; pointer-events:none; }
@@ -334,3 +511,44 @@ body.page-embed { background: transparent; }
 .toast--err svg { color:#fecaca; }
 .is-busy { opacity:.55; pointer-events:none; }
 .is-pending { opacity:.6; }
+
+/* ==========================================================================
+   Echo v2 · retint onto the shared Steadholme neutral system.
+   Figma AgW9572aDQMEDkSzerg9lR (Scriptoria, plum accent). This surface is
+   `surf/comments` in the design, so it keeps the suite's neutral ground and
+   carries its own colour on the accent.
+
+   This crate defines a COMPLETE palette in its own `:root`, so the shared kit
+   cannot be prepended — it would simply be overridden. The tokens are
+   re-pointed here instead, after everything else in the file.
+   ========================================================================== */
+:root {
+  --bg:#f6f7f9; --bg-2:#eef0f4;
+  --surface:#ffffff; --surface-2:#f6f7f9; --surface-3:#eef0f4;
+  --border:#e5e7ec; --border-2:#d3d7e0; --hairline:#eef0f4;
+  --ink:#17191f; --ink-2:#4a5160; --ink-3:#727a8a; --ink-4:#9aa2b1;
+  --accent:#be123c; --accent-2:#e11d48; --accent-ink:#9f1239;
+  --accent-soft:#ffe4e6; --accent-soft-2:#fecdd3; --accent-border:#fecdd3;
+  --brand:var(--accent); --brand-soft:var(--accent-soft); --brand-ink:var(--accent-ink);
+  --ring:rgba(190,18,60,.30);
+  --r-xs:4px; --r-sm:8px; --r:10px; --r-lg:12px;
+  --sh-xs:0 1px 2px rgba(23,25,31,.05);
+  --sh-sm:0 1px 3px rgba(23,25,31,.08),0 1px 2px rgba(23,25,31,.04);
+  --sh-md:0 6px 20px rgba(23,25,31,.10);
+
+  /* The reading sheet stays warm — a long read is not a console. */
+  --paper-bg:#fffdf9; --paper-rule:#eae4d8;
+  --code-bg:#0f1115; --code-ink:#c9d1d9; --code-dim:#5c6673;
+  --hl-mark:#ffe89a; --hl-text:#4a3a06;
+}
+:root[data-theme="dark"] {
+  --bg:#0d1117; --bg-2:#0b0f14;
+  --surface:#161b22; --surface-2:#11161d; --surface-3:#1c2129;
+  --border:#30363d; --border-2:#484f58; --hairline:#262c34;
+  --ink:#e6edf3; --ink-2:#b1bac4; --ink-3:#8b949e; --ink-4:#6e7681;
+  --accent:#fb7185; --accent-2:#fb7185; --accent-ink:#fda4af;
+  --accent-soft:#3f1220; --accent-soft-2:#3f1220; --accent-border:#3f1220;
+  --brand:var(--accent); --brand-soft:var(--accent-soft); --brand-ink:var(--accent-ink);
+  --paper-bg:#161b22; --paper-rule:#30363d;
+  --hl-mark:#5a4a12; --hl-text:#ffe89a;
+}

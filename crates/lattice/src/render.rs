@@ -1,32 +1,43 @@
 //! Server-side HTML rendering helpers: escaping, the page shell, timestamps, error pages.
 //!
-//! The enterprise Steadholme shell (top app-bar with the shield + wordmark + page name, and the
-//! signed-in email + Logout on the right) and the design-system CSS are embedded via
-//! `include_str!`, so every page is self-contained with no asset round-trips. Each handler
+//! The Lattice shell and product-owned design system are embedded in the binary. Each handler
 //! builds only its inner `content` HTML and hands it to [`layout`].
 
 use crate::auth;
 use axum::http::{
-    header::{ACCEPT_LANGUAGE, COOKIE},
-    HeaderMap,
+    header::{self, ACCEPT_LANGUAGE, COOKIE},
+    HeaderMap, HeaderValue,
 };
+use axum::response::{IntoResponse, Response};
 
-/// Lattice-only CSS layered after Odyssey's canonical font, tokens, and components.
+/// Complete, product-owned Lattice visual system.
 const SERVICE_CSS: &str = include_str!("../static/service.css");
+
+pub const APP_CSS_PATH: &str = "/assets/lattice-20260822-v2.css";
 
 static APP_CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// Embedded design-system CSS inlined into every page's `<style>`: Odyssey's canonical
-/// CSS (font + tokens + components) followed by Lattice's service surface CSS.
+/// Embedded, product-owned design-system CSS.
 fn app_css() -> &'static str {
-    APP_CSS
-        .get_or_init(|| {
-            let mut css = String::with_capacity(odyssey::APP_CSS.len() + SERVICE_CSS.len());
-            css.push_str(odyssey::APP_CSS);
-            css.push_str(SERVICE_CSS);
-            css
-        })
-        .as_str()
+    APP_CSS.get_or_init(|| SERVICE_CSS.to_owned()).as_str()
+}
+
+pub async fn app_css_asset() -> Response {
+    let mut response = app_css().into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/css; charset=utf-8"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 /// Page shell with `{{...}}` slots.
 const LAYOUT: &str = include_str!("../templates/layout.html");
@@ -49,7 +60,7 @@ pub fn layout(page_title: &str, headers: &HeaderMap, content: &str) -> String {
     let theme = odyssey::resolve_theme(cookie);
     let active = if page_title == "Recent changes" {
         "recent"
-    } else if page_title == "Coherence" {
+    } else if page_title == "Workspace health" {
         "coherence"
     } else if page_title.starts_with("Create") {
         "new"
@@ -57,7 +68,6 @@ pub fn layout(page_title: &str, headers: &HeaderMap, content: &str) -> String {
         "home"
     };
     LAYOUT
-        .replace("{{STYLE}}", app_css())
         .replace("{{LANG}}", locale.bcp47())
         .replace("{{HTML_THEME}}", odyssey::html_theme_attr(theme))
         .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(theme))
@@ -72,7 +82,7 @@ pub fn layout(page_title: &str, headers: &HeaderMap, content: &str) -> String {
 /// The Lattice app-tile icon — a Lucide-style `book-open` glyph.
 pub const APP_ICON: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>"##;
 
-/// The full Odyssey v2 app-bar: Lattice brand + workspace nav + estate preferences, then the
+/// The Lattice app-bar: product brand + workspace nav + estate preferences, then the
 /// "All apps" waffle and avatar user-menu. Public/no-session renders keep a minimal avatar.
 fn app_bar(active: &str, email: Option<&str>, locale: odyssey::Locale, theme: &str) -> String {
     let nav = format!(
@@ -81,7 +91,7 @@ fn app_bar(active: &str, email: Option<&str>, locale: odyssey::Locale, theme: &s
             r#"<a class="appnav{a_home}" href="/"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 22V12h6v10"/></svg>Home</a>"#,
             r#"<a class="appnav{a_recent}" href="/recent"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 8v5l3 2"/><circle cx="12" cy="12" r="10"/></svg>Recent changes</a>"#,
             r#"<a class="appnav{a_new}" href="/new"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="M12 5v14"/></svg>New page</a>"#,
-            r#"<a class="appnav{a_coh}" href="/coherence"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>Coherence</a>"#,
+            r#"<a class="appnav{a_coh}" href="/coherence"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>Workspace health</a>"#,
             r#"</nav>"#,
         ),
         a_home = if active == "home" { " is-active" } else { "" },
@@ -105,6 +115,12 @@ fn app_bar(active: &str, email: Option<&str>, locale: odyssey::Locale, theme: &s
     <span class="appbar__name"><b>Lattice</b><span>Knowledge workspace</span></span>
   </a>
   {nav}
+  <form class="lattice-search" role="search" method="get" action="/search">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+    <label class="sr-only" for="lattice-global-search">Search documents</label>
+    <input id="lattice-global-search" type="search" name="q" placeholder="Search documents" autocomplete="off">
+    <kbd aria-hidden="true">/</kbd>
+  </form>
   <span class="appbar__spacer"></span>
   <div class="appbar__right">{preferences}{right}</div>
 </header>"#,
@@ -236,8 +252,8 @@ mod tests {
         assert!(html.contains("me@steadholme.local"));
         assert!(html.contains("Steadholme"));
         assert!(html.contains("sso.w33d.xyz/_gw/auth/logout"));
-        // Odyssey v2 app-bar chrome: the "All apps" waffle back to the apex portal + the avatar
-        // user-menu. The legacy `allapps`/`userchip` hooks are retained on the new elements.
+        // Product app-bar chrome: the "All apps" link back to the apex portal + the avatar
+        // user-menu. Compatibility hooks remain on the product-owned elements.
         assert!(html.contains("class=\"appbar\""));
         assert!(html.contains("allapps"));
         assert!(html.contains("https://w33d.xyz"));

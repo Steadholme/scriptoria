@@ -105,7 +105,7 @@ async fn question_lifecycle_filters_and_historical_clear_are_coherent() {
     let latest = answered_page.find(LATEST_ANCHOR).unwrap();
     assert!(
         dais < answer && answer < latest,
-        "the accepted answer is rendered once on the Answer Dais before the latest boundary"
+        "the accepted answer is rendered once before the latest boundary"
     );
     assert_eq!(answered_page.matches("Renew before half-life.").count(), 1);
 
@@ -188,7 +188,7 @@ async fn question_lifecycle_filters_and_historical_clear_are_coherent() {
     let historical_location = format!("/t/{historical_id}");
     let (_, _, historical) =
         send(&state, get_as(&historical_location, ALICE_SUB, ALICE_EMAIL)).await;
-    assert!(historical.contains("Answer Dais"));
+    assert!(historical.contains("Accepted answer"));
     assert!(historical.contains("Remove solution"));
     assert_eq!(
         historical

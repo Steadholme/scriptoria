@@ -3,10 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
+  <meta name="color-scheme" content="dark">
   <link rel="icon" href="data:,">
   <title>{{TITLE}} · Pastefire · Steadholme</title>
-  <style>{{CSS}}</style>
+  <link rel="stylesheet" href="/assets/pastefire-20260823.css">
 </head>
 <body class="page-console">
   <header class="appbar">
@@ -29,7 +29,7 @@
         {{SOURCE}}
         <div class="badges">{{BADGES}}</div>
       </div>
-      <div class="console__actions">{{ACTIONS}}</div>
+      <div class="console__actions" aria-label="Paste actions"><span class="action-label">Paste actions</span>{{ACTIONS}}</div>
     </div>
     {{BURN_NOTICE}}
     <div class="layout layout--view{{LAYOUT_MOD}}">

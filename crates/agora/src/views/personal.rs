@@ -1,4 +1,4 @@
-//! Civic Ledgers — the subject-private rooms: For You, Focus, Activity, Bookmarks.
+//! Private views: For You, reading priorities, activity, and bookmarks.
 //!
 //! These views lead with the signed-in subject context, private ownership, the reason a row is
 //! present, and the snapshot/bound, THEN the content (contract five-second hierarchy for private
@@ -58,7 +58,7 @@ fn ledger_head(title: &str, owner_note: &str, meta: &str) -> String {
     <p class="ag-ledger-meta muted">{meta}</p>
   </div>
 </header>"#,
-        eyebrow = eyebrow("Civic Ledger"),
+        eyebrow = eyebrow("Private view"),
         title = escape(title),
         owner_note = escape(owner_note),
         meta = escape(meta),
@@ -85,9 +85,8 @@ fn catch_up_main(v: &CatchUpFeedVM) -> String {
         ],
     );
     let meta = format!(
-        "As of {} · page bound {} · a private snapshot, not a global feed",
+        "Updated {} · private to you",
         super::fmt_ts(s.snapshot_as_of),
-        s.visible_bound,
     );
     let body = if v.viewer.items.is_empty() {
         collection_note(s.state, "You're all caught up. Nothing new in this view.")
@@ -336,7 +335,7 @@ fn activity_main(v: &ActivityView) -> String {
     let s = &v.shared;
     let tabs = activity_tabs(s);
     let meta = format!(
-        "Page bound {} · durable record of application events, not a delivery receipt",
+        "Showing up to {} events · this is activity history, not a notification receipt",
         s.visible_bound,
     );
     let mark = v
@@ -484,7 +483,7 @@ fn bookmarks_main(v: &BookmarksView) -> String {
         ],
     );
     let meta = format!(
-        "Page bound {} · private bookmarks and notes",
+        "Showing up to {} · private bookmarks and notes",
         s.visible_bound
     );
     let body = if v.viewer.items.is_empty() {
@@ -622,7 +621,7 @@ fn bookmark_edit_main(v: &BookmarkEditView) -> String {
             ("Bookmarks", Some("/bookmarks")),
             ("Edit", None)
         ]),
-        eyebrow = eyebrow("Civic Ledger"),
+        eyebrow = eyebrow("Bookmarks"),
         title = t(&s.thread_title),
         action = o(&vs.save.action),
         hidden = hidden_inputs(&vs.save.csrf.0, &vs.save.fields),

@@ -199,3 +199,14 @@ BIND_ADDR=127.0.0.1:8720 cargo run
 - **Portal 磁贴**：名称 `Wiki`，描述「Knowledge base and runbooks.」，图标提示 `status`/通用网格
   （catalog 未知 icon 回退为网格图标），Beacon 组件名 `Wiki`。
 - **Beacon 组件**：`Wiki`（http 探测 `http://lattice:8720/healthz`）。
+
+## Frontend (v2, 2026-09-08)
+
+This surface follows the shared Steadholme v2 system implemented from the Figma
+file `AgW9572aDQMEDkSzerg9lR` (Scriptoria, plum accent), carrying its own
+`surf/*` colour on the accent.
+
+Each crate here defines a COMPLETE palette in its own `:root`, so the shared
+kit cannot be prepended — it would simply be overridden. `static/service.css`
+is therefore this crate's original layer with a token re-point appended after
+everything else.

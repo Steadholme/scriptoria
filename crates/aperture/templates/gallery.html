@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light">
   <link rel="icon" href="data:,">
   <title>Drive · Aperture · Steadholme</title>
-  <style>{{CSS}}</style>
+  <link rel="stylesheet" href="/assets/aperture-20260823.css">
 </head>
 <body class="page-console">
   <header class="appbar">
@@ -152,7 +152,7 @@
 	          });
           xhr.send(fd);
         }
-        input.addEventListener('change', function () { show(); upload(); });
+        input.addEventListener('change', show);
         ['dragenter', 'dragover'].forEach(function (ev) {
           zone.addEventListener(ev, function (e) { e.preventDefault(); zone.classList.add('dragging'); });
         });
@@ -163,7 +163,7 @@
 	          if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
 	            input.files = e.dataTransfer.files;
 	            show();
-	            upload();
+	            toast('File ready — review the name, then upload', true);
 	          }
 	        });
 	        zone.__apUpload = upload;
@@ -228,7 +228,7 @@
           if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
             current.input.files = e.dataTransfer.files;
             if (current.zone.__apShowUpload) { current.zone.__apShowUpload(); }
-            if (current.zone.__apUpload) { current.zone.__apUpload(); }
+            toast('File ready — review the name, then upload', true);
           }
         });
       }

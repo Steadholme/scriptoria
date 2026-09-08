@@ -7,7 +7,7 @@
 use axum::body::{to_bytes, Body};
 use axum::http::{header, HeaderMap, Request, StatusCode};
 use inkwell::store::Post;
-use inkwell::{app, build_dev_state, now_secs, AppState};
+use inkwell::{app, build_dev_state, handlers, now_secs, AppState};
 use tower::ServiceExt;
 
 const CSRF: &str = "library_csrf_token";
@@ -16,12 +16,10 @@ const CSRF: &str = "library_csrf_token";
 async fn library_is_private_owner_scoped_and_composable_without_javascript() {
     let state = build_dev_state();
     let now = now_secs();
-    let mut published =
-        fixture("alice-published", "alice", true, 0, "Rust, Notes", 30);
+    let mut published = fixture("alice-published", "alice", true, 0, "Rust, Notes", 30);
     published.created_at = 100;
     seed(&state, published).await;
-    let mut draft =
-        fixture("alice-draft-needle", "alice", false, 0, "Rust", 40);
+    let mut draft = fixture("alice-draft-needle", "alice", false, 0, "Rust", 40);
     draft.created_at = 20;
     seed(&state, draft).await;
     let mut scheduled = fixture(
@@ -66,7 +64,29 @@ async fn library_is_private_owner_scoped_and_composable_without_javascript() {
     assert!(body.contains(r#"data-bulk-tag"#));
     assert!(body.contains(r#"input[data-library-item]"#));
     assert!(body.contains("bulk.hidden = selected === 0"));
-    assert!(body.contains(".ink-library__bulk[hidden] { display:none; }"));
+    assert!(body.contains(&format!(r#"href="{}""#, handlers::APP_CSS_PATH)));
+    assert!(!body.contains("<style>"));
+    let (css_status, css_headers, css) = call(
+        &state,
+        Request::builder()
+            .uri(handlers::APP_CSS_PATH)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(css_status, StatusCode::OK);
+    assert_eq!(
+        css_headers.get(header::CONTENT_TYPE).unwrap(),
+        "text/css; charset=utf-8"
+    );
+    assert_eq!(
+        css_headers.get(header::CACHE_CONTROL).unwrap(),
+        "public, max-age=31536000, immutable"
+    );
+    assert!(css.contains(".ink-library__bulk[hidden] { display:none; }"));
+    assert!(css.contains(".usermenu__pop{display:none"));
+    assert!(css.contains(".iconbtn svg{width:18px;height:18px}"));
+    assert!(css.contains(".draftbar[hidden] { display:none; }"));
     assert!(body.contains("bulkTag.hidden = action.value !== 'add_tag'"));
     assert!(body.contains("var MAX_SELECTION = 50"));
     assert!(body.contains("Math.min(boxes.length, MAX_SELECTION)"));
@@ -74,10 +94,10 @@ async fn library_is_private_owner_scoped_and_composable_without_javascript() {
     assert!(body.contains("Select first 50"));
     assert!(body.contains("maximum reached"));
     assert!(body.contains("box.disabled = selectionLimitReached && !box.checked"));
-    assert!(body.contains("@media (max-width:340px)"));
-    assert!(body.contains(".appbar__nav .appnav { padding-inline:9px; font-size:13px; }"));
-    assert!(body.contains(".appbar__nav .appnav svg { display:none; }"));
-    assert!(body.contains(".ink-library .ink-library__status-tab { padding-inline:6px; }"));
+    assert!(css.contains("@media (max-width:340px)"));
+    assert!(css.contains(".appbar__nav .appnav { padding-inline:9px; font-size:13px; }"));
+    assert!(css.contains(".appbar__nav .appnav svg { display:none; }"));
+    assert!(css.contains(".ink-library .ink-library__status-tab { padding-inline:6px; }"));
     assert!(body.contains("Every selected version is checked"));
     assert!(body.contains("alice-published"));
     assert!(body.contains("alice-draft-needle"));
@@ -119,13 +139,9 @@ async fn library_is_private_owner_scoped_and_composable_without_javascript() {
     let (status, _, created_order) = call(&state, get(&created_uri, "alice", None)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(created_order.contains(r#"value="created" selected"#));
-    assert!(created_order.contains(
-        r#"href="/library?status=draft&amp;sort=created&amp;as_of="#
-    ));
+    assert!(created_order.contains(r#"href="/library?status=draft&amp;sort=created&amp;as_of="#));
     assert!(created_order.contains(r#"href="/library?tag=Rust&amp;sort=created&amp;as_of="#));
-    assert!(created_order.contains(
-        r#"name="return_to" value="/library?sort=created&amp;as_of="#
-    ));
+    assert!(created_order.contains(r#"name="return_to" value="/library?sort=created&amp;as_of="#));
     let published_at = created_order.find("alice-published").unwrap();
     let scheduled_at = created_order.find("alice-scheduled").unwrap();
     let draft_at = created_order.find("alice-draft-needle").unwrap();
@@ -251,7 +267,7 @@ async fn bulk_is_atomic_generic_on_conflict_and_returns_safely_to_library() {
     let (_, edit_headers, editor) = call(&state, get(&edit_uri, "alice", None)).await;
     assert_private_no_store(&edit_headers);
     assert!(editor.contains(&format!(r#"name="return_to" value="{safe_return}""#)));
-    assert!(editor.contains(&format!(r#"href="{safe_return}">Cancel"#)));
+    assert!(editor.contains(&format!(r#"href="{safe_return}">Keep for later"#)));
     let current = state.store.get_post("one").await.unwrap();
     let update = form(&[
         ("title", "one".to_string()),

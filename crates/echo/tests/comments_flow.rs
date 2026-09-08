@@ -7,10 +7,32 @@
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
-use echo::{app, build_dev_state};
+use echo::{app, build_dev_state, handlers};
 use tower::ServiceExt;
 
 const CSRF: &str = "tok_csrf_for_tests";
+
+#[tokio::test]
+async fn static_css_is_public_and_immutable() {
+    let response = app(build_dev_state())
+        .oneshot(get(handlers::APP_CSS_PATH))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/css; charset=utf-8"
+    );
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "public, max-age=31536000, immutable"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let css = String::from_utf8_lossy(&body);
+    assert!(css.contains(".btn-sm { min-height: 44px;"));
+}
 
 #[tokio::test]
 async fn full_comments_flow_in_memory() {

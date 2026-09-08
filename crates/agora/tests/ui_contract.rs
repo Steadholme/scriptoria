@@ -177,6 +177,7 @@ fn shell_and_css_preserve_accessible_progressive_enhancement() {
     assert!(css.contains("border-style: dashed;"));
     assert!(css.contains("min-height: 44px"));
     assert!(css.contains(".ag-row__cat a"));
+    assert!(css.contains(".menuitem svg{width:17px;height:17px"));
 
     // Orphan CSS rules must be removed
     assert!(!css.contains(".ag-read-progress {"));
@@ -239,9 +240,13 @@ fn home_is_one_landmark_and_separates_shared_from_private_truth() {
         1,
         "shell owns the only main landmark"
     );
-    assert!(html.contains("Topic Terraces"));
-    assert!(html.contains("Civic Ledgers"));
-    assert!(html.contains("page bound 20"));
+    assert!(html.contains("Categories"));
+    assert!(html.contains("My activity"));
+    assert!(html.contains("1 discussion in this view"));
+    assert!(
+        html.find("ag-home__feed").unwrap() < html.find("ag-home__rail").unwrap(),
+        "the primary discussion feed precedes supplementary navigation on narrow screens"
+    );
     assert!(html.contains("ag-key-shared"));
     assert!(html.contains("ag-key-private"));
     assert!(html.contains("Watching"));
@@ -384,8 +389,8 @@ fn thread_renders_one_answer_dais_and_truthful_page_bounds() {
     assert_eq!(html.matches(r#"id="ag-dais-title""#).count(), 1);
     assert_eq!(html.matches("accepted-body").count(), 1);
     assert!(html.contains("acceptance, not objective correctness"));
-    assert!(html.contains("Selected from 2 posts / 72 words on this page · at most 3 sentences"));
-    assert!(html.contains("Page bound 20"));
+    assert!(html.contains("Based on 2 posts on this page · up to 3 sentences"));
+    assert!(html.contains("Up to 20 per page"));
     assert!(html.contains(r#"href="/t/thread-1?latest=1#thread-latest""#));
     assert!(html.contains("Beginning of results"));
     assert!(html.contains(r#"method="post" action="/t/thread-1/reply""#));
@@ -400,9 +405,9 @@ fn thread_renders_one_answer_dais_and_truthful_page_bounds() {
         "owner and admin review links can coexist"
     );
 
-    let floor = html.find("Speaker Floor").expect("speaker floor");
-    let dais = html.find("Answer Dais").expect("answer dais");
-    let steps = html.find("Reply Steps").expect("reply steps");
+    let floor = html.find("Original post").expect("original post");
+    let dais = html.find("Accepted answer").expect("accepted answer");
+    let steps = html.find("Replies").expect("replies");
     assert!(
         floor < dais && dais < steps,
         "civic reading order is structural"

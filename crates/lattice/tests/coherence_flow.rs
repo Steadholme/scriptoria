@@ -108,11 +108,10 @@ async fn plain_page_exposes_isolation_as_a_coherence_signal() {
     .await;
     let (status, _h, body) = call(&state, get("/w/solo")).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("Coherence signals"));
+    assert!(body.contains("Workspace health"));
     assert!(body.contains("Isolated"));
-    assert!(body.contains("Linked from"));
-    assert!(body.contains("Related"));
-    assert_eq!(body.matches("None yet").count(), 2);
+    assert!(!body.contains("Linked from"));
+    assert!(!body.contains("Related"));
 }
 
 #[tokio::test]
@@ -154,7 +153,7 @@ async fn coherence_lists_stale_and_contradictions() {
 
     let (status, _h, body) = call(&state, get("/coherence")).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("Coherence"));
+    assert!(body.contains("Workspace health"));
     // Stale section flags the ancient page (and links to it), not the fresh one.
     assert!(body.contains("Stale pages"));
     assert!(
@@ -176,8 +175,30 @@ async fn coherence_empty_wiki_does_not_500() {
     let state = seeded_state(120, &[]).await;
     let (status, _h, body) = call(&state, get("/coherence")).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("Coherence"));
+    assert!(body.contains("Workspace health"));
     assert!(body.contains("0 pages"));
+}
+
+#[tokio::test]
+async fn search_finds_title_and_body_matches_without_listing_unrelated_pages() {
+    let state = seeded_state(
+        120,
+        &[
+            (
+                "runbook",
+                "Recovery Runbook",
+                "database restore snapshot retention steps",
+                10,
+            ),
+            ("salad", "Lunch Notes", "lettuce tomato cucumber", 10),
+        ],
+    )
+    .await;
+    let (status, _h, body) = call(&state, get("/search?q=restore")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Recovery Runbook"));
+    assert!(body.contains(r#"href="/w/runbook""#));
+    assert!(!body.contains(r#"href="/w/salad""#));
 }
 
 // --- helpers ---------------------------------------------------------------------------

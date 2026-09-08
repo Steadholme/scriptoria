@@ -421,13 +421,21 @@ fn render_row(post: &Post, view: &ViewState, current_url: &str) -> String {
         edit_href = esc(&edit_href),
         history_href = esc(&history_href),
         flags = flags,
-        updated = esc(&fmt_date(post.updated_at)),
+        updated = esc(&library_updated_label(post.updated_at)),
         schedule = schedule,
         version = post.edit_version,
         tags = tags,
         view_href = view_href,
         view_label = view_label,
     )
+}
+
+fn library_updated_label(updated_at: i64) -> String {
+    if updated_at <= 0 {
+        "time unavailable".to_string()
+    } else {
+        fmt_date(updated_at)
+    }
 }
 
 fn parse_action(raw: &str, raw_tag: &str) -> Result<LibraryBulkAction, AppError> {
@@ -791,5 +799,12 @@ mod tests {
             response.headers().get(header::CACHE_CONTROL).unwrap(),
             "private, no-store"
         );
+    }
+
+    #[test]
+    fn unavailable_update_time_never_renders_the_unix_epoch() {
+        assert_eq!(library_updated_label(0), "time unavailable");
+        assert_eq!(library_updated_label(-1), "time unavailable");
+        assert_ne!(library_updated_label(1), "time unavailable");
     }
 }

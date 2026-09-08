@@ -62,3 +62,14 @@ cargo test                       # in-memory flow + unit tests (no database)
 # Optional Postgres integration test:
 TEST_DATABASE_URL=postgres://... cargo test --test pg_store -- --nocapture
 ```
+
+## Frontend (v2, 2026-09-08)
+
+This surface follows the shared Steadholme v2 system implemented from the Figma
+file `AgW9572aDQMEDkSzerg9lR` (Scriptoria, plum accent), carrying its own
+`surf/*` colour on the accent.
+
+Each crate here defines a COMPLETE palette in its own `:root`, so the shared
+kit cannot be prepended — it would simply be overridden. `static/service.css`
+is therefore this crate's original layer with a token re-point appended after
+everything else.

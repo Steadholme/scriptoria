@@ -60,6 +60,7 @@ pub struct AppState {
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(handlers::health::healthz))
+        .route(handlers::APP_CSS_PATH, get(handlers::app_css_asset))
         .route("/", get(handlers::comments::dashboard))
         .route("/t/{key}", get(handlers::comments::thread_view))
         .route("/embed/{key}", get(handlers::comments::embed_view))

@@ -3,35 +3,46 @@
 //! - [`health`] — unauthenticated liveness probe (`/healthz`).
 //! - [`paste`] — the SSO pastebin surface (new form, create, view, raw, delete).
 //!
-//! The shared design tokens / CSS are embedded (via `include_str!`) and inlined into every
-//! page, matching the Steadholme enterprise brand: brand gradient, indigo accent, cards,
-//! buttons, the app-bar with the shield + wordmark. All producer-supplied text is HTML-escaped
-//! on render (defense-in-depth against stored XSS); the service injects NO raw HTML.
+//! Pastefire's product-owned design tokens / CSS are embedded (via `include_str!`) and served to
+//! every page. All producer-supplied text is HTML-escaped on render (defense-in-depth against
+//! stored XSS); the service injects NO raw HTML.
 
 pub mod health;
 pub mod paste;
 
-use axum::http::StatusCode;
-use axum::response::Html;
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::{Html, IntoResponse, Response};
 use std::sync::OnceLock;
 
-/// Pastefire-only CSS layered after Odyssey's canonical font, tokens, and components.
+/// Pastefire's complete product-owned visual system.
 pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
+
+pub const APP_CSS_PATH: &str = "/assets/pastefire-20260823.css";
 
 static APP_CSS: OnceLock<String> = OnceLock::new();
 static DYNAMIC_JS: OnceLock<String> = OnceLock::new();
 
-/// Embedded design system, inlined into each rendered page's `<style>`:
-/// Odyssey's canonical CSS followed by Pastefire's service surface CSS.
+/// Complete, product-owned Pastefire visual system.
 pub fn app_css() -> &'static str {
-    APP_CSS
-        .get_or_init(|| {
-            let mut css = String::with_capacity(odyssey::APP_CSS.len() + SERVICE_CSS.len());
-            css.push_str(odyssey::APP_CSS);
-            css.push_str(SERVICE_CSS);
-            css
-        })
-        .as_str()
+    APP_CSS.get_or_init(|| SERVICE_CSS.to_owned()).as_str()
+}
+
+pub async fn app_css_asset() -> Response {
+    let mut response = app_css().into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/css; charset=utf-8"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 
 pub fn dynamic_js() -> &'static str {
@@ -251,7 +262,6 @@ pub fn render_error(
 ) -> (StatusCode, Html<String>) {
     let (tone, glyph) = error_tone_glyph(status);
     let body = ERROR_HTML
-        .replace("{{CSS}}", app_css())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Pastefire", email))
         .replace("{{STATUS}}", &status.as_u16().to_string())

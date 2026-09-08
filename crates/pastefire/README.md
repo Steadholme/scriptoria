@@ -85,3 +85,21 @@ curl -fsS http://127.0.0.1:8730/healthz   # -> ok
 - 网关路由：`paste.w33d.xyz`，`auth=sso`。
 - Beacon 组件名：`Pastefire`。
 - Portal 磁贴：名称 `Pastefire`，描述「Share code snippets and pastes across the estate.」，图标提示 `paste`/`code`。
+
+## Frontend (v2, 2026-09-08)
+
+This surface follows the shared Steadholme v2 system implemented from the Figma
+file `AgW9572aDQMEDkSzerg9lR` (Scriptoria, plum accent), carrying its own
+`surf/*` colour on the accent.
+
+Each crate here defines a COMPLETE palette in its own `:root`, so the shared
+kit cannot be prepended — it would simply be overridden. `static/service.css`
+is therefore this crate's original layer with a token re-point appended after
+everything else.
+
+Pastefire takes the v2 DARK neutrals rather than the light ones. It is
+dark-first by design: its `:root` declares `color-scheme: dark`, and the app bar
+hard-codes a dark ground while its text resolves through `--ink`. Mapping it to
+the light neutrals turns the page light and leaves near-black text on that dark
+bar. Its `--brand` is also a light cream used as a ground, not an accent, so it
+is left alone.

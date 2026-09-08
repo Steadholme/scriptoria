@@ -7,7 +7,7 @@
   <meta name="robots" content="noindex">
   <link rel="icon" href="data:,">
   <title>{{PAGE_TITLE}} · Lattice · Steadholme</title>
-  <style>{{STYLE}}</style>
+  <link rel="stylesheet" href="/assets/lattice-20260822-v2.css">
 </head>
 <body class="page-lattice">
   {{APPBAR}}
@@ -21,6 +21,15 @@
     // matching sticky page-tree node) for the heading currently in view. Pure
     // read-only enhancement — the anchors work identically without it.
     (function () {
+      var globalSearch = document.getElementById('lattice-global-search');
+      document.addEventListener('keydown', function (event) {
+        if (event.key === '/' && !event.metaKey && !event.ctrlKey && !event.altKey &&
+            !/INPUT|TEXTAREA|SELECT/.test(document.activeElement && document.activeElement.tagName)) {
+          event.preventDefault();
+          if (globalSearch) { globalSearch.focus(); }
+        }
+      });
+
       var links = document.querySelectorAll('.toc__item a[href^="#"]');
       if (!links.length || !('IntersectionObserver' in window)) { return; }
       var liFor = {};

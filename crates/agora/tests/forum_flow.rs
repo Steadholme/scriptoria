@@ -1003,12 +1003,12 @@ async fn accepted_solution_can_be_the_exact_first_unread_boundary() {
         "the earliest accepted boundary has no phantom older reply page"
     );
     assert!(!page.contains("Load older"));
-    let dais = page.find("Answer Dais").unwrap();
+    let dais = page.find("Accepted answer").unwrap();
     let boundary = page.find("First unread").unwrap();
     let accepted = page.find("The accepted solution body.").unwrap();
     assert!(
         dais < boundary && boundary < accepted,
-        "the visible unread separator marks the accepted post inside the Answer Dais"
+        "the visible unread separator marks the accepted post inside Accepted answer"
     );
 }
 

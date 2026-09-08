@@ -49,6 +49,12 @@ pub struct IndexQuery {
     pub limit: Option<i64>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SearchQuery {
+    #[serde(default)]
+    pub q: String,
+}
+
 /// Query for `GET /recent` — keyset pagination over all revisions. `before=<ts>_<rev_id>` is the
 /// cursor taken from the previous page's last row (absent = the newest revision).
 #[derive(Debug, Deserialize)]
@@ -174,6 +180,78 @@ fn parse_before(raw: &str) -> Option<(i64, String)> {
     }
 }
 
+pub async fn search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SearchQuery>,
+) -> Result<Html<String>, AppError> {
+    let raw = query.q.trim();
+    let needle = raw.to_lowercase();
+    let mut pages = if needle.is_empty() {
+        Vec::new()
+    } else {
+        state
+            .store
+            .list_pages(None, MAX_PAGE)
+            .await?
+            .into_iter()
+            .filter(|page| {
+                page.title.to_lowercase().contains(&needle)
+                    || page.slug.to_lowercase().contains(&needle)
+                    || page.body_md.to_lowercase().contains(&needle)
+            })
+            .collect::<Vec<_>>()
+    };
+    pages.sort_by_key(|page| {
+        let title = page.title.to_lowercase();
+        if title == needle {
+            0
+        } else if title.starts_with(&needle) {
+            1
+        } else if title.contains(&needle) {
+            2
+        } else {
+            3
+        }
+    });
+
+    let results = pages
+        .iter()
+        .map(|page| {
+            let excerpt = page
+                .body_md
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty() && !line.starts_with('#'))
+                .unwrap_or("Open this document to read its contents.");
+            let excerpt = excerpt.chars().take(220).collect::<String>();
+            format!(
+                "<li class=\"search-page__result\"><h2><a href=\"/w/{slug}\">{title}</a></h2><p>{excerpt}</p><small>Updated {updated}</small></li>",
+                slug = esc(&page.slug),
+                title = esc(&page.title),
+                excerpt = esc(&excerpt),
+                updated = esc(&fmt_ts(page.updated_at)),
+            )
+        })
+        .collect::<String>();
+    let result_block = if raw.is_empty() {
+        "<div class=\"empty-state\"><h2>Find a document</h2><p>Search titles, page names, and document text.</p></div>".to_string()
+    } else if pages.is_empty() {
+        "<div class=\"empty-state\"><h2>No matching documents</h2><p>Try a shorter phrase or browse the page tree.</p><a class=\"btn btn-secondary\" href=\"/\">Browse the library</a></div>".to_string()
+    } else {
+        format!(
+            "<p class=\"muted\">{} result{}</p><ol class=\"search-page__results\">{results}</ol>",
+            pages.len(),
+            if pages.len() == 1 { "" } else { "s" },
+        )
+    };
+    let content = format!(
+        "<section class=\"search-page\"><p class=\"eyebrow\">Knowledge search</p><h1>Search documents</h1><form class=\"search-page__form\" role=\"search\" method=\"get\" action=\"/search\"><label class=\"sr-only\" for=\"search-page-query\">Search documents</label><input id=\"search-page-query\" type=\"search\" name=\"q\" value=\"{query}\" placeholder=\"Title, topic, or phrase\" autofocus><button class=\"btn btn-primary\" type=\"submit\">Search</button></form>{result_block}</section>",
+        query = esc(raw),
+    );
+    Ok(Html(layout("Search", &headers, &content)))
+}
+
 fn render_index(
     pages: &[Page],
     structure_pages: &[Page],
@@ -287,7 +365,7 @@ fn render_index(
            <aside class=\"library-rail\" aria-label=\"Workspace overview\">\
              <a class=\"coherence-entry\" href=\"/coherence\">\
                <span class=\"coherence-entry__signal\" aria-hidden=\"true\"></span>\
-               <span><strong>Coherence</strong><small>Review stale or contradictory knowledge</small></span>\
+               <span><strong>Workspace health</strong><small>Review stale or contradictory knowledge</small></span>\
                <span aria-hidden=\"true\">→</span>\
              </a>\
              <section class=\"library-activity\">\
@@ -564,6 +642,23 @@ fn render_document_inspector(view: &DocumentView<'_>) -> String {
         || view.outgoing_count > 0
         || !view.panel.related.is_empty();
     let connection_label = if connected { "Connected" } else { "Isolated" };
+    let outline = if view.toc.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<details class=\"inspector-section\" open><summary>Outline</summary>{}</details>",
+            render_toc(view.toc)
+        )
+    };
+    let relations = if connected {
+        format!(
+            "<details class=\"inspector-section\" open><summary>Connections</summary>{}</details>",
+            render_relations(view.panel)
+        )
+    } else {
+        String::new()
+    };
+    let health_open = if stale || !connected { " open" } else { "" };
     let move_form = render_move_form(page, view.pages, view.csrf);
     let move_form = if move_form.is_empty() {
         "<p class=\"inspector-empty\">This is the only page in the workspace.</p>".to_string()
@@ -574,14 +669,8 @@ fn render_document_inspector(view: &DocumentView<'_>) -> String {
     format!(
         "<aside class=\"document-inspector\" aria-label=\"Document inspector\">\
            <div class=\"inspector-head\"><p class=\"eyebrow\">Context</p><h2>Inspector</h2></div>\
-           <details class=\"inspector-section\" open>\
-             <summary>Outline</summary>\
-             {outline}\
-           </details>\
-           <details class=\"inspector-section\" open>\
-             <summary>Connections</summary>\
-             {relations}\
-           </details>\
+           {outline}\
+           {relations}\
            <details class=\"inspector-section\">\
              <summary>Document</summary>\
              <dl class=\"document-meta\">\
@@ -591,8 +680,8 @@ fn render_document_inspector(view: &DocumentView<'_>) -> String {
                <div><dt>Slug</dt><dd><code>{slug}</code></dd></div>\
              </dl>\
            </details>\
-           <details class=\"inspector-section\" open>\
-             <summary>Coherence signals</summary>\
+           <details class=\"inspector-section\"{health_open}>\
+             <summary>Workspace health</summary>\
              <div class=\"signal-line{freshness_class}\"><span aria-hidden=\"true\"></span><div><strong>{freshness_label}</strong><small>{freshness_detail}</small></div></div>\
              <div class=\"signal-line\"><span aria-hidden=\"true\"></span><div><strong>{connection_label}</strong><small>{incoming} inbound · {outgoing} outbound · {related} related</small></div></div>\
              <a class=\"inspector-link\" href=\"/coherence\">Open workspace report →</a>\
@@ -602,8 +691,8 @@ fn render_document_inspector(view: &DocumentView<'_>) -> String {
              {move_form}\
            </details>\
          </aside>",
-        outline = render_toc(view.toc),
-        relations = render_relations(view.panel),
+        outline = outline,
+        relations = relations,
         owner = esc(&page.updated_by_email),
         updated = esc(&fmt_ts(page.updated_at)),
         slug = esc(&page.slug),
@@ -611,6 +700,7 @@ fn render_document_inspector(view: &DocumentView<'_>) -> String {
         freshness_label = freshness_label,
         freshness_detail = esc(&freshness_detail),
         connection_label = connection_label,
+        health_open = health_open,
         incoming = view.panel.backlinks.len(),
         outgoing = view.outgoing_count,
         related = view.panel.related.len(),

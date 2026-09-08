@@ -11,7 +11,7 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use tower::ServiceExt;
 
-use lattice::{app, build_dev_state, AppState};
+use lattice::{app, build_dev_state, render, AppState};
 
 #[tokio::test]
 async fn healthz_ok() {
@@ -19,6 +19,24 @@ async fn healthz_ok() {
     let (status, _h, body) = call(&state, get("/healthz")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "ok");
+}
+
+#[tokio::test]
+async fn static_css_is_public_and_immutable() {
+    let state = build_dev_state();
+    let (status, headers, body) = call(&state, get(render::APP_CSS_PATH)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get(header::CONTENT_TYPE).unwrap(),
+        "text/css; charset=utf-8"
+    );
+    assert_eq!(
+        headers.get(header::CACHE_CONTROL).unwrap(),
+        "public, max-age=31536000, immutable"
+    );
+    assert!(body.contains("Lattice"));
+    assert!(body.contains(".iconbtn svg{width:18px;height:18px}"));
+    assert!(!body.contains("GENERATED FROM odyssey"));
 }
 
 #[tokio::test]
@@ -87,9 +105,9 @@ async fn full_create_edit_history_flow() {
     assert!(body.contains("<div class=\"knowledge-document\">"));
     assert!(body.contains("<article class=\"page document-article\">"));
     assert!(body.contains("<aside class=\"document-inspector\""));
-    assert!(body.contains("<summary>Outline</summary>"));
+    assert!(!body.contains("<summary>Outline</summary>"));
     assert!(body.contains("<summary>Connections</summary>"));
-    assert!(body.contains("<summary>Coherence signals</summary>"));
+    assert!(body.contains("<summary>Workspace health</summary>"));
     assert!(body.contains("<p>Welcome.</p>"));
     assert!(body.contains(r#"href="/w/runbook""#));
     assert!(
@@ -147,7 +165,14 @@ async fn recent_feed_lists_cross_page_edits_newest_first() {
     )
     .await;
     pause_for_distinct_ts().await;
-    save_page_http(&state, "beta", "Beta", "beta created", "bob@steadholme.local").await;
+    save_page_http(
+        &state,
+        "beta",
+        "Beta",
+        "beta created",
+        "bob@steadholme.local",
+    )
+    .await;
     pause_for_distinct_ts().await;
     save_page_http(
         &state,
@@ -209,7 +234,14 @@ async fn recent_feed_keyset_paginates() {
     )
     .await;
     pause_for_distinct_ts().await;
-    save_page_http(&state, "beta", "Beta", "beta created", "bob@steadholme.local").await;
+    save_page_http(
+        &state,
+        "beta",
+        "Beta",
+        "beta created",
+        "bob@steadholme.local",
+    )
+    .await;
     pause_for_distinct_ts().await;
     save_page_http(
         &state,

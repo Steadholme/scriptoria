@@ -19,8 +19,10 @@ use crate::view_model::{CacheClass, DestructiveReviewVM, ErrorView, NavTab, Page
 
 use super::{crumbs, escape, hidden_inputs, t};
 
-/// Agora-only CSS layered after Odyssey's canonical font, tokens, and components.
+/// Complete, product-owned Agora visual system.
 pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
+
+pub const APP_CSS_PATH: &str = "/assets/agora-20260822-v2.css";
 
 /// Page shell with `{{STYLE}}`/`{{DYNAMIC}}`/`{{APPBAR}}`/`{{TITLE}}`/`{{CONTENT}}` slots.
 pub const SHELL: &str = include_str!("../../templates/shell.html");
@@ -38,17 +40,9 @@ pub const LOGOUT_URL: &str = "https://sso.w33d.xyz/_gw/auth/logout";
 static APP_CSS: OnceLock<String> = OnceLock::new();
 static DYNAMIC_JS: OnceLock<String> = OnceLock::new();
 
-/// Embedded design system, inlined into each rendered page's `<style>`: Odyssey's canonical
-/// CSS followed by Agora's civic surface CSS (Odyssey dependency unchanged, contract §4).
+/// Complete, product-owned Agora visual system.
 pub fn app_css() -> &'static str {
-    APP_CSS
-        .get_or_init(|| {
-            let mut css = String::with_capacity(odyssey::APP_CSS.len() + SERVICE_CSS.len());
-            css.push_str(odyssey::APP_CSS);
-            css.push_str(SERVICE_CSS);
-            css
-        })
-        .as_str()
+    APP_CSS.get_or_init(|| SERVICE_CSS.to_owned()).as_str()
 }
 
 fn dynamic_js() -> &'static str {
@@ -65,7 +59,6 @@ fn dynamic_js() -> &'static str {
 pub fn page(chrome: &PageChrome, main_html: &str) -> String {
     let _ = chrome.cache; // CacheClass stays authoritative at Codex; never rendered.
     SHELL
-        .replace("{{STYLE}}", app_css())
         .replace("{{DYNAMIC}}", dynamic_js())
         .replace("{{APPBAR}}", &app_bar(chrome))
         .replace("{{TITLE}}", &t(&chrome.title))

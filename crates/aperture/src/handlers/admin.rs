@@ -18,7 +18,7 @@ use crate::auth;
 use crate::config::effective_quota;
 use crate::error::AppError;
 use crate::handlers::files::{html_with_csrf, redirect_found};
-use crate::handlers::{esc, human_size, userbox, app_css, SHIELD_SVG};
+use crate::handlers::{esc, human_size, userbox, SHIELD_SVG};
 use crate::model::OwnerUsage;
 use crate::AppState;
 
@@ -55,7 +55,13 @@ pub async fn index(
         }
     }
 
-    let html = render_admin(state.config.default_quota_bytes, &viewer.email, &csrf, &usage, &quotas);
+    let html = render_admin(
+        state.config.default_quota_bytes,
+        &viewer.email,
+        &csrf,
+        &usage,
+        &quotas,
+    );
     Ok(html_with_csrf(StatusCode::OK, html, &csrf))
 }
 
@@ -116,9 +122,12 @@ pub async fn set_quota(
         None => "quota override cleared".to_string(),
     };
     tracing::info!(owner, quota = ?quota, actor = actor.subject, "owner quota updated");
-    state
-        .audit
-        .emit(AuditEvent::notice("admin.quota.set", &actor.subject, owner, &detail));
+    state.audit.emit(AuditEvent::notice(
+        "admin.quota.set",
+        &actor.subject,
+        owner,
+        &detail,
+    ));
     Ok(redirect_found("/admin"))
 }
 
@@ -151,11 +160,17 @@ fn render_admin(
                 let effective = effective_quota(override_bytes, default_quota_bytes);
                 let quota_cell = match (effective, override_bytes.is_some()) {
                     (Some(q), true) => {
-                        format!("{} <span class=\"muted\">(override)</span>", esc(&human_size(q)))
+                        format!(
+                            "{} <span class=\"muted\">(override)</span>",
+                            esc(&human_size(q))
+                        )
                     }
                     (None, true) => "Unlimited <span class=\"muted\">(override)</span>".to_string(),
                     (Some(q), false) => {
-                        format!("{} <span class=\"muted\">(default)</span>", esc(&human_size(q)))
+                        format!(
+                            "{} <span class=\"muted\">(default)</span>",
+                            esc(&human_size(q))
+                        )
                     }
                     (None, false) => "Unlimited".to_string(),
                 };
@@ -198,7 +213,6 @@ fn render_admin(
     );
 
     ADMIN_HTML
-        .replace("{{CSS}}", app_css())
         .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{USERBOX}}", &userbox("Drive admin", Some(viewer_email)))
         .replace("{{DEFAULT_QUOTA}}", &esc(&default_label))

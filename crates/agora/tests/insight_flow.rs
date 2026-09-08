@@ -159,10 +159,10 @@ async fn thread_summary_endpoint_and_card() {
         "typed summary desk present"
     );
     assert!(page.contains(
-        r#"<summary class="ag-desk__summary">Local extractive summary of this page</summary>"#
+        r#"<summary class="ag-desk__summary">Summary of the replies shown here</summary>"#
     ));
     assert!(page.contains(r#"<ol class="ag-summary__list">"#));
-    assert!(page.contains("Not whole-thread, not consensus, not correctness."));
+    assert!(page.contains("This may not represent the entire thread or consensus."));
     assert!(
         page.contains("Nightly export job failing"),
         "thread still renders"
@@ -239,7 +239,7 @@ async fn summary_json_and_html_share_the_exact_reply_page_boundary() {
     assert_eq!(json["post_count"], 6);
     assert_eq!(json["state"], "available");
     assert!(json_body.contains("LateBoundaryToken"));
-    assert!(page_html.contains("Selected from 6 posts"));
+    assert!(page_html.contains("Based on 6 posts on this page"));
     for sentence in json["summary"].as_array().unwrap() {
         assert!(
             page_html.contains(sentence.as_str().unwrap()),
@@ -276,10 +276,8 @@ async fn small_thread_has_no_summary_card() {
         "tiny thread shows no summary desk"
     );
     assert!(
-        page.contains(
-            r#"<p class="muted ag-summary ag-summary--none">Not enough posts on this page to summarize.</p>"#
-        ),
-        "the typed unavailable state remains explicit"
+        !page.contains("Not enough posts on this page to summarize."),
+        "a missing optional summary should not compete with the discussion"
     );
 }
 

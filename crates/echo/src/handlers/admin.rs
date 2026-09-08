@@ -22,7 +22,7 @@ use crate::auth;
 use crate::config::MAX_PAGE;
 use crate::error::AppError;
 use crate::handlers::comments::{html_with_cookie, local_redirect, path_seg, redirect};
-use crate::handlers::{esc, fmt_datetime, topbar, app_css};
+use crate::handlers::{esc, fmt_datetime, topbar};
 use crate::markdown;
 use crate::store::{BlockedAuthor, Comment, CommentReport, Thread};
 use crate::{now_secs, AppState};
@@ -93,7 +93,6 @@ pub async fn dashboard(
     let block_form = render_block_form(&csrf);
 
     let body = ADMIN_HTML
-        .replace("{{CSS}}", app_css())
         .replace("{{TOPBAR}}", &topbar("Admin", &email))
         .replace("{{MODERATION}}", &moderation)
         .replace("{{BLOCKLIST}}", &blocklist)

@@ -20,8 +20,8 @@ use aperture::store::{
     TrashRootInput, UploadRecoveryClaim, UploadReserve, UploadReserveInput, OWNER_WRITE_FRESH,
 };
 use aperture::{
-    app, build_dev_state, drain_trash_lifecycle_once, now_secs, recover_stale_request_uploads,
-    AppState,
+    app, build_dev_state, drain_trash_lifecycle_once, handlers, now_secs,
+    recover_stale_request_uploads, AppState,
 };
 use axum::body::Body;
 use axum::http::{header, HeaderMap, Request, StatusCode};
@@ -281,6 +281,25 @@ async fn send(app: &axum::Router, req: Request<Body>) -> Resp {
         headers,
         body: bytes.to_vec(),
     }
+}
+
+async fn product_css(app: &axum::Router) -> String {
+    let asset = send(app, get(handlers::APP_CSS_PATH, None)).await;
+    assert_eq!(asset.status, StatusCode::OK);
+    assert_eq!(
+        asset.header(header::CONTENT_TYPE),
+        "text/css; charset=utf-8"
+    );
+    assert_eq!(
+        asset.header(header::CACHE_CONTROL),
+        "public, max-age=31536000, immutable"
+    );
+    let css = asset.text();
+    assert!(css.contains("min-height:44px; padding:10px 12px;"));
+    assert!(css.contains(".page-console .usermenu__btn"));
+    assert!(css.contains("width:44px;"));
+    assert!(css.contains(".folder-grid .file-card__link { min-width:44px; min-height:44px; }"));
+    css
 }
 
 fn get(path: &str, subject: Option<&str>) -> Request<Body> {
@@ -627,6 +646,18 @@ async fn production_owner_routes_fail_closed_but_capabilities_remain_anonymous()
         assert_eq!(asset.status, StatusCode::OK);
         assert_eq!(asset.header(header::CACHE_CONTROL), "public, max-age=300");
     }
+    for path in [
+        handlers::APP_CSS_PATH,
+        handlers::SHARE_ROOM_CSS_PATH,
+        handlers::SHARE_ROOM_JS_PATH,
+    ] {
+        let asset = send(&locked, get(path, None)).await;
+        assert_eq!(asset.status, StatusCode::OK);
+        assert_eq!(
+            asset.header(header::CACHE_CONTROL),
+            "public, max-age=31536000, immutable"
+        );
+    }
 
     // Explicit dev state preserves the local/test fallback.
     assert_eq!(
@@ -736,6 +767,24 @@ async fn dynamic_owner_and_capability_responses_are_never_storable() {
             "private, no-store"
         );
     }
+    for path in [
+        handlers::APP_CSS_PATH,
+        handlers::SHARE_ROOM_CSS_PATH,
+        handlers::SHARE_ROOM_JS_PATH,
+    ] {
+        let asset = send(&app, get(path, None)).await;
+        assert_eq!(asset.status, StatusCode::OK);
+        assert_eq!(
+            asset.header(header::CACHE_CONTROL),
+            "public, max-age=31536000, immutable"
+        );
+        let method_not_allowed = send(&app, post_public(path, String::new())).await;
+        assert_eq!(method_not_allowed.status, StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            method_not_allowed.header(header::CACHE_CONTROL),
+            "private, no-store"
+        );
+    }
 }
 
 #[tokio::test]
@@ -764,8 +813,8 @@ async fn public_file_share_room_is_product_owned_and_escapes_remote_names() {
     let html = page.text();
     assert!(html.contains("data-ap-share-room"));
     assert!(html.contains("PUBLIC SHARE ROOM"));
-    assert!(html.contains("href=\"/s/share-room.css\""));
-    assert!(html.contains("src=\"/s/share-room.js\""));
+    assert!(html.contains(&format!(r#"href="{}""#, handlers::SHARE_ROOM_CSS_PATH)));
+    assert!(html.contains(&format!(r#"src="{}""#, handlers::SHARE_ROOM_JS_PATH)));
     assert!(!html.contains("href=\"/share-room.css\""));
     assert!(!html.contains("src=\"/share-room.js\""));
     assert!(!html.contains("<style>"));
@@ -776,14 +825,14 @@ async fn public_file_share_room_is_product_owned_and_escapes_remote_names() {
     assert!(!html.contains("OdysseyWire"));
     assert!(!html.contains("OdysseySpark"));
 
-    let css = send(&app, get("/s/share-room.css", None)).await;
+    let css = send(&app, get(handlers::SHARE_ROOM_CSS_PATH, None)).await;
     assert_eq!(css.status, StatusCode::OK);
     assert_eq!(css.header(header::CONTENT_TYPE), "text/css; charset=utf-8");
     assert!(css.text().contains("--ap-ink"));
     assert!(!css.text().contains("GENERATED FROM odyssey"));
     assert!(!css.text().contains("OdysseyWire"));
 
-    let js = send(&app, get("/s/share-room.js", None)).await;
+    let js = send(&app, get(handlers::SHARE_ROOM_JS_PATH, None)).await;
     assert_eq!(js.status, StatusCode::OK);
     assert_eq!(
         js.header(header::CONTENT_TYPE),
@@ -804,37 +853,44 @@ async fn forced_colors_keeps_explorer_and_share_room_state_visible() {
     // stay untouched.
     let app = app(build_dev_state());
 
-    // Explorer: service.css ships inline through {{CSS}}, so the signed-in gallery
-    // carries the forced-colors layer.
+    // Explorer HTML links the immutable product stylesheet; the stylesheet carries
+    // the forced-colors layer.
     let gallery = send(&app, get("/", Some("alice"))).await;
     assert_eq!(gallery.status, StatusCode::OK);
     let html = gallery.text();
+    assert!(html.contains(&format!(r#"href="{}""#, handlers::APP_CSS_PATH)));
+    assert!(!html.contains("<style>"));
+    let product_css = product_css(&app).await;
     assert!(
-        html.contains("@media (forced-colors: active)"),
+        product_css.contains("@media (forced-colors: active)"),
         "Explorer must ship a forced-colors treatment layer"
     );
     // Focus: box-shadow rings are stripped, so focus gains a solid outline.
-    assert!(html.contains("outline: 2px solid CanvasText; outline-offset: 2px; box-shadow: none;"));
+    assert!(product_css
+        .contains("outline: 2px solid CanvasText; outline-offset: 2px; box-shadow: none;"));
     // The active view toggle re-expresses selection through system selection
     // colors, anchored on the aria-pressed state the markup already maintains.
-    assert!(html.contains(".view-toggle__btn[aria-pressed=\"true\"]"));
-    assert!(html.contains("background: SelectedItem; color: SelectedItemText;"));
+    assert!(product_css.contains(".view-toggle__btn[aria-pressed=\"true\"]"));
+    assert!(product_css.contains("background: SelectedItem; color: SelectedItemText;"));
     // Selected and Inspector-focused cards keep a visible outline; the floating
     // bulk bar keeps a border and its disabled buttons stop relying on opacity.
-    assert!(html.contains(
+    assert!(product_css.contains(
         ".file-card.is-selected, .folder-tile.is-selected { outline: 3px solid Highlight;"
     ));
-    assert!(html.contains(".file-card.is-inspected { outline: 3px dotted Highlight;"));
-    assert!(html.contains(".ap-bulk.is-enhanced.has-selection { border: 2px solid Highlight; }"));
-    assert!(html.contains(
+    assert!(product_css.contains(".file-card.is-inspected { outline: 3px dotted Highlight;"));
+    assert!(
+        product_css.contains(".ap-bulk.is-enhanced.has-selection { border: 2px solid Highlight; }")
+    );
+    assert!(product_css.contains(
         ".ap-bulk button:disabled { color: GrayText; border-color: GrayText; opacity: 1; }"
     ));
     // The Inspector drawer keeps a visible boundary when the scrim flattens.
-    assert!(html.contains(".ap-preview__panel { border-left: 3px solid CanvasText; }"));
+    assert!(product_css.contains(".ap-preview__panel { border-left: 3px solid CanvasText; }"));
     // Usage and upload fills are length-as-information: they keep author colors
     // inside a system-color track instead of vanishing with the theme.
-    assert!(html.contains(".usage-meter__track { border: 1px solid CanvasText; }"));
-    assert!(html.contains(".dropzone__bar { background: Highlight; forced-color-adjust: none; }"));
+    assert!(product_css.contains(".usage-meter__track { border: 1px solid CanvasText; }"));
+    assert!(product_css
+        .contains(".dropzone__bar { background: Highlight; forced-color-adjust: none; }"));
 
     // Share Room: the strict-CSP external stylesheet carries its own layer on the
     // anonymous asset route.
@@ -1255,6 +1311,7 @@ async fn upload_detail_raw_share_delete_lifecycle() {
     // The gallery now lists the file.
     let home2 = send(&app, get("/", Some("alice"))).await;
     assert!(home2.text().contains("screenshot.png"));
+    assert!(home2.text().contains("aria-label=\"Open screenshot.png\""));
     assert!(home2.text().contains("1 file"));
 
     // Public share fetch: NO auth headers, still returns the bytes.
@@ -2268,6 +2325,7 @@ async fn folder_create_move_filter_and_delete_lifecycle() {
     let home = send(&app, get("/", Some("alice"))).await;
     assert!(home.text().contains("Trips"));
     assert!(home.text().contains(&format!("/?folder={fid}")));
+    assert!(home.text().contains("aria-label=\"Open folder Trips\""));
     let folder_view = send(&app, get(&format!("/?folder={fid}"), Some("alice"))).await;
     assert_eq!(folder_view.status, StatusCode::OK);
     assert_eq!(
@@ -2518,6 +2576,7 @@ async fn bulk_forms_work_without_js_and_reject_csrf_foreign_or_oversized_batches
 
     let gallery = send(&app, get("/", Some("alice"))).await;
     let html = gallery.text();
+    let css = product_css(&app).await;
     assert_drive_current(&html, "/");
     let wire_followup = send(
         &app,
@@ -2551,8 +2610,11 @@ async fn bulk_forms_work_without_js_and_reject_csrf_foreign_or_oversized_batches
         "content and results precede the heavy rail in source/mobile order"
     );
     assert!(html.contains(r#"data-wire-nav=".drive-layout""#));
-    assert!(html.contains("grid-template-areas:\"content rail\""));
-    assert!(html.contains("grid-template-areas:\"content\" \"rail\""));
+    assert!(css.contains("grid-template-areas:\"rail content\""));
+    assert!(css.contains("grid-template-areas:\"content\" \"rail\""));
+    assert!(html.contains("Upload to this folder"));
+    assert!(html.contains("input.addEventListener('change', show);"));
+    assert!(!html.contains("input.addEventListener('change', function () { show(); upload(); });"));
     assert!(html.contains("document.addEventListener('odyssey:swap'"));
     assert!(html.contains("initUpload(event.target)"));
     assert!(html.contains("Promise.resolve().then(function () { syncNav(swapUrl); });"));
@@ -2581,13 +2643,13 @@ async fn bulk_forms_work_without_js_and_reject_csrf_foreign_or_oversized_batches
     assert!(html.contains("label.insertAdjacentElement('afterend', form)"));
     assert!(html.contains("has-mobile-bulk-owner"));
     assert!(
-        html.contains(".page-console .appbar__nav"),
+        css.contains(".page-console .appbar__nav"),
         "Files and Requests remain visible in the 390px app shell"
     );
-    assert!(html.contains(".ap-bulk.is-enhanced.has-selection"));
-    assert!(html.contains(".page-console.has-bulk-selection .drive-content"));
-    assert!(html.contains("overscroll-behavior:contain"));
-    assert!(html.contains("border-left:0"));
+    assert!(css.contains(".ap-bulk.is-enhanced.has-selection"));
+    assert!(css.contains(".page-console.has-bulk-selection .drive-content"));
+    assert!(css.contains("overscroll-behavior:contain"));
+    assert!(css.contains("border-left:0"));
 
     let bad_csrf = send(
         &app,
@@ -2770,6 +2832,7 @@ async fn trash_restore_and_purge_lifecycle() {
     let store: Arc<dyn Store> = state.store.clone();
     let blobs: Arc<dyn Blobs> = state.blobs.clone();
     let app = app(state);
+    let css = product_css(&app).await;
     let empty_trash = send(&app, get("/?view=trash", Some("alice"))).await;
     assert_eq!(empty_trash.status, StatusCode::OK);
     let empty_html = empty_trash.text();
@@ -2807,17 +2870,15 @@ async fn trash_restore_and_purge_lifecycle() {
     assert!(trash_html.contains("File ·"));
     assert!(trash_html.contains("Eligible for automatic deletion after <time"));
     assert!(!trash_html.contains("Permanently deleted <time"));
-    assert!(trash_html.contains(".gallery-grid:not(.is-list) .file-card--trash .ap-trash-meta"));
-    assert!(trash_html.contains(".file-card:has(.card-menu[open])"));
-    assert!(trash_html.contains("z-index:25;"));
-    assert!(trash_html.contains("overflow:visible;"));
-    assert!(trash_html.contains("bottom:30px;"));
-    assert!(trash_html.contains(".gallery-grid.is-list:has(.card-menu[open])"));
+    assert!(css.contains(".gallery-grid:not(.is-list) .file-card--trash .ap-trash-meta"));
+    assert!(css.contains(".file-card:has(.card-menu[open])"));
+    assert!(css.contains("z-index:25;"));
+    assert!(css.contains("overflow:visible;"));
+    assert!(css.contains("bottom:30px;"));
+    assert!(css.contains(".gallery-grid.is-list:has(.card-menu[open])"));
     assert!(!trash_html.contains("class=\"card-menu__pop\" role=\"menu\""));
-    assert!(trash_html.contains(".gallery-grid.is-list .file-card--trash .file-card__body"));
-    assert!(
-        trash_html.contains(".gallery-grid.is-list .file-card--trash .ap-date { display:inline; }")
-    );
+    assert!(css.contains(".gallery-grid.is-list .file-card--trash .file-card__body"));
+    assert!(css.contains(".gallery-grid.is-list .file-card--trash .ap-date { display:inline; }"));
     assert!(trash_html.contains(
         "Trashed files and folders stay in storage and count toward quota until deleted forever."
     ));
@@ -4284,8 +4345,8 @@ async fn public_upload_inbox_accepts_uploads_without_listing_files() {
     assert!(page_html.contains("data-ap-share-room"));
     assert!(page_html.contains("data-upload-form"));
     assert!(page_html.contains("data-upload-queue"));
-    assert!(page_html.contains("href=\"/s/share-room.css\""));
-    assert!(page_html.contains("src=\"/s/share-room.js\""));
+    assert!(page_html.contains(&format!(r#"href="{}""#, handlers::SHARE_ROOM_CSS_PATH)));
+    assert!(page_html.contains(&format!(r#"src="{}""#, handlers::SHARE_ROOM_JS_PATH)));
     assert!(page
         .header(header::CONTENT_SECURITY_POLICY)
         .contains("connect-src 'self'"));
