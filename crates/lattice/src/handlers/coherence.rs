@@ -57,7 +57,7 @@ fn render_coherence(
 
     format!(
         "{head}{stale}{contra}\
-         <p class=\"site-foot\">Stale + contradiction signals are computed locally (no edits made). \
+         <p class=\"coherence-note muted\">Stale + contradiction signals are computed locally (no edits made). \
           Contradiction candidates are a heuristic for review, not a verdict.</p>",
         head = head,
         stale = render_stale(stale_days, stale),

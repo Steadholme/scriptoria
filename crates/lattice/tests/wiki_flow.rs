@@ -46,8 +46,8 @@ async fn full_create_edit_history_flow() {
     // Empty index.
     let (status, _h, body) = call(&state, get("/")).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("Knowledge base"));
     assert!(body.contains("<h1>Library</h1>"));
+    assert!(body.contains("class=\"surf surf--wiki is-active\""));
     assert!(body.contains("<div class=\"knowledge-library\">"));
     assert!(body.contains("Knowledge map"));
     assert!(body.contains("Recently updated"));

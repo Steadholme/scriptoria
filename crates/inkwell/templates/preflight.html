@@ -1,15 +1,13 @@
-<main class="console console--narrow ink-preflight">
-  <header class="console__head ink-preflight__head">
-    <div>
-      <p class="ink-preflight__eyebrow">Server-validated preflight</p>
+<main class="v2-page console console--narrow ink-preflight" id="main" tabindex="-1">
+  <header class="pagehead ink-preflight__head">
+    <div class="pagehead__titles">
       <h1>{{HEADING}}</h1>
-      <p class="sub">This page reviews the server-normalized payload that will be submitted. It is not a complete theme, inbox, or third-party social preview.</p>
+      <p class="pagehead__sub">Server-validated preflight of the payload that will be submitted. It is not a complete theme, inbox, or third-party social preview.</p>
     </div>
   </header>
 
   <section class="card ink-preflight__decision" aria-labelledby="preflight-action-title">
     <div class="card__body">
-      <p class="ink-preflight__eyebrow">Final action</p>
       <h2 id="preflight-action-title">{{ACTION_TITLE}}</h2>
       <p>{{ACTION_DETAIL}}</p>
       <dl class="ink-preflight__facts">

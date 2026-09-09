@@ -246,28 +246,22 @@ pub async fn search(
         )
     };
     let content = format!(
-        "<section class=\"search-page\"><p class=\"eyebrow\">Knowledge search</p><h1>Search documents</h1><form class=\"search-page__form\" role=\"search\" method=\"get\" action=\"/search\"><label class=\"sr-only\" for=\"search-page-query\">Search documents</label><input id=\"search-page-query\" type=\"search\" name=\"q\" value=\"{query}\" placeholder=\"Title, topic, or phrase\" autofocus><button class=\"btn btn-primary\" type=\"submit\">Search</button></form>{result_block}</section>",
+        "<section class=\"search-page\"><h1>Search documents</h1><form class=\"search-page__form\" role=\"search\" method=\"get\" action=\"/search\"><label class=\"sr-only\" for=\"search-page-query\">Search documents</label><input id=\"search-page-query\" type=\"search\" name=\"q\" value=\"{query}\" placeholder=\"Title, topic, or phrase\" autofocus><button class=\"btn btn-primary\" type=\"submit\">Search</button></form>{result_block}</section>",
         query = esc(raw),
     );
     Ok(Html(layout("Search", &headers, &content)))
 }
 
-fn render_index(
-    pages: &[Page],
-    structure_pages: &[Page],
-    next: Option<&(i64, String)>,
-) -> String {
+fn render_index(pages: &[Page], structure_pages: &[Page], next: Option<&(i64, String)>) -> String {
     let total = structure_pages.len();
     let roots = structure_pages
         .iter()
         .filter(|page| page.parent_id.is_none())
         .count();
     let hero = format!(
-        "<section class=\"library-hero\">\
-           <div class=\"library-hero__copy\">\
-             <p class=\"eyebrow\">Knowledge base</p>\
+        "<section class=\"library-hero pagehead\">\
+           <div class=\"library-hero__copy pagehead__titles\">\
              <h1>Library</h1>\
-             <p>Find the source of truth, follow its context, and keep operational knowledge coherent.</p>\
            </div>\
            <form class=\"newpage library-create\" method=\"get\" action=\"/new\">\
              <label for=\"library-title\">Start a document</label>\
@@ -354,11 +348,11 @@ fn render_index(
          <div class=\"knowledge-library\">\
            <div class=\"library-main\">\
              <section class=\"library-section library-structure\">\
-               <div class=\"section-heading\"><div><p class=\"eyebrow\">Browse</p><h2>Knowledge map</h2></div><span>{total} page{plural} · {roots} root{root_plural}</span></div>\
+               <div class=\"section-heading\"><div><h2>Knowledge map</h2></div><span>{total} page{plural} · {roots} root{root_plural}</span></div>\
                {structure}\
              </section>\
              <section class=\"library-section library-directory\">\
-               <div class=\"section-heading\"><div><p class=\"eyebrow\">Directory</p><h2>All documents</h2></div></div>\
+               <div class=\"section-heading\"><div><h2>All documents</h2></div></div>\
                {directory}{older}\
              </section>\
            </div>\
@@ -369,16 +363,11 @@ fn render_index(
                <span aria-hidden=\"true\">→</span>\
              </a>\
              <section class=\"library-activity\">\
-               <div class=\"section-heading\"><div><p class=\"eyebrow\">Activity</p><h2>Recently updated</h2></div><a href=\"/recent\">View all</a></div>\
+               <div class=\"section-heading\"><div><h2>Recently updated</h2></div><a href=\"/recent\">View all</a></div>\
                {activity}\
              </section>\
-             <section class=\"library-principle\">\
-               <p class=\"eyebrow\">Working model</p>\
-               <p>Documents become useful when their ownership, history, and relationships stay visible.</p>\
-             </section>\
            </aside>\
-         </div>\
-         <p class=\"site-foot\">Steadholme Lattice · Markdown with <code>[[wiki-links]]</code> · revision-safe by default</p>",
+         </div>",
         plural = if total == 1 { "" } else { "s" },
         root_plural = if roots == 1 { "" } else { "s" },
     )
@@ -590,7 +579,6 @@ fn render_view(view: DocumentView<'_>) -> String {
         "<article class=\"page document-article\">\
            <header class=\"document-header\">\
              {breadcrumb}\
-             <p class=\"eyebrow\">Document</p>\
              <div class=\"page__bar\">\
                <div>\
                  <h1>{title}</h1>\
@@ -668,7 +656,7 @@ fn render_document_inspector(view: &DocumentView<'_>) -> String {
 
     format!(
         "<aside class=\"document-inspector\" aria-label=\"Document inspector\">\
-           <div class=\"inspector-head\"><p class=\"eyebrow\">Context</p><h2>Inspector</h2></div>\
+           <div class=\"inspector-head\"><h2>Inspector</h2></div>\
            {outline}\
            {relations}\
            <details class=\"inspector-section\">\
@@ -734,7 +722,7 @@ fn render_page_tree(pages: &[Page], current_slug: &str) -> String {
     let items = render_tree_items(pages, current_slug);
     format!(
         "<aside class=\"page-tree\" aria-label=\"Page tree\">\
-           <div class=\"page-tree__head\"><p class=\"eyebrow\">Workspace</p><h2>Page tree</h2></div>\
+           <div class=\"page-tree__head\"><h2>Page tree</h2></div>\
            <ul class=\"page-tree__list\">{items}</ul>\
          </aside>",
     )
@@ -1010,7 +998,7 @@ fn render_editor(
            <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
            <input type=\"hidden\" name=\"base_rev\" value=\"{base_rev}\">\
            <header class=\"editor__head\">\
-             <div><p class=\"eyebrow\">Writing workspace</p><h1>{verb} document</h1></div>\
+             <div><h1>{verb} document</h1></div>\
              <code>/w/{slug}</code>\
            </header>\
            <div class=\"editor__title-field\">\

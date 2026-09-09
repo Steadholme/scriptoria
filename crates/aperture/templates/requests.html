@@ -6,40 +6,33 @@
   <meta name="color-scheme" content="light">
   <link rel="icon" href="data:,">
   <title>Upload requests · Drive · Steadholme</title>
-  <link rel="stylesheet" href="/assets/aperture-20260908.css">
+  <link rel="stylesheet" href="/assets/aperture-20260909.css">
 </head>
-<body class="page-console">
-  <header class="appbar">
-    <a class="appbar__brand" href="/" aria-label="Steadholme Drive home">
-      <span class="app-tile" aria-hidden="true">⇧</span>
-      <span class="appbar__name"><b>Drive</b><span>drive.w33d.xyz</span></span>
-    </a>
-    <nav class="appbar__nav" aria-label="Drive">
-      <a class="appnav" href="/">Files</a>
-      <a class="appnav is-active" href="/requests">Requests</a>
-    </nav>
-    <span class="appbar__spacer"></span>
-    <div class="appbar__right">{{USERBOX}}</div>
-  </header>
-
-  <main class="console console--narrow request-console">
-    <div class="console__head console__head--row">
-      <div><p class="eyebrow">Request Inbox</p><h1>External intake</h1><p class="sub">Track finite, upload-only rooms without exposing their capabilities.</p></div>
+<body class="page-v2">
+<a class="skip-link" href="#main">Skip to the page</a>
+{{TOPBAR}}
+  <main class="v2-page v2-page--narrow request-console" id="main" tabindex="-1">
+    <div class="pagehead">
+      <div class="pagehead__titles">
+        <nav class="crumb" aria-label="Breadcrumb"><a href="/">Drive</a><span class="crumb__sep">/</span><span class="crumb__here">Upload requests</span></nav>
+        <h1>Upload requests</h1>
+      </div>
     </div>
     <section class="request-inbox" aria-labelledby="request-inbox-title">
       <div class="request-inbox__head">
-        <div><p class="eyebrow">Owner control plane</p><h2 id="request-inbox-title">Upload requests</h2></div>
+        <h2 id="request-inbox-title">Requests</h2>
         <p class="request-inbox__scope">{{SCOPE}}</p>
       </div>
       <nav class="request-filters" aria-label="Filter upload requests">{{FILTERS}}</nav>
       <div class="request-inbox__rows">{{REQUESTS}}</div>
     </section>
     <section class="card request-create">
-      <div class="card__head"><div><p class="eyebrow">New request</p><h2>Choose a destination folder</h2></div></div>
-      <p class="muted">The public room can add files only. You can tune its deadline, budgets and MIME allow-list after creation.</p>
+      <div class="card__head"><h2>New request</h2></div>
+      <p class="muted">A room can add files only; deadline, budgets and MIME allow-list are set after creation.</p>
       <div class="request-create-list">{{FOLDERS}}</div>
     </section>
-  </main>
+  {{FOOTER}}
+</main>
   {{DYNAMIC}}
 </body>
 </html>

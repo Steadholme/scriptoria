@@ -157,7 +157,7 @@ fn shell_and_css_preserve_accessible_progressive_enhancement() {
     let css = shell::SERVICE_CSS;
 
     assert!(template.contains(r##"href="#ag-main""##));
-    assert!(template.contains(r#"<main class="wrap ag-main" id="ag-main" tabindex="-1">"#));
+    assert!(template.contains(r#"<main class="v2-page wrap ag-main" id="ag-main" tabindex="-1">"#));
     assert!(template.contains("credentials: 'same-origin'"));
     assert!(template.contains("textContent"));
     assert!(!template.contains("innerHTML"));

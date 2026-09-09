@@ -392,7 +392,7 @@ pub async fn index(
         .replace("{{TAGLINE}}", &esc(&settings.tagline))
         .replace("{{HERO}}", &hero)
         .replace("{{PAGE_CLASS}}", "")
-        .replace("{{MH_EYEBROW}}", "Publication")
+        .replace("{{MH_CRUMB}}", "")
         .replace("{{POSTS}}", &cards)
         .replace("{{PAGER}}", &pager);
     let theme = odyssey::resolve_theme(
@@ -403,7 +403,7 @@ pub async fn index(
     let head_title = format!("{} · Steadholme", settings.title);
     let page = page_shell(PageShell {
         head_title: &head_title,
-        body_class: "page-reading",
+        body_class: "page-v2",
         rss: true,
         nav_title: &settings.title,
         email: &email,
@@ -485,7 +485,10 @@ pub async fn tag_index(
         .replace("{{TAGLINE}}", &esc(&format!("Posts tagged “{label}”")))
         .replace("{{HERO}}", "")
         .replace("{{PAGE_CLASS}}", " ink-tagview")
-        .replace("{{MH_EYEBROW}}", "Tagged")
+        .replace(
+            "{{MH_CRUMB}}",
+            "<nav class=\"crumb\" aria-label=\"Breadcrumb\"><a href=\"/\">Posts</a><span class=\"crumb__sep\">/</span><span class=\"crumb__here\">Tagged</span></nav>",
+        )
         .replace("{{POSTS}}", &cards)
         .replace("{{PAGER}}", &pager);
     let theme = odyssey::resolve_theme(
@@ -496,7 +499,7 @@ pub async fn tag_index(
     let head_title = format!("{heading} · Steadholme");
     let page = page_shell(PageShell {
         head_title: &head_title,
-        body_class: "page-reading",
+        body_class: "page-v2",
         rss: true,
         nav_title: &heading,
         email: &email,
@@ -755,7 +758,7 @@ pub async fn view(
     let head_title = format!("{document_title} · Inkwell");
     let page = page_shell(PageShell {
         head_title: &head_title,
-        body_class: "page-reading",
+        body_class: "page-v2",
         rss: true,
         nav_title: "Reading",
         email: &email,
@@ -1043,7 +1046,7 @@ fn render_review_link_management(
         String::new()
     };
     let fragment = format!(
-        r#"<main class="console console--narrow ink-review-manage"><a class="back-link" href="/edit/{slug}">&larr; Back to editor</a><div class="console__head"><span class="eyebrow">External review</span><h1>{title}</h1><p class="sub">One expiring bearer link, pinned to one saved revision.</p></div>{one_time}{schedule_note}{controls}<section class="ink-review-boundary"><h2>Capability boundary</h2><ul><li>Read-only access to one saved revision.</li><li>Publishing, revoking, expiry, or deletion makes the URL unavailable.</li><li>The URL never appears in Studio lists and cannot be recovered from this page.</li></ul></section></main>"#,
+        r#"<main class="v2-page console console--narrow ink-review-manage" id="main" tabindex="-1"><div class="pagehead"><div class="pagehead__titles"><nav class="crumb" aria-label="Breadcrumb"><a href="/library">Studio</a><span class="crumb__sep">/</span><a href="/edit/{slug}">Editor</a><span class="crumb__sep">/</span><span class="crumb__here">External review</span></nav><h1>{title}</h1></div></div>{one_time}{schedule_note}{controls}<section class="ink-review-boundary"><h2>Capability boundary</h2><ul><li>Read-only access to one saved revision.</li><li>Publishing, revoking, expiry, or deletion makes the URL unavailable.</li><li>The URL never appears in Studio lists and cannot be recovered from this page.</li></ul></section></main>"#,
         slug = esc(&post.slug),
         title = esc(&post.title),
         one_time = one_time,
@@ -1052,7 +1055,7 @@ fn render_review_link_management(
     );
     page_shell(PageShell {
         head_title: "External review · Inkwell",
-        body_class: "page-console page-review-manage",
+        body_class: "page-v2 page-review-manage",
         rss: false,
         nav_title: "Studio",
         email,
@@ -1068,7 +1071,7 @@ fn review_link_unavailable(theme: &str, status: StatusCode) -> Response {
         robots: Some("noindex,nofollow,noarchive".to_string()),
         ..PageMeta::default()
     };
-    let fragment = r#"<main class="reader ink-review-unavailable"><section class="empty-state"><span class="eyebrow">External review</span><h1>Review unavailable</h1><p>This review link is invalid or no longer available.</p><a class="btn btn-secondary" href="/">Read public posts</a></section></main>"#;
+    let fragment = r#"<main class="v2-page reader ink-review-unavailable" id="main" tabindex="-1"><section class="empty-state"><h1>Review unavailable</h1><p>This review link is invalid or no longer available.</p><a class="btn btn-secondary" href="/">Read public posts</a></section></main>"#;
     let page = review_page_shell("Review unavailable · Inkwell", theme, fragment, &metadata);
     review_link_security_response((status, Html(page)).into_response())
 }
@@ -1151,7 +1154,7 @@ pub async fn new_form(
         state_label: "draft",
         saved: false,
         heading: "New post",
-        subhead: "Compose a post in Markdown. You are the author.",
+        subhead: "Markdown · you are the author.",
         action: "/new",
         review_action: "/new/review",
         autosave_url: "",
@@ -1512,7 +1515,7 @@ pub async fn edit_form(
         state_label,
         saved,
         heading: "Edit post",
-        subhead: "Update the title, body, or publication state.",
+        subhead: "",
         action: &format!("/edit/{}", esc(&post.slug)),
         review_action: &format!("/edit/{}/review", esc(&post.slug)),
         autosave_url: &format!("/api/writer/autosave/{}", esc(&post.slug)),
@@ -1808,7 +1811,7 @@ pub async fn history(
         )
     };
     let fragment = format!(
-        r#"<main class="console console--narrow"><div class="console__head"><h1>Post history</h1><p class="sub">{title}</p></div>
+        r#"<main class="v2-page console console--narrow" id="main" tabindex="-1"><div class="pagehead"><div class="pagehead__titles"><h1>Post history</h1><p class="pagehead__sub">{title}</p></div></div>
 <p><a class="btn btn-ghost" href="{editor_href}">Back to editor</a></p>
 <section class="card"><div class="card__body"><p class="muted">Review an immutable comparison before restoring. Restore appends a new version while preserving the current Draft, Scheduled, or Published state, publication time, pin, and feature flags.</p>
 <div class="table-wrap"><table class="history"><thead><tr><th>Version</th><th>Title</th><th>Editor</th><th>Source</th><th>Chars</th><th>Action</th></tr></thead><tbody>{rows}</tbody></table></div></div></section></main>"#,
@@ -1822,7 +1825,7 @@ pub async fn history(
     );
     let page = page_shell(PageShell {
         head_title: "Post history · Inkwell",
-        body_class: "page-console",
+        body_class: "page-v2",
         rss: false,
         nav_title: "Post history",
         email: &email,
@@ -1942,7 +1945,7 @@ pub async fn history_compare(
         )
     };
     let fragment = format!(
-        r#"<main class="console revision-workbench"><div class="console__head"><span class="eyebrow">Revision Workbench</span><h1>{title}</h1><p class="sub">Compare two immutable saved versions before changing the current post.</p></div>
+        r#"<main class="v2-page console revision-workbench" id="main" tabindex="-1"><div class="pagehead"><div class="pagehead__titles"><nav class="crumb" aria-label="Breadcrumb"><a href="/library">Studio</a><span class="crumb__sep">/</span><span class="crumb__here">Revisions</span></nav><h1>{title}</h1></div></div>
 <p><a class="btn btn-ghost" href="{history_href}">&larr; Back to history</a></p>
 {controls}
 <nav class="revision-modes" aria-label="Comparison view"><a class="btn {changes_active}" href="{changes_href}">Changes</a><a class="btn {preview_active}" href="{preview_href}">Rendered preview</a></nav>
@@ -1974,7 +1977,7 @@ pub async fn history_compare(
     );
     let page = page_shell(PageShell {
         head_title: "Revision Workbench · Inkwell",
-        body_class: "page-console page-revision-workbench",
+        body_class: "page-v2 page-revision-workbench",
         rss: false,
         nav_title: "Revision Workbench",
         email: &email,
@@ -4011,7 +4014,7 @@ fn render_preflight(view: PreflightView<'_>) -> String {
     );
     page_shell(PageShell {
         head_title: "Review & publish · Inkwell",
-        body_class: "page-console page-preflight",
+        body_class: "page-v2 page-preflight",
         rss: false,
         nav_title: "Studio",
         email: view.email,
@@ -4315,7 +4318,7 @@ fn render_editor(v: EditorView<'_>) -> String {
     let head_title = format!("{} · Inkwell", v.heading);
     page_shell(PageShell {
         head_title: &head_title,
-        body_class: "page-console",
+        body_class: "page-v2",
         rss: false,
         nav_title: "Studio",
         email: v.email,

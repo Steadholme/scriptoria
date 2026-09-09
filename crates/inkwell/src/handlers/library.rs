@@ -134,7 +134,7 @@ pub async fn index(
     );
     let page = page_shell(PageShell {
         head_title: "Studio · Inkwell",
-        body_class: "page-console page-library",
+        body_class: "page-v2 page-library",
         rss: false,
         nav_title: "Studio",
         email: &email,

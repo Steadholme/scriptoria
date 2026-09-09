@@ -18,7 +18,7 @@ use crate::auth;
 use crate::config::effective_quota;
 use crate::error::AppError;
 use crate::handlers::files::{html_with_csrf, redirect_found};
-use crate::handlers::{esc, human_size, userbox, SHIELD_SVG};
+use crate::handlers::{esc, human_size, topbar, FOOTER, SHIELD_SVG};
 use crate::model::OwnerUsage;
 use crate::AppState;
 
@@ -214,7 +214,8 @@ fn render_admin(
 
     ADMIN_HTML
         .replace("{{SHIELD}}", SHIELD_SVG)
-        .replace("{{USERBOX}}", &userbox("Drive admin", Some(viewer_email)))
+        .replace("{{TOPBAR}}", &topbar("Drive admin", Some(viewer_email)))
+        .replace("{{FOOTER}}", FOOTER)
         .replace("{{DEFAULT_QUOTA}}", &esc(&default_label))
         .replace("{{ROWS}}", &rows)
         .replace("{{QUOTA_FORM}}", &quota_form)

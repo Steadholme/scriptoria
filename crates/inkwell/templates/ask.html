@@ -1,8 +1,10 @@
-<main class="console console--narrow">
-  <div class="console__head ink-pubhead">
-    <p class="eyebrow">Ask</p>
-    <h1>Ask the blog</h1>
-    <p class="sub">Ask a question and get an answer drawn straight from the published posts, with links to the sources.</p>
+<main class="v2-page console console--narrow" id="main" tabindex="-1">
+  <div class="pagehead ink-pubhead">
+    <div class="pagehead__titles">
+      <nav class="crumb" aria-label="Breadcrumb"><a href="/">Posts</a><span class="crumb__sep">/</span><span class="crumb__here">Ask</span></nav>
+      <h1>Ask the blog</h1>
+      <p class="pagehead__sub">Answers are drawn from published posts and cite them.</p>
+    </div>
   </div>
   <form class="editor ink-ask" method="post" action="/api/ask">
     <input type="hidden" name="csrf_token" value="{{CSRF}}">

@@ -176,8 +176,7 @@ fn home_main(s: &HomeShared, thread_rows: &[ThreadRowVM]) -> String {
         r#"<div class="ag-home">
   <section class="ag-home__feed" id="threads" aria-labelledby="ag-home-title">
     <div class="pagehead ag-head-tools">
-      <div class="ag-head-tools__lead">
-        {eyebrow}
+      <div class="pagehead__titles ag-head-tools__lead">
         <h1 class="ag-head__title" id="ag-home-title">{heading}</h1>
         <p class="muted ag-feed__bound">{shown} in this view</p>
       </div>
@@ -195,7 +194,6 @@ fn home_main(s: &HomeShared, thread_rows: &[ThreadRowVM]) -> String {
         terraces = category_terraces(&s.categories),
         ledgers = ledger_nav(),
         questions = questions,
-        eyebrow = eyebrow("Discussions"),
         heading = escape(&scope_heading(
             s.controls.active_scope,
             s.controls.subscribed_only
@@ -864,7 +862,7 @@ fn compose_main(s: &ComposeShared, vs: &ComposeViewerState) -> String {
     format!(
         r#"<div class="ag-compose">
   {crumb}
-  <header class="pagehead"><div class="ag-head-tools__lead">{eyebrow}<h1 class="ag-head__title">{heading}</h1></div></header>
+  <header class="pagehead"><div class="pagehead__titles ag-head-tools__lead"><h1 class="ag-head__title">{heading}</h1></div></header>
   <form class="ag-form ag-composer" method="post" action="{action}">{hidden}{quote_hidden}
   {category_field}
   {title_field}
@@ -879,7 +877,6 @@ fn compose_main(s: &ComposeShared, vs: &ComposeViewerState) -> String {
 </form>
 </div>"#,
         crumb = crumbs(&[("Home", Some("/")), (&s.heading.0, None)]),
-        eyebrow = eyebrow("Compose"),
         heading = t(&s.heading),
         action = o(&vs.submit.action),
         hidden = hidden_inputs(&vs.submit.csrf.0, &vs.submit.fields),

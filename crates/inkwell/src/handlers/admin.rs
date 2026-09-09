@@ -105,7 +105,7 @@ pub async fn index(
         .replace("{{ROWS}}", &rows);
     let page = page_shell(PageShell {
         head_title: "Admin · Inkwell",
-        body_class: "page-console",
+        body_class: "page-v2",
         rss: false,
         nav_title: "Admin",
         email: &email,

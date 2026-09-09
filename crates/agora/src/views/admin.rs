@@ -13,7 +13,7 @@ use crate::view_model::{
 use super::forum::admin_thread_toolbar;
 use super::shell;
 use super::{
-    answer_state_chip, collection_note, crumbs, escape, eyebrow, form_action, form_action_opt,
+    answer_state_chip, collection_note, crumbs, escape, form_action, form_action_opt,
     hidden_inputs, kind_chip, link_action, monogram, o, t, thread_href, time_el,
 };
 
@@ -25,7 +25,7 @@ fn admin_main(s: &AdminShared, vs: &AdminViewerState) -> String {
     format!(
         r#"<div class="ag-admin">
   {crumb}
-  <header class="pagehead"><div class="ag-head-tools__lead">{eyebrow}<h1 class="ag-head__title">Administration</h1><p class="muted">Every control here required a verified admin group.</p></div></header>
+  <header class="pagehead"><div class="pagehead__titles ag-head-tools__lead"><nav class="crumb" aria-label="Breadcrumb"><a href="/">Forum</a><span class="crumb__sep">/</span><span class="crumb__here">Administration</span></nav><h1 class="ag-head__title">Administration</h1><p class="pagehead__sub">Every control here required a verified admin group.</p></div></header>
   <section class="ag-admin-sect ag-key-shared" aria-labelledby="ag-admin-categories-title">
     <h2 class="eyebrow ag-eyebrow" id="ag-admin-categories-title">Categories</h2>
     {create}
@@ -43,7 +43,6 @@ fn admin_main(s: &AdminShared, vs: &AdminViewerState) -> String {
   </section>
 </div>"#,
         crumb = crumbs(&[("Home", Some("/")), ("Administration", None)]),
-        eyebrow = eyebrow("Forum administration"),
         create = create_category_form(&vs.create_category),
         categories = admin_categories(&vs.categories),
         bound = s.visible_thread_bound,

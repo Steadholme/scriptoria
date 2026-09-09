@@ -6,17 +6,20 @@
   <meta name="color-scheme" content="light dark">
   <link rel="icon" href="data:,">
   <title>{{TITLE_TEXT}} · Echo</title>
-  <link rel="stylesheet" href="/assets/echo-20260908.css">
+  <link rel="stylesheet" href="/assets/echo-20260909.css">
 </head>
-<body class="page-reading">
+<body class="page-v2">
+<a class="skip-link" href="#main">Skip to the thread</a>
 {{TOPBAR}}
-<main class="reader">
-  <a class="back-link" href="/">&larr; All threads</a>
-  <article class="article">
-    <header class="article__head">
-      <h1 class="article__title">{{TITLE}}</h1>
+<main class="v2-page v2-page--read" id="main" tabindex="-1">
+  <div class="pagehead">
+    <div class="pagehead__titles">
+      <nav class="crumb" aria-label="Breadcrumb"><a href="/">Comments</a><span class="crumb__sep">/</span><span class="crumb__here">{{TITLE_TEXT}}</span></nav>
+      <h1>{{TITLE}}</h1>
       <div class="article__meta">{{META}}</div>
-    </header>
+    </div>
+  </div>
+  <article class="article">
     {{SORT}}
     <div class="comment-list">
       {{COMMENTS}}
@@ -27,6 +30,17 @@
       {{COMPOSER}}
     </section>
   </article>
+<footer class="v2-foot">
+  <span class="v2-foot__lead">Steadholme · Scriptoria · comments.w33d.xyz</span>
+  <a href="https://blog.w33d.xyz">Blog</a>
+  <a href="https://forum.w33d.xyz">Forum</a>
+  <a href="https://wiki.w33d.xyz">Wiki</a>
+  <a href="https://paste.w33d.xyz">Paste</a>
+  <a href="https://drive.w33d.xyz">Drive</a>
+  <a href="https://comments.w33d.xyz">Comments</a>
+  <a href="https://status.w33d.xyz">Status</a>
+  <a href="https://w33d.xyz">All apps</a>
+</footer>
 </main>
 
 <div class="toast-host" id="hf-toasts" aria-live="polite" aria-atomic="false"></div>

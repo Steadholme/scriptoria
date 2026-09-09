@@ -6,25 +6,18 @@
   <meta name="color-scheme" content="light">
   <link rel="icon" href="data:,">
   <title>Admin · Aperture · Steadholme</title>
-  <link rel="stylesheet" href="/assets/aperture-20260908.css">
+  <link rel="stylesheet" href="/assets/aperture-20260909.css">
 </head>
-<body class="page-console">
-  <header class="appbar">
-    <a class="appbar__brand" href="/" aria-label="Steadholme Aperture home">
-      <span class="app-tile" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="22" x2="2" y1="12" y2="12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><line x1="6" x2="6.01" y1="16" y2="16"/><line x1="10" x2="10.01" y1="16" y2="16"/></svg></span>
-      <span class="appbar__name"><b>Drive</b><span>drive.w33d.xyz</span></span>
-    </a>
-    <nav class="appbar__nav" aria-label="Aperture">
-      <a class="appnav" href="/"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>Files</a>
-    </nav>
-    <span class="appbar__spacer"></span>
-    <div class="appbar__right">{{USERBOX}}</div>
-  </header>
-
-  <main class="console">
-    <div class="console__head">
-      <h1>Drive admin</h1>
-      <p class="sub">Per-owner storage usage and quota overrides. Default quota: {{DEFAULT_QUOTA}}.</p>
+<body class="page-v2">
+<a class="skip-link" href="#main">Skip to the page</a>
+{{TOPBAR}}
+  <main class="v2-page" id="main" tabindex="-1">
+    <div class="pagehead">
+      <div class="pagehead__titles">
+        <nav class="crumb" aria-label="Breadcrumb"><a href="/">Drive</a><span class="crumb__sep">/</span><span class="crumb__here">Admin</span></nav>
+        <h1>Drive admin</h1>
+        <p class="pagehead__sub">Default quota {{DEFAULT_QUOTA}}</p>
+      </div>
     </div>
 
     <section class="card">
@@ -46,6 +39,7 @@
         <p class="hint hint--muted">The override wins over the default. Leave the quota blank to clear an owner&#x27;s override; enter 0 for an explicit unlimited override.</p>
       </div>
     </section>
-  </main>
+  {{FOOTER}}
+</main>
 </body>
 </html>

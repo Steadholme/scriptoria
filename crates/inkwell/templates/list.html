@@ -1,11 +1,11 @@
-<main class="reader{{PAGE_CLASS}}">
-  <header class="ink-masthead">
-    <div>
-      <p class="ink-masthead__eyebrow">{{MH_EYEBROW}}</p>
+<main class="v2-page reader{{PAGE_CLASS}}" id="main" tabindex="-1">
+  <header class="ink-masthead pagehead">
+    <div class="pagehead__titles">
+      {{MH_CRUMB}}
       <h1 class="ink-masthead__title">{{BLOG_TITLE}}</h1>
-      <p class="ink-masthead__tagline">{{TAGLINE}}</p>
+      <p class="ink-masthead__tagline pagehead__sub">{{TAGLINE}}</p>
     </div>
-    <div class="reader__actions">
+    <div class="reader__actions pagehead__actions">
       <a class="btn btn-ghost" href="/search">Search</a>
       <a class="btn btn-ghost" href="/ask">Ask the blog</a>
       <a class="ink-rss" href="/feed.xml">RSS</a>

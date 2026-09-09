@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 /// Complete, product-owned Lattice visual system.
 const SERVICE_CSS: &str = include_str!("../static/service.css");
 
-pub const APP_CSS_PATH: &str = "/assets/lattice-20260908.css";
+pub const APP_CSS_PATH: &str = "/assets/lattice-20260909.css";
 
 static APP_CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
@@ -76,14 +76,15 @@ pub fn layout(page_title: &str, headers: &HeaderMap, content: &str) -> String {
             "{{APPBAR}}",
             &app_bar(active, email.as_deref(), locale, theme),
         )
+        .replace("{{FOOTER}}", FOOTER)
         .replace("{{CONTENT}}", content)
 }
 
 /// The Lattice app-tile icon — a Lucide-style `book-open` glyph.
 pub const APP_ICON: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>"##;
 
-/// The Lattice app-bar: product brand + workspace nav + estate preferences, then the
-/// "All apps" waffle and avatar user-menu. Public/no-session renders keep a minimal avatar.
+/// Lattice's chrome: the Scriptoria suite bar (six vhosts, Wiki filled) over a section bar
+/// carrying the wiki's own pages, its global search, and the estate preference switches.
 fn app_bar(active: &str, email: Option<&str>, locale: odyssey::Locale, theme: &str) -> String {
     let nav = format!(
         concat!(
@@ -108,74 +109,16 @@ fn app_bar(active: &str, email: Option<&str>, locale: odyssey::Locale, theme: &s
         odyssey::theme_switcher(theme, locale).0,
         odyssey::lang_switcher(locale).0,
     );
-    format!(
-        r#"<header class="appbar">
-  <a class="appbar__brand" href="/" aria-label="Steadholme Lattice home">
-    <span class="app-tile" aria-hidden="true">{icon}</span>
-    <span class="appbar__name"><b>Lattice</b><span>Knowledge workspace</span></span>
-  </a>
-  {nav}
-  <form class="lattice-search" role="search" method="get" action="/search">
+    let search = r#"<form class="lattice-search" role="search" method="get" action="/search">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
     <label class="sr-only" for="lattice-global-search">Search documents</label>
     <input id="lattice-global-search" type="search" name="q" placeholder="Search documents" autocomplete="off">
     <kbd aria-hidden="true">/</kbd>
-  </form>
-  <span class="appbar__spacer"></span>
-  <div class="appbar__right">{preferences}{right}</div>
-</header>"#,
-        icon = APP_ICON,
-        nav = nav,
-        preferences = preferences,
-        right = user_menu(email),
-    )
-}
-
-/// The app-bar's right cluster: the "All apps" waffle and the avatar user-menu (Account / All apps
-/// / the preserved cross-subdomain gateway Sign-out). Legacy `allapps`/`userchip` hooks are kept.
-/// `None`/empty identity → a minimal, no-identity avatar (never breaks rendering).
-fn user_menu(email: Option<&str>) -> String {
-    let e = email.unwrap_or("");
-    let has_id = !e.is_empty();
-    let (avatar, name_html, head_name, head_sub) = if has_id {
-        let initial = e
-            .chars()
-            .find(|c| c.is_alphanumeric())
-            .map(|c| c.to_uppercase().to_string())
-            .unwrap_or_else(|| "U".to_string());
-        (
-            esc(&initial),
-            format!("<span class=\"usermenu__name\">{}</span>", esc(e)),
-            esc(e),
-            "Signed in".to_string(),
-        )
-    } else {
-        (
-            r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="width:16px;height:16px"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>"##.to_string(),
-            String::new(),
-            "Account".to_string(),
-            "Not signed in".to_string(),
-        )
-    };
+  </form>"#;
     format!(
-        r#"<a class="iconbtn allapps" href="https://w33d.xyz" title="All apps" aria-label="All apps"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></a>
-    <div class="usermenu userchip">
-      <button class="usermenu__btn" type="button" aria-haspopup="true" aria-label="Account menu">
-        <span class="avatar" aria-hidden="true">{avatar}</span>
-        {name}
-        <svg class="usermenu__caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
-      </button>
-      <div class="usermenu__pop" role="menu">
-        <div class="usermenu__head"><span class="avatar" aria-hidden="true">{avatar}</span><div><b>{head_name}</b><span>{head_sub}</span></div></div>
-        <a class="menuitem" href="https://account.w33d.xyz" role="menuitem"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>Account</a>
-        <a class="menuitem" href="https://w33d.xyz" role="menuitem"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>All apps</a>
-        <a class="menuitem menuitem--danger" href="{LOGOUT_URL}" role="menuitem"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/></svg>Sign out</a>
-      </div>
-    </div>"#,
-        avatar = avatar,
-        name = name_html,
-        head_name = head_name,
-        head_sub = head_sub,
+        "{}{}",
+        suite_bar(email.unwrap_or(""), ""),
+        section_bar(&nav, &format!("{search}{preferences}")),
     )
 }
 
@@ -252,9 +195,11 @@ mod tests {
         assert!(html.contains("me@steadholme.local"));
         assert!(html.contains("Steadholme"));
         assert!(html.contains("sso.w33d.xyz/_gw/auth/logout"));
-        // Product app-bar chrome: the "All apps" link back to the apex portal + the avatar
-        // user-menu. Compatibility hooks remain on the product-owned elements.
-        assert!(html.contains("class=\"appbar\""));
+        // Suite chrome: the six-surface switcher, the "All apps" link back to the apex
+        // portal, and the identity chip.
+        assert!(html.contains("class=\"suitebar\""));
+        assert!(html.contains("class=\"surf surf--wiki is-active\""));
+        assert!(html.contains("class=\"surf surf--blog\""));
         assert!(html.contains("allapps"));
         assert!(html.contains("https://w33d.xyz"));
         assert!(html.contains("userchip"));
@@ -275,3 +220,117 @@ mod tests {
         assert!(html.contains("/_gw/lang?to=zh"));
     }
 }
+
+// ===== Scriptoria v2 suite chrome =====
+
+/// This surface's key in the design's `surf/*` set, and the vhost it answers on.
+pub const SURFACE_KEY: &str = "wiki";
+pub const SURFACE_HOST: &str = "wiki.w33d.xyz";
+
+/// The six Scriptoria surfaces, in the order the Figma SuiteBar (AgW9572aDQMEDkSzerg9lR,
+/// component 10:705) lists them: `key, label, origin, icon`. One bar spans all six vhosts so
+/// the single-container Host demux reads as one product instead of six unrelated sites.
+const SUITE_SURFACES: [(&str, &str, &str, &str); 6] = [
+    ("blog", "Blog", "https://blog.w33d.xyz", ICON_FEATHER),
+    ("forum", "Forum", "https://forum.w33d.xyz", ICON_FORUM),
+    ("wiki", "Wiki", "https://wiki.w33d.xyz", ICON_WIKI),
+    ("paste", "Paste", "https://paste.w33d.xyz", ICON_PASTE),
+    ("drive", "Drive", "https://drive.w33d.xyz", ICON_DRIVE),
+    (
+        "comments",
+        "Comments",
+        "https://comments.w33d.xyz",
+        ICON_COMMENTS,
+    ),
+];
+
+const ICON_FEATHER: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.24 12.24a6 6 0 0 0-8.49-8.49L5 10.5V19h8.5z"/><path d="M16 8 2 22"/><path d="M17.5 15H9"/></svg>"##;
+const ICON_FORUM: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>"##;
+const ICON_WIKI: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 7v14"/><path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z"/></svg>"##;
+const ICON_PASTE: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/></svg>"##;
+const ICON_DRIVE: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><path d="M6 16h.01"/><path d="M10 16h.01"/></svg>"##;
+const ICON_COMMENTS: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/></svg>"##;
+const ICON_WAFFLE: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>"##;
+
+/// The suite bar the design puts on every Scriptoria page: brand tile, the product name over
+/// this vhost, the six-surface switcher (each pill carrying its own `surf/*` colour, the
+/// current one filled), then the estate's identity cluster. `extra_right` takes surface-owned
+/// controls that belong beside identity; `email` empty or `—` means no gateway session, and
+/// then no address and no log-out link are drawn.
+pub fn suite_bar(email: &str, extra_right: &str) -> String {
+    let mut pills = String::new();
+    for (key, label, origin, icon) in SUITE_SURFACES {
+        let here = key == SURFACE_KEY;
+        pills.push_str(&format!(
+            r#"<a class="surf surf--{key}{state}" href="{href}"{aria}>{icon}<span>{label}</span></a>"#,
+            key = key,
+            state = if here { " is-active" } else { "" },
+            href = if here { "/" } else { origin },
+            aria = if here { r#" aria-current="page""# } else { "" },
+            icon = icon,
+            label = label,
+        ));
+    }
+    let account = suite_account(email);
+    format!(
+        r#"<header class="suitebar">
+  <a class="suitebar__brand" href="/" aria-label="Scriptoria Wiki home">
+    <span class="brand-tile" aria-hidden="true">{tile}</span>
+    <span class="suitebar__name"><b>Scriptoria</b><span class="suitebar__host">{host}</span></span>
+  </a>
+  <nav class="surfaces" aria-label="Scriptoria surfaces">{pills}</nav>
+  <span class="suitebar__spacer"></span>
+  <div class="suitebar__right">{extra_right}<a class="allapps" href="https://w33d.xyz">{waffle}<span>All apps</span></a>{account}</div>
+</header>"#,
+        tile = ICON_FEATHER,
+        host = SURFACE_HOST,
+        pills = pills,
+        extra_right = extra_right,
+        waffle = ICON_WAFFLE,
+        account = account,
+    )
+}
+
+/// The identity chip plus the gateway log-out. With no session the chip states that plainly and
+/// the log-out is omitted: a public reader has nothing to log out of.
+fn suite_account(email: &str) -> String {
+    let email = email.trim();
+    if email.is_empty() || email == "\u{2014}" {
+        return r#"<span class="user-email user-email--none">No session</span>"#.to_string();
+    }
+    let initial = email
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "S".to_string());
+    format!(
+        r#"<span class="userchip"><span class="userchip__avatar" aria-hidden="true">{initial}</span><span class="user-email">{email}</span></span><a class="suitebar__out" href="{logout}">Log out</a>"#,
+        initial = esc(&initial),
+        email = esc(email),
+        logout = LOGOUT_URL,
+    )
+}
+
+/// The section bar: this surface's own pages, under the suite bar. `nav` is the surface's
+/// existing navigation markup; `right` takes the controls that sit opposite it.
+pub fn section_bar(nav: &str, right: &str) -> String {
+    if nav.is_empty() && right.is_empty() {
+        return String::new();
+    }
+    format!(
+        r#"<div class="subbar">{nav}<span class="subbar__spacer"></span><div class="subbar__right">{right}</div></div>"#
+    )
+}
+
+/// The estate footer: what this page is, then every surface of the suite.
+pub const FOOTER: &str = r##"<footer class="v2-foot">
+  <span class="v2-foot__lead">Steadholme · Scriptoria · wiki.w33d.xyz</span>
+  <a href="https://blog.w33d.xyz">Blog</a>
+  <a href="https://forum.w33d.xyz">Forum</a>
+  <a href="https://wiki.w33d.xyz">Wiki</a>
+  <a href="https://paste.w33d.xyz">Paste</a>
+  <a href="https://drive.w33d.xyz">Drive</a>
+  <a href="https://comments.w33d.xyz">Comments</a>
+  <a href="https://status.w33d.xyz">Status</a>
+  <a href="https://w33d.xyz">All apps</a>
+</footer>"##;

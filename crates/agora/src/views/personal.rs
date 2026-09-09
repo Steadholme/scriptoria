@@ -14,8 +14,8 @@ use crate::view_model::{
 
 use super::shell;
 use super::{
-    action_label, answer_state_chip, collection_note, crumbs, escape, eyebrow, follow_marker,
-    form_action, form_action_opt, hidden_inputs, kind_chip, link_action, monogram, o, pagination,
+    action_label, answer_state_chip, collection_note, crumbs, escape, follow_marker, form_action,
+    form_action_opt, hidden_inputs, kind_chip, link_action, monogram, o, pagination,
     private_marker, t, thread_href, time_el,
 };
 
@@ -51,14 +51,14 @@ fn ledger_tabs(param: &str, aria: &str, tabs: &[(&str, &str, bool)]) -> String {
 fn ledger_head(title: &str, owner_note: &str, meta: &str) -> String {
     format!(
         r#"<header class="pagehead ag-ledger-head ag-key-private">
-  <div class="ag-head-tools__lead">
+  <div class="pagehead__titles ag-head-tools__lead">
     {eyebrow}
     <h1 class="ag-head__title">{title}</h1>
     <p class="ag-ledger-owner muted">{owner_note}</p>
     <p class="ag-ledger-meta muted">{meta}</p>
   </div>
 </header>"#,
-        eyebrow = eyebrow("Private view"),
+        eyebrow = r#"<span class="pill ag-key-private">Private view</span>"#,
         title = escape(title),
         owner_note = escape(owner_note),
         meta = escape(meta),
@@ -600,7 +600,7 @@ fn bookmark_edit_main(v: &BookmarkEditView) -> String {
     format!(
         r#"<div class="ag-bookmark-edit">
   {crumb}
-  <header class="pagehead"><div class="ag-head-tools__lead">{eyebrow}<h1 class="ag-head__title">Edit bookmark</h1><p class="muted">{title}</p></div></header>
+  <header class="pagehead"><div class="pagehead__titles ag-head-tools__lead"><h1 class="ag-head__title">Edit bookmark</h1><p class="pagehead__sub">{title}</p></div></header>
   <section class="card ag-bookmark-editor ag-key-private">
     <form class="ag-form" method="post" action="{action}">{hidden}
       <label class="ag-form__label" for="bookmark-note">Private note</label>
@@ -621,7 +621,6 @@ fn bookmark_edit_main(v: &BookmarkEditView) -> String {
             ("Bookmarks", Some("/bookmarks")),
             ("Edit", None)
         ]),
-        eyebrow = eyebrow("Bookmarks"),
         title = t(&s.thread_title),
         action = o(&vs.save.action),
         hidden = hidden_inputs(&vs.save.csrf.0, &vs.save.fields),

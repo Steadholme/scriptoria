@@ -6,30 +6,23 @@
   <meta name="color-scheme" content="light">
   <link rel="icon" href="data:,">
   <title>{{TITLE}} · Upload request · Drive</title>
-  <link rel="stylesheet" href="/assets/aperture-20260908.css">
+  <link rel="stylesheet" href="/assets/aperture-20260909.css">
 </head>
-<body class="page-console">
-  <header class="appbar">
-    <a class="appbar__brand" href="/" aria-label="Steadholme Drive home">
-      <span class="app-tile" aria-hidden="true">⇧</span>
-      <span class="appbar__name"><b>Drive</b><span>drive.w33d.xyz</span></span>
-    </a>
-    <nav class="appbar__nav" aria-label="Drive">
-      <a class="appnav" href="/">Files</a>
-      <a class="appnav is-active" href="/requests">Requests</a>
-    </nav>
-    <span class="appbar__spacer"></span>
-    <div class="appbar__right">{{USERBOX}}</div>
-  </header>
-
-  <main class="console console--narrow request-console">
-    <div class="console__head console__head--row request-head">
-      <div><p class="eyebrow"><a href="/requests">Upload requests</a> / {{STATE}}</p><h1>{{TITLE}}</h1><p class="sub">{{DESCRIPTION}}</p></div>
-      <div class="request-head__actions">{{ACTION}}</div>
+<body class="page-v2">
+<a class="skip-link" href="#main">Skip to the page</a>
+{{TOPBAR}}
+  <main class="v2-page v2-page--narrow request-console" id="main" tabindex="-1">
+    <div class="pagehead request-head">
+      <div class="pagehead__titles">
+        <nav class="crumb" aria-label="Breadcrumb"><a href="/">Drive</a><span class="crumb__sep">/</span><a href="/requests">Upload requests</a><span class="crumb__sep">/</span><span class="crumb__here">{{STATE}}</span></nav>
+        <h1>{{TITLE}}</h1>
+        <p class="pagehead__sub">{{DESCRIPTION}}</p>
+      </div>
+      <div class="pagehead__actions request-head__actions">{{ACTION}}</div>
     </div>
 
     <section class="card request-access" aria-labelledby="request-access-title">
-      <div class="card__head"><div><p class="eyebrow">Access</p><h2 id="request-access-title">Public upload capability</h2></div><span class="badge">{{STATE}}</span></div>
+      <div class="card__head"><h2 id="request-access-title">Public upload capability</h2><span class="badge">{{STATE}}</span></div>
       <p class="muted">This is the only owner panel that reveals the current request link. It can upload, but it cannot browse the destination.</p>
       <div class="embed-box__row"><input class="embed-box__input" readonly value="{{URL}}"><button class="btn btn-secondary copy-btn" type="button" data-copy=".embed-box__input" data-label="Copy">Copy</button></div>
       <div class="request-facts"><span>Destination <b>{{FOLDER}}</b></span><span>{{EXPIRY}}</span><span>{{USED_FILES}} files · {{USED_BYTES}}</span></div>
@@ -41,7 +34,7 @@
     </section>
 
     <section class="card">
-      <div class="card__head"><div><p class="eyebrow">Policy</p><h2>Request limits</h2></div></div>
+      <div class="card__head"><h2>Request limits</h2></div>
       <form class="request-policy" method="post" action="/requests/{{ID}}/update">
         <input type="hidden" name="csrf_token" value="{{CSRF}}">
         <label>Title<input name="title" value="{{TITLE}}" maxlength="120" required></label>
@@ -56,10 +49,11 @@
     </section>
 
     <section class="card">
-      <div class="card__head"><div><p class="eyebrow">Owner receipt</p><h2>Deliveries received</h2></div></div>
+      <div class="card__head"><h2>Deliveries received</h2></div>
       <div class="request-deliveries">{{RECEIPTS}}</div>
     </section>
-  </main>
+  {{FOOTER}}
+</main>
   {{DYNAMIC}}
   <script>
     (function () {

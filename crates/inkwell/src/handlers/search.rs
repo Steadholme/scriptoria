@@ -76,7 +76,7 @@ pub async fn search_page(
         .replace("{{RESULTS}}", &results_html);
     let page = page_shell(PageShell {
         head_title: "Search · Inkwell",
-        body_class: "page-console",
+        body_class: "page-v2",
         rss: false,
         nav_title: "Search",
         email: &email,

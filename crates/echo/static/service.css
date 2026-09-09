@@ -552,3 +552,206 @@ body.page-embed { background: transparent; }
   --paper-bg:#161b22; --paper-rule:#30363d;
   --hl-mark:#5a4a12; --hl-text:#ffe89a;
 }
+
+/* ==========================================================================
+   Scriptoria v2 shell (2026-09-09) — echo.
+   The 2026-09-08 pass re-pointed this crate's colour tokens and stopped there:
+   the templates stayed on the old per-app `.appbar`, and unlike the rest of the
+   estate this stylesheet never carried the v2 shell rules at all. So the
+   SuiteBar that Figma AgW9572aDQMEDkSzerg9lR puts across ALL SIX vhosts
+   (blog · forum · wiki · paste · drive · comments) existed nowhere in this
+   repo. These rules are copied from the estate's canonical v2 layer
+   (/root/w33d_infra/cistern/static/service.css) and re-tokenised onto the
+   tokens this crate declares, plus the design's per-surface `surf/*` palette.
+   ========================================================================== */
+
+/* Per-surface colours from the design's `surf/*` set. `--surf-ico` is the
+   inactive pill's icon tint; it lightens where the crate's own dark scope
+   flips the neutrals, so the tint never sits dark-on-dark. */
+:root {
+  --surf-blog:#7e22ce; --surf-forum:#0369a1; --surf-wiki:#047857;
+  --surf-paste:#b45309; --surf-drive:#1d4ed8; --surf-comments:#be123c;
+  --surf-blog-ico:#7e22ce; --surf-forum-ico:#0369a1; --surf-wiki-ico:#047857;
+  --surf-paste-ico:#b45309; --surf-drive-ico:#1d4ed8; --surf-comments-ico:#be123c;
+}
+.surf--blog { --surf:var(--surf-blog); --surf-ico:var(--surf-blog-ico); }
+.surf--forum { --surf:var(--surf-forum); --surf-ico:var(--surf-forum-ico); }
+.surf--wiki { --surf:var(--surf-wiki); --surf-ico:var(--surf-wiki-ico); }
+.surf--paste { --surf:var(--surf-paste); --surf-ico:var(--surf-paste-ico); }
+.surf--drive { --surf:var(--surf-drive); --surf-ico:var(--surf-drive-ico); }
+.surf--comments { --surf:var(--surf-comments); --surf-ico:var(--surf-comments-ico); }
+
+/* ---- Skip link (no crate here ships one) -------------------------------- */
+.skip-link {
+  position:absolute; left:8px; top:-48px; z-index:100;
+  display:inline-flex; align-items:center; height:36px; padding:0 14px;
+  border-radius:var(--r-sm); background:var(--surface); color:var(--ink);
+  border:1px solid var(--border-2); font-size:13px; font-weight:600;
+  text-decoration:none; transition:top .12s ease;
+}
+.skip-link:focus { top:8px; outline:2px solid var(--accent); outline-offset:2px; }
+
+/* ---- Page ground -------------------------------------------------------- */
+.page-v2 { min-height:100vh; margin:0; padding:0; max-width:none; background-color:var(--bg); background-image:none; }
+
+/* ---- Suite bar: one bar for all six vhosts ------------------------------ */
+.suitebar {
+  position:sticky; top:0; z-index:40; min-height:56px;
+  display:flex; align-items:center; gap:20px; padding:0 24px;
+  background:var(--surface); border-bottom:1px solid var(--border);
+  background-image:none; backdrop-filter:none;
+}
+.suitebar__brand { display:flex; align-items:center; gap:10px; color:inherit; text-decoration:none; }
+.suitebar__brand:hover { text-decoration:none; }
+.brand-tile {
+  width:28px; height:28px; border-radius:7px; flex:0 0 auto;
+  background:var(--surf-blog); color:#fff;
+  display:inline-flex; align-items:center; justify-content:center;
+}
+.brand-tile svg { width:17px; height:17px; }
+.suitebar__name { display:flex; flex-direction:column; line-height:1.2; }
+.suitebar__name b { font-size:14px; font-weight:650; color:var(--ink); }
+.suitebar__host { font-family:var(--mono); font-size:11px; font-weight:400; color:var(--ink-3); }
+.surfaces { display:flex; align-items:center; gap:4px; min-width:0; }
+.surf {
+  display:inline-flex; align-items:center; gap:6px; flex:0 0 auto;
+  height:32px; padding:0 12px; border-radius:999px;
+  border:1px solid var(--border); background:var(--surface);
+  font-size:13px; font-weight:650; color:var(--ink-2); text-decoration:none; white-space:nowrap;
+}
+.surf svg { width:14px; height:14px; color:var(--surf-ico); }
+.surf:hover { text-decoration:none; background:var(--surface-2); color:var(--ink); }
+.surf.is-active { background:var(--surf); border-color:var(--surf); color:#fff; }
+.surf.is-active svg { color:#fff; }
+.suitebar__spacer { flex:1 1 auto; }
+.suitebar__right { display:flex; align-items:center; gap:10px; }
+.suitebar .allapps {
+  width:auto; height:30px; display:inline-flex; align-items:center; gap:6px; padding:0 10px;
+  border:0; border-radius:var(--r-sm); background:transparent;
+  font-size:13px; font-weight:650; color:var(--ink-2); text-decoration:none;
+}
+.suitebar .allapps:hover { background:var(--surface-2); color:var(--ink); text-decoration:none; }
+.suitebar .allapps svg { width:16px; height:16px; }
+.suitebar .userchip {
+  min-height:0; height:30px; display:inline-flex; align-items:center; gap:8px;
+  max-width:260px; padding:0 10px 0 4px; background:var(--surface);
+  border:1px solid var(--border); border-radius:999px;
+}
+.userchip__avatar {
+  width:24px; height:24px; border-radius:50%; flex:0 0 auto;
+  background:var(--accent-soft); color:var(--accent-ink);
+  display:inline-flex; align-items:center; justify-content:center; font-size:11px; font-weight:650;
+}
+.user-email { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px; font-weight:500; color:var(--ink); }
+.user-email--none { color:var(--ink-3); }
+.suitebar__out {
+  height:30px; display:inline-flex; align-items:center; padding:0 10px;
+  border:0; border-radius:var(--r-sm); background:transparent;
+  font-size:13px; font-weight:650; color:var(--ink-2); text-decoration:none;
+}
+.suitebar__out:hover { background:var(--surface-2); color:var(--ink); text-decoration:none; }
+
+/* ---- Section bar: this surface's own pages, under the suite bar ---------- */
+.subbar {
+  display:flex; align-items:center; gap:8px; min-height:44px; padding:0 24px;
+  background:var(--surface); border-bottom:1px solid var(--border);
+}
+.subbar .appbar__nav { display:flex; align-items:center; gap:4px; min-width:0; overflow-x:auto; scrollbar-width:none; }
+.subbar .appbar__nav::-webkit-scrollbar { display:none; }
+.subbar .appnav {
+  min-height:32px; height:32px; flex:0 0 auto;
+  display:inline-flex; align-items:center; gap:6px; padding:0 11px;
+  border:1px solid transparent; border-radius:var(--r-sm); box-shadow:none;
+  background:transparent; color:var(--ink-2); font-size:13px; font-weight:650; white-space:nowrap;
+}
+.subbar .appnav svg { width:15px; height:15px; display:inline-block; }
+.subbar .appnav:hover { background:var(--surface-2); color:var(--ink); text-decoration:none; box-shadow:none; }
+.subbar .appnav.is-active { background:var(--accent-soft); border-color:var(--accent-border,var(--accent-soft-2)); color:var(--accent-ink); box-shadow:none; }
+.subbar__spacer { flex:1 1 auto; }
+.subbar__right { display:flex; align-items:center; gap:8px; flex:0 0 auto; }
+
+/* ---- Page frame --------------------------------------------------------- */
+.v2-page {
+  max-width:1280px; margin:0 auto; padding:32px 40px 40px;
+  display:flex; flex-direction:column; gap:24px;
+}
+.v2-page--narrow { max-width:820px; }
+.v2-page--read { max-width:1120px; }
+.v2-page--wide { max-width:1480px; }
+
+/* ---- Page head ---------------------------------------------------------- */
+.page-v2 .pagehead {
+  display:flex; align-items:flex-start; gap:24px;
+  margin:0; padding:0; border:0; background-image:none;
+}
+.page-v2 .pagehead::before, .page-v2 .pagehead::after { display:none; content:none; }
+.page-v2 .pagehead > :first-child { flex:1 1 auto; min-width:0; }
+.pagehead__titles { flex:1 1 auto; min-width:0; display:flex; flex-direction:column; gap:6px; }
+.pagehead__titles h1 { margin:0; font-size:24px; line-height:30px; letter-spacing:-.02em; font-weight:650; }
+.pagehead__sub { margin:0; font-size:14px; color:var(--ink-2); max-width:70ch; }
+.pagehead__actions { display:flex; align-items:center; gap:8px; flex:0 0 auto; flex-wrap:wrap; }
+
+/* Breadcrumbs. Several pages carried their trail in a `.eyebrow`, which some
+   of these stylesheets hide outright — the navigation was silently lost. */
+.crumb { display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin:0; font-size:13px; color:var(--ink-2); text-transform:none; letter-spacing:0; }
+.crumb a { color:var(--ink-2); }
+.crumb__sep { color:var(--ink-4); }
+.crumb__here { font-family:var(--mono); font-size:13px; font-weight:500; color:var(--ink); overflow-wrap:anywhere; }
+
+/* ---- Footer ------------------------------------------------------------- */
+.v2-foot {
+  margin-top:8px; padding-top:20px; border-top:1px solid var(--hairline);
+  display:flex; flex-wrap:wrap; align-items:center; gap:10px 20px;
+  font-size:12px; color:var(--ink-3);
+}
+.v2-foot__lead { flex:1 1 auto; min-width:0; }
+.v2-foot a { color:var(--ink-2); }
+
+/* ---- Responsive ladder -------------------------------------------------- */
+@media (max-width:1100px) {
+  .v2-page { padding:24px 24px 32px; }
+}
+@media (max-width:900px) {
+  .suitebar { flex-wrap:wrap; gap:8px 12px; padding:8px 14px; }
+  .suitebar__brand { order:1; }
+  .suitebar__spacer { display:none; }
+  .suitebar__right { order:2; margin-left:auto; }
+  .surfaces { order:3; flex-basis:100%; min-width:0; overflow-x:auto; scrollbar-width:none; padding-bottom:2px; }
+  .surfaces::-webkit-scrollbar { display:none; }
+  .suitebar .allapps span, .user-email { display:none; }
+  .suitebar .userchip { border:0; padding:0; max-width:none; }
+  .subbar { padding:0 14px; }
+  .v2-page { padding:20px 16px 32px; gap:16px; }
+  .page-v2 .pagehead { flex-direction:column; gap:14px; }
+  .pagehead__actions { width:100%; }
+}
+@media (max-width:520px) {
+  .suitebar__name b { font-size:13px; }
+  .suitebar__out { padding:0 6px; }
+}
+
+/* Echo's own palette flipped on `prefers-color-scheme: dark`, but the 2026-09-08
+   token re-point landed in a later, unconditional `:root` and silently won over
+   that query — nothing sets `data-theme` here, so dark mode stopped repainting
+   altogether. Re-state the v2 dark tokens under the query Echo actually uses. */
+@media (prefers-color-scheme:dark) {
+  :root {
+    --bg:#0d1117; --bg-2:#0b0f14;
+    --surface:#161b22; --surface-2:#11161d; --surface-3:#1c2129;
+    --border:#30363d; --border-2:#484f58; --hairline:#262c34;
+    --ink:#e6edf3; --ink-2:#b1bac4; --ink-3:#8b949e; --ink-4:#6e7681;
+    --accent:#fb7185; --accent-2:#fb7185; --accent-ink:#fda4af;
+    --accent-soft:#3f1220; --accent-soft-2:#3f1220; --accent-border:#3f1220;
+    --brand:var(--accent); --brand-soft:var(--accent-soft); --brand-ink:var(--accent-ink);
+    --paper-bg:#161b22; --paper-rule:#30363d;
+    --hl-mark:#5a4a12; --hl-text:#ffe89a;
+    --surf-blog-ico:#c084fc; --surf-forum-ico:#7dd3fc; --surf-wiki-ico:#6ee7b7;
+    --surf-paste-ico:#fbbf24; --surf-drive-ico:#93c5fd; --surf-comments-ico:#fb7185;
+  }
+}
+
+/* The v2 dark accent is a light tint, so a filled primary button needs dark ink
+   on it — the light-theme white is unreadable there. */
+@media (prefers-color-scheme:dark) {
+  .btn-primary, .btn.btn-primary { color:#0d1117; }
+}

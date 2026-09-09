@@ -11,8 +11,7 @@ use crate::view_model::{
 
 use super::shell;
 use super::{
-    answer_state_chip, collection_note, escape, eyebrow, kind_chip, monogram, t, thread_href,
-    time_el,
+    answer_state_chip, collection_note, escape, kind_chip, monogram, t, thread_href, time_el,
 };
 
 pub fn search(v: &SearchView) -> String {
@@ -46,11 +45,10 @@ fn search_main(s: &SearchShared, vs: &SearchViewerState) -> String {
     };
     format!(
         r#"<div class="ag-desk-page">
-  <header class="pagehead"><div class="ag-head-tools__lead">{eyebrow}<h1 class="ag-head__title">Search</h1></div></header>
+  <header class="pagehead"><div class="pagehead__titles ag-head-tools__lead"><h1 class="ag-head__title">Search</h1></div></header>
   {form}
   {body}
 </div>"#,
-        eyebrow = eyebrow("Deliberation Desk"),
         form = form,
         body = body,
     )

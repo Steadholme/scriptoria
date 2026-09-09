@@ -19,7 +19,7 @@ use crate::config::{clamp_page, DEFAULT_PAGE, MAX_BODY_BYTES, MAX_TITLE_CHARS};
 use crate::error::AppError;
 use crate::handlers::{
     dynamic_js, esc, expiry_options, fmt_dur_short, fmt_size, fmt_ts, language_label,
-    language_options, parse_expiry, userbox, LANGUAGES, SHIELD_SVG,
+    language_options, parse_expiry, topbar, FOOTER, LANGUAGES, SHIELD_SVG,
 };
 use crate::model::{Paste, PasteFile, PasteRevision};
 use crate::{highlight, now_secs, random_alnum, similar, AppState};
@@ -1129,7 +1129,8 @@ fn render_new(
     let opts_open = if burn { " open" } else { "" };
     NEW_HTML
         .replace("{{SHIELD}}", SHIELD_SVG)
-        .replace("{{USERBOX}}", &userbox("New paste", Some(&who.email)))
+        .replace("{{FOOTER}}", FOOTER)
+        .replace("{{TOPBAR}}", &topbar("New paste", Some(&who.email)))
         .replace("{{CSRF}}", &esc(csrf))
         .replace("{{LANGUAGE_OPTIONS}}", &language_options(language))
         .replace("{{EXPIRY_OPTIONS}}", &expiry_options(expiry))
@@ -1586,7 +1587,8 @@ fn fill_view(
 ) -> String {
     VIEW_HTML
         .replace("{{SHIELD}}", SHIELD_SVG)
-        .replace("{{USERBOX}}", &userbox("View paste", Some(viewer_email)))
+        .replace("{{FOOTER}}", FOOTER)
+        .replace("{{TOPBAR}}", &topbar("View paste", Some(viewer_email)))
         .replace("{{TABS}}", tabs)
         .replace("{{BADGES}}", badges)
         .replace("{{ACTIONS}}", actions)
@@ -1647,7 +1649,8 @@ fn render_revision(viewer: &Identity, paste_id: &str, rev: &PasteRevision) -> St
 fn render_unlock(viewer: &Identity, id: &str, csrf: &str, error: Option<&str>) -> String {
     UNLOCK_HTML
         .replace("{{SHIELD}}", SHIELD_SVG)
-        .replace("{{USERBOX}}", &userbox("Locked paste", Some(&viewer.email)))
+        .replace("{{FOOTER}}", FOOTER)
+        .replace("{{TOPBAR}}", &topbar("Locked paste", Some(&viewer.email)))
         .replace("{{ERROR}}", &error_block(error))
         .replace("{{ID}}", &esc(id))
         .replace("{{CSRF}}", &esc(csrf))
@@ -1666,7 +1669,8 @@ fn render_edit(
 ) -> String {
     EDIT_HTML
         .replace("{{SHIELD}}", SHIELD_SVG)
-        .replace("{{USERBOX}}", &userbox("Edit paste", Some(&who.email)))
+        .replace("{{FOOTER}}", FOOTER)
+        .replace("{{TOPBAR}}", &topbar("Edit paste", Some(&who.email)))
         .replace("{{ID}}", &esc(id))
         .replace("{{CSRF}}", &esc(csrf))
         .replace("{{LANGUAGE_OPTIONS}}", &language_options(language))
@@ -1681,10 +1685,8 @@ fn render_edit(
 fn render_history(viewer: &Identity, paste: &Paste, revisions: &[PasteRevision]) -> String {
     HISTORY_HTML
         .replace("{{SHIELD}}", SHIELD_SVG)
-        .replace(
-            "{{USERBOX}}",
-            &userbox("Paste history", Some(&viewer.email)),
-        )
+        .replace("{{FOOTER}}", FOOTER)
+        .replace("{{TOPBAR}}", &topbar("Paste history", Some(&viewer.email)))
         .replace("{{ID}}", &esc(&paste.id))
         .replace(
             "{{TABS}}",

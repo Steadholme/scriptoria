@@ -4570,7 +4570,7 @@ async fn request_rooms_owner_lifecycle_rotation_and_receipts() {
     let list_html = list.text();
     assert!(list_html.contains("Evidence intake"));
     assert!(list_html.contains("Create request"));
-    assert!(list_html.contains("Request Inbox"));
+    assert!(list_html.contains("<h1>Upload requests</h1>"));
     assert!(list_html.contains("Page size 30"));
     assert!(list_html.contains("href=\"/requests?view=all\""));
     assert!(list_html.contains("href=\"/requests?view=open\""));

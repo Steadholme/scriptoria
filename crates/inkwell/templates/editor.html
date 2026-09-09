@@ -1,7 +1,10 @@
-<main class="console console--narrow ink-editwrap">
-  <div class="console__head">
-    <h1>{{HEADING}}</h1>
-    <p class="sub">{{SUBHEAD}}</p>
+<main class="v2-page console console--narrow ink-editwrap" id="main" tabindex="-1">
+  <div class="pagehead">
+    <div class="pagehead__titles">
+      <nav class="crumb" aria-label="Breadcrumb"><a href="/library">Studio</a><span class="crumb__sep">/</span><span class="crumb__here">{{HEADING}}</span></nav>
+      <h1>{{HEADING}}</h1>
+      <p class="pagehead__sub">{{SUBHEAD}}</p>
+    </div>
   </div>
   <form class="editor ink-editor" method="post" action="{{ACTION}}" data-writer-studio data-initial-state="{{STATE_KEY}}" data-recovery-scope="{{RECOVERY_SCOPE}}" data-autosave-url="{{AUTOSAVE_URL}}">
     <input type="hidden" name="csrf_token" value="{{CSRF}}">

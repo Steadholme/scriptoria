@@ -12,7 +12,7 @@ use crate::audit::AuditEvent;
 use crate::auth;
 use crate::error::AppError;
 use crate::handlers::files::{html_with_csrf, redirect_found};
-use crate::handlers::{dynamic_js, esc, fmt_ts, human_size, userbox};
+use crate::handlers::{dynamic_js, esc, fmt_ts, human_size, topbar, FOOTER};
 use crate::model::{
     FolderRec, UploadDeliveryBundle, UploadRequestInbox, UploadRequestInboxCursor,
     UploadRequestInboxView, UploadRequestRec, UploadRequestSummary, UploadReviewDisposition,
@@ -779,7 +779,8 @@ fn render_index(
     };
     REQUESTS_HTML
         .replace("{{DYNAMIC}}", dynamic_js())
-        .replace("{{USERBOX}}", &userbox("Drive", Some(email)))
+        .replace("{{TOPBAR}}", &topbar("Requests", Some(email)))
+        .replace("{{FOOTER}}", FOOTER)
         .replace("{{FILTERS}}", &filters)
         .replace("{{SCOPE}}", &esc(&scope))
         .replace("{{REQUESTS}}", &rows)
@@ -959,7 +960,8 @@ fn render_detail(email: &str, csrf: &str, detail: RequestDetailContext<'_>) -> S
     };
     REQUEST_DETAIL_HTML
         .replace("{{DYNAMIC}}", dynamic_js())
-        .replace("{{USERBOX}}", &userbox("Drive", Some(email)))
+        .replace("{{TOPBAR}}", &topbar("Requests", Some(email)))
+        .replace("{{FOOTER}}", FOOTER)
         .replace("{{ID}}", &esc(&request.id))
         .replace("{{TITLE}}", &esc(&request.title))
         .replace("{{DESCRIPTION}}", &esc(&request.description))

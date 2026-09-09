@@ -6,27 +6,16 @@
   <meta name="color-scheme" content="dark">
   <link rel="icon" href="data:,">
   <title>Password required · Pastefire · Steadholme</title>
-  <link rel="stylesheet" href="/assets/pastefire-20260908.css">
+  <link rel="stylesheet" href="/assets/pastefire-20260909.css">
 </head>
-<body class="page-console">
-  <header class="appbar">
-    <a class="appbar__brand" href="/" aria-label="Steadholme Pastefire home">
-      <span class="app-tile" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/></svg></span>
-      <span class="appbar__name"><b>Paste</b><span>paste.w33d.xyz</span></span>
-    </a>
-    <nav class="appbar__nav" aria-label="Pastefire">
-      <a class="appnav" href="/"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="M12 5v14"/></svg>New paste</a>
-    </nav>
-    <span class="appbar__spacer"></span>
-    <div class="appbar__right">{{USERBOX}}</div>
-  </header>
-
-  <main class="console pf-gate">
+<body class="page-v2">
+<a class="skip-link" href="#main">Skip to the paste</a>
+{{TOPBAR}}
+  <main class="v2-page v2-page--narrow pf-gate" id="main" tabindex="-1">
     <section class="card pf-gate__card">
       <div class="card__body">
         <div class="pf-gate__glyph" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></div>
         <h1>Password required</h1>
-        <p class="sub">This paste is protected. Enter its password to view the contents.</p>
         <span class="pf-gate__id">{{ID}}</span>
         {{ERROR}}
         <form method="post" action="/unlock/{{ID}}">
@@ -41,6 +30,7 @@
         </form>
       </div>
     </section>
+{{FOOTER}}
   </main>
 </body>
 </html>

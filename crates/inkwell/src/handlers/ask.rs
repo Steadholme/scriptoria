@@ -137,7 +137,7 @@ fn render_console(
         .replace("{{ANSWER}}", answer_html);
     page_shell(PageShell {
         head_title: "Ask the blog · Inkwell",
-        body_class: "page-console",
+        body_class: "page-v2",
         rss: false,
         nav_title: "Ask",
         email,

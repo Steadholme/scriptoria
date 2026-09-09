@@ -29,7 +29,7 @@ use crate::error::AppError;
 use crate::handlers::{
     dynamic_js, esc, expiry_options, fmt_ts, human_size, parse_expiry, render_share_room_error,
     resolve_content_type, safe_filename, share_room_html, share_room_html_with_csrf,
-    sniff_verified_upload_type, userbox, FILE_SVG, SHIELD_SVG,
+    sniff_verified_upload_type, topbar, FILE_SVG, FOOTER, SHIELD_SVG,
 };
 use crate::model::{
     library_type_for, FileComment, FileRec, FolderRec, LibraryCursor, LibraryItem, LibraryItemKind,
@@ -3677,28 +3677,25 @@ fn folder_chain(folders: &[FolderRec], folder: &FolderRec) -> Vec<FolderRec> {
 /// Render the folder breadcrumb: `My Drive › … › current`, each ancestor a link, the current node
 /// plain text. Owner-scoped; every name escaped.
 fn render_breadcrumb(chain: &[FolderRec]) -> String {
-    let mut out = String::from("<nav class=\"breadcrumb\" aria-label=\"Folder path\">");
-    if chain.is_empty() {
-        out.push_str("<span class=\"breadcrumb__here\">My Drive</span>");
-    } else {
-        out.push_str("<a class=\"breadcrumb__crumb\" href=\"/\">My Drive</a>");
-        for (i, f) in chain.iter().enumerate() {
-            out.push_str("<span class=\"breadcrumb__sep\" aria-hidden=\"true\">&rsaquo;</span>");
-            if i + 1 == chain.len() {
-                out.push_str(&format!(
-                    "<span class=\"breadcrumb__here\">{}</span>",
-                    esc(&f.name)
-                ));
-            } else {
-                out.push_str(&format!(
-                    "<a class=\"breadcrumb__crumb\" href=\"/?folder={id}\">{name}</a>",
-                    id = esc(&f.id),
-                    name = esc(&f.name),
-                ));
-            }
-        }
+    // At the root the trail would be the title repeated, so only the title is drawn.
+    let Some(current) = chain.last() else {
+        return "<h1 class=\"drive-title\">My Drive</h1>".to_string();
+    };
+    let mut out = String::from("<nav class=\"breadcrumb crumb\" aria-label=\"Folder path\">");
+    out.push_str("<a class=\"breadcrumb__crumb\" href=\"/\">My Drive</a>");
+    for f in chain.iter().take(chain.len() - 1) {
+        out.push_str("<span class=\"breadcrumb__sep\" aria-hidden=\"true\">&rsaquo;</span>");
+        out.push_str(&format!(
+            "<a class=\"breadcrumb__crumb\" href=\"/?folder={id}\">{name}</a>",
+            id = esc(&f.id),
+            name = esc(&f.name),
+        ));
     }
     out.push_str("</nav>");
+    out.push_str(&format!(
+        "<h1 class=\"drive-title\">{}</h1>",
+        esc(&current.name)
+    ));
     out
 }
 
@@ -4014,7 +4011,7 @@ fn render_library_gallery(input: LibraryRender<'_>) -> String {
         })
         .unwrap_or_default();
     let breadcrumb = format!(
-        "<nav class=\"breadcrumb\" aria-label=\"Library view\"><span class=\"breadcrumb__here\">{}</span></nav>",
+        "<nav class=\"breadcrumb crumb\" aria-label=\"Library view\"><a href=\"/\">My Drive</a></nav><h1 class=\"drive-title\">{}</h1>",
         esc(heading)
     );
     let upload = render_upload_form(input.csrf, "");
@@ -4022,7 +4019,8 @@ fn render_library_gallery(input: LibraryRender<'_>) -> String {
     GALLERY_HTML
         .replace("{{DYNAMIC}}", dynamic_js())
         .replace("{{SHIELD}}", SHIELD_SVG)
-        .replace("{{USERBOX}}", &userbox("Drive", Some(&input.who.email)))
+        .replace("{{TOPBAR}}", &topbar("Drive", Some(&input.who.email)))
+        .replace("{{FOOTER}}", FOOTER)
         .replace("{{USAGE}}", &render_usage_meter(input.used, input.quota))
         .replace("{{UPLOAD}}", &upload)
         .replace(
@@ -4140,7 +4138,8 @@ fn render_gallery(
     GALLERY_HTML
         .replace("{{DYNAMIC}}", dynamic_js())
         .replace("{{SHIELD}}", SHIELD_SVG)
-        .replace("{{USERBOX}}", &userbox("Drive", Some(&who.email)))
+        .replace("{{TOPBAR}}", &topbar("Drive", Some(&who.email)))
+        .replace("{{FOOTER}}", FOOTER)
         .replace("{{USAGE}}", &render_usage_meter(used, quota))
         .replace("{{UPLOAD}}", &upload)
         .replace(
@@ -4266,11 +4265,12 @@ fn render_trash_gallery(input: TrashRender<'_>) -> String {
         render_trash_cards(input.items, input.csrf)
     };
     let breadcrumb =
-        "<nav class=\"breadcrumb\" aria-label=\"Folder path\"><a class=\"breadcrumb__crumb\" href=\"/\">My Drive</a><span class=\"breadcrumb__sep\" aria-hidden=\"true\">&rsaquo;</span><span class=\"breadcrumb__here\">Trash</span></nav>";
+        "<nav class=\"breadcrumb crumb\" aria-label=\"Folder path\"><a class=\"breadcrumb__crumb\" href=\"/\">My Drive</a></nav><h1 class=\"drive-title\">Trash</h1>";
     GALLERY_HTML
         .replace("{{DYNAMIC}}", dynamic_js())
         .replace("{{SHIELD}}", SHIELD_SVG)
-        .replace("{{USERBOX}}", &userbox("Drive", Some(&input.who.email)))
+        .replace("{{TOPBAR}}", &topbar("Drive", Some(&input.who.email)))
+        .replace("{{FOOTER}}", FOOTER)
         .replace("{{USAGE}}", &render_usage_meter(input.used, input.quota))
         .replace("{{UPLOAD}}", "")
         .replace(
@@ -5360,7 +5360,8 @@ fn render_detail(ctx: DetailRender<'_>) -> String {
     DETAIL_HTML
         .replace("{{DYNAMIC}}", dynamic_js())
         .replace("{{SHIELD}}", SHIELD_SVG)
-        .replace("{{USERBOX}}", &userbox("Drive", Some(&viewer.email)))
+        .replace("{{TOPBAR}}", &topbar("Drive", Some(&viewer.email)))
+        .replace("{{FOOTER}}", FOOTER)
         .replace("{{NAME}}", &esc(&rec.name))
         .replace("{{TYPE_TILE}}", &type_tile)
         .replace("{{FACTS}}", &facts)

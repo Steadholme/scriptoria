@@ -6,22 +6,12 @@
   <meta name="color-scheme" content="dark">
   <link rel="icon" href="data:,">
   <title>{{STATUS}} · Pastefire · Steadholme</title>
-  <link rel="stylesheet" href="/assets/pastefire-20260908.css">
+  <link rel="stylesheet" href="/assets/pastefire-20260909.css">
 </head>
-<body class="page-console">
-  <header class="appbar">
-    <a class="appbar__brand" href="/" aria-label="Steadholme Pastefire home">
-      <span class="app-tile" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/></svg></span>
-      <span class="appbar__name"><b>Paste</b><span>paste.w33d.xyz</span></span>
-    </a>
-    <nav class="appbar__nav" aria-label="Pastefire">
-      <a class="appnav" href="/"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="M12 5v14"/></svg>New paste</a>
-    </nav>
-    <span class="appbar__spacer"></span>
-    <div class="appbar__right">{{USERBOX}}</div>
-  </header>
-
-  <main class="console">
+<body class="page-v2">
+<a class="skip-link" href="#main">Skip to the paste</a>
+{{TOPBAR}}
+  <main class="v2-page v2-page--narrow" id="main" tabindex="-1">
     <section class="card card--message pf-msg pf-msg--{{TONE}}">
       <div class="card__body">
         <div class="pf-msg__glyph" aria-hidden="true">{{GLYPH}}</div>
@@ -31,6 +21,7 @@
         <a class="btn btn-primary" href="/">Back to Pastefire</a>
       </div>
     </section>
+{{FOOTER}}
   </main>
 </body>
 </html>
