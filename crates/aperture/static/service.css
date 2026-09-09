@@ -2491,3 +2491,24 @@ body.page-console, body.page-share-landing, body.page-v2 {
 /* The Files view's page title: the folder path is the trail, the current folder
    is the page's heading. The drive layout has no pagehead row of its own. */
 .drive-title { margin:2px 0 0; font-size:20px; line-height:26px; font-weight:650; letter-spacing:-.01em; }
+
+/* ==========================================================================
+   System dark. These tokens existed only under :root[data-theme="dark"], and
+   this crate never emits a data-theme attribute, so the dark ramp above was
+   unreachable — dark renders were identical to light. Mirroring the same
+   tokens onto the viewer's system preference needs no cookie plumbing; an
+   explicit data-theme="light" still wins.
+   ========================================================================== */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg:#0d1117; --bg-2:#0b0f14;
+    --surface:#161b22; --surface-2:#11161d; --surface-3:#1c2129;
+    --border:#30363d; --border-2:#484f58; --hairline:#262c34;
+    --ink:#e6edf3; --ink-2:#b1bac4; --ink-3:#8b949e; --ink-4:#6e7681;
+    --accent:#93c5fd; --accent-2:#93c5fd; --accent-ink:#bfdbfe;
+    --accent-soft:#152241; --accent-soft-2:#152241; --accent-border:#152241;
+    --brand:var(--accent); --brand-soft:var(--accent-soft); --brand-ink:var(--accent-ink);
+    --paper-bg:#161b22; --paper-rule:#30363d;
+    --hl-mark:#5a4a12; --hl-text:#ffe89a;
+  }
+}

@@ -2453,3 +2453,28 @@ body.page-v2 > .v2-foot { width:min(100%, var(--ag-content)); margin:0 auto; pad
 .subbar .ag-quick-search__submit svg { width:16px; height:16px; }
 .subbar .ag-quick-search input[type="search"] { height:34px; }
 .subbar .ag-quick-search__key { margin-right:8px; }
+
+/* ==========================================================================
+   System dark. These tokens existed only under :root[data-theme="dark"], and
+   this crate never emits a data-theme attribute, so the dark ramp above was
+   unreachable — dark renders were identical to light. Mirroring the same
+   tokens onto the viewer's system preference needs no cookie plumbing; an
+   explicit data-theme="light" still wins.
+   ========================================================================== */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg:#0d1117; --bg-2:#0b0f14;
+    --surface:#161b22; --surface-2:#11161d; --surface-3:#1c2129;
+    --border:#30363d; --border-2:#484f58; --hairline:#262c34;
+    --ink:#e6edf3; --ink-2:#b1bac4; --ink-3:#8b949e; --ink-4:#6e7681;
+    --accent:#7dd3fc; --accent-2:#7dd3fc; --accent-ink:#bae6fd;
+    --accent-soft:#0c2a3d; --accent-soft-2:#0c2a3d; --accent-border:#0c2a3d;
+    --brand:var(--accent); --brand-soft:var(--accent-soft); --brand-ink:var(--accent-ink);
+    --paper-bg:#161b22; --paper-rule:#30363d;
+    --hl-mark:#5a4a12; --hl-text:#ffe89a;
+  }
+  :root:not([data-theme="light"]) {
+    --surf-blog-ico:#c084fc; --surf-forum-ico:#7dd3fc; --surf-wiki-ico:#6ee7b7;
+    --surf-paste-ico:#fbbf24; --surf-drive-ico:#93c5fd; --surf-comments-ico:#fb7185;
+  }
+}
